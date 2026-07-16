@@ -9,7 +9,9 @@
 //! (Devirtualisierung nach Dean/Grove/Chambers 1995, sound unter
 //! Closed World); der Receiver behält seinen Null-Check.
 
+mod escape;
 mod inline;
+pub use escape::stack_allocate;
 pub use inline::inline_program;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +26,7 @@ pub struct Stats {
     pub virtual_sites: usize,
     pub devirtualized: usize,
     pub inlined_calls: usize,
+    pub stack_allocated: usize,
 }
 
 /// Schlüssel eines virtuellen Call-Sites: statische Klasse + Name + Deskriptor.

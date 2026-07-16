@@ -68,16 +68,19 @@ fn main() {
     if !no_solver {
         let mut s = fastllvm_solver::run(&mut program);
         s.inlined_calls = fastllvm_solver::inline_program(&mut program);
+        s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
         if stats {
             eprintln!(
                 "solver: {} Klassen instanziiert, {} Funktionen erreichbar ({} entfernt), \
-                 {} virtuelle Sites, {} devirtualisiert, {} Calls geinlinet",
+                 {} virtuelle Sites, {} devirtualisiert, {} Calls geinlinet, \
+                 {} Allokationen auf den Stack",
                 s.instantiated_classes,
                 s.reachable_functions,
                 s.pruned_functions,
                 s.virtual_sites,
                 s.devirtualized,
                 s.inlined_calls,
+                s.stack_allocated,
             );
         }
     }

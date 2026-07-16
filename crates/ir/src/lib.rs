@@ -15,7 +15,7 @@ pub enum Ty {
 }
 
 /// Index eines Locals in `Function::locals`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Local(pub u32);
 
 /// Index eines Basic Blocks in `Function::blocks`.
@@ -88,6 +88,10 @@ pub enum Statement {
     },
     /// Objektallokation; Felder sind genullt (Java-Default), Header gesetzt.
     New { dest: Local, class: String },
+    /// Stack-Allokation: von der Escape-Analyse bewiesen, dass das Objekt
+    /// die Funktion nie verlässt (Ownership light, DESIGN.md §6a) —
+    /// Lebenszeit = Stack-Frame, wie ein Rust-Wert ohne Box.
+    StackNew { dest: Local, class: String },
     GetField { dest: Local, obj: Operand, class: String, field: String },
     PutField { obj: Operand, class: String, field: String, value: Operand },
 }

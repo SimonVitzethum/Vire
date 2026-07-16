@@ -155,6 +155,24 @@ Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular �
 3. Präzises Mark-Sweep via Statepoints — realistisch 2–5k LOC.
 4. Arena-only per Spracheinschränkung (SCJ-Modell).
 
+### 6a. Speichersicherheit („Rust-artig")
+
+Ziel: die Sicherheitsgarantien von Rust — kein Use-after-free, kein Out-of-bounds, keine wilden Pointer — hergestellt durch **statischen Beweis wo möglich, Laufzeit-Check wo nötig**. Nicht Ziel: Rusts Typsystem nachbauen; Java-Programme tragen keine Lifetime-Annotationen, also muss der Solver die Beweise liefern (DESIGN.md §3.3: Ownership-Inferenz ist Forschungsmodul, die Teilmenge unten ist der tragfähige Teil).
+
+Stand der Garantien (umgesetzt):
+
+| Gefahr | Absicherung |
+|---|---|
+| Use-after-free | Kein manuelles `free`. Heap-Objekte leben bis Prozessende (bis RC/GC in Stufe 4); Stack-Objekte nur nach **bewiesenem** Nicht-Entkommen (Escape-Analyse, s. u.) |
+| Wilde/uninitalisierte Pointer | `jrt_alloc` nullt; keine Pointerarithmetik in der Sprache; Casts (`checkcast`) werden **statisch bewiesen** oder sind Build-Fehler |
+| Null-Dereferenz | expliziter Check vor Feldzugriff/Dispatch → definierte `NullPointerException` statt UB |
+| Division/Überlauf | `jrt_idiv`/`jrt_irem` (Exception bei /0, `MIN/-1` definiert); Arithmetik wrappt definiert; Shift-Beträge maskiert |
+| Typkonfusion | Closed World + statisch bewiesene Casts; Vtable-Slots nur für RTA-erreichbare Methoden |
+
+**Escape-Analyse → Stack-Allokation (`crates/solver/src/escape.rs`):** Objekte, die ihre Funktion beweisbar nie verlassen (kein Return, kein Call-Argument, nie als Wert gespeichert; Alias-Fixpunkt über Copy-Ketten), werden `alloca` statt Heap — exakt Rusts Ownership-Modell für den beweisbaren Teil: ein Besitzer (der Stack-Frame), statisch bekannte Lebenszeit. Konservativ: Allokationen in Schleifen bleiben Heap (Alloca-Wiederverwendung bei lebenden Aliasen wäre unsound). Läuft nach Devirt+Inlining, weil geinlinte Konstruktoren/Getter aus „entkommt als Argument" ein sichtbares, harmloses `putfield` machen.
+
+**Reflection/„dynamisches" Klassenladen (umgesetzt, §1.3):** `Class.forName`, `X.class`, `getName`, `newInstance` werden per lokaler Konstantenpropagation (Origin-Analyse mit Copy-Ketten) zur Compile-Zeit aufgelöst; Class-Objekte sind Singletons mit Pointer-Identität. Nicht auflösbar → Build-Fehler mit Begründung, keine stillen Laufzeitfallen.
+
 **Klassenbibliothek:** „läuft echter Java-Code" heißt `java.base` (String = UTF-16, Collections, Math, IO). OpenJDK `java.base` ist GPLv2 **mit Classpath Exception** → statisches Linken erlaubt. Alternativen: TeaVM-Classlib (Apache-2.0, Teilmenge), GNU Classpath.
 
 ---
@@ -163,7 +181,7 @@ Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular �
 
 1. Classfile-Parser + Mittel-IR (MIR-Vorbild) + naive LLVM-Absenkung — „Hello World läuft" ✅ **umgesetzt** (Cargo-Workspace `crates/`, Binary `fastjavac`; Teilmenge: statische Methoden, int-Arithmetik, Kontrollfluss, println-Intrinsics; textuelles LLVM-IR + clang statt Bindings, da inkwell/llvm-sys LLVM 22 noch nicht abdecken)
 2. Closed-World-Reachability + CHA-Devirt + Inlining (größter Hebel, geringste Forschungsunsicherheit) ✅ **umgesetzt** (`crates/solver`: RTA-Fixpunkt nach Bacon/Sweeney, Devirtualisierung monomorpher Sites mit erhaltenem Null-Check, Pruning unerreichbarer Funktionen, Mid-IR-Inliner; dazu Objektmodell: Prefix-Layout `{vtable-ptr, super-Felder, eigene Felder}`, Vtables mit geerbten Slots, `jrt_alloc` nullt Felder — noch ohne GC, Objekte leben bis Prozessende; Interfaces/`invokeinterface`, Arrays, statische Felder und `<clinit>` weiterhin außerhalb der Teilmenge)
-3. TBAA-Baum + Escape-Analyse (Heap→Stack, Lock-Elision)
+3. TBAA-Baum + Escape-Analyse (Heap→Stack, Lock-Elision) — ⚙️ **teilweise**: Escape-Analyse mit Stack-Allokation umgesetzt (§6a); TBAA und Lock-Elision offen. Dazu vorgezogen aus §1.3: statische Reflection-Auflösung (forName/getName/newInstance/X.class, checkcast-Beweis)
 4. RC-GC + Mini-Runtime (`no_std`, seL4-Target)
 5. PGO + guarded devirtualization
 6. Objektsensitive Points-to zur Präzisionsverschärfung

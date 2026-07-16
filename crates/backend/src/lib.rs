@@ -160,7 +160,7 @@ pub fn emit(program: &Program) -> String {
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.statements)
         .filter_map(|st| match st {
-            Statement::New { class, .. } => Some(class.as_str()),
+            Statement::New { class, .. } | Statement::StackNew { class, .. } => Some(class.as_str()),
             _ => None,
         })
         .collect();
@@ -383,6 +383,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 "  {t} = call ptr @jrt_alloc(i64 ptrtoint (ptr getelementptr ({sn}, ptr null, i32 1) to i64))"
             )
             .unwrap();
+            writeln!(w, "  store ptr @vt.{}, ptr {t}", sanitize(class)).unwrap();
+            writeln!(w, "  store ptr {t}, ptr %l{}", dest.0).unwrap();
+        }
+        Statement::StackNew { dest, class } => {
+            let sn = ctx.struct_name(class);
+            let t = e.fresh();
+            // Escape-Analyse hat funktions-lokale Lebenszeit bewiesen:
+            // alloca statt Heap. Nullen + Header wie bei New.
+            writeln!(w, "  {t} = alloca {sn}").unwrap();
+            writeln!(w, "  store {sn} zeroinitializer, ptr {t}").unwrap();
             writeln!(w, "  store ptr @vt.{}, ptr {t}", sanitize(class)).unwrap();
             writeln!(w, "  store ptr {t}, ptr %l{}", dest.0).unwrap();
         }
