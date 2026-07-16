@@ -572,6 +572,7 @@ void *jrt_take_pending(void) {
  * { ptr super }. Immortale Objekte ohne Descriptor (Slot 2 null) → false. */
 typedef struct TypeDesc {
     struct TypeDesc *super;
+    const char *cname; /* gepunkteter Klassenname für Uncaught-Meldung */
 } TypeDesc;
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
@@ -605,14 +606,22 @@ void jrt_checkcast(void *obj, void *target_td) {
  * (Ohne Laufzeit-Typinfo generisch — Klassenname/Message wären ein
  * späterer Schritt, DESIGN.md §6.) */
 void jrt_check_uncaught(void) {
-    if (pending_exception) {
-        if (pending_message) {
-            fprintf(stderr, "Exception in thread \"main\" %s\n", pending_message);
+    if (!pending_exception) return;
+    if (pending_message) {
+        /* Laufzeit-Exception (Sentinel) mit fertigem Meldungstext. */
+        fprintf(stderr, "Exception in thread \"main\" %s\n", pending_message);
+    } else {
+        /* Benutzer-Exception: Klassenname aus dem Type-Descriptor. */
+        JObjHeader *h = (JObjHeader *)pending_exception;
+        void **vt = (void **)h->vtable;
+        TypeDesc *td = vt ? (TypeDesc *)vt[2] : NULL;
+        if (td && td->cname) {
+            fprintf(stderr, "Exception in thread \"main\" %s\n", td->cname);
         } else {
             fputs("Exception in thread \"main\" (unbehandelte Exception)\n", stderr);
         }
-        exit(1);
     }
+    exit(1);
 }
 
 /* --- Arrays ---------------------------------------------------------- */

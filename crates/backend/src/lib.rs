@@ -334,15 +334,31 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
     writeln!(w).unwrap();
 
-    // Type-Descriptoren für instanceof: { ptr super_descriptor }. Die Kette
+    // Type-Descriptoren für instanceof: { ptr super, ptr name }. Die Kette
     // endet bei null (Object/nicht modellierte Basis). jrt_instanceof läuft
-    // sie ab.
+    // sie ab; der Name (gepunktet) dient der Uncaught-Meldung.
     for c in &program.classes {
         let super_td = match &c.super_name {
             Some(s) if program.class(s).is_some() => format!("@td.{}", sanitize(s)),
             _ => "null".to_string(),
         };
-        writeln!(w, "@td.{} = internal constant {{ ptr }} {{ ptr {super_td} }}", sanitize(&c.name)).unwrap();
+        let dotted = c.name.replace('/', ".");
+        let bytes = dotted.as_bytes();
+        writeln!(
+            w,
+            "@cname.{} = private unnamed_addr constant [{n} x i8] c\"{esc}\\00\"",
+            sanitize(&c.name),
+            n = bytes.len() + 1,
+            esc = escape_ll(bytes),
+        )
+        .unwrap();
+        writeln!(
+            w,
+            "@td.{} = internal constant {{ ptr, ptr }} {{ ptr {super_td}, ptr @cname.{} }}",
+            sanitize(&c.name),
+            sanitize(&c.name),
+        )
+        .unwrap();
     }
     writeln!(w).unwrap();
 
