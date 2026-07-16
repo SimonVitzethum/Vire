@@ -769,6 +769,22 @@ void jrt_throw_npe(void) {
 void jrt_throw_sioobe(void) {
     throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");
 }
+
+/* Throwable.getMessage(): liest das $message-Feld (erstes Instanzfeld von
+ * java.lang.Throwable → Offset 3 Worte). Laufzeit-Sentinels (Arith/NPE/…)
+ * haben keinen Type-Descriptor (vt[2]==NULL) und kein solches Feld → null.
+ * Rückgabe retained (+1 für den Aufrufer, Owning-Slot-Modell). */
+void *jrt_throwable_message(void *obj) {
+    if (!obj) {
+        throw_runtime(&npe_exc_obj, "java.lang.NullPointerException");
+        return NULL;
+    }
+    void **vt = (void **)((JObjHeader *)obj)->vtable;
+    if (!vt || vt[2] == NULL) return NULL; /* Sentinel ohne Message-Feld */
+    void *msg = *(void **)((char *)obj + 24);
+    jrt_retain(msg);
+    return msg;
+}
 int32_t jrt_pending_set(void) {
     return pending_exception != NULL;
 }

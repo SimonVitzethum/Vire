@@ -133,6 +133,76 @@ pub fn register_builtins(program: &mut Program) {
     program.classes.push(builtin("java/lang/Character", "character"));
     program.classes.push(builtin("java/lang/Float", "float"));
     register_enum(program);
+    register_throwables(program);
+}
+
+/// Throwable/Exception/RuntimeException als eingebaute Basisklassen: Throwable
+/// hält das `$message`-Feld, alle drei bekommen `<init>()V` und
+/// `<init>(String)V` (setzen die Message). `getMessage()` wird im Frontend als
+/// Intrinsic abgefangen. Damit funktionieren `new RuntimeException("…")` und
+/// benutzerdefinierte Exceptions mit Message; für das *catch* bleiben diese
+/// drei Basistypen catch-all (Sentinels tragen keinen Type-Descriptor).
+fn register_throwables(program: &mut Program) {
+    // (Klasse, Superklasse)
+    let chain = [
+        ("java/lang/Throwable", None),
+        ("java/lang/Exception", Some("java/lang/Throwable")),
+        ("java/lang/RuntimeException", Some("java/lang/Exception")),
+    ];
+    for (cls, sup) in chain {
+        let init0 = mangle(cls, "<init>", "()V");
+        let init1 = mangle(cls, "<init>", "(Ljava/lang/String;)V");
+        let fields = if cls == "java/lang/Throwable" {
+            vec![FieldInfo { name: "$message".to_string(), ty: Ty::Ref }]
+        } else {
+            Vec::new()
+        };
+        program.classes.push(ClassInfo {
+            name: cls.to_string(),
+            super_name: sup.map(str::to_string),
+            is_interface: false,
+            interfaces: Vec::new(),
+            fields,
+            static_fields: Vec::new(),
+            methods: vec![
+                MethodInfo { name: "<init>".into(), desc: "()V".into(), is_static: false, has_body: true, mangled: init0.clone() },
+                MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;)V".into(), is_static: false, has_body: true, mangled: init1.clone() },
+            ],
+            has_clinit: false,
+        });
+        // <init>(): this.$message = null
+        program.functions.push(Function {
+            name: init0,
+            params: vec![Ty::Ref],
+            ret: Ty::Void,
+            locals: vec![Ty::Ref],
+            blocks: vec![BasicBlock {
+                statements: vec![Statement::PutField {
+                    obj: Operand::Copy(Local(0)),
+                    class: "java/lang/Throwable".to_string(),
+                    field: "$message".into(),
+                    value: Operand::ConstNull,
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        });
+        // <init>(String): this.$message = msg
+        program.functions.push(Function {
+            name: init1,
+            params: vec![Ty::Ref, Ty::Ref],
+            ret: Ty::Void,
+            locals: vec![Ty::Ref, Ty::Ref],
+            blocks: vec![BasicBlock {
+                statements: vec![Statement::PutField {
+                    obj: Operand::Copy(Local(0)),
+                    class: "java/lang/Throwable".to_string(),
+                    field: "$message".into(),
+                    value: Operand::Copy(Local(1)),
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        });
+    }
 }
 
 /// java.lang.Enum als Basisklasse aller enums: hält name (String) und
@@ -721,6 +791,13 @@ fn lower_method(
                     None
                 } else {
                     match cf.class_name(e.catch_type) {
+                        // Die eingebauten Basis-Throwables bleiben catch-all:
+                        // Laufzeit-Sentinels (Arith/NPE/Bounds) tragen keinen
+                        // Type-Descriptor und würden einen typisierten
+                        // instanceof gegen RuntimeException sonst verfehlen.
+                        Ok("java/lang/Throwable")
+                        | Ok("java/lang/Exception")
+                        | Ok("java/lang/RuntimeException") => None,
                         Ok(c) if program.class(c).is_some() => Some(c.to_string()),
                         _ => None,
                     }
@@ -1671,6 +1748,19 @@ fn lower_block(
                 if name == "addSuppressed" && desc == "(Ljava/lang/Throwable;)V" {
                     pop!(); // suppressed throwable
                     pop!(); // receiver
+                    continue;
+                }
+                // Throwable.getMessage(): $message-Feld lesen (Sentinel-sicher
+                // über die Runtime, die den Type-Descriptor prüft).
+                if name == "getMessage" && desc == "()Ljava/lang/String;" {
+                    let recv = pop!();
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stack.push(Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: "jrt_throwable_message".to_string(),
+                        args: vec![Operand::Copy(recv)],
+                    });
                     continue;
                 }
                 // Array-clone() (u.a. von enum values() erzeugt): flache

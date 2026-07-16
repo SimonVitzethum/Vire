@@ -141,6 +141,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_arraylen", "i32 (ptr)"),
     ("jrt_array_clone", "ptr (ptr, i64, i32)"),
     ("jrt_enum_valueof", "ptr (ptr, ptr)"),
+    ("jrt_throwable_message", "ptr (ptr)"),
     ("jrt_array_ref_drop", "void (ptr)"),
     ("jrt_array_ref_trace", "void (ptr, ptr)"),
     ("jrt_noop_drop", "void (ptr)"),
