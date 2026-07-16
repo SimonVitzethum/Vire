@@ -1,8 +1,6 @@
 package java.util;
 
-// Minimaler Stub im java.util-Paket, kompiliert über --patch-module.
-// fastjavac nutzt diese .class; javac prüft Nutzercode gegen das echte JDK.
-public class ArrayList<E> {
+public class ArrayList<E> implements List<E> {
     private Object[] elems;
     private int count;
 
@@ -24,6 +22,10 @@ public class ArrayList<E> {
 
     public int size() {
         return count;
+    }
+
+    public Iterator<E> iterator() {
+        return new ArrayListIterator<E>(this);
     }
 
     private void grow() {
