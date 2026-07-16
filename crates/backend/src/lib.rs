@@ -67,6 +67,16 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_boolean_equals", "i32 (ptr, ptr)"),
     ("jrt_boolean_hashcode", "i32 (ptr)"),
     ("jrt_boolean_tostring", "ptr (ptr)"),
+    ("jrt_double_valueof", "ptr (double)"),
+    ("jrt_double_doublevalue", "double (ptr)"),
+    ("jrt_double_equals", "i32 (ptr, ptr)"),
+    ("jrt_double_hashcode", "i32 (ptr)"),
+    ("jrt_double_tostring", "ptr (ptr)"),
+    ("jrt_character_valueof", "ptr (i32)"),
+    ("jrt_character_charvalue", "i32 (ptr)"),
+    ("jrt_character_equals", "i32 (ptr, ptr)"),
+    ("jrt_character_hashcode", "i32 (ptr)"),
+    ("jrt_character_tostring", "ptr (ptr)"),
     ("jrt_str_concat", "ptr (ptr, ptr)"),
     ("jrt_int_to_str", "ptr (i32)"),
     ("jrt_long_to_str", "ptr (i64)"),
@@ -284,6 +294,8 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "@jrt_integer_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_long_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_boolean_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_double_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_character_vt = external global ptr").unwrap();
     // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
     // aber refcount -1 = immortal → retain/release/Collector No-Op, die
     // Read-only-Konstante bleibt unberührt. Vtable = @vt.java_lang_String
@@ -396,6 +408,8 @@ pub fn emit(program: &Program) -> String {
         ("jrt_integer_valueof", "java/lang/Integer", "jrt_integer_vt"),
         ("jrt_long_valueof", "java/lang/Long", "jrt_long_vt"),
         ("jrt_boolean_valueof", "java/lang/Boolean", "jrt_boolean_vt"),
+        ("jrt_double_valueof", "java/lang/Double", "jrt_double_vt"),
+        ("jrt_character_valueof", "java/lang/Character", "jrt_character_vt"),
     ];
     for (vf, cls, _) in &wrappers {
         if calls_fn(vf) {

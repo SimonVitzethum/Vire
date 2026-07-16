@@ -129,6 +129,8 @@ pub fn register_builtins(program: &mut Program) {
     program.classes.push(builtin("java/lang/Integer", "integer"));
     program.classes.push(builtin("java/lang/Long", "long"));
     program.classes.push(builtin("java/lang/Boolean", "boolean"));
+    program.classes.push(builtin("java/lang/Double", "double"));
+    program.classes.push(builtin("java/lang/Character", "character"));
 }
 
 /// Phase 2: alle Methodenrümpfe absenken.
@@ -1126,6 +1128,8 @@ fn lower_block(
                     ("java/lang/Integer", "intValue", "()I") => Some(("jrt_integer_intvalue", Ty::I32)),
                     ("java/lang/Long", "longValue", "()J") => Some(("jrt_long_longvalue", Ty::I64)),
                     ("java/lang/Boolean", "booleanValue", "()Z") => Some(("jrt_boolean_booleanvalue", Ty::I32)),
+                    ("java/lang/Double", "doubleValue", "()D") => Some(("jrt_double_doublevalue", Ty::F64)),
+                    ("java/lang/Character", "charValue", "()C") => Some(("jrt_character_charvalue", Ty::I32)),
                     _ => None,
                 };
                 if let Some((f, rty)) = unbox {
@@ -1452,6 +1456,8 @@ fn lower_block(
                     ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => Some("jrt_integer_valueof"),
                     ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => Some("jrt_long_valueof"),
                     ("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;") => Some("jrt_boolean_valueof"),
+                    ("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;") => Some("jrt_double_valueof"),
+                    ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => Some("jrt_character_valueof"),
                     _ => None,
                 };
                 if let Some(f) = box_fn {

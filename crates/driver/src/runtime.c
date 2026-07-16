@@ -218,6 +218,53 @@ void *jrt_boolean_tostring(void *o) {
     return ((JInteger *)o)->value ? str_from_buf("true", 4) : str_from_buf("false", 5);
 }
 
+void *jrt_double_vt = NULL;
+void *jrt_character_vt = NULL;
+typedef struct {
+    int64_t refcount, rcflags;
+    void *vtable;
+    double value;
+} JDouble;
+
+void *jrt_double_valueof(double v) {
+    JDouble *o = (JDouble *)jrt_alloc((int64_t)sizeof(JDouble));
+    o->vtable = jrt_double_vt;
+    o->value = v;
+    return o;
+}
+double jrt_double_doublevalue(void *o) { return ((JDouble *)o)->value; }
+int32_t jrt_double_hashcode(void *o) {
+    int64_t bits;
+    memcpy(&bits, &((JDouble *)o)->value, sizeof bits);
+    return (int32_t)(bits ^ (bits >> 32)); /* Java Double.hashCode */
+}
+int32_t jrt_double_equals(void *a, void *b) {
+    if (!b || ((JDouble *)b)->vtable != jrt_double_vt) return 0;
+    return ((JDouble *)a)->value == ((JDouble *)b)->value;
+}
+void *jrt_double_tostring(void *o) {
+    char buf[32];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", ((JDouble *)o)->value));
+}
+
+/* Character nutzt dasselbe Layout wie Integer (char = i32). */
+void *jrt_character_valueof(int32_t v) {
+    JInteger *o = (JInteger *)jrt_alloc((int64_t)sizeof(JInteger));
+    o->vtable = jrt_character_vt;
+    o->value = v;
+    return o;
+}
+int32_t jrt_character_charvalue(void *o) { return ((JInteger *)o)->value; }
+int32_t jrt_character_hashcode(void *o) { return ((JInteger *)o)->value; }
+int32_t jrt_character_equals(void *a, void *b) {
+    if (!b || ((JInteger *)b)->vtable != jrt_character_vt) return 0;
+    return ((JInteger *)a)->value == ((JInteger *)b)->value;
+}
+void *jrt_character_tostring(void *o) {
+    char c = (char)((JInteger *)o)->value;
+    return str_from_buf(&c, 1);
+}
+
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
  * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
  * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */

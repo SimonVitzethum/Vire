@@ -77,6 +77,8 @@ pub fn run(program: &mut Program) -> Stats {
         ("jrt_integer_valueof", "java/lang/Integer"),
         ("jrt_long_valueof", "java/lang/Long"),
         ("jrt_boolean_valueof", "java/lang/Boolean"),
+        ("jrt_double_valueof", "java/lang/Double"),
+        ("jrt_character_valueof", "java/lang/Character"),
     ] {
         if calls_fn(vf) {
             instantiated.insert(cls.to_string());
