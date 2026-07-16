@@ -140,8 +140,8 @@ Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular �
 | Feature | Auflösung |
 |---|---|
 | GC | s. u. |
-| Exceptions | ✅ **umgesetzt** (pending-Modell): `jrt_throw` setzt eine schwebende Exception, der Code prüft nach jedem werfenden Aufruf `jrt_pending_set` → Handler oder Propagation (Cleanup + Dummy-Return). Kein Unwinder/Personality. Frontend liest die Exception-Table, splittet Blöcke an werfenden Aufrufen, Handler betreten mit der Exception aus `jrt_take_pending`; RC-korrekt. Offen: typspezifische `catch`-Diskriminierung (erster Handler = catch-all), `finally`, abfangbare Laufzeit-Exceptions (NPE/div0/bounds bleiben `exit`), Klassenname in Uncaught-Meldung |
-| Vererbung/Interfaces | Vtables/Itables, rein statisch |
+| Exceptions | ✅ **umgesetzt** (pending-Modell): `jrt_throw` setzt eine schwebende Exception, der Code prüft nach jedem werfenden Aufruf `jrt_pending_set` → Handler oder Propagation (Cleanup + Dummy-Return). Kein Unwinder/Personality. Frontend liest die Exception-Table, splittet Blöcke an werfenden Aufrufen, Handler betreten mit der Exception aus `jrt_take_pending`; RC-korrekt. **Typspezifische `catch`-Diskriminierung** über Dispatch-Ketten mit `jrt_pending_instanceof` (Laufzeit-Typinfo, s. u.); mehrere `catch`-Blöcke und Subklassen-Matching; `finally` (javac-catch-all + Duplikat) funktioniert. Offen: abfangbare Laufzeit-Exceptions (NPE/div0/bounds bleiben `exit`), Klassenname in Uncaught-Meldung |
+| Vererbung/Interfaces | ✅ Vtables mit globalen Interface-Slots (dieselbe Interface-Methode überall am selben Slot); RTA devirtualisiert monomorphe Interface-Calls. Laufzeit-Typinfo: Type-Descriptor pro Klasse in Vtable-Slot 2 (`{ ptr super }`-Kette), `jrt_instanceof` für Casts/catch |
 | Reflection/`forName`/dyn. Laden | Closed World + Deklaration (s. 1.3) |
 | `null` | explizite Checks (Segfault-Handler-Trick = Runtime) |
 | Integer (int/long) | `wrapping_*`; div/0 → `ArithmeticException`; `MIN/-1` definiert; Shift maskiert (&31/&63); `lcmp` über Runtime |

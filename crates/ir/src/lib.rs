@@ -102,6 +102,9 @@ pub enum Statement {
     PutField { obj: Operand, class: String, field: String, value: Operand },
     GetStatic { dest: Local, class: String, field: String },
     PutStatic { class: String, field: String, value: Operand },
+    /// `dest = (pending exception instanceof class) ? 1 : 0` — für die
+    /// Typ-Diskriminierung mehrerer catch-Blöcke.
+    InstanceOfPending { dest: Local, class: String },
     /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
     NewArray { dest: Local, elem: Ty, len: Operand },
     ArrayLen { dest: Local, arr: Operand },

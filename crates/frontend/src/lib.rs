@@ -367,18 +367,55 @@ fn lower_method(
         .iter()
         .map(|e| block_of_pc[&(e.handler_pc as usize)])
         .collect();
-    let exc_target_of_pc: HashMap<usize, Block> = instrs
-        .iter()
-        .map(|(pc, _)| {
-            let target = code
-                .exceptions
-                .iter()
-                .find(|e| (e.start_pc as usize) <= *pc && *pc < (e.end_pc as usize))
-                .map(|e| block_of_pc[&(e.handler_pc as usize)])
-                .unwrap_or(propagate_block);
-            (*pc, target)
-        })
-        .collect();
+    // Alle Handler, die einen pc abdecken (in Table-Reihenfolge). catch_type 0
+    // oder eine nicht modellierte Klasse (java/lang/Exception, …) wirkt als
+    // catch-all (None); modellierte Klassen als echter instanceof-Typ.
+    let handlers_of_pc = |pc: usize| -> Vec<(Option<String>, Block)> {
+        code.exceptions
+            .iter()
+            .filter(|e| (e.start_pc as usize) <= pc && pc < (e.end_pc as usize))
+            .map(|e| {
+                let cc = if e.catch_type == 0 {
+                    None
+                } else {
+                    match cf.class_name(e.catch_type) {
+                        Ok(c) if program.class(c).is_some() => Some(c.to_string()),
+                        _ => None,
+                    }
+                };
+                (cc, block_of_pc[&(e.handler_pc as usize)])
+            })
+            .collect()
+    };
+    // Länge der Dispatch-Kette: bis einschließlich des ersten catch-all.
+    let chain_len = |list: &[(Option<String>, Block)]| -> usize {
+        list.iter().position(|(cc, _)| cc.is_none()).map(|i| i + 1).unwrap_or(list.len())
+    };
+
+    // Für jeden werfenden pc das Exception-Ziel: direkter Handler (einzelner
+    // catch-all), Kette (typspezifisch) oder Propagate-Block. Ketten werden
+    // nach Handler-Liste dedupliziert und synthetische Blöcke ab hinter dem
+    // Propagate-Block angesiedelt.
+    let mut chain_entry: HashMap<Vec<(Option<String>, Block)>, Block> = HashMap::new();
+    let mut chains: Vec<(Block, Vec<(Option<String>, Block)>)> = Vec::new();
+    let mut next_synth = propagate_block.0 + 1;
+    let mut exc_target_of_pc: HashMap<usize, Block> = HashMap::new();
+    for (pc, _) in &instrs {
+        let list = handlers_of_pc(*pc);
+        let target = if list.is_empty() {
+            propagate_block
+        } else if list[0].0.is_none() {
+            list[0].1 // erster Handler fängt alles → direkt
+        } else {
+            *chain_entry.entry(list.clone()).or_insert_with(|| {
+                let entry = Block(next_synth);
+                next_synth += chain_len(&list) as u32;
+                chains.push((entry, list.clone()));
+                entry
+            })
+        };
+        exc_target_of_pc.insert(*pc, target);
+    }
 
     let mut ml = MethodLowering { cf, locals: Vec::new(), slot_map: HashMap::new(), stack_map: HashMap::new() };
 
@@ -399,7 +436,12 @@ fn lower_method(
         block_entry_stack.insert(hb, vec![Ty::Ref]);
     }
     let mut done: Vec<Option<BasicBlock>> = vec![None; leaders.len()];
+    // Handler sind eigene Einstiegspunkte: die Dispatch-Ketten springen sie
+    // an, nicht die werfenden Blöcke direkt.
     let mut worklist = vec![Block(0)];
+    for &hb in &handler_blocks {
+        worklist.push(hb);
+    }
 
     while let Some(blk) = worklist.pop() {
         if done[blk.0 as usize].is_some() {
@@ -429,8 +471,9 @@ fn lower_method(
             &exc_target_of_pc,
         )?;
         for (succ, stack) in succs {
-            // Der Propagate-Block ist synthetisch (nicht in der Worklist).
-            if succ == propagate_block {
+            // Propagate- und Dispatch-Ketten-Blöcke sind synthetisch (Index
+            // ab propagate_block) und werden separat generiert.
+            if succ.0 >= propagate_block.0 {
                 continue;
             }
             // Handler-Eintrittsstacks sind fest [Ref] und werden nicht vom
@@ -473,6 +516,28 @@ fn lower_method(
         Ty::Ref => Some(Operand::ConstNull),
     };
     blocks.push(BasicBlock { statements: Vec::new(), terminator: Terminator::Return(dummy) });
+
+    // Dispatch-Ketten der typspezifischen catch-Blöcke anhängen. Reihenfolge
+    // = Zuweisungsreihenfolge, damit die vorab vergebenen Indizes stimmen.
+    for (entry, list) in &chains {
+        let n = chain_len(list);
+        for i in 0..n {
+            let (cc, handler) = &list[i];
+            let block = match cc {
+                None => BasicBlock { statements: Vec::new(), terminator: Terminator::Goto(*handler) },
+                Some(class) => {
+                    let c = ml.fresh(Ty::I32);
+                    let next = if i + 1 < n { Block(entry.0 + (i + 1) as u32) } else { propagate_block };
+                    BasicBlock {
+                        statements: vec![Statement::InstanceOfPending { dest: c, class: class.clone() }],
+                        terminator: Terminator::Branch { cond: Operand::Copy(c), then_blk: *handler, else_blk: next },
+                    }
+                }
+            };
+            debug_assert_eq!(blocks.len() as u32, entry.0 + i as u32);
+            blocks.push(block);
+        }
+    }
 
     Ok(Function {
         name: mangle(&cf.this_class, &m.name, &m.descriptor),

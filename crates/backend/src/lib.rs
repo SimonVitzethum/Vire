@@ -74,6 +74,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_pending_set", "i32 ()"),
     ("jrt_take_pending", "ptr ()"),
     ("jrt_check_uncaught", "void ()"),
+    ("jrt_pending_instanceof", "i32 (ptr)"),
     ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
     ("jrt_bounds_check", "void (ptr, i32)"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -114,9 +115,11 @@ fn elem_size(elem: Ty) -> usize {
 const HEADER_SLOTS: usize = 3;
 /// Word-Offset des Vtable-Zeigers im Header (für ptr-getelementptr).
 const VTABLE_WORD: usize = 2;
-/// Vtable-Slot 0 = Drop-Funktion, Slot 1 = Trace-Funktion (Zyklen-Collector);
-/// virtuelle Methoden beginnen ab Slot 2.
-const VTABLE_METHOD_OFFSET: usize = 2;
+/// Vtable-Slot 0 = Drop, Slot 1 = Trace (Zyklen-Collector), Slot 2 =
+/// Type-Descriptor (instanceof); Interface-/virtuelle Methoden ab Slot 3.
+const VTABLE_METHOD_OFFSET: usize = 3;
+/// Vtable-Slot des Type-Descriptors.
+const VTABLE_TYPEDESC_SLOT: usize = 2;
 
 /// Klassen-Kontext: Layouts und Vtables, aus `Program::classes` berechnet.
 struct Ctx<'a> {
@@ -284,8 +287,21 @@ pub fn emit(program: &Program) -> String {
     // released/besucht seine Elemente über Runtime-Helfer.
     writeln!(w, "%arr.int = type {{ i64, i64, ptr, i64, [0 x i32] }}").unwrap();
     writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, [0 x ptr] }}").unwrap();
-    writeln!(w, "@vt.array.int = internal unnamed_addr constant [2 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace]").unwrap();
-    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [2 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace]").unwrap();
+    // Arrays haben keinen Type-Descriptor (Slot 2 = null → instanceof false).
+    writeln!(w, "@vt.array.int = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
+    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
+    writeln!(w).unwrap();
+
+    // Type-Descriptoren für instanceof: { ptr super_descriptor }. Die Kette
+    // endet bei null (Object/nicht modellierte Basis). jrt_instanceof läuft
+    // sie ab.
+    for c in &program.classes {
+        let super_td = match &c.super_name {
+            Some(s) if program.class(s).is_some() => format!("@td.{}", sanitize(s)),
+            _ => "null".to_string(),
+        };
+        writeln!(w, "@td.{} = internal constant {{ ptr }} {{ ptr {super_td} }}", sanitize(&c.name)).unwrap();
+    }
     writeln!(w).unwrap();
 
     // Statische Felder als globale Variablen (mit ConstantValue-Initialwert).
@@ -333,6 +349,7 @@ pub fn emit(program: &Program) -> String {
         let mut entries = vec![
             format!("ptr @drop.{}", sanitize(class)),
             format!("ptr @trace.{}", sanitize(class)),
+            format!("ptr @td.{}", sanitize(class)),
         ];
         let sym_entry = |sym: Option<String>| match sym {
             Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
@@ -760,6 +777,11 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             } else {
                 writeln!(w, "  store {} {v}, ptr {g}", llty(ty)).unwrap();
             }
+        }
+        Statement::InstanceOfPending { dest, class } => {
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i32 @jrt_pending_instanceof(ptr @td.{})", sanitize(class)).unwrap();
+            writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
         }
         Statement::NewArray { dest, elem, len } => {
             let n = e.operand(w, len);

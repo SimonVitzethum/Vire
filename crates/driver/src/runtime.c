@@ -397,6 +397,31 @@ void *jrt_take_pending(void) {
     pending_exception = NULL;
     return e;
 }
+/* instanceof: läuft die Type-Descriptor-Kette des Objekts ab und vergleicht
+ * mit dem Ziel-Descriptor. Vtable-Slot 2 ist der Type-Descriptor;
+ * { ptr super }. Immortale Objekte ohne Descriptor (Slot 2 null) → false. */
+typedef struct TypeDesc {
+    struct TypeDesc *super;
+} TypeDesc;
+
+int32_t jrt_instanceof(void *obj, void *target_td) {
+    if (!obj) return 0;
+    JObjHeader *h = (JObjHeader *)obj;
+    void **vt = (void **)h->vtable;
+    if (!vt) return 0;
+    TypeDesc *td = (TypeDesc *)vt[2];
+    while (td) {
+        if ((void *)td == target_td) return 1;
+        td = td->super;
+    }
+    return 0;
+}
+
+/* Prüft die schwebende Exception gegen einen catch-Typ (Dispatch-Kaskade). */
+int32_t jrt_pending_instanceof(void *target_td) {
+    return jrt_instanceof(pending_exception, target_td);
+}
+
 /* Von @main nach java_main aufgerufen: unbehandelte Exception melden.
  * (Ohne Laufzeit-Typinfo generisch — Klassenname/Message wären ein
  * späterer Schritt, DESIGN.md §6.) */
