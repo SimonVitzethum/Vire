@@ -7,3 +7,6 @@
 # javac-/fastjavac-Ausgaben in den Beispielen: alles außer den Quellen
 examples/*
 !examples/*.java
+
+# kompilierte Stub-Klassenbibliothek
+/stdlib/out/
