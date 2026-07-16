@@ -22,12 +22,21 @@ pub fn inline_program(program: &mut Program) -> usize {
             matches!(st, Statement::Call { func, .. } if *func == f.name)
         })
     };
+    // Funktionen mit Exception-Kontrollfluss nicht inlinen: ihr
+    // Propagate-Return würde beim Inlinen zum normalen Fortsetzungsblock
+    // umgebogen und der pending-Check des Aufrufers ginge verloren.
+    let has_exception_flow = |f: &Function| {
+        f.blocks.iter().flat_map(|b| &b.statements).any(|st| {
+            matches!(st, Statement::Call { func, .. }
+                if func == "jrt_throw" || func == "jrt_pending_set" || func == "jrt_take_pending")
+        })
+    };
 
     // Kandidaten kopieren, damit Aufrufer mutierbar bleiben.
     let candidates: BTreeMap<String, Function> = program
         .functions
         .iter()
-        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f))
+        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f) && !has_exception_flow(f))
         .map(|f| (f.name.clone(), f.clone()))
         .collect();
 

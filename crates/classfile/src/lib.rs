@@ -81,11 +81,23 @@ impl Method {
     }
 }
 
+/// Eintrag der Exception-Table (JVMS 4.7.3): der Bereich [start_pc, end_pc)
+/// wird von handler_pc abgefangen, wenn der geworfene Typ zu catch_type passt
+/// (catch_type 0 = finally / fängt alles).
+#[derive(Debug, Clone)]
+pub struct ExceptionEntry {
+    pub start_pc: u16,
+    pub end_pc: u16,
+    pub handler_pc: u16,
+    pub catch_type: u16,
+}
+
 #[derive(Debug)]
 pub struct Code {
     pub max_stack: u16,
     pub max_locals: u16,
     pub bytecode: Vec<u8>,
+    pub exceptions: Vec<ExceptionEntry>,
 }
 
 #[derive(Debug)]
@@ -206,8 +218,18 @@ impl ClassFile {
                     let max_locals = cr.u16()?;
                     let code_len = cr.u32()? as usize;
                     let bytecode = cr.bytes(code_len)?.to_vec();
-                    // Exception-Table und Sub-Attribute (LineNumberTable, …) ignorieren.
-                    code = Some(Code { max_stack, max_locals, bytecode });
+                    let ex_count = cr.u16()?;
+                    let mut exceptions = Vec::with_capacity(ex_count as usize);
+                    for _ in 0..ex_count {
+                        exceptions.push(ExceptionEntry {
+                            start_pc: cr.u16()?,
+                            end_pc: cr.u16()?,
+                            handler_pc: cr.u16()?,
+                            catch_type: cr.u16()?,
+                        });
+                    }
+                    // Sub-Attribute (LineNumberTable, StackMapTable, …) ignorieren.
+                    code = Some(Code { max_stack, max_locals, bytecode, exceptions });
                 } else {
                     r.bytes(attr_len)?;
                 }

@@ -103,6 +103,7 @@ pub enum Instr {
     /// anewarray: Array von Referenzen (Klassenindex, hier ignoriert).
     NewArrayRef(u16),
     ArrayLength,
+    AThrow,
     IaLoad,
     IaStore,
     AaLoad,
@@ -266,6 +267,7 @@ pub fn decode_code(
             }
             0xBD => (Instr::NewArrayRef(u16_at(pc + 1)?), 3),
             0xBE => (Instr::ArrayLength, 1),
+            0xBF => (Instr::AThrow, 1),
             0xC0 => (Instr::CheckCast(u16_at(pc + 1)?), 3),
             0xC6 => (Instr::IfRefNull(Cond::Eq, branch(pc + 1)?), 3),
             0xC7 => (Instr::IfRefNull(Cond::Ne, branch(pc + 1)?), 3),

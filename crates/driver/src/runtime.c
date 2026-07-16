@@ -376,6 +376,37 @@ void jrt_null_check(const void *p) {
     }
 }
 
+/* --- Exceptions ------------------------------------------------------
+ * "pending exception"-Modell (single-thread): jrt_throw setzt die schwebende
+ * Exception (und hält eine Referenz darauf); der generierte Code prüft nach
+ * jedem werfenden Aufruf jrt_pending_set und springt zum Handler oder
+ * propagiert. jrt_take_pending übergibt die Referenz an den Handler. */
+static void *pending_exception = NULL;
+
+void jrt_throw(void *e) {
+    jrt_retain(e); /* bleibt am Leben, solange sie schwebt */
+    pending_exception = e;
+}
+int32_t jrt_pending_set(void) {
+    return pending_exception != NULL;
+}
+/* Übergibt die schwebende Referenz an den Aufrufer (Handler) und löscht
+ * das Flag — kein retain/release, die +1 wird transferiert. */
+void *jrt_take_pending(void) {
+    void *e = pending_exception;
+    pending_exception = NULL;
+    return e;
+}
+/* Von @main nach java_main aufgerufen: unbehandelte Exception melden.
+ * (Ohne Laufzeit-Typinfo generisch — Klassenname/Message wären ein
+ * späterer Schritt, DESIGN.md §6.) */
+void jrt_check_uncaught(void) {
+    if (pending_exception) {
+        fputs("Exception in thread \"main\" (unbehandelte Exception)\n", stderr);
+        exit(1);
+    }
+}
+
 /* --- Arrays ---------------------------------------------------------- */
 
 /* Gleicher Header wie Objekte, dann die Länge; Elemente folgen direkt. */

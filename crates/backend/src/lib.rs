@@ -70,6 +70,10 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_null_check", "void (ptr)"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
+    ("jrt_throw", "void (ptr)"),
+    ("jrt_pending_set", "i32 ()"),
+    ("jrt_take_pending", "ptr ()"),
+    ("jrt_check_uncaught", "void ()"),
     ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
     ("jrt_bounds_check", "void (ptr, i32)"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -342,6 +346,8 @@ pub fn emit(program: &Program) -> String {
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
         writeln!(w, "  call void @java_main()").unwrap();
+        // Unbehandelte Exception aus main melden (statt still zu ignorieren).
+        writeln!(w, "  call void @jrt_check_uncaught()").unwrap();
         writeln!(w, "  ret i32 0").unwrap();
         writeln!(w, "}}").unwrap();
     }

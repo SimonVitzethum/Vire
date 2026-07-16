@@ -317,7 +317,16 @@ fn lower_method(
                     leaders.push(*next_pc);
                 }
             }
-            Instr::Return | Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn => {
+            Instr::Return | Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn
+            | Instr::AThrow => {
+                if let Some((next_pc, _)) = instrs.get(i + 1) {
+                    leaders.push(*next_pc);
+                }
+            }
+            // Werfende Aufrufe beenden den Block (danach folgt der
+            // Exception-Check), also ist die nächste Instruktion ein Leader.
+            // (invokedynamic = Konkatenation wirft nicht.)
+            Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_) => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -325,10 +334,40 @@ fn lower_method(
             _ => {}
         }
     }
+    // Exception-Handler-Einstiege sind Leader.
+    for e in &code.exceptions {
+        leaders.push(e.handler_pc as usize);
+    }
     leaders.sort_unstable();
     leaders.dedup();
     let block_of_pc: HashMap<usize, Block> =
         leaders.iter().enumerate().map(|(i, pc)| (*pc, Block(i as u32))).collect();
+
+    // Synthetischer Propagate-Block (letzter Block): wird angesprungen, wenn
+    // eine Exception aus dieser Methode heraus propagiert. Er läuft ins
+    // Funktions-Cleanup (Backend released die Locals; die Exception bleibt in
+    // jrt_pending) und returnt einen Dummy — der Aufrufer prüft pending.
+    let propagate_block = Block(leaders.len() as u32);
+
+    // Handler-Blöcke und, pro werfender Instruktion, das Sprungziel im
+    // Ausnahmefall (innerster umschließender Handler oder Propagate-Block).
+    let handler_blocks: std::collections::HashSet<Block> = code
+        .exceptions
+        .iter()
+        .map(|e| block_of_pc[&(e.handler_pc as usize)])
+        .collect();
+    let exc_target_of_pc: HashMap<usize, Block> = instrs
+        .iter()
+        .map(|(pc, _)| {
+            let target = code
+                .exceptions
+                .iter()
+                .find(|e| (e.start_pc as usize) <= *pc && *pc < (e.end_pc as usize))
+                .map(|e| block_of_pc[&(e.handler_pc as usize)])
+                .unwrap_or(propagate_block);
+            (*pc, target)
+        })
+        .collect();
 
     let mut ml = MethodLowering { cf, locals: Vec::new(), slot_map: HashMap::new(), stack_map: HashMap::new() };
 
@@ -344,6 +383,10 @@ fn lower_method(
     // Worklist über Blöcke; Stack-Zustand (Typen) wird an Nachfolger propagiert.
     let mut block_entry_stack: HashMap<Block, Vec<Ty>> = HashMap::new();
     block_entry_stack.insert(Block(0), Vec::new());
+    // Handler betreten mit genau der Exception auf dem Stack (JVMS 4.10.1).
+    for &hb in &handler_blocks {
+        block_entry_stack.insert(hb, vec![Ty::Ref]);
+    }
     let mut done: Vec<Option<BasicBlock>> = vec![None; leaders.len()];
     let mut worklist = vec![Block(0)];
 
@@ -371,8 +414,20 @@ fn lower_method(
             entry_stack,
             &block_of_pc,
             fallthrough,
+            handler_blocks.contains(&blk),
+            &exc_target_of_pc,
         )?;
         for (succ, stack) in succs {
+            // Der Propagate-Block ist synthetisch (nicht in der Worklist).
+            if succ == propagate_block {
+                continue;
+            }
+            // Handler-Eintrittsstacks sind fest [Ref] und werden nicht vom
+            // Vorgänger überschrieben (der Ausnahme-Zweig leert den Stack).
+            if handler_blocks.contains(&succ) {
+                worklist.push(succ);
+                continue;
+            }
             match block_entry_stack.get(&succ) {
                 Some(prev) => {
                     if *prev != stack {
@@ -392,10 +447,21 @@ fn lower_method(
     }
 
     // Unerreichte Blöcke (z. B. nach javac totem Code) als leere Returns.
-    let blocks = done
+    let mut blocks: Vec<BasicBlock> = done
         .into_iter()
         .map(|b| b.unwrap_or(BasicBlock { statements: Vec::new(), terminator: Terminator::Return(None) }))
         .collect();
+
+    // Propagate-Block anhängen: Return eines Dummy passend zum Rückgabetyp
+    // (der Wert wird nie benutzt — der Aufrufer sieht die pending exception).
+    let dummy = match ret {
+        Ty::Void => None,
+        Ty::I32 => Some(Operand::ConstI32(0)),
+        Ty::I64 => Some(Operand::ConstI64(0)),
+        Ty::F64 => Some(Operand::ConstF64(0.0)),
+        Ty::Ref => Some(Operand::ConstNull),
+    };
+    blocks.push(BasicBlock { statements: Vec::new(), terminator: Terminator::Return(dummy) });
 
     Ok(Function {
         name: mangle(&cf.this_class, &m.name, &m.descriptor),
@@ -415,10 +481,24 @@ fn lower_block(
     entry_stack: Vec<Ty>,
     block_of_pc: &HashMap<usize, Block>,
     fallthrough: Option<Block>,
+    is_handler: bool,
+    exc_target_of_pc: &HashMap<usize, Block>,
 ) -> Result<(BasicBlock, Vec<(Block, Vec<Ty>)>)> {
     // Stack als Liste von Typen; Wert der Tiefe d liegt im Local stack_slot(d, ty).
     let mut stack: Vec<Ty> = entry_stack;
     let mut stmts: Vec<Statement> = Vec::new();
+
+    // Handler betreten mit der Exception auf dem Stack: aus jrt_pending holen.
+    if is_handler {
+        let l = ml.stack_slot(0, Ty::Ref);
+        stmts.push(Statement::Call {
+            dest: Some(l),
+            func: "jrt_take_pending".to_string(),
+            args: Vec::new(),
+        });
+    }
+    // Werfender Aufruf am Blockende → Terminator prüft die pending exception.
+    let mut throw_after: Option<usize> = None;
 
     macro_rules! push {
         ($ty:expr, $rv:expr) => {{
@@ -741,6 +821,17 @@ fn lower_block(
                 let v = pop!();
                 terminator = Some(Terminator::Return(Some(Operand::Copy(v))));
             }
+            Instr::AThrow => {
+                let obj = pop!();
+                stmts.push(Statement::Call {
+                    dest: None,
+                    func: "jrt_throw".to_string(),
+                    args: vec![Operand::Copy(obj)],
+                });
+                let target = exc_target_of_pc[pc];
+                succs.push((target, stack.clone()));
+                terminator = Some(Terminator::Goto(target));
+            }
             Instr::AConstNull => {
                 push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
             }
@@ -829,8 +920,10 @@ fn lower_block(
                 let recv = pop!();
                 args.push(Operand::Copy(recv));
                 args.reverse();
-                if class == "java/lang/Object" && name == "<init>" {
-                    // Leerer Object-Konstruktor: entfällt.
+                if name == "<init>" && program.class(&class).is_none() {
+                    // Konstruktor einer nicht modellierten Basisklasse
+                    // (Object, Throwable, RuntimeException, …): entfällt.
+                    // Argumente wurden bereits gepoppt.
                     continue;
                 }
                 // invokespecial dispatcht nicht: Konstruktor, super-Aufruf
@@ -849,6 +942,7 @@ fn lower_block(
                     Some(l)
                 };
                 stmts.push(Statement::Call { dest, func: mangled, args });
+                throw_after = Some(*pc);
             }
             Instr::GetStatic(idx) => {
                 let (class, name, _) = ml.cf.member_ref(*idx)?;
@@ -980,6 +1074,7 @@ fn lower_block(
                 let mut params = vec![Ty::Ref];
                 params.extend(ptys);
                 stmts.push(Statement::CallVirtual { dest, class, name, desc, params, ret: rty, args });
+                throw_after = Some(*pc);
             }
             Instr::InvokeDynamic(idx) => {
                 // Nur String-Konkatenation (StringConcatFactory) wird statisch
@@ -1137,7 +1232,32 @@ fn lower_block(
                     stmts.pop();
                 }
                 stmts.push(Statement::Call { dest, func: mangle(class, name, desc), args });
+                throw_after = Some(*pc);
             }
+        }
+    }
+
+    // Werfender Aufruf am Blockende: pending prüfen → Handler/Propagation
+    // oder normal weiter.
+    if terminator.is_none() {
+        if let Some(throw_pc) = throw_after {
+            let target = exc_target_of_pc[&throw_pc];
+            let cont = fallthrough.ok_or_else(|| {
+                FrontendError::Unsupported(format!("werfender Aufruf ohne Folgeblock bei pc={throw_pc}"))
+            })?;
+            let c = ml.fresh(Ty::I32);
+            stmts.push(Statement::Call {
+                dest: Some(c),
+                func: "jrt_pending_set".to_string(),
+                args: Vec::new(),
+            });
+            succs.push((target, stack.clone()));
+            succs.push((cont, stack.clone()));
+            terminator = Some(Terminator::Branch {
+                cond: Operand::Copy(c),
+                then_blk: target,
+                else_blk: cont,
+            });
         }
     }
 

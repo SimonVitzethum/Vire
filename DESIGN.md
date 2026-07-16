@@ -140,7 +140,7 @@ Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular �
 | Feature | Auflösung |
 |---|---|
 | GC | s. u. |
-| Exceptions | Desugaring zu `Result<T, Throwable>`, implizite Propagation — kein Unwinder/Personality nötig |
+| Exceptions | ✅ **umgesetzt** (pending-Modell): `jrt_throw` setzt eine schwebende Exception, der Code prüft nach jedem werfenden Aufruf `jrt_pending_set` → Handler oder Propagation (Cleanup + Dummy-Return). Kein Unwinder/Personality. Frontend liest die Exception-Table, splittet Blöcke an werfenden Aufrufen, Handler betreten mit der Exception aus `jrt_take_pending`; RC-korrekt. Offen: typspezifische `catch`-Diskriminierung (erster Handler = catch-all), `finally`, abfangbare Laufzeit-Exceptions (NPE/div0/bounds bleiben `exit`), Klassenname in Uncaught-Meldung |
 | Vererbung/Interfaces | Vtables/Itables, rein statisch |
 | Reflection/`forName`/dyn. Laden | Closed World + Deklaration (s. 1.3) |
 | `null` | explizite Checks (Segfault-Handler-Trick = Runtime) |
