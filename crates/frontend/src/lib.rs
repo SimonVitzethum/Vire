@@ -143,6 +143,49 @@ fn field_ty(
     }
 }
 
+/// Woher der Wert eines Locals zuletzt kam — lokale Konstantenpropagation
+/// für die statische Reflection-Auflösung (DESIGN.md §1.3). javac legt
+/// `ldc`-Argumente direkt vor dem Aufruf ab, daher reicht der Blick in den
+/// aktuellen Block.
+enum Origin<'a> {
+    Op(&'a Operand),
+    New(&'a str),
+    Opaque,
+}
+
+fn origin_of<'a>(stmts: &'a [Statement], l: Local) -> Origin<'a> {
+    origin_from(stmts, stmts.len(), l, 8)
+}
+
+/// Sucht die letzte Zuweisung an `l` vor Index `upto` und verfolgt
+/// Copy-Ketten (astore/aload legt Werte über JVM-Slot-Locals um).
+fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) -> Origin<'a> {
+    if depth == 0 {
+        return Origin::Opaque;
+    }
+    for i in (0..upto).rev() {
+        match &stmts[i] {
+            Statement::Assign(d, rv) if *d == l => {
+                return match rv {
+                    Rvalue::Use(Operand::Copy(src)) => origin_from(stmts, i, *src, depth - 1),
+                    Rvalue::Use(op) => Origin::Op(op),
+                    _ => Origin::Opaque,
+                };
+            }
+            Statement::New { dest, class } if *dest == l => return Origin::New(class),
+            Statement::Call { dest: Some(d), .. }
+            | Statement::CallVirtual { dest: Some(d), .. }
+            | Statement::GetField { dest: d, .. }
+                if *d == l =>
+            {
+                return Origin::Opaque;
+            }
+            _ => {}
+        }
+    }
+    Origin::Opaque
+}
+
 struct MethodLowering<'a> {
     cf: &'a ClassFile,
     locals: Vec<Ty>,
@@ -205,7 +248,10 @@ fn lower_method(
     let mut leaders = vec![0usize];
     for (i, (_, instr)) in instrs.iter().enumerate() {
         match instr {
-            Instr::IfICmp(_, t) | Instr::IfZero(_, t) => {
+            Instr::IfICmp(_, t)
+            | Instr::IfZero(_, t)
+            | Instr::IfACmp(_, t)
+            | Instr::IfRefNull(_, t) => {
                 leaders.push(*t);
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
@@ -344,18 +390,37 @@ fn lower_block(
 
     for (pc, instr) in instrs.iter() {
         last_pc_end = *pc;
+        if terminator.is_some() {
+            // Darf nie passieren: hieße, die Leader-Berechnung hat einen
+            // Terminator-Opcode nicht als Blockende erkannt.
+            return Err(FrontendError::Unsupported(format!(
+                "interner Fehler: Instruktion nach Terminator bei pc={pc}"
+            )));
+        }
         match instr {
             Instr::Nop => {}
             Instr::IConst(v) | Instr::LdcInt(v) => {
                 push!(Ty::I32, Rvalue::Use(Operand::ConstI32(*v)));
             }
             Instr::LdcString(idx) => {
-                let s = match ml.cf.constant_pool.get(*idx as usize) {
-                    Some(Const::String { utf8 }) => ml.cf.utf8(*utf8)?,
+                match ml.cf.constant_pool.get(*idx as usize) {
+                    Some(Const::String { utf8 }) => {
+                        let sid = program.intern_string(ml.cf.utf8(*utf8)?);
+                        push!(Ty::Ref, Rvalue::Use(Operand::ConstStr(sid)));
+                    }
+                    // ldc einer Klassenkonstante (`Widget.class`).
+                    Some(Const::Class { .. }) => {
+                        let class = ml.cf.class_name(*idx)?.to_string();
+                        if program.class(&class).is_none() {
+                            return Err(FrontendError::Unsupported(format!(
+                                "{class}.class (Klasse nicht im Closed-World-Input)"
+                            )));
+                        }
+                        program.intern_class_object(&class);
+                        push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(class)));
+                    }
                     _ => return Err(FrontendError::Unsupported(format!("ldc auf CP-Index {idx}"))),
-                };
-                let sid = program.intern_string(s);
-                push!(Ty::Ref, Rvalue::Use(Operand::ConstStr(sid)));
+                }
             }
             Instr::ILoad(slot) => {
                 let l = ml.jvm_slot(*slot, Ty::I32);
@@ -564,6 +629,49 @@ fn lower_block(
                     });
                     continue;
                 }
+                // Reflection auf einem statisch bekannten Class-Objekt.
+                if class == "java/lang/Class" {
+                    let recv = pop!();
+                    let target = match origin_of(&stmts, recv) {
+                        Origin::Op(Operand::ConstClass(c)) => c.clone(),
+                        _ => {
+                            return Err(FrontendError::Unsupported(format!(
+                                "Class.{name} auf nicht statisch bekanntem Class-Objekt \
+                                 (Closed World: Reflection muss statisch auflösbar sein)"
+                            )));
+                        }
+                    };
+                    match (name, desc) {
+                        ("getName", "()Ljava/lang/String;") => {
+                            let sid = program.intern_class_object(&target);
+                            push!(Ty::Ref, Rvalue::Use(Operand::ConstStr(sid)));
+                        }
+                        ("newInstance", "()Ljava/lang/Object;") => {
+                            let ctor = program
+                                .resolve_method(&target, "<init>", "()V")
+                                .map(|(_, mi)| mi.mangled.clone())
+                                .ok_or_else(|| {
+                                    FrontendError::Unsupported(format!(
+                                        "{target}.newInstance(): kein parameterloser Konstruktor"
+                                    ))
+                                })?;
+                            let l = ml.stack_slot(stack.len(), Ty::Ref);
+                            stmts.push(Statement::New { dest: l, class: target });
+                            stmts.push(Statement::Call {
+                                dest: None,
+                                func: ctor,
+                                args: vec![Operand::Copy(l)],
+                            });
+                            stack.push(Ty::Ref);
+                        }
+                        _ => {
+                            return Err(FrontendError::Unsupported(format!(
+                                "Class.{name}{desc} (Reflection-Teilmenge: forName, getName, newInstance)"
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
                 if program.class(&class).is_none() {
                     return Err(FrontendError::Unsupported(format!(
@@ -589,8 +697,60 @@ fn lower_block(
                 params.extend(ptys);
                 stmts.push(Statement::CallVirtual { dest, class, name, desc, params, ret: rty, args });
             }
+            Instr::CheckCast(idx) => {
+                // Closed World: der Cast muss statisch beweisbar sein, sonst
+                // Build-Fehler. Ein Laufzeit-Typtest käme mit instanceof
+                // (Klassen-Metadaten im Header) in einer späteren Stufe.
+                let target = ml.cf.class_name(*idx)?.to_string();
+                let top_ty = *stack.last().ok_or_else(|| {
+                    FrontendError::Unsupported("checkcast auf leerem Stack".into())
+                })?;
+                let top = ml.stack_slot(stack.len() - 1, top_ty);
+                let provable = match origin_of(&stmts, top) {
+                    Origin::New(c) => program.is_subclass(c, &target),
+                    Origin::Op(Operand::ConstNull) => true,
+                    Origin::Op(Operand::ConstStr(_)) => target == "java/lang/String",
+                    Origin::Op(Operand::ConstClass(_)) => target == "java/lang/Class",
+                    _ => false,
+                };
+                if !provable {
+                    return Err(FrontendError::Unsupported(format!(
+                        "checkcast {target} nicht statisch beweisbar"
+                    )));
+                }
+                // Beweisbar → kein Code nötig.
+            }
             Instr::InvokeStatic(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;
+                // Reflection: Class.forName mit konstantem Argument wird zur
+                // Compile-Zeit aufgelöst — statisch bekanntes "dynamisches"
+                // Klassenladen im Sinne von DESIGN.md §1.3.
+                if class == "java/lang/Class" && name == "forName" {
+                    if desc != "(Ljava/lang/String;)Ljava/lang/Class;" {
+                        return Err(FrontendError::Unsupported(format!("Class.forName{desc}")));
+                    }
+                    let arg = pop!();
+                    let sid = match origin_of(&stmts, arg) {
+                        Origin::Op(Operand::ConstStr(s)) => *s,
+                        _ => {
+                            return Err(FrontendError::Unsupported(
+                                "Class.forName mit nicht-konstantem Argument (Closed World: \
+                                 Reflection muss statisch auflösbar sein)"
+                                    .into(),
+                            ))
+                        }
+                    };
+                    let dotted = program.strings[sid as usize].clone();
+                    let target = dotted.replace('.', "/");
+                    if program.class(&target).is_none() {
+                        return Err(FrontendError::Unsupported(format!(
+                            "Class.forName(\"{dotted}\"): Klasse nicht im Closed-World-Input"
+                        )));
+                    }
+                    program.intern_class_object(&target);
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target)));
+                    continue;
+                }
                 let (ptys, rty) = parse_descriptor(desc)?;
                 let mut args = Vec::new();
                 for _ in &ptys {

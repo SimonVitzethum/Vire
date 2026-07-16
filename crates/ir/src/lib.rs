@@ -29,6 +29,10 @@ pub enum Operand {
     ConstI64(i64),
     /// Verweis auf ein String-Literal in `Program::strings`.
     ConstStr(u32),
+    /// Class-Objekt einer zur Compile-Zeit aufgelösten Klasse (Reflection,
+    /// DESIGN.md §1.3). Singleton pro Klasse → `==` ist Pointer-Gleichheit,
+    /// wie in Java.
+    ConstClass(String),
     ConstNull,
 }
 
@@ -160,6 +164,9 @@ pub struct Program {
     pub classes: Vec<ClassInfo>,
     /// String-Literal-Pool; `Operand::ConstStr` indiziert hierher.
     pub strings: Vec<String>,
+    /// Klassen mit Class-Objekt (durch Reflection berührt):
+    /// Klassenname → String-Index des gepunkteten Namens (für getName).
+    pub class_objects: Vec<(String, u32)>,
 }
 
 impl Program {
@@ -169,6 +176,18 @@ impl Program {
         }
         self.strings.push(s.to_string());
         (self.strings.len() - 1) as u32
+    }
+
+    /// Registriert das Class-Objekt einer Klasse und liefert den
+    /// String-Index ihres gepunkteten Namens.
+    pub fn intern_class_object(&mut self, class: &str) -> u32 {
+        if let Some((_, sid)) = self.class_objects.iter().find(|(c, _)| c == class) {
+            return *sid;
+        }
+        let dotted = class.replace('/', ".");
+        let sid = self.intern_string(&dotted);
+        self.class_objects.push((class.to_string(), sid));
+        sid
     }
 
     pub fn class(&self, name: &str) -> Option<&ClassInfo> {

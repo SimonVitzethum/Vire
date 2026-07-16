@@ -129,6 +129,16 @@ pub fn emit(program: &Program) -> String {
         )
         .unwrap();
     }
+    // Class-Objekt-Singletons (Reflection): { ptr auf Namens-String }.
+    // Pointer-Identität ersetzt Javas Class-Gleichheit.
+    for (class, sid) in &program.class_objects {
+        writeln!(
+            w,
+            "@jclass.{} = internal unnamed_addr constant {{ ptr }} {{ ptr @jstr.{sid} }}",
+            sanitize(class),
+        )
+        .unwrap();
+    }
     writeln!(w).unwrap();
 
     // Struct-Typen für alle Klassen.
@@ -222,7 +232,7 @@ fn operand_ty(f: &Function, op: &Operand) -> Ty {
         Operand::Copy(l) => f.locals[l.0 as usize],
         Operand::ConstI32(_) => Ty::I32,
         Operand::ConstI64(_) => Ty::I64,
-        Operand::ConstStr(_) | Operand::ConstNull => Ty::Ref,
+        Operand::ConstStr(_) | Operand::ConstClass(_) | Operand::ConstNull => Ty::Ref,
     }
 }
 
@@ -252,6 +262,7 @@ impl<'a> FnEmitter<'a> {
             Operand::ConstI64(0) => "null".to_string(),
             Operand::ConstI64(v) => v.to_string(),
             Operand::ConstStr(i) => format!("@jstr.{i}"),
+            Operand::ConstClass(c) => format!("@jclass.{}", sanitize(c)),
             Operand::ConstNull => "null".to_string(),
         }
     }

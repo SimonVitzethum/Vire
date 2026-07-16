@@ -57,6 +57,7 @@ pub enum Instr {
     InvokeSpecial(u16),
     InvokeStatic(u16),
     New(u16),
+    CheckCast(u16),
     AConstNull,
     /// ifnull (Eq) / ifnonnull (Ne)
     IfRefNull(Cond, usize),
@@ -157,6 +158,7 @@ pub fn decode_code(
             0xB7 => (Instr::InvokeSpecial(u16_at(pc + 1)?), 3),
             0xB8 => (Instr::InvokeStatic(u16_at(pc + 1)?), 3),
             0xBB => (Instr::New(u16_at(pc + 1)?), 3),
+            0xC0 => (Instr::CheckCast(u16_at(pc + 1)?), 3),
             0xC6 => (Instr::IfRefNull(Cond::Eq, branch(pc + 1)?), 3),
             0xC7 => (Instr::IfRefNull(Cond::Ne, branch(pc + 1)?), 3),
             _ => return Err(ParseError::UnsupportedOpcode(op, pc)),
