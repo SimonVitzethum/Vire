@@ -48,11 +48,17 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_release", "void (ptr)"),
 ];
 
-/// Feste Header-Slots vor den Instanzfeldern: refcount (i64) + vtable (ptr).
-/// Instanzfelder beginnen daher bei GEP-Index 2, der Vtable-Zeiger bei 1.
-const HEADER_SLOTS: usize = 2;
-/// Vtable-Slot 0 ist die Drop-Funktion; virtuelle Methoden ab Slot 1.
-const VTABLE_DROP_SLOTS: usize = 1;
+/// Feste Header-Slots vor den Instanzfeldern:
+///   Slot 0: refcount (i64), <0 = immortal
+///   Slot 1: rcflags (i64) — Farbe/Buffered-Bit für den Zyklen-Collector
+///   Slot 2: vtable (ptr)
+/// Instanzfelder beginnen daher bei GEP-Index 3.
+const HEADER_SLOTS: usize = 3;
+/// Word-Offset des Vtable-Zeigers im Header (für ptr-getelementptr).
+const VTABLE_WORD: usize = 2;
+/// Vtable-Slot 0 = Drop-Funktion, Slot 1 = Trace-Funktion (Zyklen-Collector);
+/// virtuelle Methoden beginnen ab Slot 2.
+const VTABLE_METHOD_OFFSET: usize = 2;
 
 /// Klassen-Kontext: Layouts und Vtables, aus `Program::classes` berechnet.
 struct Ctx<'a> {
@@ -128,7 +134,7 @@ impl<'a> Ctx<'a> {
         self.vtable_slots(class)
             .iter()
             .position(|(n, d, _)| n == name && d == desc)
-            .map(|i| i + VTABLE_DROP_SLOTS)
+            .map(|i| i + VTABLE_METHOD_OFFSET)
     }
 }
 
@@ -164,9 +170,9 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Struct-Typen: { i64 refcount, ptr vtable, felder… }.
+    // Struct-Typen: { i64 refcount, i64 rcflags, ptr vtable, felder… }.
     for c in &program.classes {
-        let mut parts = vec!["i64".to_string(), "ptr".to_string()];
+        let mut parts = vec!["i64".to_string(), "i64".to_string(), "ptr".to_string()];
         parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
@@ -189,8 +195,11 @@ pub fn emit(program: &Program) -> String {
         .collect();
     for class in &instantiated {
         let slots = ctx.vtable_slots(class);
-        // Slot 0: Drop-Funktion der Klasse; danach die Methoden-Slots.
-        let mut entries = vec![format!("ptr @drop.{}", sanitize(class))];
+        // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); danach Methoden.
+        let mut entries = vec![
+            format!("ptr @drop.{}", sanitize(class)),
+            format!("ptr @trace.{}", sanitize(class)),
+        ];
         entries.extend(slots.iter().map(|(_, _, sym)| match sym {
             Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
             _ => "ptr null".to_string(),
@@ -206,14 +215,29 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Drop-Funktionen: released die Ref-Felder des Objekts (nicht rekursiv
-    // im Code — die Runtime ruft jrt_release, das ggf. weiter absteigt).
+    // Drop-Funktionen: released die Ref-Felder des Objekts (die Runtime
+    // steigt via jrt_release rekursiv ab).
     for class in &instantiated {
         writeln!(w, "define internal void @drop.{}(ptr %o) {{", sanitize(class)).unwrap();
         for (k, slot) in ctx.ref_field_slots(class).into_iter().enumerate() {
             writeln!(w, "  %f{k} = getelementptr {}, ptr %o, i32 0, i32 {slot}", ctx.struct_name(class)).unwrap();
             writeln!(w, "  %v{k} = load ptr, ptr %f{k}").unwrap();
             writeln!(w, "  call void @jrt_release(ptr %v{k})").unwrap();
+        }
+        writeln!(w, "  ret void").unwrap();
+        writeln!(w, "}}").unwrap();
+    }
+    writeln!(w).unwrap();
+
+    // Trace-Funktionen: rufen den Collector-Visitor auf jedes Ref-Feld.
+    // Der Bacon-Rajan-Collector nutzt sie, um Objektgraphen zu durchlaufen,
+    // ohne die Feldstruktur zu kennen.
+    for class in &instantiated {
+        writeln!(w, "define internal void @trace.{}(ptr %o, ptr %visit) {{", sanitize(class)).unwrap();
+        for (k, slot) in ctx.ref_field_slots(class).into_iter().enumerate() {
+            writeln!(w, "  %f{k} = getelementptr {}, ptr %o, i32 0, i32 {slot}", ctx.struct_name(class)).unwrap();
+            writeln!(w, "  %v{k} = load ptr, ptr %f{k}").unwrap();
+            writeln!(w, "  call void %visit(ptr %v{k})").unwrap();
         }
         writeln!(w, "  ret void").unwrap();
         writeln!(w, "}}").unwrap();
@@ -425,9 +449,9 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 .unwrap_or_else(|| panic!("Vtable-Slot {class}.{name}{desc} fehlt"));
             let recv = e.operand(w, &args[0]);
             writeln!(w, "  call void @jrt_null_check(ptr {recv})").unwrap();
-            // Vtable liegt im Header-Slot 1 (hinter dem refcount).
+            // Vtable liegt im Header (hinter refcount + rcflags).
             let vtp = e.fresh();
-            writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 1").unwrap();
+            writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
             writeln!(w, "  {vt} = load ptr, ptr {vtp}").unwrap();
             let slotp = e.fresh();
@@ -513,12 +537,11 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
     }
 }
 
-/// Speichert `val` in den Vtable-Slot des Objektheaders (Slot 1).
+/// Speichert die Vtable im Objektheader (hinter refcount + rcflags).
 fn store_vtable(w: &mut String, e: &mut FnEmitter, obj: &str, class: &str) {
     let vtp = e.fresh();
-    writeln!(w, "  {vtp} = getelementptr ptr, ptr {obj}, i64 1").unwrap();
+    writeln!(w, "  {vtp} = getelementptr ptr, ptr {obj}, i64 {VTABLE_WORD}").unwrap();
     writeln!(w, "  store ptr @vt.{}, ptr {vtp}", sanitize(class)).unwrap();
-    let _ = e;
 }
 
 /// Schreibt `val` in ein Local. Für Ref-Locals gilt die Owning-Slot-
