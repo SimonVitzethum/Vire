@@ -132,6 +132,87 @@ pub fn register_builtins(program: &mut Program) {
     program.classes.push(builtin("java/lang/Double", "double"));
     program.classes.push(builtin("java/lang/Character", "character"));
     program.classes.push(builtin("java/lang/Float", "float"));
+    register_enum(program);
+}
+
+/// java.lang.Enum als Basisklasse aller enums: hält name (String) und
+/// ordinal (int); name()/ordinal()/toString() lesen die Felder, der
+/// Konstruktor <init>(String,int) setzt sie. Methodenrümpfe werden direkt
+/// als IR erzeugt.
+fn register_enum(program: &mut Program) {
+    let cls = "java/lang/Enum";
+    let name_m = mangle(cls, "name", "()Ljava/lang/String;");
+    let ord_m = mangle(cls, "ordinal", "()I");
+    let tostr_m = mangle(cls, "toString", "()Ljava/lang/String;");
+    let init_m = mangle(cls, "<init>", "(Ljava/lang/String;I)V");
+
+    program.classes.push(ClassInfo {
+        name: cls.to_string(),
+        super_name: None,
+        is_interface: false,
+        interfaces: Vec::new(),
+        fields: vec![
+            FieldInfo { name: "$name".to_string(), ty: Ty::Ref },
+            FieldInfo { name: "$ordinal".to_string(), ty: Ty::I32 },
+        ],
+        static_fields: Vec::new(),
+        methods: vec![
+            MethodInfo { name: "name".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, mangled: name_m.clone() },
+            MethodInfo { name: "ordinal".into(), desc: "()I".into(), is_static: false, has_body: true, mangled: ord_m.clone() },
+            MethodInfo { name: "toString".into(), desc: "()Ljava/lang/String;".into(), is_static: false, has_body: true, mangled: tostr_m.clone() },
+            MethodInfo { name: "<init>".into(), desc: "(Ljava/lang/String;I)V".into(), is_static: false, has_body: true, mangled: init_m.clone() },
+        ],
+        has_clinit: false,
+    });
+
+    // name()/toString(): return this.$name
+    let getter_name = |mangled: String| Function {
+        name: mangled,
+        params: vec![Ty::Ref],
+        ret: Ty::Ref,
+        locals: vec![Ty::Ref, Ty::Ref],
+        blocks: vec![BasicBlock {
+            statements: vec![Statement::GetField {
+                dest: Local(1),
+                obj: Operand::Copy(Local(0)),
+                class: cls.to_string(),
+                field: "$name".to_string(),
+            }],
+            terminator: Terminator::Return(Some(Operand::Copy(Local(1)))),
+        }],
+    };
+    program.functions.push(getter_name(name_m));
+    program.functions.push(getter_name(tostr_m));
+    // ordinal(): return this.$ordinal
+    program.functions.push(Function {
+        name: ord_m,
+        params: vec![Ty::Ref],
+        ret: Ty::I32,
+        locals: vec![Ty::Ref, Ty::I32],
+        blocks: vec![BasicBlock {
+            statements: vec![Statement::GetField {
+                dest: Local(1),
+                obj: Operand::Copy(Local(0)),
+                class: cls.to_string(),
+                field: "$ordinal".to_string(),
+            }],
+            terminator: Terminator::Return(Some(Operand::Copy(Local(1)))),
+        }],
+    });
+    // <init>(name, ordinal): this.$name = name; this.$ordinal = ordinal
+    program.functions.push(Function {
+        name: init_m,
+        params: vec![Ty::Ref, Ty::Ref, Ty::I32],
+        ret: Ty::Void,
+        locals: vec![Ty::Ref, Ty::Ref, Ty::I32],
+        blocks: vec![BasicBlock {
+            statements: vec![
+                Statement::PutField { obj: Operand::Copy(Local(0)), class: cls.to_string(), field: "$name".into(), value: Operand::Copy(Local(1)) },
+                Statement::PutField { obj: Operand::Copy(Local(0)), class: cls.to_string(), field: "$ordinal".into(), value: Operand::Copy(Local(2)) },
+            ],
+            terminator: Terminator::Return(None),
+        }],
+    });
 }
 
 /// Phase 2: alle Methodenrümpfe absenken.
@@ -1585,6 +1666,31 @@ fn lower_block(
                     }
                     continue;
                 }
+                // Array-clone() (u.a. von enum values() erzeugt): flache
+                // Kopie mit retain der Ref-Elemente in der Runtime.
+                if class.starts_with('[') && name == "clone" {
+                    let arr = pop!();
+                    let (elem_size, is_ref) = match class.as_bytes().get(1) {
+                        Some(b'L') | Some(b'[') => (8, 1),
+                        Some(b'J') | Some(b'D') => (8, 0),
+                        Some(b'I') | Some(b'F') => (4, 0),
+                        Some(b'S') | Some(b'C') => (2, 0),
+                        Some(b'Z') | Some(b'B') => (1, 0),
+                        _ => (8, 0),
+                    };
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stack.push(Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: "jrt_array_clone".to_string(),
+                        args: vec![
+                            Operand::Copy(arr),
+                            Operand::ConstI64(elem_size),
+                            Operand::ConstI32(is_ref),
+                        ],
+                    });
+                    continue;
+                }
                 // Reflection auf einem statisch bekannten Class-Objekt.
                 if class == "java/lang/Class" {
                     let recv = pop!();
@@ -1922,6 +2028,38 @@ fn lower_block(
                     program.intern_class_object(&target);
                     let l = push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target.clone())));
                     ml.class_const.insert(l, target);
+                    continue;
+                }
+                // Enum.valueOf(Class, name): über die values() des statisch
+                // bekannten enum iterieren und per $name-Feld vergleichen.
+                if class == "java/lang/Enum"
+                    && name == "valueOf"
+                    && desc == "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;"
+                {
+                    let name_arg = pop!();
+                    let cls_arg = pop!();
+                    let target = match origin_of(&stmts, cls_arg) {
+                        Origin::Op(Operand::ConstClass(c)) => c.clone(),
+                        _ => match ml.class_const.get(&cls_arg).cloned() {
+                            Some(c) => c,
+                            None => return Err(FrontendError::Unsupported(
+                                "Enum.valueOf mit nicht statisch bekanntem Class-Objekt".into(),
+                            )),
+                        },
+                    };
+                    let values = program
+                        .resolve_method(&target, "values", &format!("()[L{target};"))
+                        .map(|(_, mi)| mi.mangled.clone())
+                        .ok_or_else(|| FrontendError::Unsupported(format!("{target}.values()")))?;
+                    let arr = ml.fresh(Ty::Ref);
+                    stmts.push(Statement::Call { dest: Some(arr), func: values, args: vec![] });
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stack.push(Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: "jrt_enum_valueof".to_string(),
+                        args: vec![Operand::Copy(arr), Operand::Copy(name_arg)],
+                    });
                     continue;
                 }
                 // String.format(fmt, Object[]) → Runtime-Formatter.

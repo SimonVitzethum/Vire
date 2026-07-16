@@ -948,6 +948,51 @@ void jrt_array_ref_trace(void *p, void (*visit)(void *)) {
 void jrt_noop_drop(void *p) { (void)p; }
 void jrt_noop_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; }
 
+/* enum valueOf: über das values-Array laufen und das Element mit passendem
+ * $name (erstes Instanzfeld, Offset 3 Worte) suchen. Rückgabe retained (+1
+ * für den Aufrufer); das Array selbst bleibt Eigentum des Aufrufers und wird
+ * von dessen Owning-Slot-Cleanup freigegeben. */
+int32_t jrt_str_equals(const JStr *a, const JStr *b);
+void *jrt_enum_valueof(void *values, void *name) {
+    JArray *a = (JArray *)values;
+    void *found = NULL;
+    void **elems = (void **)(a + 1);
+    for (int64_t i = 0; i < a->length; i++) {
+        void *e = elems[i];
+        if (!e) continue;
+        JStr *ename = *(JStr **)((char *)e + 24);
+        if (jrt_str_equals(ename, (const JStr *)name)) {
+            found = e;
+            break;
+        }
+    }
+    if (!found) {
+        fputs("Exception in thread \"main\" java.lang.IllegalArgumentException\n", stderr);
+        exit(1);
+    }
+    jrt_retain(found);
+    return found;
+}
+
+/* Flache Kopie eines Arrays (u.a. für enum values()). Gleiche vtable und
+ * Länge; bei Ref-Arrays wird jedes kopierte Element retained. */
+void *jrt_array_clone(void *arr, int64_t elem_size, int32_t is_ref) {
+    if (!arr) {
+        throw_runtime(&npe_exc_obj, NPE_MSG);
+        return NULL;
+    }
+    JArray *a = (JArray *)arr;
+    void *p = jrt_alloc_array(a->length, elem_size, a->vtable);
+    memcpy((JArray *)p + 1, a + 1, (size_t)a->length * (size_t)elem_size);
+    if (is_ref) {
+        void **elems = (void **)((JArray *)p + 1);
+        for (int64_t i = 0; i < a->length; i++) {
+            jrt_retain(elems[i]);
+        }
+    }
+    return p;
+}
+
 /* --- Java-Arithmetik-Semantik ---------------------------------------- */
 
 /* JLS 15.17.2: Division durch 0 wirft ArithmeticException (jetzt abfangbar
