@@ -549,6 +549,8 @@ void jrt_throw(void *e) {
  * gefangen; ihre Meldung überlebt bis zur Uncaught-Ausgabe. */
 void *jrt_sentinel_vtable[3] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, NULL};
 static JObjHeader arith_exc_obj = {-1, 0, jrt_sentinel_vtable};
+static JObjHeader npe_exc_obj = {-1, 0, jrt_sentinel_vtable};
+static JObjHeader bounds_exc_obj = {-1, 0, jrt_sentinel_vtable};
 
 /* Von den Runtime-Checks aufgerufen: schwebende Laufzeit-Exception setzen. */
 static void throw_runtime(void *sentinel, const char *msg) {
@@ -653,6 +655,56 @@ void jrt_bounds_check(const void *arr, int32_t index) {
                 index, (long long)len);
         exit(1);
     }
+}
+
+/* Abfangbare Array-Zugriffe: Check + Zugriff gekapselt, damit sie über das
+ * pending-Modell werfen können (NPE/ArrayIndexOutOfBounds) statt abzubrechen.
+ * Bei Fehler wird ein safe default zurückgegeben; der generierte Code prüft
+ * danach pending und springt zum Handler oder propagiert. */
+#define NPE_MSG "java.lang.NullPointerException"
+#define AIOOBE_MSG "java.lang.ArrayIndexOutOfBoundsException"
+
+static int arr_ok(const JArray *a, int32_t i) {
+    if (!a) {
+        throw_runtime(&npe_exc_obj, NPE_MSG);
+        return 0;
+    }
+    if (i < 0 || i >= a->length) {
+        throw_runtime(&bounds_exc_obj, AIOOBE_MSG);
+        return 0;
+    }
+    return 1;
+}
+
+int32_t jrt_iaload(void *arr, int32_t i) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return 0;
+    return ((int32_t *)(a + 1))[i];
+}
+void jrt_iastore(void *arr, int32_t i, int32_t v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    ((int32_t *)(a + 1))[i] = v;
+}
+void *jrt_aaload(void *arr, int32_t i) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return NULL;
+    return ((void **)(a + 1))[i]; /* geborgt; Aufrufer retained */
+}
+void jrt_aastore(void *arr, int32_t i, void *v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    void **slot = &((void **)(a + 1))[i];
+    jrt_retain(v);
+    jrt_release(*slot);
+    *slot = v;
+}
+int32_t jrt_arraylen(void *arr) {
+    if (!arr) {
+        throw_runtime(&npe_exc_obj, NPE_MSG);
+        return 0;
+    }
+    return (int32_t)((JArray *)arr)->length;
 }
 
 /* Drop/Trace für ref[]: über die Elemente laufen. */

@@ -377,7 +377,9 @@ fn lower_method(
             // Division wirft ArithmeticException.
             Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_)
             | Instr::InvokeInterface(_)
-            | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem => {
+            | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem
+            | Instr::IaLoad | Instr::AaLoad | Instr::IaStore | Instr::AaStore
+            | Instr::ArrayLength => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -976,6 +978,7 @@ fn lower_block(
                 let dest = ml.stack_slot(stack.len(), Ty::I32);
                 stmts.push(Statement::ArrayLen { dest, arr: Operand::Copy(arr) });
                 stack.push(Ty::I32);
+                throw_after = Some(*pc); // NPE bei null-Array
             }
             Instr::IaLoad | Instr::AaLoad => {
                 let elem = if matches!(instr, Instr::IaLoad) { Ty::I32 } else { Ty::Ref };
@@ -989,6 +992,7 @@ fn lower_block(
                     elem,
                 });
                 stack.push(elem);
+                throw_after = Some(*pc); // NPE / ArrayIndexOutOfBounds
             }
             Instr::IaStore | Instr::AaStore => {
                 let elem = if matches!(instr, Instr::IaStore) { Ty::I32 } else { Ty::Ref };
@@ -1001,6 +1005,7 @@ fn lower_block(
                     value: Operand::Copy(value),
                     elem,
                 });
+                throw_after = Some(*pc); // NPE / ArrayIndexOutOfBounds
             }
             Instr::New(idx) => {
                 let class = ml.cf.class_name(*idx)?.to_string();

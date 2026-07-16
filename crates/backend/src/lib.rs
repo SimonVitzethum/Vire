@@ -109,20 +109,16 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_checkcast", "void (ptr, ptr)"),
     ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
     ("jrt_bounds_check", "void (ptr, i32)"),
+    ("jrt_iaload", "i32 (ptr, i32)"),
+    ("jrt_iastore", "void (ptr, i32, i32)"),
+    ("jrt_aaload", "ptr (ptr, i32)"),
+    ("jrt_aastore", "void (ptr, i32, ptr)"),
+    ("jrt_arraylen", "i32 (ptr)"),
     ("jrt_array_ref_drop", "void (ptr)"),
     ("jrt_array_ref_trace", "void (ptr, ptr)"),
     ("jrt_noop_drop", "void (ptr)"),
     ("jrt_noop_trace", "void (ptr, ptr)"),
 ];
-
-/// LLVM-Struct eines Arrays: gleicher Header wie Objekte, dann Länge und
-/// die (flexibel dimensionierten) Elemente.
-fn array_struct(elem: Ty) -> &'static str {
-    match elem {
-        Ty::Ref => "%arr.ref",
-        _ => "%arr.int",
-    }
-}
 
 fn array_vtable(elem: Ty) -> &'static str {
     match elem {
@@ -906,61 +902,32 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             .unwrap();
             store_dest(w, e, *dest, &t, false); // alloc gab +1
         }
+        // Array-Zugriffe über Runtime-Helfer (Check + Zugriff gekapselt),
+        // damit NPE/ArrayIndexOutOfBounds abfangbar sind (pending-Modell).
         Statement::ArrayLen { dest, arr } => {
             let a = e.operand(w, arr);
-            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
-            let p = e.fresh();
-            writeln!(w, "  {p} = getelementptr %arr.int, ptr {a}, i32 0, i32 3").unwrap();
             let t = e.fresh();
-            writeln!(w, "  {t} = load i64, ptr {p}").unwrap();
-            let t32 = e.fresh();
-            writeln!(w, "  {t32} = trunc i64 {t} to i32").unwrap();
-            writeln!(w, "  store i32 {t32}, ptr %l{}", dest.0).unwrap();
+            writeln!(w, "  {t} = call i32 @jrt_arraylen(ptr {a})").unwrap();
+            writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
         }
         Statement::ArrayLoad { dest, arr, index, elem } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
-            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
-            writeln!(w, "  call void @jrt_bounds_check(ptr {a}, i32 {i})").unwrap();
-            let p = elem_ptr(w, e, *elem, &a, &i);
+            let (func, rty) = if *elem == Ty::Ref { ("jrt_aaload", "ptr") } else { ("jrt_iaload", "i32") };
             let t = e.fresh();
-            writeln!(w, "  {t} = load {}, ptr {p}", llty(*elem)).unwrap();
-            // Ref-Element geladen → Kopie ins Local wird owned (retain).
+            writeln!(w, "  {t} = call {rty} @{func}(ptr {a}, i32 {i})").unwrap();
+            // Ref-Element ist geborgt → Kopie ins Local wird owned (retain).
             store_dest(w, e, *dest, &t, *elem == Ty::Ref);
         }
         Statement::ArrayStore { arr, index, value, elem } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
-            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
-            writeln!(w, "  call void @jrt_bounds_check(ptr {a}, i32 {i})").unwrap();
             let v = e.operand(w, value);
-            let p = elem_ptr(w, e, *elem, &a, &i);
-            if *elem == Ty::Ref {
-                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
-                let old = e.fresh();
-                writeln!(w, "  {old} = load ptr, ptr {p}").unwrap();
-                writeln!(w, "  store ptr {v}, ptr {p}").unwrap();
-                writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
-            } else {
-                writeln!(w, "  store {} {v}, ptr {p}", llty(*elem)).unwrap();
-            }
+            // aastore erledigt das RC (retain neu, release alt) intern.
+            let func = if *elem == Ty::Ref { "jrt_aastore" } else { "jrt_iastore" };
+            writeln!(w, "  call void @{func}(ptr {a}, i32 {i}, {} {v})", llty(*elem)).unwrap();
         }
     }
-}
-
-/// GEP auf das `index`-te Element eines Arrays.
-fn elem_ptr(w: &mut String, e: &mut FnEmitter, elem: Ty, arr: &str, index: &str) -> String {
-    let p = e.fresh();
-    // sext des i32-Index nach i64 für den GEP.
-    let i64idx = e.fresh();
-    writeln!(w, "  {i64idx} = sext i32 {index} to i64").unwrap();
-    writeln!(
-        w,
-        "  {p} = getelementptr {}, ptr {arr}, i32 0, i32 4, i64 {i64idx}",
-        array_struct(elem),
-    )
-    .unwrap();
-    p
 }
 
 /// Speichert die Vtable im Objektheader (hinter refcount + rcflags).
