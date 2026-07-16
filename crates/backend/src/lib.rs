@@ -836,7 +836,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 writeln!(w, "  switch i32 {v}, label %bb{} [{arms}]", default.0).unwrap();
             }
             Terminator::Return(None) => {
-                emit_cleanup(w, &mut e);
+                emit_cleanup(w, ctx, &mut e);
                 writeln!(w, "  ret void").unwrap();
             }
             Terminator::Return(Some(op)) => {
@@ -847,7 +847,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 if ty == Ty::Ref {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
-                emit_cleanup(w, &mut e);
+                emit_cleanup(w, ctx, &mut e);
                 writeln!(w, "  ret {} {v}", llty(ty)).unwrap();
             }
         }
@@ -857,7 +857,12 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
 
 /// Released alle Ref-Locals der Funktion (Owning-Slot-Modell): jedes
 /// Ref-Local hält eine Referenz, die beim Verlassen der Funktion endet.
-fn emit_cleanup(w: &mut String, e: &mut FnEmitter) {
+///
+/// Stack-allozierte Objekte (`StackNew`, immortal) brauchen keine Feld-
+/// Freigabe: die feld-sensitive Escape-Analyse promoviert Container und Inhalt
+/// nur gemeinsam (both-or-neither), sodass ein Stack-Container ausschließlich
+/// immortale Inhalte hält — nichts, das lecken könnte.
+fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
     for (i, ty) in e.f.locals.iter().enumerate() {
         if *ty == Ty::Ref {
             let t = e.fresh();

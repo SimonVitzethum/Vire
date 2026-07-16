@@ -132,6 +132,7 @@ run enum          0 Enum1 Enum1 Color
 run twr           0 Twr Twr Res MyException
 run messages      0 Messages Messages Boom
 run enumswitch    0 EnumSwitch EnumSwitch Dir
+run escfields     0 EscapeFields EscapeFields Node2
 
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"

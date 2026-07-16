@@ -31,33 +31,140 @@ pub fn stack_allocate(program: &mut Program) -> usize {
 
 fn run_function(f: &mut Function) -> usize {
     let cyclic = cyclic_blocks(f);
-    let mut promote: Vec<(usize, usize)> = Vec::new();
 
-    for (bi, bb) in f.blocks.iter().enumerate() {
-        for (si, st) in bb.statements.iter().enumerate() {
-            let Statement::New { dest, .. } = st else { continue };
-            if cyclic[bi] {
-                continue;
+    // Objekte = Allokations-Sites. Position (bi, si) + Ziel-Local.
+    let news: Vec<(usize, usize, Local)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, bb)| {
+            bb.statements.iter().enumerate().filter_map(move |(si, st)| match st {
+                Statement::New { dest, .. } => Some((bi, si, *dest)),
+                _ => None,
+            })
+        })
+        .collect();
+    if news.is_empty() {
+        return 0;
+    }
+
+    // Alias-Menge pro Objekt (flussunsensitiver Kopie-Fixpunkt; wegen
+    // Local-Slot-Wiederverwendung konservativ überschätzt → nur mehr Escapes).
+    let aliases: Vec<BTreeSet<Local>> = news.iter().map(|(_, _, d)| alias_set(f, *d)).collect();
+    // Objekte, die ein Operand referenzieren kann.
+    let objs_of = |op: &Operand| -> Vec<usize> {
+        match op {
+            Operand::Copy(l) => (0..news.len()).filter(|&i| aliases[i].contains(l)).collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    // direct[o] = o entkommt unmittelbar; edges = ungerichtete Kanten zwischen
+    // Objekten, die per Feld verbunden sind (both-or-neither: Container und
+    // Inhalt werden nur gemeinsam promoviert). So hält ein Stack-Container
+    // ausschließlich immortale Inhalte → keine Feld-Freigabe/Leck möglich.
+    let n = news.len();
+    let mut direct = vec![false; n];
+    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let mark = |set: &mut Vec<bool>, op: &Operand| {
+        for oi in objs_of(op) {
+            set[oi] = true;
+        }
+    };
+    let is_ref_operand = |op: &Operand| matches!(op, Operand::Copy(l) if f.locals[l.0 as usize] == Ty::Ref);
+
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            match st {
+                // Aufrufargumente entkommen (Callee könnte sie festhalten);
+                // der reine Null-Check tut das nicht.
+                Statement::Call { func, args, .. } => {
+                    if func != "jrt_null_check" {
+                        for a in args {
+                            mark(&mut direct, a);
+                        }
+                    }
+                }
+                Statement::CallGuarded { args, .. }
+                | Statement::CallVirtual { args, .. }
+                | Statement::CallPoly { args, .. } => {
+                    for a in args {
+                        mark(&mut direct, a);
+                    }
+                }
+                Statement::PutStatic { value, .. } | Statement::ArrayStore { value, .. } => {
+                    mark(&mut direct, value);
+                }
+                // Feld-Sensitivität, `obj.field = value`:
+                //  - value verfolgt, obj verfolgt  → ungerichtete Kante value↔obj
+                //  - value verfolgt, obj unbekannt → value entkommt (in fremden
+                //    Container gespeichert)
+                //  - value unbekannte Ref, obj verfolgt → obj entkommt (ein
+                //    immortaler Stack-Container hielte sonst eine Heap-Referenz,
+                //    deren Drop nie läuft → Leck)
+                Statement::PutField { obj, value, .. } => {
+                    let vs = objs_of(value);
+                    let os = objs_of(obj);
+                    if !vs.is_empty() {
+                        if os.is_empty() {
+                            for ov in &vs {
+                                direct[*ov] = true;
+                            }
+                        } else {
+                            for &ov in &vs {
+                                for &oo in &os {
+                                    edges[ov].insert(oo);
+                                    edges[oo].insert(ov);
+                                }
+                            }
+                        }
+                    } else if !os.is_empty() && is_ref_operand(value) {
+                        for oo in &os {
+                            direct[*oo] = true;
+                        }
+                    }
+                }
+                _ => {}
             }
-            if !escapes(f, *dest) {
-                promote.push((bi, si));
-            }
+        }
+        if let Terminator::Return(Some(op)) = &bb.terminator {
+            mark(&mut direct, op);
         }
     }
 
-    let n = promote.len();
-    for (bi, si) in promote {
-        let Statement::New { dest, class } = f.blocks[bi].statements[si].clone() else {
+    // Fixpunkt: Entkommen über die ungerichteten Kanten propagieren — eine
+    // Zusammenhangskomponente entkommt, sobald ein Mitglied entkommt.
+    let mut escape = direct;
+    loop {
+        let mut changed = false;
+        for a in 0..n {
+            if !escape[a] && edges[a].iter().any(|&b| escape[b]) {
+                escape[a] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Nicht entkommende, nicht in Schleifen liegende Objekte stack-allozieren.
+    let mut count = 0;
+    for (idx, (bi, si, _)) in news.iter().enumerate() {
+        if escape[idx] || cyclic[*bi] {
+            continue;
+        }
+        let Statement::New { dest, class } = f.blocks[*bi].statements[*si].clone() else {
             unreachable!()
         };
-        f.blocks[bi].statements[si] = Statement::StackNew { dest, class };
+        f.blocks[*bi].statements[*si] = Statement::StackNew { dest, class };
+        count += 1;
     }
-    n
+    count
 }
 
-/// Alias-Fixpunkt: alle Locals, die den Wert von `root` halten können,
-/// dann Prüfung aller Escape-Quellen.
-fn escapes(f: &Function, root: Local) -> bool {
+/// Alias-Fixpunkt: alle Locals, die den Wert von `root` halten können.
+fn alias_set(f: &Function, root: Local) -> BTreeSet<Local> {
     let mut aliases: BTreeSet<Local> = BTreeSet::new();
     aliases.insert(root);
     loop {
@@ -75,52 +182,7 @@ fn escapes(f: &Function, root: Local) -> bool {
             break;
         }
     }
-
-    let is_alias = |op: &Operand| matches!(op, Operand::Copy(l) if aliases.contains(l));
-
-    for bb in &f.blocks {
-        for st in &bb.statements {
-            match st {
-                Statement::Call { func, args, .. } => {
-                    if func != "jrt_null_check" && args.iter().any(is_alias) {
-                        return true;
-                    }
-                }
-                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
-                    if args.iter().any(is_alias) {
-                        return true;
-                    }
-                }
-                Statement::PutField { value, .. } => {
-                    if is_alias(value) {
-                        return true;
-                    }
-                }
-                Statement::ArrayStore { value, .. } => {
-                    // In ein Array gespeichert → das Objekt überlebt uns
-                    // potentiell; konservativ als entkommend werten.
-                    if is_alias(value) {
-                        return true;
-                    }
-                }
-                Statement::PutStatic { value, .. } => {
-                    // In ein statisches Feld gespeichert → entkommt.
-                    if is_alias(value) {
-                        return true;
-                    }
-                }
-                // GetField/PutField/Array-Zugriff über `obj`/`arr` sowie
-                // Vergleiche lassen das Objekt selbst nicht entkommen.
-                _ => {}
-            }
-        }
-        if let Terminator::Return(Some(op)) = &bb.terminator {
-            if is_alias(op) {
-                return true;
-            }
-        }
-    }
-    false
+    aliases
 }
 
 /// Blöcke, die auf einem Zyklus liegen (sich selbst erreichen können).
