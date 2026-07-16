@@ -1153,6 +1153,13 @@ fn lower_block(
             }
             Instr::New(idx) => {
                 let class = ml.cf.class_name(*idx)?.to_string();
+                // StringBuilder ist runtime-gestützt: new → jrt_sb_new.
+                if class == "java/lang/StringBuilder" {
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stmts.push(Statement::Call { dest: Some(l), func: "jrt_sb_new".to_string(), args: vec![] });
+                    stack.push(Ty::Ref);
+                    continue;
+                }
                 if program.class(&class).is_none() {
                     return Err(FrontendError::Unsupported(format!("new {class} (Klasse nicht im Closed-World-Input)")));
                 }
@@ -1200,6 +1207,19 @@ fn lower_block(
                 let recv = pop!();
                 args.push(Operand::Copy(recv));
                 args.reverse();
+                // StringBuilder-Konstruktor (Objekt kam schon von jrt_sb_new):
+                // ()V ist ein No-Op, (String) hängt den String an.
+                if class == "java/lang/StringBuilder" && name == "<init>" {
+                    // args = [receiver, string?] (schon eingesammelt, reversed).
+                    if desc == "(Ljava/lang/String;)V" {
+                        stmts.push(Statement::Call {
+                            dest: None,
+                            func: "jrt_sb_init_str".to_string(),
+                            args,
+                        });
+                    }
+                    continue;
+                }
                 if name == "<init>" && program.class(&class).is_none() {
                     // Konstruktor einer nicht modellierten Basisklasse
                     // (Object, Throwable, RuntimeException, …): entfällt.
@@ -1274,6 +1294,37 @@ fn lower_block(
                         func: intrinsic.to_string(),
                         args: arg.into_iter().map(Operand::Copy).collect(),
                     });
+                    continue;
+                }
+                // StringBuilder-Methoden (runtime-gestützt). append gibt
+                // this zurück (Verkettung), toString einen neuen String.
+                if class == "java/lang/StringBuilder" {
+                    let (func, rty) = match (name, desc) {
+                        ("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;") => ("jrt_sb_append_str", Ty::Ref),
+                        ("append", "(I)Ljava/lang/StringBuilder;") => ("jrt_sb_append_int", Ty::Ref),
+                        ("append", "(C)Ljava/lang/StringBuilder;") => ("jrt_sb_append_char", Ty::Ref),
+                        ("append", "(J)Ljava/lang/StringBuilder;") => ("jrt_sb_append_long", Ty::Ref),
+                        ("append", "(D)Ljava/lang/StringBuilder;") => ("jrt_sb_append_double", Ty::Ref),
+                        ("append", "(Z)Ljava/lang/StringBuilder;") => ("jrt_sb_append_bool", Ty::Ref),
+                        ("toString", "()Ljava/lang/String;") => ("jrt_sb_tostring", Ty::Ref),
+                        ("length", "()I") => ("jrt_sb_length", Ty::I32),
+                        _ => {
+                            return Err(FrontendError::Unsupported(format!(
+                                "StringBuilder.{name}{desc}"
+                            )))
+                        }
+                    };
+                    let (ptys, _) = parse_descriptor(desc)?;
+                    let mut args = Vec::new();
+                    for _ in &ptys {
+                        args.push(Operand::Copy(pop!()));
+                    }
+                    let recv = pop!();
+                    args.push(Operand::Copy(recv));
+                    args.reverse();
+                    let l = ml.stack_slot(stack.len(), rty);
+                    stack.push(rty);
+                    stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
                     continue;
                 }
                 // Unboxing: Wrapper.<prim>Value() → eingepackter Wert.

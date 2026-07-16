@@ -25,8 +25,10 @@
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
 void *jrt_alloc(int64_t size);
+void jrt_retain(void *p);
 void jrt_throw_npe(void);
 void jrt_throw_sioobe(void);
+static void jrt_sb_drop(void *p);
 
 /* Vtable für zur Laufzeit erzeugte Strings. Ihr Layout (mit Type-Descriptor
  * und den Object-Methoden-Slots) ist programmabhängig, daher wird sie im
@@ -351,6 +353,89 @@ JStr *jrt_double_to_str(double d) {
 JStr *jrt_float_to_str(float f) {
     char buf[32];
     return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", (double)f));
+}
+
+/* --- StringBuilder (runtime-gestützt) -------------------------------
+ * Wachsender Byte-Puffer; RC-verwaltetes Objekt mit eigener drop-Funktion
+ * (gibt den Puffer frei). append(X) gibt this zurück (Verkettung). */
+void (*jrt_sb_vtable[3])(void) = {
+    (void (*)(void))jrt_sb_drop,
+    (void (*)(void))jrt_noop_trace,
+    (void (*)(void))0, /* kein Type-Descriptor */
+};
+typedef struct {
+    int64_t refcount, rcflags;
+    void *vtable;
+    uint8_t *buf;
+    int64_t len, cap;
+} JSB;
+
+static void jrt_sb_drop(void *p) { free(((JSB *)p)->buf); }
+
+void *jrt_sb_new(void) {
+    JSB *sb = (JSB *)jrt_alloc((int64_t)sizeof(JSB));
+    sb->vtable = (void *)jrt_sb_vtable;
+    sb->cap = 16;
+    sb->buf = (uint8_t *)malloc(16);
+    sb->len = 0;
+    return sb;
+}
+static void sb_append(JSB *sb, const void *b, int64_t n) {
+    if (sb->len + n > sb->cap) {
+        while (sb->len + n > sb->cap) sb->cap *= 2;
+        sb->buf = (uint8_t *)realloc(sb->buf, (size_t)sb->cap);
+    }
+    memcpy(sb->buf + sb->len, b, (size_t)n);
+    sb->len += n;
+}
+/* append gibt this zurück (Verkettung); der Aufrufer erwartet eine
+ * transferierte +1-Referenz → retain. */
+void *jrt_sb_append_str(void *p, const JStr *s) {
+    if (s) sb_append((JSB *)p, s->bytes, s->len);
+    else sb_append((JSB *)p, "null", 4);
+    jrt_retain(p);
+    return p;
+}
+void *jrt_sb_append_int(void *p, int32_t v) {
+    char b[16];
+    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%d", v));
+    jrt_retain(p);
+    return p;
+}
+void *jrt_sb_append_long(void *p, int64_t v) {
+    char b[24];
+    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%lld", (long long)v));
+    jrt_retain(p);
+    return p;
+}
+void *jrt_sb_append_double(void *p, double v) {
+    char b[32];
+    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%g", v));
+    jrt_retain(p);
+    return p;
+}
+void *jrt_sb_append_char(void *p, int32_t c) {
+    char b = (char)c;
+    sb_append((JSB *)p, &b, 1);
+    jrt_retain(p);
+    return p;
+}
+void *jrt_sb_append_bool(void *p, int32_t v) {
+    if (v) sb_append((JSB *)p, "true", 4);
+    else sb_append((JSB *)p, "false", 5);
+    jrt_retain(p);
+    return p;
+}
+JStr *jrt_sb_tostring(void *p) {
+    JSB *sb = (JSB *)p;
+    return str_from_buf((const char *)sb->buf, (int)sb->len);
+}
+int32_t jrt_sb_length(void *p) { return (int32_t)((JSB *)p)->len; }
+/* StringBuilder(String)-Konstruktor: anhängen ohne retain (Rückgabe
+ * verworfen, der Receiver ist geborgt). */
+void jrt_sb_init_str(void *p, const JStr *s) {
+    if (s) sb_append((JSB *)p, s->bytes, s->len);
+    else sb_append((JSB *)p, "null", 4);
 }
 
 /* --- Referenzzählung + Zyklen-Collector ------------------------------ */
