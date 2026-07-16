@@ -175,9 +175,10 @@ struct LambdaInfo {
     iface: String,       // Funktionsinterface (Rückgabetyp des indy)
     sam_method: String,  // Name der Interface-Methode (z. B. "apply")
     sam_desc: String,    // Deskriptor der Interface-Methode
-    impl_class: String,  // Klasse der Lambda-Rumpf-Methode
-    impl_name: String,   // lambda$…
-    impl_desc: String,   // Deskriptor der Rumpf-Methode (captures + SAM-Args)
+    kind: u8,            // MethodHandle-Referenzart (5=virtual, 6=static, …)
+    impl_class: String,  // Klasse der Ziel-/Rumpf-Methode
+    impl_name: String,   // lambda$… oder referenzierte Methode
+    impl_desc: String,   // Deskriptor der Ziel-Methode
     captures: Vec<Ty>,   // eingefangene Variablen (indy-Parameter)
 }
 
@@ -186,7 +187,10 @@ struct LambdaInfo {
 /// weiterleitet (captures aus Feldern + eigene Argumente). Liefert den
 /// Klassennamen (idempotent pro Rumpf-Methode).
 fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
-    let class_name = format!("$lambda${}${}", info.impl_class, info.impl_name);
+    let class_name = format!(
+        "$lambda${}${}${}${}",
+        info.iface, info.sam_method, info.impl_class, info.impl_name
+    );
     if program.class(&class_name).is_some() {
         return Ok(class_name);
     }
@@ -240,14 +244,71 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     for k in 0..n_sam {
         impl_args.push(Operand::Copy(Local((1 + k) as u32)));
     }
-    let impl_mangled = mangle(&info.impl_class, &info.impl_name, &info.impl_desc);
     let result = if sam_ret == Ty::Void {
         None
     } else {
         locals.push(sam_ret);
         Some(Local((locals.len() - 1) as u32))
     };
-    stmts.push(Statement::Call { dest: result, func: impl_mangled, args: impl_args });
+    // Intrinsic-gestützte Ziele (z. B. String::length) direkt aufrufen —
+    // sie haben keinen Vtable-Slot.
+    let intrinsic = match (info.impl_class.as_str(), info.impl_name.as_str(), info.impl_desc.as_str()) {
+        ("java/lang/String", "length", "()I") => Some("jrt_str_length"),
+        ("java/lang/String", "isEmpty", "()Z") => Some("jrt_str_is_empty"),
+        ("java/lang/String", "charAt", "(I)C") => Some("jrt_str_char_at"),
+        ("java/lang/String", "hashCode", "()I") => Some("jrt_str_hashcode"),
+        _ => None,
+    };
+    if let Some(f) = intrinsic {
+        stmts.push(Statement::Call { dest: result, func: f.to_string(), args: impl_args });
+        let terminator = Terminator::Return(result.map(Operand::Copy));
+        program.functions.push(Function {
+            name: sam_mangled,
+            params: locals[..=n_sam].to_vec(),
+            ret: sam_ret,
+            locals,
+            blocks: vec![BasicBlock { statements: stmts, terminator }],
+        });
+        return Ok(class_name);
+    }
+    // Dispatch je nach Referenzart der Ziel-Methode.
+    match info.kind {
+        // REF_invokeVirtual / REF_invokeInterface: erstes Argument ist der
+        // Receiver, virtueller Aufruf.
+        5 | 9 => {
+            let (mut mparams, mret) = parse_descriptor(&info.impl_desc)?;
+            mparams.insert(0, Ty::Ref);
+            stmts.push(Statement::CallVirtual {
+                dest: result,
+                class: info.impl_class.clone(),
+                name: info.impl_name.clone(),
+                desc: info.impl_desc.clone(),
+                params: mparams,
+                ret: mret,
+                args: impl_args,
+            });
+        }
+        // REF_newInvokeSpecial: Konstruktor-Referenz → new + <init>.
+        8 => {
+            let obj = result.expect("Konstruktor-Referenz muss ein Objekt liefern");
+            stmts.push(Statement::New { dest: obj, class: info.impl_class.clone() });
+            let mut ctor_args = vec![Operand::Copy(obj)];
+            ctor_args.extend(impl_args);
+            stmts.push(Statement::Call {
+                dest: None,
+                func: mangle(&info.impl_class, "<init>", &info.impl_desc),
+                args: ctor_args,
+            });
+        }
+        // REF_invokeStatic / REF_invokeSpecial: direkter Aufruf.
+        _ => {
+            stmts.push(Statement::Call {
+                dest: result,
+                func: mangle(&info.impl_class, &info.impl_name, &info.impl_desc),
+                args: impl_args,
+            });
+        }
+    }
     let terminator = Terminator::Return(result.map(Operand::Copy));
 
     program.functions.push(Function {
@@ -1475,11 +1536,12 @@ fn lower_block(
                         _ => return Err(FrontendError::Unsupported("Lambda ohne Interface-Rückgabe".into())),
                     };
                     let sam_desc = ml.cf.method_type(bsm_args[0])?.to_string();
-                    let (_, impl_class, impl_name, impl_desc) = ml.cf.method_handle(bsm_args[1])?;
+                    let (kind, impl_class, impl_name, impl_desc) = ml.cf.method_handle(bsm_args[1])?;
                     let info = LambdaInfo {
                         iface,
                         sam_method: dname.to_string(),
                         sam_desc,
+                        kind,
                         impl_class: impl_class.to_string(),
                         impl_name: impl_name.to_string(),
                         impl_desc: impl_desc.to_string(),
