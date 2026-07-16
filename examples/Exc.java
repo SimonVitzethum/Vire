@@ -47,5 +47,3 @@ public class Exc {
     }
 }
 
-class MyException extends RuntimeException {
-}

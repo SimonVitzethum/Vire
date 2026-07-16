@@ -501,6 +501,11 @@ struct MethodLowering<'a> {
     slot_map: HashMap<(u16, Ty), Local>,
     /// (Stack-Tiefe, Typ) → IR-Local.
     stack_map: HashMap<(usize, Ty), Local>,
+    /// IR-Local → bekannter ConstClass-Wert (Reflection). Wird über
+    /// Kopien (aload/astore) propagiert, damit `getName`/`newInstance` das
+    /// Class-Objekt auch blockübergreifend statisch auflösen (die
+    /// Origin-Analyse ist nur block-lokal, seit invokestatic splittet).
+    class_const: HashMap<Local, String>,
 }
 
 impl<'a> MethodLowering<'a> {
@@ -664,7 +669,13 @@ fn lower_method(
         exc_target_of_pc.insert(*pc, target);
     }
 
-    let mut ml = MethodLowering { cf, locals: Vec::new(), slot_map: HashMap::new(), stack_map: HashMap::new() };
+    let mut ml = MethodLowering {
+        cf,
+        locals: Vec::new(),
+        slot_map: HashMap::new(),
+        stack_map: HashMap::new(),
+        class_const: HashMap::new(),
+    };
 
     // Parameter belegen die ersten IR-Locals; JVM-Slot-Zählung beachtet
     // breite Typen (long/double = 2 Slots).
@@ -878,7 +889,8 @@ fn lower_block(
                             )));
                         }
                         program.intern_class_object(&class);
-                        push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(class)));
+                        let l = push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(class.clone())));
+                        ml.class_const.insert(l, class);
                     }
                     _ => return Err(FrontendError::Unsupported(format!("ldc auf CP-Index {idx}"))),
                 }
@@ -934,7 +946,10 @@ fn lower_block(
             }
             Instr::ALoad(slot) => {
                 let l = ml.jvm_slot(*slot, Ty::Ref);
-                push!(Ty::Ref, Rvalue::Use(Operand::Copy(l)));
+                let dest = push!(Ty::Ref, Rvalue::Use(Operand::Copy(l)));
+                if let Some(c) = ml.class_const.get(&l).cloned() {
+                    ml.class_const.insert(dest, c); // ConstClass über Kopie propagieren
+                }
             }
             Instr::IStore(slot) => {
                 let v = pop!();
@@ -945,6 +960,10 @@ fn lower_block(
                 let v = pop!();
                 let l = ml.jvm_slot(*slot, Ty::Ref);
                 stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
+                match ml.class_const.get(&v).cloned() {
+                    Some(c) => { ml.class_const.insert(l, c); }
+                    None => { ml.class_const.remove(&l); } // Slot überschrieben
+                }
             }
             Instr::IInc(slot, delta) => {
                 let l = ml.jvm_slot(*slot, Ty::I32);
@@ -1520,12 +1539,16 @@ fn lower_block(
                     let recv = pop!();
                     let target = match origin_of(&stmts, recv) {
                         Origin::Op(Operand::ConstClass(c)) => c.clone(),
-                        _ => {
-                            return Err(FrontendError::Unsupported(format!(
-                                "Class.{name} auf nicht statisch bekanntem Class-Objekt \
-                                 (Closed World: Reflection muss statisch auflösbar sein)"
-                            )));
-                        }
+                        // Blockübergreifend über die ConstClass-Verfolgung.
+                        _ => match ml.class_const.get(&recv).cloned() {
+                            Some(c) => c,
+                            None => {
+                                return Err(FrontendError::Unsupported(format!(
+                                    "Class.{name} auf nicht statisch bekanntem Class-Objekt \
+                                     (Closed World: Reflection muss statisch auflösbar sein)"
+                                )));
+                            }
+                        },
                     };
                     match (name, desc) {
                         ("getName", "()Ljava/lang/String;") => {
@@ -1846,7 +1869,8 @@ fn lower_block(
                         )));
                     }
                     program.intern_class_object(&target);
-                    push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target)));
+                    let l = push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target.clone())));
+                    ml.class_const.insert(l, target);
                     continue;
                 }
                 // Autoboxing: Wrapper.valueOf(primitive) → Runtime-Box.
