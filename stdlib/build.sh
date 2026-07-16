@@ -1,9 +1,9 @@
 #!/bin/sh
-# Kompiliert die java.util-Stub-Klassenbibliothek. Der --patch-module-Trick
-# erlaubt es, Klassen im reservierten java.util-Paket zu kompilieren; die
-# entstehenden .class-Dateien gibt man fastjavac zusammen mit dem
-# Nutzercode. Nutzercode wird ganz normal gegen das echte JDK kompiliert.
+# Kompiliert die java.*-Stub-Klassenbibliothek (--patch-module-Trick, damit
+# reservierte Pakete wie java.util kompilierbar sind).
 set -e
 dir="$(dirname "$0")"
-javac --patch-module java.base="$dir" -d "$dir/out" "$dir"/java/util/*.java
+find "$dir/java" -name '*.java' > "$dir/.sources"
+javac --patch-module java.base="$dir" -d "$dir/out" @"$dir/.sources"
+rm -f "$dir/.sources"
 echo "Stub-Bibliothek in $dir/out/"

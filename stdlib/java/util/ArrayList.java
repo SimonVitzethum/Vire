@@ -28,6 +28,10 @@ public class ArrayList<E> implements List<E> {
         return new ArrayListIterator<E>(this);
     }
 
+    public java.util.stream.Stream<E> stream() {
+        return new java.util.stream.StreamImpl<E>(this);
+    }
+
     private void grow() {
         Object[] bigger = new Object[elems.length * 2];
         for (int i = 0; i < count; i++) bigger[i] = elems[i];

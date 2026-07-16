@@ -244,12 +244,6 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     for k in 0..n_sam {
         impl_args.push(Operand::Copy(Local((1 + k) as u32)));
     }
-    let result = if sam_ret == Ty::Void {
-        None
-    } else {
-        locals.push(sam_ret);
-        Some(Local((locals.len() - 1) as u32))
-    };
     // Intrinsic-gestützte Ziele (z. B. String::length) direkt aufrufen —
     // sie haben keinen Vtable-Slot.
     let intrinsic = match (info.impl_class.as_str(), info.impl_name.as_str(), info.impl_desc.as_str()) {
@@ -259,56 +253,79 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         ("java/lang/String", "hashCode", "()I") => Some("jrt_str_hashcode"),
         _ => None,
     };
+
+    // Roher Rückgabetyp der Ziel-Methode (vor Adaption an den SAM-Typ).
+    let impl_ret_char = info.impl_desc.rsplit_once(')').map(|(_, r)| r.chars().next()).flatten();
+    let impl_ret = if info.kind == 8 {
+        Ty::Ref // Konstruktor liefert ein Objekt
+    } else {
+        parse_descriptor(&info.impl_desc)?.1
+    };
+    // Roh-Ergebnis-Local (Typ der Ziel-Methode).
+    let raw = if impl_ret == Ty::Void {
+        None
+    } else {
+        locals.push(impl_ret);
+        Some(Local((locals.len() - 1) as u32))
+    };
+
     if let Some(f) = intrinsic {
-        stmts.push(Statement::Call { dest: result, func: f.to_string(), args: impl_args });
-        let terminator = Terminator::Return(result.map(Operand::Copy));
-        program.functions.push(Function {
-            name: sam_mangled,
-            params: locals[..=n_sam].to_vec(),
-            ret: sam_ret,
-            locals,
-            blocks: vec![BasicBlock { statements: stmts, terminator }],
-        });
-        return Ok(class_name);
-    }
-    // Dispatch je nach Referenzart der Ziel-Methode.
-    match info.kind {
-        // REF_invokeVirtual / REF_invokeInterface: erstes Argument ist der
-        // Receiver, virtueller Aufruf.
-        5 | 9 => {
-            let (mut mparams, mret) = parse_descriptor(&info.impl_desc)?;
-            mparams.insert(0, Ty::Ref);
-            stmts.push(Statement::CallVirtual {
-                dest: result,
-                class: info.impl_class.clone(),
-                name: info.impl_name.clone(),
-                desc: info.impl_desc.clone(),
-                params: mparams,
-                ret: mret,
-                args: impl_args,
-            });
-        }
-        // REF_newInvokeSpecial: Konstruktor-Referenz → new + <init>.
-        8 => {
-            let obj = result.expect("Konstruktor-Referenz muss ein Objekt liefern");
-            stmts.push(Statement::New { dest: obj, class: info.impl_class.clone() });
-            let mut ctor_args = vec![Operand::Copy(obj)];
-            ctor_args.extend(impl_args);
-            stmts.push(Statement::Call {
-                dest: None,
-                func: mangle(&info.impl_class, "<init>", &info.impl_desc),
-                args: ctor_args,
-            });
-        }
-        // REF_invokeStatic / REF_invokeSpecial: direkter Aufruf.
-        _ => {
-            stmts.push(Statement::Call {
-                dest: result,
-                func: mangle(&info.impl_class, &info.impl_name, &info.impl_desc),
-                args: impl_args,
-            });
+        stmts.push(Statement::Call { dest: raw, func: f.to_string(), args: impl_args });
+    } else {
+        match info.kind {
+            5 | 9 => {
+                let (mut mparams, mret) = parse_descriptor(&info.impl_desc)?;
+                mparams.insert(0, Ty::Ref);
+                stmts.push(Statement::CallVirtual {
+                    dest: raw,
+                    class: info.impl_class.clone(),
+                    name: info.impl_name.clone(),
+                    desc: info.impl_desc.clone(),
+                    params: mparams,
+                    ret: mret,
+                    args: impl_args,
+                });
+            }
+            8 => {
+                let obj = raw.expect("Konstruktor-Referenz muss ein Objekt liefern");
+                stmts.push(Statement::New { dest: obj, class: info.impl_class.clone() });
+                let mut ctor_args = vec![Operand::Copy(obj)];
+                ctor_args.extend(impl_args);
+                stmts.push(Statement::Call {
+                    dest: None,
+                    func: mangle(&info.impl_class, "<init>", &info.impl_desc),
+                    args: ctor_args,
+                });
+            }
+            _ => {
+                stmts.push(Statement::Call {
+                    dest: raw,
+                    func: mangle(&info.impl_class, &info.impl_name, &info.impl_desc),
+                    args: impl_args,
+                });
+            }
         }
     }
+
+    // Rückgabe an den SAM-Typ anpassen: primitives Ergebnis → Wrapper boxen,
+    // wenn das Interface Object erwartet (LambdaMetafactory-Adaption).
+    let result = match (raw, sam_ret) {
+        (Some(r), Ty::Ref) if impl_ret != Ty::Ref => {
+            let box_fn = match impl_ret_char {
+                Some('J') => "jrt_long_valueof",
+                Some('F') => "jrt_float_valueof",
+                Some('D') => "jrt_double_valueof",
+                Some('C') => "jrt_character_valueof",
+                Some('Z') => "jrt_boolean_valueof",
+                _ => "jrt_integer_valueof",
+            };
+            locals.push(Ty::Ref);
+            let boxed = Local((locals.len() - 1) as u32);
+            stmts.push(Statement::Call { dest: Some(boxed), func: box_fn.to_string(), args: vec![Operand::Copy(r)] });
+            Some(boxed)
+        }
+        (r, _) => r,
+    };
     let terminator = Terminator::Return(result.map(Operand::Copy));
 
     program.functions.push(Function {
@@ -1355,6 +1372,28 @@ fn lower_block(
                         func: intrinsic.to_string(),
                         args: arg.into_iter().map(Operand::Copy).collect(),
                     });
+                    continue;
+                }
+                // print(ln)(Object): virtueller toString, dann als String
+                // ausgeben.
+                if class == "java/io/PrintStream"
+                    && (name == "println" || name == "print")
+                    && desc == "(Ljava/lang/Object;)V"
+                {
+                    let arg = pop!();
+                    pop!(); // Receiver-Dummy
+                    let s = ml.fresh(Ty::Ref);
+                    stmts.push(Statement::CallVirtual {
+                        dest: Some(s),
+                        class: "java/lang/Object".to_string(),
+                        name: "toString".to_string(),
+                        desc: "()Ljava/lang/String;".to_string(),
+                        params: vec![Ty::Ref],
+                        ret: Ty::Ref,
+                        args: vec![Operand::Copy(arg)],
+                    });
+                    let f = if name == "println" { "jrt_println_str" } else { "jrt_print_str" };
+                    stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(s)] });
                     continue;
                 }
                 // StringBuilder-Methoden (runtime-gestützt). append gibt
