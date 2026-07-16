@@ -37,6 +37,11 @@ run() {
         echo "FAIL $name (javac): $(head -1 "$work/err")"; fail=$((fail+1)); return
     fi
     classes="$work/$main.class"
+    # Synthetische/innere Klassen der Main-Klasse (z.B. der enum-switch-
+    # $SwitchMap-Helfer Main$1) automatisch als Closed-World-Input mitnehmen.
+    for f in "$work/$main"\$*.class; do
+        [ -e "$f" ] && classes="$classes $f"
+    done
     for a in "$@"; do
         case "$a" in
             @stdlib) usestd=1; continue;;
@@ -126,6 +131,7 @@ run format        0 Format Format
 run enum          0 Enum1 Enum1 Color
 run twr           0 Twr Twr Res MyException
 run messages      0 Messages Messages Boom
+run enumswitch    0 EnumSwitch EnumSwitch Dir
 
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"

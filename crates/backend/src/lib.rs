@@ -616,11 +616,63 @@ fn emit_clinit_chain(
         }
         if ci.has_clinit {
             let sym = fastllvm_ir::clinit_symbol(class);
+            // Statische Abhängigkeiten: liest/erzeugt der <clinit> die Statik
+            // einer anderen Klasse (z.B. der enum-switch-Helfer Main$1 ruft
+            // Dir.values() und liest Dir.N), muss deren <clinit> vorher laufen.
+            // Java initialisiert lazy bei erstem Zugriff; wir eager, daher hier
+            // topologisch vorziehen (der emitted-Guard bricht etwaige Zyklen).
+            if let Some(f) = ctx.program.functions.iter().find(|f| f.name == sym) {
+                for dep in clinit_deps(ctx, f) {
+                    if dep != class {
+                        emit_clinit_chain(w, ctx, &dep, defined, emitted);
+                    }
+                }
+            }
             if defined.contains(sym.as_str()) {
                 writeln!(w, "  call void @{sym}()").unwrap();
             }
         }
     }
+}
+
+/// Klassen, deren Statik ein `<clinit>`-Rumpf berührt (Feld-/New-/Cast-/
+/// virtueller Zugriff sowie direkte Calls in ihre Methoden) — Kandidaten,
+/// die vor diesem `<clinit>` initialisiert sein müssen.
+fn clinit_deps(ctx: &Ctx, f: &Function) -> BTreeSet<String> {
+    // Symbol → deklarierende Klasse, um Call-Ziele einer Klasse zuzuordnen.
+    let sym_class = |sym: &str| -> Option<String> {
+        ctx.program
+            .classes
+            .iter()
+            .find(|c| c.methods.iter().any(|m| m.mangled == sym))
+            .map(|c| c.name.clone())
+    };
+    let mut deps = BTreeSet::new();
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            match st {
+                Statement::GetStatic { class, .. }
+                | Statement::PutStatic { class, .. }
+                | Statement::New { class, .. }
+                | Statement::StackNew { class, .. }
+                | Statement::GetField { class, .. }
+                | Statement::PutField { class, .. }
+                | Statement::CallVirtual { class, .. }
+                | Statement::InstanceOf { class, .. }
+                | Statement::InstanceOfPending { class, .. }
+                | Statement::CheckCast { class, .. } => {
+                    deps.insert(class.clone());
+                }
+                Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => {
+                    if let Some(c) = sym_class(func) {
+                        deps.insert(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    deps
 }
 
 /// Runtime-Default-Implementierung einer Object-Wurzelmethode.
