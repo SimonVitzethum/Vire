@@ -73,13 +73,14 @@ fn main() {
         if stats {
             eprintln!(
                 "solver: {} Klassen instanziiert, {} Funktionen erreichbar ({} entfernt), \
-                 {} virtuelle Sites, {} devirtualisiert, {} Calls geinlinet, \
+                 {} virtuelle Sites, {} devirtualisiert, {} bikonditional, {} Calls geinlinet, \
                  {} Allokationen auf den Stack",
                 s.instantiated_classes,
                 s.reachable_functions,
                 s.pruned_functions,
                 s.virtual_sites,
                 s.devirtualized,
+                s.poly_devirtualized,
                 s.inlined_calls,
                 s.stack_allocated,
             );

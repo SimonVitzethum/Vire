@@ -18,6 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
+/// Höchstzahl konkreter Zielklassen, bis zu der ein polymorpher Site zur
+/// Typ-Wächter-Kaskade wird (darüber bleibt Vtable-Dispatch günstiger).
+const MAX_POLY_CLASSES: usize = 3;
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub instantiated_classes: usize,
@@ -25,6 +29,7 @@ pub struct Stats {
     pub pruned_functions: usize,
     pub virtual_sites: usize,
     pub devirtualized: usize,
+    pub poly_devirtualized: usize,
     pub inlined_calls: usize,
     pub stack_allocated: usize,
 }
@@ -153,6 +158,20 @@ pub fn run(program: &mut Program) -> Stats {
                         i += 1;
                         continue;
                     }
+                    // Bikonditionale Devirtualisierung: wenige (≤3) konkrete
+                    // Zielklassen → Typ-Wächter-Kaskade aus Direkt-Aufrufen
+                    // statt Vtable-Dispatch (LLVM inlinet die Direkt-Calls).
+                    let pairs = resolve_target_pairs(&program.classes, &instantiated, class, name, desc);
+                    let distinct: BTreeSet<&String> = pairs.iter().map(|(_, s)| s).collect();
+                    if pairs.len() >= 2 && pairs.len() <= MAX_POLY_CLASSES && distinct.len() >= 2 {
+                        let Statement::CallVirtual { dest, ret, args, .. } = bb.statements.remove(i) else {
+                            unreachable!()
+                        };
+                        bb.statements.insert(i, Statement::CallPoly { dest, ret, args, targets: pairs });
+                        stats.poly_devirtualized += 1;
+                        i += 1;
+                        continue;
+                    }
                 }
                 i += 1;
             }
@@ -233,4 +252,61 @@ fn resolve_targets_ref(
         }
     }
     targets
+}
+
+/// Wie `resolve_targets_ref`, aber (konkrete Klasse → Symbol)-Paare: für die
+/// bikonditionale Devirtualisierung, die pro konkreter Klasse einen
+/// Vtable-Zeiger-Vergleich emittiert. Deterministisch sortiert.
+fn resolve_target_pairs(
+    classes: &[ClassInfo],
+    instantiated: &BTreeSet<String>,
+    class: &str,
+    name: &str,
+    desc: &str,
+) -> Vec<(String, String)> {
+    let class_of = |n: &str| classes.iter().find(|c| c.name == n);
+    let is_subtype = |sub: &str, sup: &str| -> bool {
+        if sup == "java/lang/Object" {
+            return true;
+        }
+        let mut stack = vec![sub.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(c) = stack.pop() {
+            if c == sup {
+                return true;
+            }
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if let Some(ci) = class_of(&c) {
+                if let Some(s) = &ci.super_name {
+                    stack.push(s.clone());
+                }
+                for i in &ci.interfaces {
+                    stack.push(i.clone());
+                }
+            }
+        }
+        false
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for inst in instantiated {
+        if !is_subtype(inst, class) {
+            continue;
+        }
+        let mut cur = inst.as_str();
+        loop {
+            let Some(ci) = class_of(cur) else { break };
+            if let Some(m) = ci.methods.iter().find(|m| m.name == name && m.desc == desc && m.has_body) {
+                pairs.push((inst.clone(), m.mangled.clone()));
+                break;
+            }
+            match ci.super_name.as_deref() {
+                Some(s) => cur = s,
+                None => break,
+            }
+        }
+    }
+    pairs.sort();
+    pairs
 }

@@ -86,7 +86,7 @@ fn escapes(f: &Function, root: Local) -> bool {
                         return true;
                     }
                 }
-                Statement::CallVirtual { args, .. } => {
+                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
                     if args.iter().any(is_alias) {
                         return true;
                     }

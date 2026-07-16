@@ -668,6 +668,11 @@ fn clinit_deps(ctx: &Ctx, f: &Function) -> BTreeSet<String> {
                         deps.insert(c);
                     }
                 }
+                Statement::CallPoly { targets, .. } => {
+                    for (c, _) in targets {
+                        deps.insert(c.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -949,6 +954,62 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 }
             }
             writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{cont}:").unwrap();
+        }
+        Statement::CallPoly { dest, ret, args, targets } => {
+            let recv = e.operand(w, &args[0]);
+            // Argumente einmal materialisieren (in allen Zweigen gültig).
+            let mut avs = vec![format!("ptr {recv}")];
+            for a in &args[1..] {
+                let ty = llty(operand_ty(e.f, a));
+                let v = e.operand(w, a);
+                avs.push(format!("{ty} {v}"));
+            }
+            let avs = avs.join(", ");
+            let cont = e.fresh_label();
+            // Abfangbare Receiver-NPE: bei null → npe-Block.
+            let (nb, ok) = (e.fresh_label(), e.fresh_label());
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {recv}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+            writeln!(w, "{nb}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{ok}:").unwrap();
+            // Vtable-Zeiger des Receivers laden.
+            let vtp = e.fresh();
+            writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
+            let vt = e.fresh();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}").unwrap();
+            // Kaskade: pro Klasse ein Vtable-Vergleich → Direkt-Call; das
+            // letzte Ziel ist der else-Zweig (Closed World: Receiver ist
+            // garantiert eine der instanziierten Zielklassen).
+            let emit_call = |w: &mut String, e: &mut FnEmitter, sym: &str| {
+                match dest {
+                    None => writeln!(w, "  call {} @{sym}({avs})", llty(*ret)).unwrap(),
+                    Some(d) => {
+                        let t = e.fresh();
+                        writeln!(w, "  {t} = call {} @{sym}({avs})", llty(*ret)).unwrap();
+                        store_dest(w, e, *d, &t, false);
+                    }
+                }
+            };
+            for (k, (cls, sym)) in targets.iter().enumerate() {
+                if k + 1 == targets.len() {
+                    // letztes Ziel: unbedingt (else)
+                    emit_call(w, e, sym);
+                    writeln!(w, "  br label %{cont}").unwrap();
+                } else {
+                    let (hit, miss) = (e.fresh_label(), e.fresh_label());
+                    let eqv = e.fresh();
+                    writeln!(w, "  {eqv} = icmp eq ptr {vt}, @vt.{}", sanitize(cls)).unwrap();
+                    writeln!(w, "  br i1 {eqv}, label %{hit}, label %{miss}").unwrap();
+                    writeln!(w, "{hit}:").unwrap();
+                    emit_call(w, e, sym);
+                    writeln!(w, "  br label %{cont}").unwrap();
+                    writeln!(w, "{miss}:").unwrap();
+                }
+            }
             writeln!(w, "{cont}:").unwrap();
         }
         Statement::New { dest, class } => {

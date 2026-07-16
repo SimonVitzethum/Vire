@@ -209,7 +209,8 @@ fn remap_statement(st: &mut Statement, off: u32) {
         }
         Statement::Call { dest, args, .. }
         | Statement::CallGuarded { dest, args, .. }
-        | Statement::CallVirtual { dest, args, .. } => {
+        | Statement::CallVirtual { dest, args, .. }
+        | Statement::CallPoly { dest, args, .. } => {
             if let Some(d) = dest {
                 remap_local(d, off);
             }

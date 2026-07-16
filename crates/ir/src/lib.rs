@@ -101,6 +101,17 @@ pub enum Statement {
         ret: Ty,
         args: Vec<Operand>,
     },
+    /// Polymorpher, aber kleiner Call-Site (2–3 instanziierte Zielklassen):
+    /// der Solver ersetzt den Vtable-Dispatch durch eine Typ-Wächter-Kaskade
+    /// aus Direkt-Aufrufen (guarded devirtualization / polymorphic inline
+    /// cache). `args[0]` ist der Receiver (auf null geprüft); `targets` sind
+    /// (konkrete Klasse, Symbol)-Paare, das letzte dient als else-Zweig.
+    CallPoly {
+        dest: Option<Local>,
+        ret: Ty,
+        args: Vec<Operand>,
+        targets: Vec<(String, String)>,
+    },
     /// Objektallokation; Felder sind genullt (Java-Default), Header gesetzt.
     New { dest: Local, class: String },
     /// Stack-Allokation: von der Escape-Analyse bewiesen, dass das Objekt
