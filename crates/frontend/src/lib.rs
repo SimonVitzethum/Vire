@@ -1666,6 +1666,13 @@ fn lower_block(
                     }
                     continue;
                 }
+                // Throwable.addSuppressed (von try-with-resources erzeugt):
+                // unterdrückte Exceptions sind rein diagnostisch → no-op.
+                if name == "addSuppressed" && desc == "(Ljava/lang/Throwable;)V" {
+                    pop!(); // suppressed throwable
+                    pop!(); // receiver
+                    continue;
+                }
                 // Array-clone() (u.a. von enum values() erzeugt): flache
                 // Kopie mit retain der Ref-Elemente in der Runtime.
                 if class.starts_with('[') && name == "clone" {

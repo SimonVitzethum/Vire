@@ -124,6 +124,7 @@ run intstreams    0 IntStreams IntStreams @stdlib
 run switch        0 Switch Switch
 run format        0 Format Format
 run enum          0 Enum1 Enum1 Color
+run twr           0 Twr Twr Res MyException
 
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"
