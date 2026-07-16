@@ -56,6 +56,7 @@ pub enum Instr {
     InvokeVirtual(u16),
     InvokeSpecial(u16),
     InvokeStatic(u16),
+    InvokeDynamic(u16),
     New(u16),
     CheckCast(u16),
     /// newarray mit primitivem Elementtyp (atype-Code, hier nur int=10).
@@ -170,6 +171,7 @@ pub fn decode_code(
             0xB6 => (Instr::InvokeVirtual(u16_at(pc + 1)?), 3),
             0xB7 => (Instr::InvokeSpecial(u16_at(pc + 1)?), 3),
             0xB8 => (Instr::InvokeStatic(u16_at(pc + 1)?), 3),
+            0xBA => (Instr::InvokeDynamic(u16_at(pc + 1)?), 5),
             0xBB => (Instr::New(u16_at(pc + 1)?), 3),
             0xBC => {
                 // newarray: atype 10 = T_INT (aktuell einzig unterstützt).

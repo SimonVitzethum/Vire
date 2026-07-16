@@ -46,6 +46,12 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_str_is_empty", "i32 (ptr)"),
     ("jrt_str_char_at", "i32 (ptr, i32)"),
     ("jrt_str_equals", "i32 (ptr, ptr)"),
+    ("jrt_str_concat", "ptr (ptr, ptr)"),
+    ("jrt_int_to_str", "ptr (i32)"),
+    ("jrt_long_to_str", "ptr (i64)"),
+    ("jrt_char_to_str", "ptr (i32)"),
+    ("jrt_bool_to_str", "ptr (i32)"),
+    ("jrt_double_to_str", "ptr (double)"),
     ("jrt_idiv", "i32 (i32, i32)"),
     ("jrt_irem", "i32 (i32, i32)"),
     ("jrt_alloc", "ptr (i64)"),
@@ -181,14 +187,15 @@ pub fn emit(program: &Program) -> String {
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
-    // String-Literale: immortaler Header (refcount -1) + Länge + Bytes.
-    // Refcount -1 macht retain/release zu No-Ops (Read-only-Konstante bleibt
-    // unberührt), sodass Literale wie normale Referenzen fließen können.
+    writeln!(w, "@jrt_string_vtable = external constant [2 x ptr]").unwrap();
+    // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
+    // aber refcount -1 = immortal → retain/release/Collector No-Op, die
+    // Read-only-Konstante bleibt unberührt.
     for (i, s) in program.strings.iter().enumerate() {
         let bytes = s.as_bytes();
         writeln!(
             w,
-            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, [{n} x i8] }} {{ i64 -1, i64 {n}, [{n} x i8] c\"{esc}\" }}",
+            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} {{ i64 -1, i64 0, ptr @jrt_string_vtable, i64 {n}, [{n} x i8] c\"{esc}\" }}",
             n = bytes.len(),
             esc = escape_ll(bytes),
         )

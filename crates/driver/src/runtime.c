@@ -20,12 +20,28 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+void jrt_noop_drop(void *p);
+void jrt_noop_trace(void *p, void (*visit)(void *));
+
+/* Vtable für Strings (keine Ref-Felder → No-Op-Drop/Trace). Von den
+ * String-Literalen im generierten Code und von zur Laufzeit erzeugten
+ * Strings gemeinsam genutzt. */
+void (*const jrt_string_vtable[2])(void) = {
+    (void (*)(void))jrt_noop_drop,
+    (void (*)(void))jrt_noop_trace,
+};
 
 /* --- Ausgabe --------------------------------------------------------- */
 
-/* String-Literal: immortaler Header + Länge + Bytes (UTF-8). */
+/* String: voller Objekt-Header (damit Literale und zur Laufzeit erzeugte
+ * Strings uniform RC-verwaltet sind), dann Länge + Bytes (UTF-8).
+ * Literale sind immortal (refcount -1), konkatenierte Strings nicht. */
 typedef struct {
     int64_t refcount;
+    int64_t rcflags;
+    void *vtable;
     int64_t len;
     uint8_t bytes[];
 } JStr;
@@ -95,6 +111,58 @@ int32_t jrt_str_equals(const JStr *a, const JStr *b) {
         if (a->bytes[i] != b->bytes[i]) return 0;
     }
     return 1;
+}
+
+/* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
+ * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
+ * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */
+void *jrt_alloc(int64_t size);
+
+static JStr *str_alloc(int64_t len) {
+    JStr *s = (JStr *)jrt_alloc((int64_t)sizeof(JStr) + len);
+    s->vtable = (void *)jrt_string_vtable;
+    s->len = len;
+    return s;
+}
+
+JStr *jrt_str_concat(const JStr *a, const JStr *b) {
+    static const uint8_t NUL[4] = {'n', 'u', 'l', 'l'};
+    const uint8_t *ba = a ? a->bytes : NUL;
+    int64_t la = a ? a->len : 4;
+    const uint8_t *bb = b ? b->bytes : NUL;
+    int64_t lb = b ? b->len : 4;
+    JStr *r = str_alloc(la + lb);
+    memcpy(r->bytes, ba, (size_t)la);
+    memcpy(r->bytes + la, bb, (size_t)lb);
+    return r;
+}
+
+static JStr *str_from_buf(const char *buf, int n) {
+    JStr *r = str_alloc(n);
+    memcpy(r->bytes, buf, (size_t)n);
+    return r;
+}
+
+JStr *jrt_int_to_str(int32_t v) {
+    char buf[16];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%d", v));
+}
+JStr *jrt_long_to_str(int64_t v) {
+    char buf[24];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%lld", (long long)v));
+}
+JStr *jrt_char_to_str(int32_t c) {
+    char b = (char)c;
+    return str_from_buf(&b, 1);
+}
+JStr *jrt_bool_to_str(int32_t b) {
+    return b ? str_from_buf("true", 4) : str_from_buf("false", 5);
+}
+/* Java-Double.toString ist der kürzeste rundreisesichere Text; wir nähern
+ * mit %g an (dokumentierte Abweichung, DESIGN.md §6). */
+JStr *jrt_double_to_str(double d) {
+    char buf[32];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", d));
 }
 
 /* --- Referenzzählung + Zyklen-Collector ------------------------------ */

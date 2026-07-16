@@ -117,6 +117,59 @@ fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
     Ok((params, ret))
 }
 
+/// Roh-Parameter-Deskriptoren eines Methodendeskriptors (z. B.
+/// `["I", "Ljava/lang/String;"]`) — für die String-Konkatenation, die je
+/// nach Typ eine andere `to_str`-Konvertierung braucht.
+/// Fügt einen Konvertierungs-Call (`jrt_*_to_str`) ein und liefert das
+/// String-Ergebnis-Local als Operand.
+fn str_conv(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, func: &str, val: Local) -> Operand {
+    let l = ml.fresh(Ty::Ref);
+    stmts.push(Statement::Call {
+        dest: Some(l),
+        func: func.to_string(),
+        args: vec![Operand::Copy(val)],
+    });
+    Operand::Copy(l)
+}
+
+/// Schiebt angesammelte Literalzeichen als String-Konstante in die Teileliste.
+fn flush_lit(lit: &mut String, parts: &mut Vec<Operand>, program: &mut Program) {
+    if !lit.is_empty() {
+        let sid = program.intern_string(lit);
+        parts.push(Operand::ConstStr(sid));
+        lit.clear();
+    }
+}
+
+fn descriptor_params(desc: &str) -> Result<Vec<String>> {
+    let inner = desc
+        .strip_prefix('(')
+        .and_then(|s| s.split_once(')'))
+        .ok_or_else(|| FrontendError::Unsupported(format!("Deskriptor {desc}")))?
+        .0;
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut s = String::from(c);
+        match c {
+            'L' => {
+                for c2 in chars.by_ref() {
+                    s.push(c2);
+                    if c2 == ';' {
+                        break;
+                    }
+                }
+            }
+            '[' => {
+                return Err(FrontendError::Unsupported(format!("Array-Argument in {desc}")));
+            }
+            _ => {}
+        }
+        out.push(s);
+    }
+    Ok(out)
+}
+
 fn field_ty(
     c: char,
     rest: &mut std::iter::Peekable<impl Iterator<Item = char>>,
@@ -764,6 +817,94 @@ fn lower_block(
                 let mut params = vec![Ty::Ref];
                 params.extend(ptys);
                 stmts.push(Statement::CallVirtual { dest, class, name, desc, params, ret: rty, args });
+            }
+            Instr::InvokeDynamic(idx) => {
+                // Nur String-Konkatenation (StringConcatFactory) wird statisch
+                // aufgelöst — Closed World, DESIGN.md §1.3.
+                let (dname, ddesc, bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
+                if dname != "makeConcatWithConstants" && dname != "makeConcat" {
+                    return Err(FrontendError::Unsupported(format!(
+                        "invokedynamic {dname} (nur String-Konkatenation unterstützt)"
+                    )));
+                }
+                let with_constants = dname == "makeConcatWithConstants";
+                let param_descs = descriptor_params(ddesc)?;
+                let recipe: String = if with_constants {
+                    ml.cf.const_string(bsm_args[0])?.to_string()
+                } else {
+                    "\u{1}".repeat(param_descs.len())
+                };
+                // Konstante Bootstrap-Argumente (ab Index 1) vorab als Strings.
+                let const_strings: Vec<String> = if with_constants {
+                    bsm_args[1..]
+                        .iter()
+                        .map(|&i| ml.cf.const_string(i).map(str::to_string))
+                        .collect::<std::result::Result<_, _>>()?
+                } else {
+                    Vec::new()
+                };
+
+                // Dynamische Argumente vom Stack holen (in umgekehrter
+                // Reihenfolge) und zu String-Operanden konvertieren.
+                let mut arg_parts: Vec<Operand> = vec![Operand::ConstNull; param_descs.len()];
+                for k in (0..param_descs.len()).rev() {
+                    let val = pop!();
+                    let pd = param_descs[k].as_str();
+                    let part = match pd {
+                        "Ljava/lang/String;" => Operand::Copy(val),
+                        "I" | "S" | "B" => str_conv(ml, &mut stmts, "jrt_int_to_str", val),
+                        "C" => str_conv(ml, &mut stmts, "jrt_char_to_str", val),
+                        "Z" => str_conv(ml, &mut stmts, "jrt_bool_to_str", val),
+                        _ => {
+                            return Err(FrontendError::Unsupported(format!(
+                                "Konkatenation von Argument-Typ {pd} (Teilmenge: int, char, boolean, String)"
+                            )))
+                        }
+                    };
+                    arg_parts[k] = part;
+                }
+
+                // Recipe in Teile zerlegen:  = Argument,  =
+                // Konstante, sonst Literalzeichen.
+                let mut parts: Vec<Operand> = Vec::new();
+                let mut lit = String::new();
+                let mut ai = 0;
+                let mut ci = 0;
+                for ch in recipe.chars() {
+                    match ch {
+                        '\u{1}' => {
+                            flush_lit(&mut lit, &mut parts, program);
+                            parts.push(arg_parts[ai].clone());
+                            ai += 1;
+                        }
+                        '\u{2}' => {
+                            flush_lit(&mut lit, &mut parts, program);
+                            let sid = program.intern_string(&const_strings[ci]);
+                            parts.push(Operand::ConstStr(sid));
+                            ci += 1;
+                        }
+                        c => lit.push(c),
+                    }
+                }
+                flush_lit(&mut lit, &mut parts, program);
+
+                // Teile mit jrt_str_concat falten.
+                let result = if parts.is_empty() {
+                    Operand::ConstStr(program.intern_string(""))
+                } else {
+                    let mut acc = parts[0].clone();
+                    for p in &parts[1..] {
+                        let l = ml.fresh(Ty::Ref);
+                        stmts.push(Statement::Call {
+                            dest: Some(l),
+                            func: "jrt_str_concat".to_string(),
+                            args: vec![acc, p.clone()],
+                        });
+                        acc = Operand::Copy(l);
+                    }
+                    acc
+                };
+                push!(Ty::Ref, Rvalue::Use(result));
             }
             Instr::CheckCast(idx) => {
                 // Closed World: der Cast muss statisch beweisbar sein, sonst

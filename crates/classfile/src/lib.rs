@@ -51,7 +51,19 @@ pub enum Const {
     MethodRef { class: u16, name_and_type: u16 },
     InterfaceMethodRef { class: u16, name_and_type: u16 },
     NameAndType { name: u16, descriptor: u16 },
+    MethodHandle { reference_kind: u8, reference_index: u16 },
+    MethodType { descriptor: u16 },
+    InvokeDynamic { bootstrap_method_attr_index: u16, name_and_type: u16 },
     Unusable,
+}
+
+/// Eintrag im BootstrapMethods-Attribut (JVMS 4.7.23).
+#[derive(Debug, Clone)]
+pub struct BootstrapMethod {
+    /// CP-Index einer MethodHandle-Konstante.
+    pub method_ref: u16,
+    /// CP-Indizes der statischen Bootstrap-Argumente.
+    pub args: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -98,6 +110,7 @@ pub struct ClassFile {
     pub interfaces: Vec<String>,
     pub fields: Vec<Field>,
     pub methods: Vec<Method>,
+    pub bootstrap_methods: Vec<BootstrapMethod>,
 }
 
 impl ClassFile {
@@ -132,11 +145,11 @@ impl ClassFile {
                 10 => Const::MethodRef { class: r.u16()?, name_and_type: r.u16()? },
                 11 => Const::InterfaceMethodRef { class: r.u16()?, name_and_type: r.u16()? },
                 12 => Const::NameAndType { name: r.u16()?, descriptor: r.u16()? },
-                // MethodHandle/MethodType/Dynamic/InvokeDynamic/Module/Package:
-                // Struktur überlesen, damit spätere Einträge erreichbar bleiben.
-                15 => { r.bytes(3)?; Const::Unusable }
-                16 => { r.bytes(2)?; Const::Unusable }
-                17 | 18 => { r.bytes(4)?; Const::Unusable }
+                15 => Const::MethodHandle { reference_kind: r.u8()?, reference_index: r.u16()? },
+                16 => Const::MethodType { descriptor: r.u16()? },
+                18 => Const::InvokeDynamic { bootstrap_method_attr_index: r.u16()?, name_and_type: r.u16()? },
+                // Dynamic (condy)/Module/Package: überlesen.
+                17 => { r.bytes(4)?; Const::Unusable }
                 19 | 20 => { r.bytes(2)?; Const::Unusable }
                 t => return Err(ParseError::UnsupportedConstTag(t)),
             };
@@ -202,7 +215,29 @@ impl ClassFile {
             methods.push(Method { access_flags, name, descriptor, code });
         }
 
-        skip_attributes(&mut r)?;
+        // Klassen-Attribute: BootstrapMethods sammeln (für invokedynamic),
+        // Rest überlesen.
+        let mut bootstrap_methods = Vec::new();
+        let attr_count = r.u16()?;
+        for _ in 0..attr_count {
+            let attr_name_idx = r.u16()?;
+            let attr_len = r.u32()? as usize;
+            if utf8_at(&constant_pool, attr_name_idx)? == "BootstrapMethods" {
+                let mut br = Reader { data: r.bytes(attr_len)?, pos: 0 };
+                let num = br.u16()?;
+                for _ in 0..num {
+                    let method_ref = br.u16()?;
+                    let num_args = br.u16()?;
+                    let mut args = Vec::with_capacity(num_args as usize);
+                    for _ in 0..num_args {
+                        args.push(br.u16()?);
+                    }
+                    bootstrap_methods.push(BootstrapMethod { method_ref, args });
+                }
+            } else {
+                r.bytes(attr_len)?;
+            }
+        }
 
         let this_class = class_name_at(&constant_pool, this_idx)?.to_string();
         let super_class = if super_idx == 0 {
@@ -215,11 +250,64 @@ impl ClassFile {
             .map(|i| class_name_at(&constant_pool, i).map(str::to_string))
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(ClassFile { constant_pool, access_flags, this_class, super_class, interfaces, fields, methods })
+        Ok(ClassFile {
+            constant_pool,
+            access_flags,
+            this_class,
+            super_class,
+            interfaces,
+            fields,
+            methods,
+            bootstrap_methods,
+        })
     }
 
     pub fn utf8(&self, idx: u16) -> Result<&str> {
         utf8_at(&self.constant_pool, idx)
+    }
+
+    /// Löst einen invokedynamic-Callsite auf. Liefert (Name, Deskriptor,
+    /// Bootstrap-Methodenname, Bootstrap-Argument-CP-Indizes). Der
+    /// Bootstrap-Methodenname erlaubt dem Frontend, `makeConcatWithConstants`
+    /// zu erkennen und statisch aufzulösen (DESIGN.md §1.3).
+    pub fn invoke_dynamic(&self, idx: u16) -> Result<(&str, &str, &str, &[u16])> {
+        let (bsm_idx, nat) = match self.constant_pool.get(idx as usize) {
+            Some(Const::InvokeDynamic { bootstrap_method_attr_index, name_and_type }) => {
+                (*bootstrap_method_attr_index, *name_and_type)
+            }
+            _ => return Err(ParseError::BadIndex(idx)),
+        };
+        let (name, desc) = match self.constant_pool.get(nat as usize) {
+            Some(Const::NameAndType { name, descriptor }) => (*name, *descriptor),
+            _ => return Err(ParseError::BadIndex(nat)),
+        };
+        let bsm = self
+            .bootstrap_methods
+            .get(bsm_idx as usize)
+            .ok_or(ParseError::BadIndex(bsm_idx))?;
+        // Bootstrap-MethodHandle → referenzierte Methode → deren Name.
+        let bsm_name = match self.constant_pool.get(bsm.method_ref as usize) {
+            Some(Const::MethodHandle { reference_index, .. }) => {
+                self.member_ref(*reference_index)?.1
+            }
+            _ => return Err(ParseError::BadIndex(bsm.method_ref)),
+        };
+        Ok((
+            utf8_at(&self.constant_pool, name)?,
+            utf8_at(&self.constant_pool, desc)?,
+            bsm_name,
+            &bsm.args,
+        ))
+    }
+
+    /// Liefert einen String aus einer String- oder Utf8-Konstante
+    /// (Bootstrap-Argumente sind String-Konstanten).
+    pub fn const_string(&self, idx: u16) -> Result<&str> {
+        match self.constant_pool.get(idx as usize) {
+            Some(Const::String { utf8 }) => utf8_at(&self.constant_pool, *utf8),
+            Some(Const::Utf8(s)) => Ok(s),
+            _ => Err(ParseError::BadIndex(idx)),
+        }
     }
 
     pub fn class_name(&self, idx: u16) -> Result<&str> {
