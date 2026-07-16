@@ -75,6 +75,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_take_pending", "ptr ()"),
     ("jrt_check_uncaught", "void ()"),
     ("jrt_pending_instanceof", "i32 (ptr)"),
+    ("jrt_checkcast", "void (ptr, ptr)"),
     ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
     ("jrt_bounds_check", "void (ptr, i32)"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -782,6 +783,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let t = e.fresh();
             writeln!(w, "  {t} = call i32 @jrt_pending_instanceof(ptr @td.{})", sanitize(class)).unwrap();
             writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
+        }
+        Statement::CheckCast { obj, class } => {
+            let o = e.operand(w, obj);
+            writeln!(w, "  call void @jrt_checkcast(ptr {o}, ptr @td.{})", sanitize(class)).unwrap();
         }
         Statement::NewArray { dest, elem, len } => {
             let n = e.operand(w, len);

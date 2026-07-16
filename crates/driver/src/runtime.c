@@ -439,6 +439,15 @@ int32_t jrt_pending_instanceof(void *target_td) {
     return jrt_instanceof(pending_exception, target_td);
 }
 
+/* Laufzeit-checkcast auf eine modellierte Klasse: null passiert immer,
+ * sonst muss der Typ passen (ClassCastException = Abbruch). */
+void jrt_checkcast(void *obj, void *target_td) {
+    if (obj && !jrt_instanceof(obj, target_td)) {
+        fputs("Exception in thread \"main\" java.lang.ClassCastException\n", stderr);
+        exit(1);
+    }
+}
+
 /* Von @main nach java_main aufgerufen: unbehandelte Exception melden.
  * (Ohne Laufzeit-Typinfo generisch — Klassenname/Message wären ein
  * späterer Schritt, DESIGN.md §6.) */

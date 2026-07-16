@@ -1288,12 +1288,14 @@ fn lower_block(
                     Origin::Op(Operand::ConstClass(_)) => target == "java/lang/Class",
                     _ => false,
                 };
-                if !provable {
-                    return Err(FrontendError::Unsupported(format!(
-                        "checkcast {target} nicht statisch beweisbar"
-                    )));
+                if provable {
+                    // Statisch bewiesen → kein Code.
+                } else if program.class(&target).is_some() {
+                    // Modellierte Zielklasse → Laufzeit-Check.
+                    stmts.push(Statement::CheckCast { obj: Operand::Copy(top), class: target });
                 }
-                // Beweisbar → kein Code nötig.
+                // Nicht modellierte Zielklasse (String, java/lang/*): Cast
+                // durchreichen (catch-all-Prinzip wie bei catch-Typen).
             }
             Instr::InvokeInterface(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;

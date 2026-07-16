@@ -105,6 +105,9 @@ pub enum Statement {
     /// `dest = (pending exception instanceof class) ? 1 : 0` — für die
     /// Typ-Diskriminierung mehrerer catch-Blöcke.
     InstanceOfPending { dest: Local, class: String },
+    /// Laufzeit-checkcast auf eine modellierte Klasse: wirft
+    /// ClassCastException bei Mismatch, sonst passthrough.
+    CheckCast { obj: Operand, class: String },
     /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
     NewArray { dest: Local, elem: Ty, len: Operand },
     ArrayLen { dest: Local, arr: Operand },
