@@ -9,6 +9,7 @@ use std::fmt;
 pub enum Ty {
     I32,
     I64,
+    F32,
     F64,
     /// Referenztyp; vorerst opak (Zeiger). Für String-Literale genutzt.
     Ref,
@@ -28,6 +29,7 @@ pub enum Operand {
     Copy(Local),
     ConstI32(i32),
     ConstI64(i64),
+    ConstF32(f32),
     ConstF64(f64),
     /// Verweis auf ein String-Literal in `Program::strings`.
     ConstStr(u32),

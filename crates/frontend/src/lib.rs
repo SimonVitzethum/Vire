@@ -131,6 +131,7 @@ pub fn register_builtins(program: &mut Program) {
     program.classes.push(builtin("java/lang/Boolean", "boolean"));
     program.classes.push(builtin("java/lang/Double", "double"));
     program.classes.push(builtin("java/lang/Character", "character"));
+    program.classes.push(builtin("java/lang/Float", "float"));
 }
 
 /// Phase 2: alle Methodenrümpfe absenken.
@@ -228,6 +229,7 @@ fn field_ty(
         // boolean/byte/short/char sind auf Stack und in Locals int (JVMS 2.11.1).
         'I' | 'Z' | 'B' | 'S' | 'C' => Ok(Ty::I32),
         'J' => Ok(Ty::I64),
+        'F' => Ok(Ty::F32),
         'D' => Ok(Ty::F64),
         'L' => {
             for c in rest.by_ref() {
@@ -367,7 +369,7 @@ fn lower_method(
                 }
             }
             Instr::Return | Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn
-            | Instr::AThrow => {
+            | Instr::FReturn | Instr::AThrow => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -554,6 +556,7 @@ fn lower_method(
         Ty::Void => None,
         Ty::I32 => Some(Operand::ConstI32(0)),
         Ty::I64 => Some(Operand::ConstI64(0)),
+        Ty::F32 => Some(Operand::ConstF32(0.0)),
         Ty::F64 => Some(Operand::ConstF64(0.0)),
         Ty::Ref => Some(Operand::ConstNull),
     };
@@ -660,6 +663,9 @@ fn lower_block(
                         let sid = program.intern_string(ml.cf.utf8(*utf8)?);
                         push!(Ty::Ref, Rvalue::Use(Operand::ConstStr(sid)));
                     }
+                    Some(Const::Float(v)) => {
+                        push!(Ty::F32, Rvalue::Use(Operand::ConstF32(*v)));
+                    }
                     // ldc einer Klassenkonstante (`Widget.class`).
                     Some(Const::Class { .. }) => {
                         let class = ml.cf.class_name(*idx)?.to_string();
@@ -676,6 +682,9 @@ fn lower_block(
             }
             Instr::LConst(v) => {
                 push!(Ty::I64, Rvalue::Use(Operand::ConstI64(*v)));
+            }
+            Instr::FConst(v) => {
+                push!(Ty::F32, Rvalue::Use(Operand::ConstF32(*v)));
             }
             Instr::DConst(v) => {
                 push!(Ty::F64, Rvalue::Use(Operand::ConstF64(*v)));
@@ -697,6 +706,10 @@ fn lower_block(
                 let l = ml.jvm_slot(*slot, Ty::I64);
                 push!(Ty::I64, Rvalue::Use(Operand::Copy(l)));
             }
+            Instr::FLoad(slot) => {
+                let l = ml.jvm_slot(*slot, Ty::F32);
+                push!(Ty::F32, Rvalue::Use(Operand::Copy(l)));
+            }
             Instr::DLoad(slot) => {
                 let l = ml.jvm_slot(*slot, Ty::F64);
                 push!(Ty::F64, Rvalue::Use(Operand::Copy(l)));
@@ -704,6 +717,11 @@ fn lower_block(
             Instr::LStore(slot) => {
                 let v = pop!();
                 let l = ml.jvm_slot(*slot, Ty::I64);
+                stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
+            }
+            Instr::FStore(slot) => {
+                let v = pop!();
+                let l = ml.jvm_slot(*slot, Ty::F32);
                 stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
             }
             Instr::DStore(slot) => {
@@ -743,6 +761,22 @@ fn lower_block(
             Instr::DNeg => {
                 let v = pop!();
                 push!(Ty::F64, Rvalue::Neg(Operand::Copy(v)));
+            }
+            Instr::FNeg => {
+                let v = pop!();
+                push!(Ty::F32, Rvalue::Neg(Operand::Copy(v)));
+            }
+            Instr::FAdd | Instr::FSub | Instr::FMul | Instr::FDiv | Instr::FRem => {
+                let op = match instr {
+                    Instr::FAdd => BinOp::Add,
+                    Instr::FSub => BinOp::Sub,
+                    Instr::FMul => BinOp::Mul,
+                    Instr::FDiv => BinOp::Div,
+                    _ => BinOp::Rem,
+                };
+                let b = pop!();
+                let a = pop!();
+                push!(Ty::F32, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
             }
             Instr::LAdd | Instr::LSub | Instr::LMul | Instr::LAnd | Instr::LOr | Instr::LXor
             | Instr::LShl | Instr::LShr | Instr::LUShr => {
@@ -787,11 +821,13 @@ fn lower_block(
                 stack.push(Ty::I64);
                 throw_after = Some(*pc);
             }
-            Instr::LCmp | Instr::DCmpL | Instr::DCmpG => {
+            Instr::LCmp | Instr::DCmpL | Instr::DCmpG | Instr::FCmpL | Instr::FCmpG => {
                 let func = match instr {
                     Instr::LCmp => "jrt_lcmp",
                     Instr::DCmpL => "jrt_dcmpl",
-                    _ => "jrt_dcmpg",
+                    Instr::DCmpG => "jrt_dcmpg",
+                    Instr::FCmpL => "jrt_fcmpl",
+                    _ => "jrt_fcmpg",
                 };
                 let b = pop!();
                 let a = pop!();
@@ -819,12 +855,29 @@ fn lower_block(
                 let v = pop!();
                 push!(Ty::F64, Rvalue::Convert(Operand::Copy(v)));
             }
-            // d2i/d2l saturieren (Java-Semantik) → Runtime.
-            Instr::D2I | Instr::D2L => {
-                let (func, ty) = if matches!(instr, Instr::D2I) {
-                    ("jrt_d2i", Ty::I32)
-                } else {
-                    ("jrt_d2l", Ty::I64)
+            Instr::I2F => {
+                let v = pop!();
+                push!(Ty::F32, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::L2F => {
+                let v = pop!();
+                push!(Ty::F32, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::F2D => {
+                let v = pop!();
+                push!(Ty::F64, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::D2F => {
+                let v = pop!();
+                push!(Ty::F32, Rvalue::Convert(Operand::Copy(v)));
+            }
+            // d2i/d2l/f2i/f2l saturieren (Java-Semantik) → Runtime.
+            Instr::D2I | Instr::D2L | Instr::F2I | Instr::F2L => {
+                let (func, ty) = match instr {
+                    Instr::D2I => ("jrt_d2i", Ty::I32),
+                    Instr::D2L => ("jrt_d2l", Ty::I64),
+                    Instr::F2I => ("jrt_f2i", Ty::I32),
+                    _ => ("jrt_f2l", Ty::I64),
                 };
                 let v = pop!();
                 let l = ml.stack_slot(stack.len(), ty);
@@ -948,7 +1001,7 @@ fn lower_block(
                 terminator = Some(Terminator::Goto(blk));
             }
             Instr::Return => terminator = Some(Terminator::Return(None)),
-            Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn => {
+            Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn | Instr::FReturn => {
                 let v = pop!();
                 terminator = Some(Terminator::Return(Some(Operand::Copy(v))));
             }
@@ -1118,6 +1171,8 @@ fn lower_block(
                     ("java/io/PrintStream", "print", "(J)V") => Some("jrt_print_long"),
                     ("java/io/PrintStream", "println", "(D)V") => Some("jrt_println_double"),
                     ("java/io/PrintStream", "print", "(D)V") => Some("jrt_print_double"),
+                    ("java/io/PrintStream", "println", "(F)V") => Some("jrt_println_float"),
+                    ("java/io/PrintStream", "print", "(F)V") => Some("jrt_print_float"),
                     _ => None,
                 };
                 if let Some(intrinsic) = intrinsic {
@@ -1137,6 +1192,7 @@ fn lower_block(
                     ("java/lang/Boolean", "booleanValue", "()Z") => Some(("jrt_boolean_booleanvalue", Ty::I32)),
                     ("java/lang/Double", "doubleValue", "()D") => Some(("jrt_double_doublevalue", Ty::F64)),
                     ("java/lang/Character", "charValue", "()C") => Some(("jrt_character_charvalue", Ty::I32)),
+                    ("java/lang/Float", "floatValue", "()F") => Some(("jrt_float_floatvalue", Ty::F32)),
                     _ => None,
                 };
                 if let Some((f, rty)) = unbox {
@@ -1300,6 +1356,7 @@ fn lower_block(
                         "Z" => str_conv(ml, &mut stmts, "jrt_bool_to_str", val),
                         "J" => str_conv(ml, &mut stmts, "jrt_long_to_str", val),
                         "D" => str_conv(ml, &mut stmts, "jrt_double_to_str", val),
+                        "F" => str_conv(ml, &mut stmts, "jrt_float_to_str", val),
                         // Beliebiges Objekt (Wrapper, user-Klasse) → virtueller
                         // toString. (null-Argument → NPE statt "null"; der
                         // StringConcatFactory-Sonderfall ist nicht abgebildet.)
@@ -1470,6 +1527,7 @@ fn lower_block(
                     ("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;") => Some("jrt_boolean_valueof"),
                     ("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;") => Some("jrt_double_valueof"),
                     ("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;") => Some("jrt_character_valueof"),
+                    ("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;") => Some("jrt_float_valueof"),
                     _ => None,
                 };
                 if let Some(f) = box_fn {
@@ -1494,6 +1552,7 @@ fn lower_block(
                         "(Z)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_bool_to_str", arg),
                         "(J)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_long_to_str", arg),
                         "(D)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_double_to_str", arg),
+                        "(F)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_float_to_str", arg),
                         "(Ljava/lang/Object;)Ljava/lang/String;"
                         | "(Ljava/lang/String;)Ljava/lang/String;" => {
                             let l = ml.fresh(Ty::Ref);

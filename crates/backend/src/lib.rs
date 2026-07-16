@@ -28,6 +28,7 @@ fn llty(ty: Ty) -> &'static str {
     match ty {
         Ty::I32 => "i32",
         Ty::I64 => "i64",
+        Ty::F32 => "float",
         Ty::F64 => "double",
         Ty::Ref => "ptr",
         Ty::Void => "void",
@@ -77,6 +78,11 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_character_equals", "i32 (ptr, ptr)"),
     ("jrt_character_hashcode", "i32 (ptr)"),
     ("jrt_character_tostring", "ptr (ptr)"),
+    ("jrt_float_valueof", "ptr (float)"),
+    ("jrt_float_floatvalue", "float (ptr)"),
+    ("jrt_float_equals", "i32 (ptr, ptr)"),
+    ("jrt_float_hashcode", "i32 (ptr)"),
+    ("jrt_float_tostring", "ptr (ptr)"),
     ("jrt_str_concat", "ptr (ptr, ptr)"),
     ("jrt_int_to_str", "ptr (i32)"),
     ("jrt_long_to_str", "ptr (i64)"),
@@ -92,10 +98,17 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_dcmpg", "i32 (double, double)"),
     ("jrt_d2i", "i32 (double)"),
     ("jrt_d2l", "i64 (double)"),
+    ("jrt_fcmpl", "i32 (float, float)"),
+    ("jrt_fcmpg", "i32 (float, float)"),
+    ("jrt_f2i", "i32 (float)"),
+    ("jrt_f2l", "i64 (float)"),
     ("jrt_print_long", "void (i64)"),
     ("jrt_println_long", "void (i64)"),
     ("jrt_print_double", "void (double)"),
     ("jrt_println_double", "void (double)"),
+    ("jrt_print_float", "void (float)"),
+    ("jrt_println_float", "void (float)"),
+    ("jrt_float_to_str", "ptr (float)"),
     ("jrt_alloc", "ptr (i64)"),
     ("jrt_null_check", "void (ptr)"),
     ("jrt_throw_npe", "void ()"),
@@ -293,6 +306,7 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "@jrt_boolean_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_double_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_character_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_float_vt = external global ptr").unwrap();
     // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
     // aber refcount -1 = immortal → retain/release/Collector No-Op, die
     // Read-only-Konstante bleibt unberührt. Vtable = @vt.java_lang_String
@@ -423,6 +437,7 @@ pub fn emit(program: &Program) -> String {
         ("jrt_boolean_valueof", "java/lang/Boolean", "jrt_boolean_vt"),
         ("jrt_double_valueof", "java/lang/Double", "jrt_double_vt"),
         ("jrt_character_valueof", "java/lang/Character", "jrt_character_vt"),
+        ("jrt_float_valueof", "java/lang/Float", "jrt_float_vt"),
     ];
     for (vf, cls, _) in &wrappers {
         if calls_fn(vf) {
@@ -609,6 +624,7 @@ fn operand_ty(f: &Function, op: &Operand) -> Ty {
         Operand::Copy(l) => f.locals[l.0 as usize],
         Operand::ConstI32(_) => Ty::I32,
         Operand::ConstI64(_) => Ty::I64,
+        Operand::ConstF32(_) => Ty::F32,
         Operand::ConstF64(_) => Ty::F64,
         Operand::ConstStr(_) | Operand::ConstClass(_) | Operand::ConstNull => Ty::Ref,
     }
@@ -646,6 +662,8 @@ impl<'a> FnEmitter<'a> {
             Operand::ConstI64(v) => v.to_string(),
             // LLVM verlangt exakte double-Literale → Bit-Muster als Hex.
             Operand::ConstF64(v) => format!("0x{:016X}", v.to_bits()),
+            // float-Literale in LLVM: Hex des exakt promoteten double-Werts.
+            Operand::ConstF32(v) => format!("0x{:016X}", (*v as f64).to_bits()),
             Operand::ConstStr(i) => format!("@jstr.{i}"),
             Operand::ConstClass(c) => format!("@jclass.{}", sanitize(c)),
             Operand::ConstNull => "null".to_string(),
@@ -741,8 +759,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     let ty = operand_ty(e.f, op);
                     let v = e.operand(w, op);
                     let t = e.fresh();
-                    if ty == Ty::F64 {
-                        writeln!(w, "  {t} = fneg double {v}").unwrap();
+                    if ty == Ty::F64 || ty == Ty::F32 {
+                        writeln!(w, "  {t} = fneg {} {v}", llty(ty)).unwrap();
                     } else {
                         writeln!(w, "  {t} = sub {} 0, {v}", llty(ty)).unwrap();
                     }
@@ -762,7 +780,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     let inst = match (from, to) {
                         (Ty::I32, Ty::I64) => "sext",
                         (Ty::I32, Ty::F64) | (Ty::I64, Ty::F64) => "sitofp",
+                        (Ty::I32, Ty::F32) | (Ty::I64, Ty::F32) => "sitofp",
                         (Ty::I64, Ty::I32) => "trunc",
+                        (Ty::F32, Ty::F64) => "fpext",
+                        (Ty::F64, Ty::F32) => "fptrunc",
                         _ => panic!("unerwartete Konvertierung {from:?} -> {to:?}"),
                     };
                     writeln!(w, "  {t} = {inst} {} {v} to {}", llty(from), llty(to)).unwrap();
@@ -1065,17 +1086,17 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         return t;
     }
 
-    // double-Arithmetik.
-    if aty == Ty::F64 {
+    // Gleitkomma-Arithmetik (double/float).
+    if aty == Ty::F64 || aty == Ty::F32 {
         let inst = match op {
             BinOp::Add => "fadd",
             BinOp::Sub => "fsub",
             BinOp::Mul => "fmul",
             BinOp::Div => "fdiv",
             BinOp::Rem => "frem",
-            _ => panic!("Bit-/Shift-Operation auf double"),
+            _ => panic!("Bit-/Shift-Operation auf Gleitkomma"),
         };
-        writeln!(w, "  {t} = {inst} double {a}, {b}").unwrap();
+        writeln!(w, "  {t} = {inst} {} {a}, {b}", llty(aty)).unwrap();
         return t;
     }
 

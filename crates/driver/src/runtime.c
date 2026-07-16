@@ -269,6 +269,35 @@ void *jrt_character_tostring(void *o) {
     return str_from_buf(&c, 1);
 }
 
+void *jrt_float_vt = NULL;
+typedef struct {
+    int64_t refcount, rcflags;
+    void *vtable;
+    float value;
+} JFloat;
+
+void *jrt_float_valueof(float v) {
+    JFloat *o = (JFloat *)jrt_alloc((int64_t)sizeof(JFloat));
+    o->vtable = jrt_float_vt;
+    o->value = v;
+    return o;
+}
+float jrt_float_floatvalue(void *o) { return ((JFloat *)o)->value; }
+int32_t jrt_float_hashcode(void *o) {
+    int32_t bits;
+    float v = ((JFloat *)o)->value;
+    memcpy(&bits, &v, sizeof bits);
+    return bits; /* Java Float.hashCode = floatToIntBits */
+}
+int32_t jrt_float_equals(void *a, void *b) {
+    if (!b || ((JFloat *)b)->vtable != jrt_float_vt) return 0;
+    return ((JFloat *)a)->value == ((JFloat *)b)->value;
+}
+void *jrt_float_tostring(void *o) {
+    char buf[32];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", (double)((JFloat *)o)->value));
+}
+
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
  * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
  * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */
@@ -318,6 +347,10 @@ JStr *jrt_bool_to_str(int32_t b) {
 JStr *jrt_double_to_str(double d) {
     char buf[32];
     return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", d));
+}
+JStr *jrt_float_to_str(float f) {
+    char buf[32];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", (double)f));
 }
 
 /* --- Referenzzählung + Zyklen-Collector ------------------------------ */
@@ -832,6 +865,34 @@ int64_t jrt_d2l(double d) {
     if (d <= -9223372036854775808.0) return INT64_MIN;
     return (int64_t)d;
 }
+
+/* float-Vergleiche/Konvertierungen (analog double). */
+int32_t jrt_fcmpl(float a, float b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == b) return 0;
+    return -1;
+}
+int32_t jrt_fcmpg(float a, float b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == b) return 0;
+    return 1;
+}
+int32_t jrt_f2i(float f) {
+    if (f != f) return 0;
+    if (f >= 2147483647.0f) return INT32_MAX;
+    if (f <= -2147483648.0f) return INT32_MIN;
+    return (int32_t)f;
+}
+int64_t jrt_f2l(float f) {
+    if (f != f) return 0;
+    if (f >= 9223372036854775807.0f) return INT64_MAX;
+    if (f <= -9223372036854775808.0f) return INT64_MIN;
+    return (int64_t)f;
+}
+void jrt_print_float(float f) { printf("%g", (double)f); }
+void jrt_println_float(float f) { printf("%g\n", (double)f); }
 
 void jrt_print_long(int64_t v) { printf("%lld", (long long)v); }
 void jrt_println_long(int64_t v) { printf("%lld\n", (long long)v); }
