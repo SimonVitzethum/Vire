@@ -244,6 +244,40 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     for k in 0..n_sam {
         impl_args.push(Operand::Copy(Local((1 + k) as u32)));
     }
+
+    // Argument-Unboxing an der SAM-Grenze: erwartet die Zielmethode ein
+    // Primitiv, während das Interface Object übergibt (z. B. F.apply(Integer)
+    // → static int-Methode), wird via Wrapper-<prim>Value entpackt.
+    // impl_param_descs sind die Rohtypen der Ziel-Parameter; bei virtuellen
+    // Aufrufen ist der Receiver (Position 0) vorangestellt und bleibt Ref.
+    let mut impl_param_descs = descriptor_params(&info.impl_desc)?;
+    if matches!(info.kind, 5 | 9) {
+        impl_param_descs.insert(0, "Ljava/lang/Object;".to_string());
+    }
+    let arg_types: Vec<Ty> = info.captures.iter().copied().chain(sam_params.iter().copied()).collect();
+    for (i, pd) in impl_param_descs.iter().enumerate() {
+        let pc = pd.chars().next().unwrap();
+        let is_prim = matches!(pc, 'I' | 'S' | 'B' | 'C' | 'Z' | 'J' | 'F' | 'D');
+        if is_prim && arg_types.get(i) == Some(&Ty::Ref) {
+            let (unbox_fn, unbox_ty) = match pc {
+                'J' => ("jrt_long_longvalue", Ty::I64),
+                'F' => ("jrt_float_floatvalue", Ty::F32),
+                'D' => ("jrt_double_doublevalue", Ty::F64),
+                'C' => ("jrt_character_charvalue", Ty::I32),
+                'Z' => ("jrt_boolean_booleanvalue", Ty::I32),
+                _ => ("jrt_integer_intvalue", Ty::I32),
+            };
+            locals.push(unbox_ty);
+            let unboxed = Local((locals.len() - 1) as u32);
+            stmts.push(Statement::Call {
+                dest: Some(unboxed),
+                func: unbox_fn.to_string(),
+                args: vec![impl_args[i].clone()],
+            });
+            impl_args[i] = Operand::Copy(unboxed);
+        }
+    }
+
     // Intrinsic-gestützte Ziele (z. B. String::length) direkt aufrufen —
     // sie haben keinen Vtable-Slot.
     let intrinsic = match (info.impl_class.as_str(), info.impl_name.as_str(), info.impl_desc.as_str()) {
