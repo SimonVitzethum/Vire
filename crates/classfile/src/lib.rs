@@ -337,6 +337,27 @@ impl ClassFile {
         ))
     }
 
+    /// Löst eine MethodHandle-Konstante zu (reference_kind, Klasse, Name,
+    /// Deskriptor) der referenzierten Methode auf.
+    pub fn method_handle(&self, idx: u16) -> Result<(u8, &str, &str, &str)> {
+        let (kind, ref_idx) = match self.constant_pool.get(idx as usize) {
+            Some(Const::MethodHandle { reference_kind, reference_index }) => {
+                (*reference_kind, *reference_index)
+            }
+            _ => return Err(ParseError::BadIndex(idx)),
+        };
+        let (class, name, desc) = self.member_ref(ref_idx)?;
+        Ok((kind, class, name, desc))
+    }
+
+    /// Deskriptor einer MethodType-Konstante.
+    pub fn method_type(&self, idx: u16) -> Result<&str> {
+        match self.constant_pool.get(idx as usize) {
+            Some(Const::MethodType { descriptor }) => utf8_at(&self.constant_pool, *descriptor),
+            _ => Err(ParseError::BadIndex(idx)),
+        }
+    }
+
     /// Liefert einen String aus einer String- oder Utf8-Konstante
     /// (Bootstrap-Argumente sind String-Konstanten).
     pub fn const_string(&self, idx: u16) -> Result<&str> {

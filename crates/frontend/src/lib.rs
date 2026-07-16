@@ -170,6 +170,97 @@ fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
 /// Roh-Parameter-Deskriptoren eines Methodendeskriptors (z. B.
 /// `["I", "Ljava/lang/String;"]`) — für die String-Konkatenation, die je
 /// nach Typ eine andere `to_str`-Konvertierung braucht.
+/// Details eines Lambda-Callsites (aus dem invokedynamic + LambdaMetafactory).
+struct LambdaInfo {
+    iface: String,       // Funktionsinterface (Rückgabetyp des indy)
+    sam_method: String,  // Name der Interface-Methode (z. B. "apply")
+    sam_desc: String,    // Deskriptor der Interface-Methode
+    impl_class: String,  // Klasse der Lambda-Rumpf-Methode
+    impl_name: String,   // lambda$…
+    impl_desc: String,   // Deskriptor der Rumpf-Methode (captures + SAM-Args)
+    captures: Vec<Ty>,   // eingefangene Variablen (indy-Parameter)
+}
+
+/// Registriert eine synthetische Klasse, die das Funktionsinterface
+/// implementiert und die SAM-Methode an die Lambda-Rumpf-Methode
+/// weiterleitet (captures aus Feldern + eigene Argumente). Liefert den
+/// Klassennamen (idempotent pro Rumpf-Methode).
+fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
+    let class_name = format!("$lambda${}${}", info.impl_class, info.impl_name);
+    if program.class(&class_name).is_some() {
+        return Ok(class_name);
+    }
+    // Capture-Felder cap0.. mit den eingefangenen Typen.
+    let fields: Vec<FieldInfo> = info
+        .captures
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| FieldInfo { name: format!("cap{i}"), ty })
+        .collect();
+
+    let (sam_params, sam_ret) = parse_descriptor(&info.sam_desc)?;
+    let sam_mangled = mangle(&class_name, &info.sam_method, &info.sam_desc);
+
+    program.classes.push(ClassInfo {
+        name: class_name.clone(),
+        super_name: None,
+        is_interface: false,
+        interfaces: vec![info.iface.clone()],
+        fields,
+        static_fields: Vec::new(),
+        methods: vec![MethodInfo {
+            name: info.sam_method.clone(),
+            desc: info.sam_desc.clone(),
+            is_static: false,
+            has_body: true,
+            mangled: sam_mangled.clone(),
+        }],
+        has_clinit: false,
+    });
+
+    // Rumpf der SAM-Methode: Captures aus Feldern laden, dann die
+    // Lambda-Rumpf-Methode mit (captures…, sam-args…) aufrufen.
+    let mut locals = vec![Ty::Ref]; // Local 0 = this
+    locals.extend(sam_params.iter().copied());
+    let n_sam = sam_params.len();
+
+    let mut stmts = Vec::new();
+    let mut impl_args = Vec::new();
+    for (i, &cty) in info.captures.iter().enumerate() {
+        locals.push(cty);
+        let cap_local = Local((locals.len() - 1) as u32);
+        stmts.push(Statement::GetField {
+            dest: cap_local,
+            obj: Operand::Copy(Local(0)),
+            class: class_name.clone(),
+            field: format!("cap{i}"),
+        });
+        impl_args.push(Operand::Copy(cap_local));
+    }
+    for k in 0..n_sam {
+        impl_args.push(Operand::Copy(Local((1 + k) as u32)));
+    }
+    let impl_mangled = mangle(&info.impl_class, &info.impl_name, &info.impl_desc);
+    let result = if sam_ret == Ty::Void {
+        None
+    } else {
+        locals.push(sam_ret);
+        Some(Local((locals.len() - 1) as u32))
+    };
+    stmts.push(Statement::Call { dest: result, func: impl_mangled, args: impl_args });
+    let terminator = Terminator::Return(result.map(Operand::Copy));
+
+    program.functions.push(Function {
+        name: sam_mangled,
+        params: locals[..=n_sam].to_vec(),
+        ret: sam_ret,
+        locals,
+        blocks: vec![BasicBlock { statements: stmts, terminator }],
+    });
+
+    Ok(class_name)
+}
+
 /// Fügt einen Konvertierungs-Call (`jrt_*_to_str`) ein und liefert das
 /// String-Ergebnis-Local als Operand.
 fn str_conv(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, func: &str, val: Local) -> Operand {
@@ -1318,12 +1409,64 @@ fn lower_block(
                 throw_after = Some(*pc);
             }
             Instr::InvokeDynamic(idx) => {
-                // Nur String-Konkatenation (StringConcatFactory) wird statisch
-                // aufgelöst — Closed World, DESIGN.md §1.3.
-                let (dname, ddesc, _bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
+                // Statisch aufgelöst (Closed World, DESIGN.md §1.3):
+                // String-Konkatenation und Lambdas (LambdaMetafactory).
+                let (dname, ddesc, bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
+
+                // --- Lambda (LambdaMetafactory.metafactory) ---
+                if bsm_name == "metafactory" || bsm_name == "altMetafactory" {
+                    let iface = match parse_descriptor(ddesc)?.1 {
+                        Ty::Ref => {
+                            // Rückgabetyp des indy = "L…;" → Interface-Name.
+                            let d = ddesc.rsplit_once(')').unwrap().1;
+                            d.trim_start_matches('L').trim_end_matches(';').to_string()
+                        }
+                        _ => return Err(FrontendError::Unsupported("Lambda ohne Interface-Rückgabe".into())),
+                    };
+                    let sam_desc = ml.cf.method_type(bsm_args[0])?.to_string();
+                    let (_, impl_class, impl_name, impl_desc) = ml.cf.method_handle(bsm_args[1])?;
+                    let info = LambdaInfo {
+                        iface,
+                        sam_method: dname.to_string(),
+                        sam_desc,
+                        impl_class: impl_class.to_string(),
+                        impl_name: impl_name.to_string(),
+                        impl_desc: impl_desc.to_string(),
+                        captures: descriptor_params(ddesc)?
+                            .iter()
+                            .map(|p| {
+                                let mut c = p.chars().peekable();
+                                let f = c.next().unwrap();
+                                field_ty(f, &mut c, p)
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    };
+                    let lambda_class = register_lambda(program, &info)?;
+                    // Eingefangene Argumente vom Stack holen (in Reihenfolge).
+                    let n = info.captures.len();
+                    let mut caps = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        caps.push(pop!());
+                    }
+                    caps.reverse();
+                    // Lambda-Objekt erzeugen und Capture-Felder setzen.
+                    let obj = ml.stack_slot(stack.len(), Ty::Ref);
+                    stmts.push(Statement::New { dest: obj, class: lambda_class.clone() });
+                    for (i, cap) in caps.into_iter().enumerate() {
+                        stmts.push(Statement::PutField {
+                            obj: Operand::Copy(obj),
+                            class: lambda_class.clone(),
+                            field: format!("cap{i}"),
+                            value: Operand::Copy(cap),
+                        });
+                    }
+                    stack.push(Ty::Ref);
+                    continue;
+                }
+
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokedynamic {dname} (nur String-Konkatenation unterstützt)"
+                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda)"
                     )));
                 }
                 let with_constants = dname == "makeConcatWithConstants";
