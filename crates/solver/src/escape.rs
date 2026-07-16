@@ -103,6 +103,12 @@ fn escapes(f: &Function, root: Local) -> bool {
                         return true;
                     }
                 }
+                Statement::PutStatic { value, .. } => {
+                    // In ein statisches Feld gespeichert → entkommt.
+                    if is_alias(value) {
+                        return true;
+                    }
+                }
                 // GetField/PutField/Array-Zugriff über `obj`/`arr` sowie
                 // Vergleiche lassen das Objekt selbst nicht entkommen.
                 _ => {}

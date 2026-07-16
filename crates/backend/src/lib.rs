@@ -155,6 +155,12 @@ impl<'a> Ctx<'a> {
         Some((owner, idx + HEADER_SLOTS, ty))
     }
 
+    /// Global-Symbol und Typ eines statischen Feldes (Superkette hoch).
+    fn static_field(&self, class: &str, field: &str) -> Option<(String, Ty)> {
+        let (owner, ty) = self.program.resolve_static_field(class, field)?;
+        Some((format!("@sf.{}.{}", sanitize(owner), sanitize(field)), ty))
+    }
+
     /// Ref-Felder von `class` (inkl. geerbter) als GEP-Index-Liste — für
     /// die generierte Drop-Funktion.
     fn ref_field_slots(&self, class: &str) -> Vec<usize> {
@@ -242,6 +248,30 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, [0 x ptr] }}").unwrap();
     writeln!(w, "@vt.array.int = internal unnamed_addr constant [2 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace]").unwrap();
     writeln!(w, "@vt.array.ref = internal unnamed_addr constant [2 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace]").unwrap();
+    writeln!(w).unwrap();
+
+    // Statische Felder als globale Variablen (mit ConstantValue-Initialwert).
+    for c in &program.classes {
+        for f in &c.static_fields {
+            let init = match &f.init {
+                None if f.ty == Ty::Ref => "null".to_string(),
+                None if f.ty == Ty::F64 => "0.0".to_string(),
+                None => "0".to_string(),
+                Some(ConstInit::I32(v)) => v.to_string(),
+                Some(ConstInit::I64(v)) => v.to_string(),
+                Some(ConstInit::F64(v)) => format!("0x{:016X}", v.to_bits()),
+                Some(ConstInit::Str(sid)) => format!("@jstr.{sid}"),
+            };
+            writeln!(
+                w,
+                "@sf.{}.{} = internal global {} {init}",
+                sanitize(&c.name),
+                sanitize(&f.name),
+                llty(f.ty),
+            )
+            .unwrap();
+        }
+    }
     writeln!(w).unwrap();
 
     let defined: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
@@ -345,7 +375,23 @@ pub fn emit(program: &Program) -> String {
 
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
+        // Statische Initialisierer vor main, Superklasse vor Subklasse.
+        let mut emitted: BTreeSet<String> = BTreeSet::new();
+        for c in &program.classes {
+            emit_clinit_chain(w, &ctx, &c.name, &defined, &mut emitted);
+        }
         writeln!(w, "  call void @java_main()").unwrap();
+        // Statische Ref-Felder freigeben (GC-Wurzeln bis Programmende) —
+        // hält die Heap-Bilanz sauber.
+        for c in &program.classes {
+            for f in &c.static_fields {
+                if f.ty == Ty::Ref {
+                    let t = format!("%sf_{}_{}", sanitize(&c.name), sanitize(&f.name));
+                    writeln!(w, "  {t} = load ptr, ptr @sf.{}.{}", sanitize(&c.name), sanitize(&f.name)).unwrap();
+                    writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
+                }
+            }
+        }
         // Unbehandelte Exception aus main melden (statt still zu ignorieren).
         writeln!(w, "  call void @jrt_check_uncaught()").unwrap();
         writeln!(w, "  ret i32 0").unwrap();
@@ -353,6 +399,31 @@ pub fn emit(program: &Program) -> String {
     }
 
     out
+}
+
+/// Ruft die <clinit> von `class` auf, aber erst die der Superklasse
+/// (JVMS 5.5) — jede höchstens einmal.
+fn emit_clinit_chain(
+    w: &mut String,
+    ctx: &Ctx,
+    class: &str,
+    defined: &BTreeSet<&str>,
+    emitted: &mut BTreeSet<String>,
+) {
+    if !emitted.insert(class.to_string()) {
+        return;
+    }
+    if let Some(ci) = ctx.class(class) {
+        if let Some(sup) = &ci.super_name {
+            emit_clinit_chain(w, ctx, sup, defined, emitted);
+        }
+        if ci.has_clinit {
+            let sym = fastllvm_ir::clinit_symbol(class);
+            if defined.contains(sym.as_str()) {
+                writeln!(w, "  call void @{sym}()").unwrap();
+            }
+        }
+    }
 }
 
 fn operand_ty(f: &Function, op: &Operand) -> Ty {
@@ -619,6 +690,26 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
             } else {
                 writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
+            }
+        }
+        Statement::GetStatic { dest, class, field } => {
+            let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));
+            let t = e.fresh();
+            writeln!(w, "  {t} = load {}, ptr {g}", llty(ty)).unwrap();
+            // Ref aus globalem Feld ins Local kopiert → owned (retain).
+            store_dest(w, e, *dest, &t, ty == Ty::Ref);
+        }
+        Statement::PutStatic { class, field, value } => {
+            let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));
+            let v = e.operand(w, value);
+            if ty == Ty::Ref {
+                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                let old = e.fresh();
+                writeln!(w, "  {old} = load ptr, ptr {g}").unwrap();
+                writeln!(w, "  store ptr {v}, ptr {g}").unwrap();
+                writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
+            } else {
+                writeln!(w, "  store {} {v}, ptr {g}", llty(ty)).unwrap();
             }
         }
         Statement::NewArray { dest, elem, len } => {

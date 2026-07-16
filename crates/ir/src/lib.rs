@@ -100,6 +100,8 @@ pub enum Statement {
     StackNew { dest: Local, class: String },
     GetField { dest: Local, obj: Operand, class: String, field: String },
     PutField { obj: Operand, class: String, field: String, value: Operand },
+    GetStatic { dest: Local, class: String, field: String },
+    PutStatic { class: String, field: String, value: Operand },
     /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
     NewArray { dest: Local, elem: Ty, len: Operand },
     ArrayLen { dest: Local, arr: Operand },
@@ -146,6 +148,22 @@ pub struct FieldInfo {
     pub ty: Ty,
 }
 
+/// Compile-Zeit-Initialwert eines statischen Feldes (ConstantValue).
+#[derive(Debug, Clone)]
+pub enum ConstInit {
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    Str(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticFieldInfo {
+    pub name: String,
+    pub ty: Ty,
+    pub init: Option<ConstInit>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub name: String,
@@ -172,7 +190,10 @@ pub struct ClassInfo {
     pub super_name: Option<String>,
     /// Nur deklarierte Instanzfelder; Superklassen-Felder über die Kette.
     pub fields: Vec<FieldInfo>,
+    pub static_fields: Vec<StaticFieldInfo>,
     pub methods: Vec<MethodInfo>,
+    /// Hat die Klasse einen statischen Initialisierer (<clinit>)?
+    pub has_clinit: bool,
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +244,18 @@ impl Program {
         }
     }
 
+    /// Statisches Feld auflösen (Superklassen-Kette hoch). Liefert
+    /// (Besitzerklasse, Typ).
+    pub fn resolve_static_field(&self, class: &str, field: &str) -> Option<(&str, Ty)> {
+        let mut cur = self.class(class)?;
+        loop {
+            if let Some(f) = cur.static_fields.iter().find(|f| f.name == field) {
+                return Some((cur.name.as_str(), f.ty));
+            }
+            cur = self.class(cur.super_name.as_deref()?)?;
+        }
+    }
+
     /// Methoden-Auflösung: findet die Implementierung von `name`+`desc`
     /// ab `class` aufwärts. Liefert die definierende ClassInfo + MethodInfo.
     pub fn resolve_method(&self, class: &str, name: &str, desc: &str) -> Option<(&ClassInfo, &MethodInfo)> {
@@ -253,6 +286,19 @@ impl Program {
 /// Macht aus einem JVM-Namen einen linkbaren Bezeichner.
 pub fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
+/// Linker-Symbol einer Methode. Muss über alle Crates konsistent sein.
+pub fn mangle(class: &str, name: &str, descriptor: &str) -> String {
+    if name == "main" && descriptor == "([Ljava/lang/String;)V" {
+        return "java_main".to_string();
+    }
+    format!("J_{}_{}_{}", sanitize(class), sanitize(name), sanitize(descriptor))
+}
+
+/// Symbol des statischen Initialisierers einer Klasse.
+pub fn clinit_symbol(class: &str) -> String {
+    mangle(class, "<clinit>", "()V")
 }
 
 // --- Textuelle Ausgabe für Debugging (`--emit-ir`) ---

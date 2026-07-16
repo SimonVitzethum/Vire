@@ -105,6 +105,9 @@ pub struct Field {
     pub access_flags: u16,
     pub name: String,
     pub descriptor: String,
+    /// CP-Index des ConstantValue-Attributs (statische finals mit
+    /// Compile-Zeit-Konstante), falls vorhanden.
+    pub constant_value: Option<u16>,
 }
 
 impl Field {
@@ -191,11 +194,23 @@ impl ClassFile {
             let access_flags = r.u16()?;
             let name_idx = r.u16()?;
             let desc_idx = r.u16()?;
-            skip_attributes(&mut r)?;
+            let mut constant_value = None;
+            let attr_count = r.u16()?;
+            for _ in 0..attr_count {
+                let attr_name_idx = r.u16()?;
+                let attr_len = r.u32()? as usize;
+                if utf8_at(&constant_pool, attr_name_idx)? == "ConstantValue" {
+                    let mut cr = Reader { data: r.bytes(attr_len)?, pos: 0 };
+                    constant_value = Some(cr.u16()?);
+                } else {
+                    r.bytes(attr_len)?;
+                }
+            }
             fields.push(Field {
                 access_flags,
                 name: utf8_at(&constant_pool, name_idx)?.to_string(),
                 descriptor: utf8_at(&constant_pool, desc_idx)?.to_string(),
+                constant_value,
             });
         }
 

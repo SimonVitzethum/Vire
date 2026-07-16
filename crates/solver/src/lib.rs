@@ -39,12 +39,21 @@ pub fn run(program: &mut Program) -> Stats {
     let func_index: BTreeMap<String, usize> =
         program.functions.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
 
-    let roots: Vec<String> = if func_index.contains_key("java_main") {
+    let mut roots: Vec<String> = if func_index.contains_key("java_main") {
         vec!["java_main".to_string()]
     } else {
         // Library-Modus: kein Einstiegspunkt bekannt → alles ist Wurzel.
         func_index.keys().cloned().collect()
     };
+    // Statische Initialisierer laufen beim Programmstart → immer erreichbar.
+    for c in &program.classes {
+        if c.has_clinit {
+            let clinit = fastllvm_ir::clinit_symbol(&c.name);
+            if func_index.contains_key(&clinit) {
+                roots.push(clinit);
+            }
+        }
+    }
 
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut instantiated: BTreeSet<String> = BTreeSet::new();

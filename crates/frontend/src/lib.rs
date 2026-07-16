@@ -41,17 +41,33 @@ type Result<T> = std::result::Result<T, FrontendError>;
 /// Phase 1: Klassenmodell registrieren (vor dem Absenken aller Methoden,
 /// damit Feld-/Methodenauflösung über Klassengrenzen funktioniert).
 pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
-    let mut fields = Vec::new();
-    for f in &cf.fields {
-        if f.is_static() {
-            return Err(FrontendError::Unsupported(format!(
-                "statisches Feld {}.{}",
-                cf.this_class, f.name
-            )));
-        }
-        let mut chars = f.descriptor.chars().peekable();
+    let field_ty_of = |desc: &str| -> Result<Ty> {
+        let mut chars = desc.chars().peekable();
         let c = chars.next().ok_or_else(|| FrontendError::Unsupported("leerer Felddeskriptor".into()))?;
-        fields.push(FieldInfo { name: f.name.clone(), ty: field_ty(c, &mut chars, &f.descriptor)? });
+        field_ty(c, &mut chars, desc)
+    };
+
+    let mut fields = Vec::new();
+    let mut static_fields = Vec::new();
+    for f in &cf.fields {
+        let ty = field_ty_of(&f.descriptor)?;
+        if f.is_static() {
+            // ConstantValue → Compile-Zeit-Initialwert (statische finals).
+            let init = match f.constant_value {
+                Some(idx) => Some(match cf.constant_pool.get(idx as usize) {
+                    Some(Const::Integer(v)) => ConstInit::I32(*v),
+                    Some(Const::Long(v)) => ConstInit::I64(*v),
+                    Some(Const::Double(v)) => ConstInit::F64(*v),
+                    Some(Const::Float(v)) => ConstInit::F64(*v as f64),
+                    Some(Const::String { utf8 }) => ConstInit::Str(program.intern_string(cf.utf8(*utf8)?)),
+                    _ => return Err(FrontendError::Unsupported(format!("ConstantValue von {}.{}", cf.this_class, f.name))),
+                }),
+                None => None,
+            };
+            static_fields.push(StaticFieldInfo { name: f.name.clone(), ty, init });
+        } else {
+            fields.push(FieldInfo { name: f.name.clone(), ty });
+        }
     }
     let methods = cf
         .methods
@@ -65,11 +81,14 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
             mangled: mangle(&cf.this_class, &m.name, &m.descriptor),
         })
         .collect();
+    let has_clinit = cf.methods.iter().any(|m| m.name == "<clinit>" && m.code.is_some());
     program.classes.push(ClassInfo {
         name: cf.this_class.clone(),
         super_name: cf.super_class.clone().filter(|s| s != "java/lang/Object"),
         fields,
+        static_fields,
         methods,
+        has_clinit,
     });
     Ok(())
 }
@@ -77,11 +96,6 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
 /// Phase 2: alle Methodenrümpfe absenken.
 pub fn lower_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     for m in &cf.methods {
-        if m.name == "<clinit>" {
-            // Statische Initialisierer: außerhalb der Teilmenge (keine
-            // statischen Felder); javac erzeugt sie hier nicht.
-            continue;
-        }
         let Some(code) = &m.code else { continue };
         let f = lower_method(cf, m, code, program)?;
         program.functions.push(f);
@@ -89,12 +103,7 @@ pub fn lower_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     Ok(())
 }
 
-pub fn mangle(class: &str, name: &str, descriptor: &str) -> String {
-    if name == "main" && descriptor == "([Ljava/lang/String;)V" {
-        return "java_main".to_string();
-    }
-    format!("J_{}_{}_{}", sanitize(class), sanitize(name), sanitize(descriptor))
-}
+pub use fastllvm_ir::{clinit_symbol as clinit_name, mangle};
 
 /// Parst einen Methodendeskriptor zu (Parametertypen, Rückgabetyp).
 fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
@@ -950,8 +959,23 @@ fn lower_block(
                     // Receiver-Dummy; das println-Intrinsic ignoriert ihn.
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                 } else {
-                    return Err(FrontendError::Unsupported(format!("getstatic {class}.{name}")));
+                    let (class, field) = (class.to_string(), name.to_string());
+                    let (_, ty) = program.resolve_static_field(&class, &field).ok_or_else(|| {
+                        FrontendError::Unsupported(format!("getstatic {class}.{field}"))
+                    })?;
+                    let l = ml.stack_slot(stack.len(), ty);
+                    stmts.push(Statement::GetStatic { dest: l, class, field });
+                    stack.push(ty);
                 }
+            }
+            Instr::PutStatic(idx) => {
+                let (class, field, _) = ml.cf.member_ref(*idx)?;
+                let (class, field) = (class.to_string(), field.to_string());
+                if program.resolve_static_field(&class, &field).is_none() {
+                    return Err(FrontendError::Unsupported(format!("putstatic {class}.{field}")));
+                }
+                let value = pop!();
+                stmts.push(Statement::PutStatic { class, field, value: Operand::Copy(value) });
             }
             Instr::InvokeVirtual(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;

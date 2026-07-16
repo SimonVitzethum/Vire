@@ -184,5 +184,7 @@ fn remap_statement(st: &mut Statement, off: u32) {
             remap_operand(index, off);
             remap_operand(value, off);
         }
+        Statement::GetStatic { dest, .. } => remap_local(dest, off),
+        Statement::PutStatic { value, .. } => remap_operand(value, off),
     }
 }
