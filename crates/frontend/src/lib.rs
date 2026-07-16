@@ -532,6 +532,44 @@ fn lower_block(
             Instr::AConstNull => {
                 push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
             }
+            Instr::NewArrayInt | Instr::NewArrayRef(_) => {
+                let elem = if matches!(instr, Instr::NewArrayInt) { Ty::I32 } else { Ty::Ref };
+                let len = pop!();
+                let l = ml.stack_slot(stack.len(), Ty::Ref);
+                stmts.push(Statement::NewArray { dest: l, elem, len: Operand::Copy(len) });
+                stack.push(Ty::Ref);
+            }
+            Instr::ArrayLength => {
+                let arr = pop!();
+                let dest = ml.stack_slot(stack.len(), Ty::I32);
+                stmts.push(Statement::ArrayLen { dest, arr: Operand::Copy(arr) });
+                stack.push(Ty::I32);
+            }
+            Instr::IaLoad | Instr::AaLoad => {
+                let elem = if matches!(instr, Instr::IaLoad) { Ty::I32 } else { Ty::Ref };
+                let index = pop!();
+                let arr = pop!();
+                let l = ml.stack_slot(stack.len(), elem);
+                stmts.push(Statement::ArrayLoad {
+                    dest: l,
+                    arr: Operand::Copy(arr),
+                    index: Operand::Copy(index),
+                    elem,
+                });
+                stack.push(elem);
+            }
+            Instr::IaStore | Instr::AaStore => {
+                let elem = if matches!(instr, Instr::IaStore) { Ty::I32 } else { Ty::Ref };
+                let value = pop!();
+                let index = pop!();
+                let arr = pop!();
+                stmts.push(Statement::ArrayStore {
+                    arr: Operand::Copy(arr),
+                    index: Operand::Copy(index),
+                    value: Operand::Copy(value),
+                    elem,
+                });
+            }
             Instr::New(idx) => {
                 let class = ml.cf.class_name(*idx)?.to_string();
                 if program.class(&class).is_none() {

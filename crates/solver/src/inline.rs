@@ -157,5 +157,23 @@ fn remap_statement(st: &mut Statement, off: u32) {
             remap_operand(obj, off);
             remap_operand(value, off);
         }
+        Statement::NewArray { dest, len, .. } => {
+            remap_local(dest, off);
+            remap_operand(len, off);
+        }
+        Statement::ArrayLen { dest, arr } => {
+            remap_local(dest, off);
+            remap_operand(arr, off);
+        }
+        Statement::ArrayLoad { dest, arr, index, .. } => {
+            remap_local(dest, off);
+            remap_operand(arr, off);
+            remap_operand(index, off);
+        }
+        Statement::ArrayStore { arr, index, value, .. } => {
+            remap_operand(arr, off);
+            remap_operand(index, off);
+            remap_operand(value, off);
+        }
     }
 }

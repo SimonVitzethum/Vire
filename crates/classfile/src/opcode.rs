@@ -58,6 +58,15 @@ pub enum Instr {
     InvokeStatic(u16),
     New(u16),
     CheckCast(u16),
+    /// newarray mit primitivem Elementtyp (atype-Code, hier nur int=10).
+    NewArrayInt,
+    /// anewarray: Array von Referenzen (Klassenindex, hier ignoriert).
+    NewArrayRef(u16),
+    ArrayLength,
+    IaLoad,
+    IaStore,
+    AaLoad,
+    AaStore,
     AConstNull,
     /// ifnull (Eq) / ifnonnull (Ne)
     IfRefNull(Cond, usize),
@@ -118,6 +127,10 @@ pub fn decode_code(
             0x3B..=0x3E => (Instr::IStore(op as u16 - 0x3B), 1),
             0x3A => (Instr::AStore(u8_at(pc + 1)? as u16), 2),
             0x4B..=0x4E => (Instr::AStore(op as u16 - 0x4B), 1),
+            0x2E => (Instr::IaLoad, 1),
+            0x32 => (Instr::AaLoad, 1),
+            0x4F => (Instr::IaStore, 1),
+            0x53 => (Instr::AaStore, 1),
             0x57 => (Instr::Pop, 1),
             0x59 => (Instr::Dup, 1),
             0x60 => (Instr::IAdd, 1),
@@ -158,6 +171,16 @@ pub fn decode_code(
             0xB7 => (Instr::InvokeSpecial(u16_at(pc + 1)?), 3),
             0xB8 => (Instr::InvokeStatic(u16_at(pc + 1)?), 3),
             0xBB => (Instr::New(u16_at(pc + 1)?), 3),
+            0xBC => {
+                // newarray: atype 10 = T_INT (aktuell einzig unterstützt).
+                let atype = u8_at(pc + 1)?;
+                if atype != 10 {
+                    return Err(ParseError::UnsupportedOpcode(op, pc));
+                }
+                (Instr::NewArrayInt, 2)
+            }
+            0xBD => (Instr::NewArrayRef(u16_at(pc + 1)?), 3),
+            0xBE => (Instr::ArrayLength, 1),
             0xC0 => (Instr::CheckCast(u16_at(pc + 1)?), 3),
             0xC6 => (Instr::IfRefNull(Cond::Eq, branch(pc + 1)?), 3),
             0xC7 => (Instr::IfRefNull(Cond::Ne, branch(pc + 1)?), 3),

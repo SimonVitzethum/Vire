@@ -94,6 +94,13 @@ pub enum Statement {
     StackNew { dest: Local, class: String },
     GetField { dest: Local, obj: Operand, class: String, field: String },
     PutField { obj: Operand, class: String, field: String, value: Operand },
+    /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
+    NewArray { dest: Local, elem: Ty, len: Operand },
+    ArrayLen { dest: Local, arr: Operand },
+    /// `dest = arr[index]`; bounds-gecheckt.
+    ArrayLoad { dest: Local, arr: Operand, index: Operand, elem: Ty },
+    /// `arr[index] = value`; bounds-gecheckt.
+    ArrayStore { arr: Operand, index: Operand, value: Operand, elem: Ty },
 }
 
 #[derive(Debug, Clone)]

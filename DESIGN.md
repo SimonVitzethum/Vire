@@ -165,6 +165,7 @@ Stand der Garantien (umgesetzt):
 |---|---|
 | Use-after-free | Kein manuelles `free`. Heap-Objekte werden per **Referenzzählung** (§6-GC-Option 1) freigegeben, sobald die letzte Referenz endet; Stack-Objekte nur nach **bewiesenem** Nicht-Entkommen (Escape-Analyse, s. u.). Doppel-Free ausgeschlossen (immortal-Markierung + Owning-Slot-Disziplin, per Leak-Detektor verifiziert) |
 | Wilde/uninitalisierte Pointer | `jrt_alloc` nullt; keine Pointerarithmetik in der Sprache; Casts (`checkcast`) werden **statisch bewiesen** oder sind Build-Fehler |
+| Array-Zugriff außerhalb der Grenzen | `jrt_bounds_check` vor jedem Load/Store → definierte `ArrayIndexOutOfBoundsException`; negative Länge → `NegativeArraySizeException` |
 | Null-Dereferenz | expliziter Check vor Feldzugriff/Dispatch → definierte `NullPointerException` statt UB |
 | Division/Überlauf | `jrt_idiv`/`jrt_irem` (Exception bei /0, `MIN/-1` definiert); Arithmetik wrappt definiert; Shift-Beträge maskiert |
 | Typkonfusion | Closed World + statisch bewiesene Casts; Vtable-Slots nur für RTA-erreichbare Methoden |

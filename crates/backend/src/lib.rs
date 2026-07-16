@@ -46,7 +46,37 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_null_check", "void (ptr)"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
+    ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
+    ("jrt_bounds_check", "void (ptr, i32)"),
+    ("jrt_array_ref_drop", "void (ptr)"),
+    ("jrt_array_ref_trace", "void (ptr, ptr)"),
+    ("jrt_noop_drop", "void (ptr)"),
+    ("jrt_noop_trace", "void (ptr, ptr)"),
 ];
+
+/// LLVM-Struct eines Arrays: gleicher Header wie Objekte, dann Länge und
+/// die (flexibel dimensionierten) Elemente.
+fn array_struct(elem: Ty) -> &'static str {
+    match elem {
+        Ty::Ref => "%arr.ref",
+        _ => "%arr.int",
+    }
+}
+
+fn array_vtable(elem: Ty) -> &'static str {
+    match elem {
+        Ty::Ref => "@vt.array.ref",
+        _ => "@vt.array.int",
+    }
+}
+
+/// Elementgröße in Bytes (für die Allokation).
+fn elem_size(elem: Ty) -> usize {
+    match elem {
+        Ty::Ref | Ty::I64 => 8,
+        _ => 4,
+    }
+}
 
 /// Feste Header-Slots vor den Instanzfeldern:
 ///   Slot 0: refcount (i64), <0 = immortal
@@ -176,6 +206,13 @@ pub fn emit(program: &Program) -> String {
         parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
+    // Array-Typen (Header + i64 Länge + flexibles Elementfeld) und ihre
+    // Vtables. int[] hat keine Ref-Elemente → No-Op-Drop/Trace; ref[]
+    // released/besucht seine Elemente über Runtime-Helfer.
+    writeln!(w, "%arr.int = type {{ i64, i64, ptr, i64, [0 x i32] }}").unwrap();
+    writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, [0 x ptr] }}").unwrap();
+    writeln!(w, "@vt.array.int = internal unnamed_addr constant [2 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace]").unwrap();
+    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [2 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace]").unwrap();
     writeln!(w).unwrap();
 
     let defined: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
@@ -534,7 +571,75 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
             }
         }
+        Statement::NewArray { dest, elem, len } => {
+            let n = e.operand(w, len);
+            let n64 = e.fresh();
+            writeln!(w, "  {n64} = sext i32 {n} to i64").unwrap();
+            let t = e.fresh();
+            writeln!(
+                w,
+                "  {t} = call ptr @jrt_alloc_array(i64 {n64}, i64 {}, ptr {})",
+                elem_size(*elem),
+                array_vtable(*elem),
+            )
+            .unwrap();
+            store_dest(w, e, *dest, &t, false); // alloc gab +1
+        }
+        Statement::ArrayLen { dest, arr } => {
+            let a = e.operand(w, arr);
+            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
+            let p = e.fresh();
+            writeln!(w, "  {p} = getelementptr %arr.int, ptr {a}, i32 0, i32 3").unwrap();
+            let t = e.fresh();
+            writeln!(w, "  {t} = load i64, ptr {p}").unwrap();
+            let t32 = e.fresh();
+            writeln!(w, "  {t32} = trunc i64 {t} to i32").unwrap();
+            writeln!(w, "  store i32 {t32}, ptr %l{}", dest.0).unwrap();
+        }
+        Statement::ArrayLoad { dest, arr, index, elem } => {
+            let a = e.operand(w, arr);
+            let i = e.operand(w, index);
+            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
+            writeln!(w, "  call void @jrt_bounds_check(ptr {a}, i32 {i})").unwrap();
+            let p = elem_ptr(w, e, *elem, &a, &i);
+            let t = e.fresh();
+            writeln!(w, "  {t} = load {}, ptr {p}", llty(*elem)).unwrap();
+            // Ref-Element geladen → Kopie ins Local wird owned (retain).
+            store_dest(w, e, *dest, &t, *elem == Ty::Ref);
+        }
+        Statement::ArrayStore { arr, index, value, elem } => {
+            let a = e.operand(w, arr);
+            let i = e.operand(w, index);
+            writeln!(w, "  call void @jrt_null_check(ptr {a})").unwrap();
+            writeln!(w, "  call void @jrt_bounds_check(ptr {a}, i32 {i})").unwrap();
+            let v = e.operand(w, value);
+            let p = elem_ptr(w, e, *elem, &a, &i);
+            if *elem == Ty::Ref {
+                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                let old = e.fresh();
+                writeln!(w, "  {old} = load ptr, ptr {p}").unwrap();
+                writeln!(w, "  store ptr {v}, ptr {p}").unwrap();
+                writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
+            } else {
+                writeln!(w, "  store {} {v}, ptr {p}", llty(*elem)).unwrap();
+            }
+        }
     }
+}
+
+/// GEP auf das `index`-te Element eines Arrays.
+fn elem_ptr(w: &mut String, e: &mut FnEmitter, elem: Ty, arr: &str, index: &str) -> String {
+    let p = e.fresh();
+    // sext des i32-Index nach i64 für den GEP.
+    let i64idx = e.fresh();
+    writeln!(w, "  {i64idx} = sext i32 {index} to i64").unwrap();
+    writeln!(
+        w,
+        "  {p} = getelementptr {}, ptr {arr}, i32 0, i32 4, i64 {i64idx}",
+        array_struct(elem),
+    )
+    .unwrap();
+    p
 }
 
 /// Speichert die Vtable im Objektheader (hinter refcount + rcflags).

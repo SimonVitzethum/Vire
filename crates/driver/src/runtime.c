@@ -262,6 +262,68 @@ void jrt_null_check(const void *p) {
     }
 }
 
+/* --- Arrays ---------------------------------------------------------- */
+
+/* Gleicher Header wie Objekte, dann die Länge; Elemente folgen direkt. */
+typedef struct {
+    int64_t refcount;
+    int64_t rcflags;
+    void *vtable;
+    int64_t length;
+} JArray;
+
+void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
+    if (count < 0) {
+        fputs("Exception in thread \"main\" java.lang.NegativeArraySizeException\n", stderr);
+        exit(1);
+    }
+    void *p = calloc(1, sizeof(JArray) + (size_t)count * (size_t)elem_size);
+    if (!p) {
+        fputs("Exception in thread \"main\" java.lang.OutOfMemoryError\n", stderr);
+        exit(1);
+    }
+    if (total_allocated++ == 0) {
+        atexit(jrt_shutdown);
+    }
+    live_objects++;
+    JArray *a = (JArray *)p;
+    a->refcount = 1;
+    a->vtable = vtable;
+    a->length = count;
+    return p;
+}
+
+void jrt_bounds_check(const void *arr, int32_t index) {
+    int64_t len = ((const JArray *)arr)->length;
+    if (index < 0 || index >= len) {
+        fprintf(stderr,
+                "Exception in thread \"main\" "
+                "java.lang.ArrayIndexOutOfBoundsException: Index %d out of bounds for length %lld\n",
+                index, (long long)len);
+        exit(1);
+    }
+}
+
+/* Drop/Trace für ref[]: über die Elemente laufen. */
+void jrt_array_ref_drop(void *p) {
+    JArray *a = (JArray *)p;
+    void **elems = (void **)(a + 1);
+    for (int64_t i = 0; i < a->length; i++) {
+        jrt_release(elems[i]);
+    }
+}
+void jrt_array_ref_trace(void *p, void (*visit)(void *)) {
+    JArray *a = (JArray *)p;
+    void **elems = (void **)(a + 1);
+    for (int64_t i = 0; i < a->length; i++) {
+        visit(elems[i]);
+    }
+}
+
+/* int[] hat keine Ref-Elemente. */
+void jrt_noop_drop(void *p) { (void)p; }
+void jrt_noop_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; }
+
 /* --- Java-Arithmetik-Semantik ---------------------------------------- */
 
 /* JLS 15.17.2: Division durch 0 wirft ArithmeticException;

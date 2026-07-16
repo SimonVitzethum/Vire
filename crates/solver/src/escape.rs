@@ -96,8 +96,15 @@ fn escapes(f: &Function, root: Local) -> bool {
                         return true;
                     }
                 }
-                // GetField/PutField über `obj` sowie Vergleiche (Binary)
-                // lassen das Objekt nicht entkommen.
+                Statement::ArrayStore { value, .. } => {
+                    // In ein Array gespeichert → das Objekt überlebt uns
+                    // potentiell; konservativ als entkommend werten.
+                    if is_alias(value) {
+                        return true;
+                    }
+                }
+                // GetField/PutField/Array-Zugriff über `obj`/`arr` sowie
+                // Vergleiche lassen das Objekt selbst nicht entkommen.
                 _ => {}
             }
         }
