@@ -44,7 +44,15 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_irem", "i32 (i32, i32)"),
     ("jrt_alloc", "ptr (i64)"),
     ("jrt_null_check", "void (ptr)"),
+    ("jrt_retain", "void (ptr)"),
+    ("jrt_release", "void (ptr)"),
 ];
+
+/// Feste Header-Slots vor den Instanzfeldern: refcount (i64) + vtable (ptr).
+/// Instanzfelder beginnen daher bei GEP-Index 2, der Vtable-Zeiger bei 1.
+const HEADER_SLOTS: usize = 2;
+/// Vtable-Slot 0 ist die Drop-Funktion; virtuelle Methoden ab Slot 1.
+const VTABLE_DROP_SLOTS: usize = 1;
 
 /// Klassen-Kontext: Layouts und Vtables, aus `Program::classes` berechnet.
 struct Ctx<'a> {
@@ -73,14 +81,25 @@ impl<'a> Ctx<'a> {
         out
     }
 
-    /// GEP-Index (+1 für den Vtable-Header) und Typ eines Felds, aufgelöst
+    /// GEP-Index (nach dem Header) und Typ eines Felds, aufgelöst
     /// ab `class` die Superkette hoch.
     fn field_slot(&self, class: &str, field: &str) -> Option<(String, usize, Ty)> {
         let (owner, ty) = self.program.resolve_field(class, field)?;
         let owner = owner.to_string();
         let flat = self.flatten_fields(&owner);
         let idx = flat.iter().position(|(o, n, _)| *o == owner && n == field)?;
-        Some((owner, idx + 1, ty))
+        Some((owner, idx + HEADER_SLOTS, ty))
+    }
+
+    /// Ref-Felder von `class` (inkl. geerbter) als GEP-Index-Liste — für
+    /// die generierte Drop-Funktion.
+    fn ref_field_slots(&self, class: &str) -> Vec<usize> {
+        self.flatten_fields(class)
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, t))| *t == Ty::Ref)
+            .map(|(i, _)| i + HEADER_SLOTS)
+            .collect()
     }
 
     /// Vtable-Slots von `class`: (name, desc, Implementierungs-Symbol).
@@ -104,10 +123,12 @@ impl<'a> Ctx<'a> {
         slots
     }
 
+    /// GEP-Index eines Methoden-Slots in der Vtable (nach dem Drop-Slot).
     fn vtable_index(&self, class: &str, name: &str, desc: &str) -> Option<usize> {
         self.vtable_slots(class)
             .iter()
             .position(|(n, d, _)| n == name && d == desc)
+            .map(|i| i + VTABLE_DROP_SLOTS)
     }
 }
 
@@ -118,32 +139,34 @@ pub fn emit(program: &Program) -> String {
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
-    // String-Literale als { i64 len, [n x i8] }.
+    // String-Literale: immortaler Header (refcount -1) + Länge + Bytes.
+    // Refcount -1 macht retain/release zu No-Ops (Read-only-Konstante bleibt
+    // unberührt), sodass Literale wie normale Referenzen fließen können.
     for (i, s) in program.strings.iter().enumerate() {
         let bytes = s.as_bytes();
         writeln!(
             w,
-            "@jstr.{i} = private unnamed_addr constant {{ i64, [{n} x i8] }} {{ i64 {n}, [{n} x i8] c\"{esc}\" }}",
+            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, [{n} x i8] }} {{ i64 -1, i64 {n}, [{n} x i8] c\"{esc}\" }}",
             n = bytes.len(),
             esc = escape_ll(bytes),
         )
         .unwrap();
     }
-    // Class-Objekt-Singletons (Reflection): { ptr auf Namens-String }.
+    // Class-Objekt-Singletons (Reflection): immortaler Header + Namens-String.
     // Pointer-Identität ersetzt Javas Class-Gleichheit.
     for (class, sid) in &program.class_objects {
         writeln!(
             w,
-            "@jclass.{} = internal unnamed_addr constant {{ ptr }} {{ ptr @jstr.{sid} }}",
+            "@jclass.{} = internal unnamed_addr constant {{ i64, ptr }} {{ i64 -1, ptr @jstr.{sid} }}",
             sanitize(class),
         )
         .unwrap();
     }
     writeln!(w).unwrap();
 
-    // Struct-Typen für alle Klassen.
+    // Struct-Typen: { i64 refcount, ptr vtable, felder… }.
     for c in &program.classes {
-        let mut parts = vec!["ptr".to_string()];
+        let mut parts = vec!["i64".to_string(), "ptr".to_string()];
         parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
@@ -166,21 +189,34 @@ pub fn emit(program: &Program) -> String {
         .collect();
     for class in &instantiated {
         let slots = ctx.vtable_slots(class);
-        let entries: Vec<String> = slots
-            .iter()
-            .map(|(_, _, sym)| match sym {
-                Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
-                _ => "ptr null".to_string(),
-            })
-            .collect();
+        // Slot 0: Drop-Funktion der Klasse; danach die Methoden-Slots.
+        let mut entries = vec![format!("ptr @drop.{}", sanitize(class))];
+        entries.extend(slots.iter().map(|(_, _, sym)| match sym {
+            Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
+            _ => "ptr null".to_string(),
+        }));
         writeln!(
             w,
             "@vt.{} = internal unnamed_addr constant [{} x ptr] [{}]",
             sanitize(class),
-            slots.len().max(1),
-            if entries.is_empty() { "ptr null".to_string() } else { entries.join(", ") },
+            entries.len(),
+            entries.join(", "),
         )
         .unwrap();
+    }
+    writeln!(w).unwrap();
+
+    // Drop-Funktionen: released die Ref-Felder des Objekts (nicht rekursiv
+    // im Code — die Runtime ruft jrt_release, das ggf. weiter absteigt).
+    for class in &instantiated {
+        writeln!(w, "define internal void @drop.{}(ptr %o) {{", sanitize(class)).unwrap();
+        for (k, slot) in ctx.ref_field_slots(class).into_iter().enumerate() {
+            writeln!(w, "  %f{k} = getelementptr {}, ptr %o, i32 0, i32 {slot}", ctx.struct_name(class)).unwrap();
+            writeln!(w, "  %v{k} = load ptr, ptr %f{k}").unwrap();
+            writeln!(w, "  call void @jrt_release(ptr %v{k})").unwrap();
+        }
+        writeln!(w, "  ret void").unwrap();
+        writeln!(w, "}}").unwrap();
     }
     writeln!(w).unwrap();
 
@@ -281,8 +317,21 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     for (i, ty) in f.locals.iter().enumerate() {
         writeln!(w, "  %l{i} = alloca {}", llty(*ty)).unwrap();
     }
+    // Ref-Locals müssen vor dem ersten (Cleanup-)Load null sein, damit das
+    // Massen-Release am Funktionsende keinen Garbage dereferenziert.
+    let n_params = f.params.len();
+    for (i, ty) in f.locals.iter().enumerate() {
+        if *ty == Ty::Ref && i >= n_params {
+            writeln!(w, "  store ptr null, ptr %l{i}").unwrap();
+        }
+    }
     for (i, ty) in f.params.iter().enumerate() {
         writeln!(w, "  store {} %p{i}, ptr %l{i}", llty(*ty)).unwrap();
+        // Ref-Parameter sind geborgt; retain macht sie zu owned, sodass das
+        // Cleanup sie uniform releasen darf (Aufrufer behält seine Referenz).
+        if *ty == Ty::Ref {
+            writeln!(w, "  call void @jrt_retain(ptr %p{i})").unwrap();
+        }
     }
     writeln!(w, "  br label %bb0").unwrap();
 
@@ -301,15 +350,36 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 writeln!(w, "  {b} = icmp ne i32 {c}, 0").unwrap();
                 writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}", then_blk.0, else_blk.0).unwrap();
             }
-            Terminator::Return(None) => writeln!(w, "  ret void").unwrap(),
+            Terminator::Return(None) => {
+                emit_cleanup(w, &mut e);
+                writeln!(w, "  ret void").unwrap();
+            }
             Terminator::Return(Some(op)) => {
-                let ty = llty(operand_ty(f, op));
+                let ty = operand_ty(f, op);
                 let v = e.operand(w, op);
-                writeln!(w, "  ret {ty} {v}").unwrap();
+                // Rückgabe-Ref muss das Cleanup überleben → retain, dann
+                // transferiert der Aufrufer die +1.
+                if ty == Ty::Ref {
+                    writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                }
+                emit_cleanup(w, &mut e);
+                writeln!(w, "  ret {} {v}", llty(ty)).unwrap();
             }
         }
     }
     writeln!(w, "}}\n").unwrap();
+}
+
+/// Released alle Ref-Locals der Funktion (Owning-Slot-Modell): jedes
+/// Ref-Local hält eine Referenz, die beim Verlassen der Funktion endet.
+fn emit_cleanup(w: &mut String, e: &mut FnEmitter) {
+    for (i, ty) in e.f.locals.iter().enumerate() {
+        if *ty == Ty::Ref {
+            let t = e.fresh();
+            writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
+            writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
+        }
+    }
 }
 
 fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) {
@@ -331,7 +401,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     emit_binop(w, e, *op, aty, &av, &bv)
                 }
             };
-            writeln!(w, "  store {dty} {val}, ptr %l{}", dest.0).unwrap();
+            let _ = dty;
+            // Kopien/Konstanten ins Ref-Local sind geborgt → retain der neue,
+            // release der alte (store_dest). Nicht-Ref: schlichter store.
+            store_dest(w, e, *dest, &val, true);
         }
         Statement::Call { dest, func, args } => {
             let avs = call_args(w, e, args);
@@ -341,7 +414,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     let rty = llty(e.f.locals[d.0 as usize]);
                     let t = e.fresh();
                     writeln!(w, "  {t} = call {rty} @{func}({avs})").unwrap();
-                    writeln!(w, "  store {rty} {t}, ptr %l{}", d.0).unwrap();
+                    // Ref-Rückgabe transferiert +1 (kein retain).
+                    store_dest(w, e, *d, &t, false);
                 }
             }
         }
@@ -351,8 +425,11 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 .unwrap_or_else(|| panic!("Vtable-Slot {class}.{name}{desc} fehlt"));
             let recv = e.operand(w, &args[0]);
             writeln!(w, "  call void @jrt_null_check(ptr {recv})").unwrap();
+            // Vtable liegt im Header-Slot 1 (hinter dem refcount).
+            let vtp = e.fresh();
+            writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 1").unwrap();
             let vt = e.fresh();
-            writeln!(w, "  {vt} = load ptr, ptr {recv}").unwrap();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}").unwrap();
             let slotp = e.fresh();
             writeln!(w, "  {slotp} = getelementptr ptr, ptr {vt}, i64 {slot}").unwrap();
             let fnp = e.fresh();
@@ -370,31 +447,35 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 Some(d) => {
                     let t = e.fresh();
                     writeln!(w, "  {t} = call {} {fnp}({})", llty(*ret), avs.join(", ")).unwrap();
-                    writeln!(w, "  store {} {t}, ptr %l{}", llty(*ret), d.0).unwrap();
+                    // Ref-Rückgabe transferiert +1 (kein retain).
+                    store_dest(w, e, *d, &t, false);
                 }
             }
         }
         Statement::New { dest, class } => {
             let sn = ctx.struct_name(class);
             let t = e.fresh();
-            // sizeof über GEP-Konstante; jrt_alloc nullt (Java-Defaultwerte).
+            // sizeof über GEP-Konstante; jrt_alloc nullt Felder und setzt
+            // refcount=1 (Java-Defaultwerte + erste Referenz).
             writeln!(
                 w,
                 "  {t} = call ptr @jrt_alloc(i64 ptrtoint (ptr getelementptr ({sn}, ptr null, i32 1) to i64))"
             )
             .unwrap();
-            writeln!(w, "  store ptr @vt.{}, ptr {t}", sanitize(class)).unwrap();
-            writeln!(w, "  store ptr {t}, ptr %l{}", dest.0).unwrap();
+            store_vtable(w, e, &t, class);
+            store_dest(w, e, *dest, &t, false); // alloc gab +1
         }
         Statement::StackNew { dest, class } => {
             let sn = ctx.struct_name(class);
             let t = e.fresh();
             // Escape-Analyse hat funktions-lokale Lebenszeit bewiesen:
-            // alloca statt Heap. Nullen + Header wie bei New.
+            // alloca statt Heap. refcount=-1 macht das Objekt immortal —
+            // retain/release sind No-Ops, es wird nie freigegeben.
             writeln!(w, "  {t} = alloca {sn}").unwrap();
             writeln!(w, "  store {sn} zeroinitializer, ptr {t}").unwrap();
-            writeln!(w, "  store ptr @vt.{}, ptr {t}", sanitize(class)).unwrap();
-            writeln!(w, "  store ptr {t}, ptr %l{}", dest.0).unwrap();
+            writeln!(w, "  store i64 -1, ptr {t}").unwrap();
+            store_vtable(w, e, &t, class);
+            store_dest(w, e, *dest, &t, false);
         }
         Statement::GetField { dest, obj, class, field } => {
             let (owner, idx, ty) = ctx
@@ -406,7 +487,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {p}", llty(ty)).unwrap();
-            writeln!(w, "  store {} {t}, ptr %l{}", llty(ty), dest.0).unwrap();
+            // Feldwert ist geborgt; die Kopie ins Local wird owned → retain.
+            store_dest(w, e, *dest, &t, true);
         }
         Statement::PutField { obj, class, field, value } => {
             let (owner, idx, ty) = ctx
@@ -417,9 +499,45 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let v = e.operand(w, value);
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
-            writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
+            if ty == Ty::Ref {
+                // Feld übernimmt eine owning-Referenz: retain neu, release alt.
+                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                let old = e.fresh();
+                writeln!(w, "  {old} = load ptr, ptr {p}").unwrap();
+                writeln!(w, "  store ptr {v}, ptr {p}").unwrap();
+                writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
+            } else {
+                writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
+            }
         }
     }
+}
+
+/// Speichert `val` in den Vtable-Slot des Objektheaders (Slot 1).
+fn store_vtable(w: &mut String, e: &mut FnEmitter, obj: &str, class: &str) {
+    let vtp = e.fresh();
+    writeln!(w, "  {vtp} = getelementptr ptr, ptr {obj}, i64 1").unwrap();
+    writeln!(w, "  store ptr @vt.{}, ptr {vtp}", sanitize(class)).unwrap();
+    let _ = e;
+}
+
+/// Schreibt `val` in ein Local. Für Ref-Locals gilt die Owning-Slot-
+/// Disziplin: der alte Wert wird released, der neue ggf. retained
+/// (`retain_new`: true bei Kopie/geborgtem Wert, false bei transferierter
+/// +1-Referenz aus New/Call).
+fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_new: bool) {
+    let ty = e.f.locals[dest.0 as usize];
+    if ty != Ty::Ref {
+        writeln!(w, "  store {} {val}, ptr %l{}", llty(ty), dest.0).unwrap();
+        return;
+    }
+    let old = e.fresh();
+    writeln!(w, "  {old} = load ptr, ptr %l{}", dest.0).unwrap();
+    if retain_new {
+        writeln!(w, "  call void @jrt_retain(ptr {val})").unwrap();
+    }
+    writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
+    writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
 }
 
 fn call_args(w: &mut String, e: &mut FnEmitter, args: &[Operand]) -> String {

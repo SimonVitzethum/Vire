@@ -150,7 +150,7 @@ Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular �
 | `<clinit>` | Startup in definierter Reihenfolge; wo möglich zur Build-Zeit vorausgerechnet |
 
 **GC-Optionen** (Reihenfolge = Implementierungsplan):
-1. **Referenzzählung** — deterministisch, keine Stackmaps, leakt Zyklen; für Embedded oft ausreichend; billigster Einstieg. **Erster GC.**
+1. **Referenzzählung** ✅ **umgesetzt** — deterministisch, keine Stackmaps, leakt Zyklen; für Embedded oft ausreichend; billigster Einstieg. Modell (Backend + `runtime.c`): Objekt-Header `{ i64 refcount, ptr vtable, felder… }`; refcount<0 = *immortal* (Stack-Objekte aus der Escape-Analyse, String-/Class-Literale) → retain/release sind No-Ops. Owning-Slot-Disziplin: jedes Ref-Local/-Feld hält +1; Store retained neu / released alt; Ref-Parameter werden bei Eintritt retained; Rückgabe transferiert +1; Funktionsende released alle Ref-Locals; Vtable-Slot 0 ist die Drop-Funktion der Klasse (released Ref-Felder rekursiv über die Runtime). Aufrufargumente sind geborgt (kein RC). Leak-Detektor über `FASTLLVM_HEAPSTATS` (alloziert vs. live). Verifiziert: azyklische Graphen gehen auf 0 live, Zyklen leaken bewusst statt zu crashen. **Erster GC.**
 2. Escape-Analyse + Regionen/Arenen — eliminiert je nach Programm 20–60 % der Allokationen, ersetzt den Kollektor aber nicht.
 3. Präzises Mark-Sweep via Statepoints — realistisch 2–5k LOC.
 4. Arena-only per Spracheinschränkung (SCJ-Modell).
@@ -163,7 +163,7 @@ Stand der Garantien (umgesetzt):
 
 | Gefahr | Absicherung |
 |---|---|
-| Use-after-free | Kein manuelles `free`. Heap-Objekte leben bis Prozessende (bis RC/GC in Stufe 4); Stack-Objekte nur nach **bewiesenem** Nicht-Entkommen (Escape-Analyse, s. u.) |
+| Use-after-free | Kein manuelles `free`. Heap-Objekte werden per **Referenzzählung** (§6-GC-Option 1) freigegeben, sobald die letzte Referenz endet; Stack-Objekte nur nach **bewiesenem** Nicht-Entkommen (Escape-Analyse, s. u.). Doppel-Free ausgeschlossen (immortal-Markierung + Owning-Slot-Disziplin, per Leak-Detektor verifiziert) |
 | Wilde/uninitalisierte Pointer | `jrt_alloc` nullt; keine Pointerarithmetik in der Sprache; Casts (`checkcast`) werden **statisch bewiesen** oder sind Build-Fehler |
 | Null-Dereferenz | expliziter Check vor Feldzugriff/Dispatch → definierte `NullPointerException` statt UB |
 | Division/Überlauf | `jrt_idiv`/`jrt_irem` (Exception bei /0, `MIN/-1` definiert); Arithmetik wrappt definiert; Shift-Beträge maskiert |
@@ -182,7 +182,7 @@ Stand der Garantien (umgesetzt):
 1. Classfile-Parser + Mittel-IR (MIR-Vorbild) + naive LLVM-Absenkung — „Hello World läuft" ✅ **umgesetzt** (Cargo-Workspace `crates/`, Binary `fastjavac`; Teilmenge: statische Methoden, int-Arithmetik, Kontrollfluss, println-Intrinsics; textuelles LLVM-IR + clang statt Bindings, da inkwell/llvm-sys LLVM 22 noch nicht abdecken)
 2. Closed-World-Reachability + CHA-Devirt + Inlining (größter Hebel, geringste Forschungsunsicherheit) ✅ **umgesetzt** (`crates/solver`: RTA-Fixpunkt nach Bacon/Sweeney, Devirtualisierung monomorpher Sites mit erhaltenem Null-Check, Pruning unerreichbarer Funktionen, Mid-IR-Inliner; dazu Objektmodell: Prefix-Layout `{vtable-ptr, super-Felder, eigene Felder}`, Vtables mit geerbten Slots, `jrt_alloc` nullt Felder — noch ohne GC, Objekte leben bis Prozessende; Interfaces/`invokeinterface`, Arrays, statische Felder und `<clinit>` weiterhin außerhalb der Teilmenge)
 3. TBAA-Baum + Escape-Analyse (Heap→Stack, Lock-Elision) — ⚙️ **teilweise**: Escape-Analyse mit Stack-Allokation umgesetzt (§6a); TBAA und Lock-Elision offen. Dazu vorgezogen aus §1.3: statische Reflection-Auflösung (forName/getName/newInstance/X.class, checkcast-Beweis)
-4. RC-GC + Mini-Runtime (`no_std`, seL4-Target)
+4. RC-GC + Mini-Runtime (`no_std`, seL4-Target) — ✅ **umgesetzt** (Referenzzählung, §6-GC-Option 1; Runtime aktuell hosted/libc, `no_std`-Port offen)
 5. PGO + guarded devirtualization
 6. Objektsensitive Points-to zur Präzisionsverschärfung
 7. Forschungsmodule (optional): Ownership/Regionen, SMT-Orakel-Ausbau
