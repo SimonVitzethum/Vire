@@ -334,10 +334,12 @@ fn lower_method(
                     leaders.push(*next_pc);
                 }
             }
-            // Werfende Aufrufe beenden den Block (danach folgt der
-            // Exception-Check), also ist die nächste Instruktion ein Leader.
-            // (invokedynamic = Konkatenation wirft nicht.)
-            Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_) => {
+            // Werfende Operationen beenden den Block (danach folgt der
+            // Exception-Check). invokedynamic (Konkatenation) wirft nicht;
+            // Division wirft ArithmeticException.
+            Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_)
+            | Instr::InvokeInterface(_)
+            | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -743,6 +745,7 @@ fn lower_block(
                     args: vec![Operand::Copy(a), Operand::Copy(b)],
                 });
                 stack.push(Ty::I64);
+                throw_after = Some(*pc);
             }
             Instr::LCmp | Instr::DCmpL | Instr::DCmpG => {
                 let func = match instr {
@@ -792,14 +795,12 @@ fn lower_block(
                 });
                 stack.push(ty);
             }
-            Instr::IAdd | Instr::ISub | Instr::IMul | Instr::IDiv | Instr::IRem
+            Instr::IAdd | Instr::ISub | Instr::IMul
             | Instr::IShl | Instr::IShr | Instr::IUShr | Instr::IAnd | Instr::IOr | Instr::IXor => {
                 let op = match instr {
                     Instr::IAdd => BinOp::Add,
                     Instr::ISub => BinOp::Sub,
                     Instr::IMul => BinOp::Mul,
-                    Instr::IDiv => BinOp::Div,
-                    Instr::IRem => BinOp::Rem,
                     Instr::IShl => BinOp::Shl,
                     Instr::IShr => BinOp::Shr,
                     Instr::IUShr => BinOp::UShr,
@@ -810,6 +811,20 @@ fn lower_block(
                 let b = pop!();
                 let a = pop!();
                 push!(Ty::I32, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
+            }
+            // Division/Rest werfen ArithmeticException → werfender Runtime-Call.
+            Instr::IDiv | Instr::IRem => {
+                let func = if matches!(instr, Instr::IDiv) { "jrt_idiv" } else { "jrt_irem" };
+                let b = pop!();
+                let a = pop!();
+                let l = ml.stack_slot(stack.len(), Ty::I32);
+                stmts.push(Statement::Call {
+                    dest: Some(l),
+                    func: func.to_string(),
+                    args: vec![Operand::Copy(a), Operand::Copy(b)],
+                });
+                stack.push(Ty::I32);
+                throw_after = Some(*pc);
             }
             Instr::Pop => {
                 pop!();

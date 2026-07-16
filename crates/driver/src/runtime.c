@@ -382,10 +382,27 @@ void jrt_null_check(const void *p) {
  * jedem werfenden Aufruf jrt_pending_set und springt zum Handler oder
  * propagiert. jrt_take_pending übergibt die Referenz an den Handler. */
 static void *pending_exception = NULL;
+/* Meldungstext einer schwebenden Laufzeit-Exception (Sentinel); NULL bei
+ * benutzergeworfenen Exceptions. */
+static const char *pending_message = NULL;
 
 void jrt_throw(void *e) {
     jrt_retain(e); /* bleibt am Leben, solange sie schwebt */
     pending_exception = e;
+    pending_message = NULL;
+}
+
+/* Sentinel-Objekte für Laufzeit-Exceptions (NPE, ArithmeticException, …):
+ * immortale Header (refcount -1) mit einer No-Op-Vtable ohne
+ * Type-Descriptor. Von catch-all (catch Exception / RuntimeException)
+ * gefangen; ihre Meldung überlebt bis zur Uncaught-Ausgabe. */
+void *jrt_sentinel_vtable[3] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, NULL};
+static JObjHeader arith_exc_obj = {-1, 0, jrt_sentinel_vtable};
+
+/* Von den Runtime-Checks aufgerufen: schwebende Laufzeit-Exception setzen. */
+static void throw_runtime(void *sentinel, const char *msg) {
+    pending_exception = sentinel;
+    pending_message = msg;
 }
 int32_t jrt_pending_set(void) {
     return pending_exception != NULL;
@@ -427,7 +444,11 @@ int32_t jrt_pending_instanceof(void *target_td) {
  * späterer Schritt, DESIGN.md §6.) */
 void jrt_check_uncaught(void) {
     if (pending_exception) {
-        fputs("Exception in thread \"main\" (unbehandelte Exception)\n", stderr);
+        if (pending_message) {
+            fprintf(stderr, "Exception in thread \"main\" %s\n", pending_message);
+        } else {
+            fputs("Exception in thread \"main\" (unbehandelte Exception)\n", stderr);
+        }
         exit(1);
     }
 }
@@ -496,12 +517,14 @@ void jrt_noop_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; }
 
 /* --- Java-Arithmetik-Semantik ---------------------------------------- */
 
-/* JLS 15.17.2: Division durch 0 wirft ArithmeticException;
- * INT_MIN / -1 ist definiert als INT_MIN (in C wäre beides UB). */
+/* JLS 15.17.2: Division durch 0 wirft ArithmeticException (jetzt abfangbar
+ * über das pending-Modell); INT_MIN / -1 ist definiert als INT_MIN. */
+#define ARITH_MSG "java.lang.ArithmeticException: / by zero"
+
 int32_t jrt_idiv(int32_t a, int32_t b) {
     if (b == 0) {
-        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
-        exit(1);
+        throw_runtime(&arith_exc_obj, ARITH_MSG);
+        return 0;
     }
     if (a == INT32_MIN && b == -1)
         return INT32_MIN;
@@ -510,8 +533,8 @@ int32_t jrt_idiv(int32_t a, int32_t b) {
 
 int32_t jrt_irem(int32_t a, int32_t b) {
     if (b == 0) {
-        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
-        exit(1);
+        throw_runtime(&arith_exc_obj, ARITH_MSG);
+        return 0;
     }
     if (a == INT32_MIN && b == -1)
         return 0;
@@ -522,8 +545,8 @@ int32_t jrt_irem(int32_t a, int32_t b) {
 
 int64_t jrt_ldiv(int64_t a, int64_t b) {
     if (b == 0) {
-        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
-        exit(1);
+        throw_runtime(&arith_exc_obj, ARITH_MSG);
+        return 0;
     }
     if (a == INT64_MIN && b == -1)
         return INT64_MIN;
@@ -532,8 +555,8 @@ int64_t jrt_ldiv(int64_t a, int64_t b) {
 
 int64_t jrt_lrem(int64_t a, int64_t b) {
     if (b == 0) {
-        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
-        exit(1);
+        throw_runtime(&arith_exc_obj, ARITH_MSG);
+        return 0;
     }
     if (a == INT64_MIN && b == -1)
         return 0;
