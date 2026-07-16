@@ -379,7 +379,7 @@ fn lower_method(
             | Instr::InvokeInterface(_)
             | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem
             | Instr::IaLoad | Instr::AaLoad | Instr::IaStore | Instr::AaStore
-            | Instr::ArrayLength => {
+            | Instr::ArrayLength | Instr::GetField(_) | Instr::PutField(_) => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -1027,6 +1027,7 @@ fn lower_block(
                 let l = ml.stack_slot(stack.len(), fty);
                 stmts.push(Statement::GetField { dest: l, obj: Operand::Copy(obj), class, field });
                 stack.push(fty);
+                throw_after = Some(*pc); // NPE bei null-Objekt
             }
             Instr::PutField(idx) => {
                 let (class, field, _) = ml.cf.member_ref(*idx)?;
@@ -1042,6 +1043,7 @@ fn lower_block(
                     field,
                     value: Operand::Copy(value),
                 });
+                throw_after = Some(*pc); // NPE bei null-Objekt
             }
             Instr::InvokeSpecial(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;

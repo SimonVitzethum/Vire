@@ -80,6 +80,13 @@ pub enum Statement {
         func: String,
         args: Vec<Operand>,
     },
+    /// Devirtualisierter Instanzaufruf: wie `Call`, aber `args[0]` (der
+    /// Receiver) wird auf null geprüft → abfangbare NullPointerException.
+    CallGuarded {
+        dest: Option<Local>,
+        func: String,
+        args: Vec<Operand>,
+    },
     /// Virtueller Aufruf über die Vtable; `args[0]` ist der Receiver.
     /// `class` ist der statische Typ des Call-Sites; der Solver ersetzt
     /// monomorphe Sites durch `Call` (CHA-Devirtualisierung).

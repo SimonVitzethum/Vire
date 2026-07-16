@@ -98,6 +98,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_println_double", "void (double)"),
     ("jrt_alloc", "ptr (i64)"),
     ("jrt_null_check", "void (ptr)"),
+    ("jrt_throw_npe", "void ()"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
     ("jrt_throw", "void (ptr)"),
@@ -616,12 +617,20 @@ fn operand_ty(f: &Function, op: &Operand) -> Ty {
 struct FnEmitter<'a> {
     f: &'a Function,
     tmp: u32,
+    label: u32,
 }
 
 impl<'a> FnEmitter<'a> {
     fn fresh(&mut self) -> String {
         self.tmp += 1;
         format!("%t{}", self.tmp)
+    }
+
+    /// Frisches LLVM-Blocklabel (für Mid-Block-Verzweigungen wie den
+    /// Null-Skip bei Feld-/Receiver-Zugriffen).
+    fn fresh_label(&mut self) -> String {
+        self.label += 1;
+        format!("nz{}", self.label)
     }
 
     /// Materialisiert einen Operanden als SSA-Wert; Locals werden geladen.
@@ -675,7 +684,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     }
     writeln!(w, "  br label %bb0").unwrap();
 
-    let mut e = FnEmitter { f, tmp: 0 };
+    let mut e = FnEmitter { f, tmp: 0, label: 0 };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -778,12 +787,53 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 }
             }
         }
+        // Devirtualisierter Instanzaufruf mit abfangbarer Receiver-NPE.
+        Statement::CallGuarded { dest, func, args } => {
+            let recv = e.operand(w, &args[0]);
+            let avs = call_args(w, e, args);
+            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {recv}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+            writeln!(w, "{nb}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{ok}:").unwrap();
+            match dest {
+                None => writeln!(w, "  call void @{func}({avs})").unwrap(),
+                Some(d) => {
+                    let rty = llty(e.f.locals[d.0 as usize]);
+                    let t = e.fresh();
+                    writeln!(w, "  {t} = call {rty} @{func}({avs})").unwrap();
+                    store_dest(w, e, *d, &t, false);
+                }
+            }
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{cont}:").unwrap();
+        }
         Statement::CallVirtual { dest, class, name, desc, params, ret, args } => {
             let slot = ctx
                 .vtable_index(class, name, desc)
                 .unwrap_or_else(|| panic!("Vtable-Slot {class}.{name}{desc} fehlt"));
             let recv = e.operand(w, &args[0]);
-            writeln!(w, "  call void @jrt_null_check(ptr {recv})").unwrap();
+            // Restliche Argumente vor dem Verzweigen materialisieren (dürfen
+            // in beiden Zweigen benutzt werden).
+            let mut avs = vec![format!("ptr {recv}")];
+            for a in &args[1..] {
+                let ty = llty(operand_ty(e.f, a));
+                let v = e.operand(w, a);
+                avs.push(format!("{ty} {v}"));
+            }
+            let _ = params;
+            // Abfangbare Receiver-NPE: bei null zum npe-Block, sonst Dispatch.
+            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {recv}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+            writeln!(w, "{nb}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{ok}:").unwrap();
             // Vtable liegt im Header (hinter refcount + rcflags).
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
@@ -793,14 +843,6 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {slotp} = getelementptr ptr, ptr {vt}, i64 {slot}").unwrap();
             let fnp = e.fresh();
             writeln!(w, "  {fnp} = load ptr, ptr {slotp}").unwrap();
-            // Receiver wurde schon materialisiert; restliche Argumente jetzt.
-            let mut avs = vec![format!("ptr {recv}")];
-            for a in &args[1..] {
-                let ty = llty(operand_ty(e.f, a));
-                let v = e.operand(w, a);
-                avs.push(format!("{ty} {v}"));
-            }
-            let _ = params;
             match dest {
                 None => writeln!(w, "  call {} {fnp}({})", llty(*ret), avs.join(", ")).unwrap(),
                 Some(d) => {
@@ -810,6 +852,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     store_dest(w, e, *d, &t, false);
                 }
             }
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{cont}:").unwrap();
         }
         Statement::New { dest, class } => {
             let sn = ctx.struct_name(class);
@@ -841,21 +885,38 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 .field_slot(class, field)
                 .unwrap_or_else(|| panic!("Feld {class}.{field} fehlt"));
             let o = e.operand(w, obj);
-            writeln!(w, "  call void @jrt_null_check(ptr {o})").unwrap();
+            // Abfangbare NPE: bei null zum npe-Block (pending), sonst Zugriff.
+            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+            writeln!(w, "{nb}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{ok}:").unwrap();
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {p}", llty(ty)).unwrap();
             // Feldwert ist geborgt; die Kopie ins Local wird owned → retain.
             store_dest(w, e, *dest, &t, true);
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{cont}:").unwrap();
         }
         Statement::PutField { obj, class, field, value } => {
             let (owner, idx, ty) = ctx
                 .field_slot(class, field)
                 .unwrap_or_else(|| panic!("Feld {class}.{field} fehlt"));
             let o = e.operand(w, obj);
-            writeln!(w, "  call void @jrt_null_check(ptr {o})").unwrap();
             let v = e.operand(w, value);
+            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+            writeln!(w, "{nb}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{ok}:").unwrap();
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             if ty == Ty::Ref {
@@ -868,6 +929,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             } else {
                 writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
             }
+            writeln!(w, "  br label %{cont}").unwrap();
+            writeln!(w, "{cont}:").unwrap();
         }
         Statement::GetStatic { dest, class, field } => {
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));

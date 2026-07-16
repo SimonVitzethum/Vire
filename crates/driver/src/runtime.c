@@ -557,6 +557,13 @@ static void throw_runtime(void *sentinel, const char *msg) {
     pending_exception = sentinel;
     pending_message = msg;
 }
+
+/* Abfangbare NullPointerException (Feld-/Receiver-Zugriff): Sentinel in
+ * pending setzen; der generierte Code überspringt den Zugriff und prüft
+ * danach pending. */
+void jrt_throw_npe(void) {
+    throw_runtime(&npe_exc_obj, "java.lang.NullPointerException");
+}
 int32_t jrt_pending_set(void) {
     return pending_exception != NULL;
 }

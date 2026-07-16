@@ -143,17 +143,13 @@ pub fn run(program: &mut Program) -> Stats {
                             unreachable!()
                         };
                         // Java-Semantik: auch der devirtualisierte Aufruf
-                        // wirft NPE bei null-Receiver.
+                        // wirft NPE bei null-Receiver (abfangbar via CallGuarded).
                         bb.statements.insert(
                             i,
-                            Statement::Call { dest: None, func: "jrt_null_check".into(), args: vec![args[0].clone()] },
-                        );
-                        bb.statements.insert(
-                            i + 1,
-                            Statement::Call { dest, func: targets.into_iter().next().unwrap(), args },
+                            Statement::CallGuarded { dest, func: targets.into_iter().next().unwrap(), args },
                         );
                         stats.devirtualized += 1;
-                        i += 2;
+                        i += 1;
                         continue;
                     }
                 }
