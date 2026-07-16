@@ -174,7 +174,7 @@ Stand der Garantien (umgesetzt):
 
 **Reflection/„dynamisches" Klassenladen (umgesetzt, §1.3):** `Class.forName`, `X.class`, `getName`, `newInstance` werden per lokaler Konstantenpropagation (Origin-Analyse mit Copy-Ketten) zur Compile-Zeit aufgelöst; Class-Objekte sind Singletons mit Pointer-Identität. Nicht auflösbar → Build-Fehler mit Begründung, keine stillen Laufzeitfallen.
 
-**Klassenbibliothek:** „läuft echter Java-Code" heißt `java.base` (String = UTF-16, Collections, Math, IO). OpenJDK `java.base` ist GPLv2 **mit Classpath Exception** → statisches Linken erlaubt. Alternativen: TeaVM-Classlib (Apache-2.0, Teilmenge), GNU Classpath.
+**Klassenbibliothek:** „läuft echter Java-Code" heißt `java.base` (String = UTF-16, Collections, Math, IO). OpenJDK `java.base` ist GPLv2 **mit Classpath Exception** → statisches Linken erlaubt. Alternativen: TeaVM-Classlib (Apache-2.0, Teilmenge), GNU Classpath. **Umgesetzte Teilmenge:** `String.length/charAt/equals/isEmpty` und `System.out.print(ln)` für String/int/char als Runtime-Intrinsics (Byte-/ASCII-Semantik statt UTF-16; `charAt` liefert das Byte). Offen: String-Konkatenation (Java 9+ via `invokedynamic`/StringConcatFactory — statisch auflösbar im Geist von §1.3, aber noch nicht gebaut), StringBuilder, Collections.
 
 ---
 

@@ -51,6 +51,52 @@ void jrt_println_ln(void) {
     fputc('\n', stdout);
 }
 
+void jrt_print_char(int32_t c) {
+    fputc(c, stdout);
+}
+
+void jrt_println_char(int32_t c) {
+    fputc(c, stdout);
+    fputc('\n', stdout);
+}
+
+/* String-Methoden (Byte-/ASCII-Semantik, s. Frontend-Kommentar). */
+int32_t jrt_str_length(const JStr *s) {
+    if (!s) {
+        fputs("Exception in thread \"main\" java.lang.NullPointerException\n", stderr);
+        exit(1);
+    }
+    return (int32_t)s->len;
+}
+
+int32_t jrt_str_is_empty(const JStr *s) {
+    return jrt_str_length(s) == 0;
+}
+
+int32_t jrt_str_char_at(const JStr *s, int32_t i) {
+    if (!s) {
+        fputs("Exception in thread \"main\" java.lang.NullPointerException\n", stderr);
+        exit(1);
+    }
+    if (i < 0 || i >= s->len) {
+        fprintf(stderr,
+                "Exception in thread \"main\" "
+                "java.lang.StringIndexOutOfBoundsException: index %d, length %lld\n",
+                i, (long long)s->len);
+        exit(1);
+    }
+    return (int32_t)s->bytes[i];
+}
+
+int32_t jrt_str_equals(const JStr *a, const JStr *b) {
+    if (a == b) return 1;
+    if (!a || !b || a->len != b->len) return 0;
+    for (int64_t i = 0; i < a->len; i++) {
+        if (a->bytes[i] != b->bytes[i]) return 0;
+    }
+    return 1;
+}
+
 /* --- Referenzzählung + Zyklen-Collector ------------------------------ */
 
 typedef struct {

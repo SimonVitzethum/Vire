@@ -655,6 +655,8 @@ fn lower_block(
                     ("java/io/PrintStream", "println", "()V") => Some("jrt_println_ln"),
                     ("java/io/PrintStream", "print", "(Ljava/lang/String;)V") => Some("jrt_print_str"),
                     ("java/io/PrintStream", "print", "(I)V") => Some("jrt_print_int"),
+                    ("java/io/PrintStream", "println", "(C)V") => Some("jrt_println_char"),
+                    ("java/io/PrintStream", "print", "(C)V") => Some("jrt_print_char"),
                     _ => None,
                 };
                 if let Some(intrinsic) = intrinsic {
@@ -665,6 +667,34 @@ fn lower_block(
                         func: intrinsic.to_string(),
                         args: arg.into_iter().map(Operand::Copy).collect(),
                     });
+                    continue;
+                }
+                // String-Methoden als Runtime-Intrinsics (Receiver ist ein
+                // echtes Argument, kein Dummy). UTF-8/Byte-Semantik: charAt
+                // liefert das Byte — für ASCII korrekt (Java: UTF-16-Einheit).
+                if class == "java/lang/String" {
+                    let func = match (name, desc) {
+                        ("length", "()I") => "jrt_str_length",
+                        ("charAt", "(I)C") => "jrt_str_char_at",
+                        ("equals", "(Ljava/lang/Object;)Z") => "jrt_str_equals",
+                        ("isEmpty", "()Z") => "jrt_str_is_empty",
+                        _ => {
+                            return Err(FrontendError::Unsupported(format!(
+                                "String.{name}{desc} (Teilmenge: length, charAt, equals, isEmpty)"
+                            )))
+                        }
+                    };
+                    let (ptys, _) = parse_descriptor(&desc)?;
+                    let mut args = Vec::new();
+                    for _ in &ptys {
+                        args.push(Operand::Copy(pop!()));
+                    }
+                    let recv = pop!();
+                    args.push(Operand::Copy(recv));
+                    args.reverse();
+                    let l = ml.stack_slot(stack.len(), Ty::I32);
+                    stack.push(Ty::I32);
+                    stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
                     continue;
                 }
                 // Reflection auf einem statisch bekannten Class-Objekt.
