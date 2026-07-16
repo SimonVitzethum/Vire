@@ -19,24 +19,20 @@ pub fn inline_program(program: &mut Program) -> usize {
     let size = |f: &Function| f.blocks.iter().map(|b| b.statements.len()).sum::<usize>();
     let calls_self = |f: &Function| {
         f.blocks.iter().flat_map(|b| &b.statements).any(|st| {
-            matches!(st, Statement::Call { func, .. } if *func == f.name)
+            matches!(st, Statement::Call { func, .. } | Statement::CallGuarded { func, .. }
+                if *func == f.name)
         })
     };
-    // Funktionen mit Exception-Kontrollfluss nicht inlinen: ihr
-    // Propagate-Return würde beim Inlinen zum normalen Fortsetzungsblock
-    // umgebogen und der pending-Check des Aufrufers ginge verloren.
-    let has_exception_flow = |f: &Function| {
-        f.blocks.iter().flat_map(|b| &b.statements).any(|st| {
-            matches!(st, Statement::Call { func, .. }
-                if func == "jrt_throw" || func == "jrt_pending_set" || func == "jrt_take_pending")
-        })
-    };
+    // Exception-Fluss im Callee ist inlinebar: jeder Aufruf-Site hat einen
+    // pending-Check danach (throw_after), sodass eine aus dem geinlinten
+    // Rumpf propagierende Exception im Fortsetzungsblock erkannt wird; ein
+    // interner try/catch-Handler ist ohnehin selbstständig.
 
     // Kandidaten kopieren, damit Aufrufer mutierbar bleiben.
     let candidates: BTreeMap<String, Function> = program
         .functions
         .iter()
-        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f) && !has_exception_flow(f))
+        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f))
         .map(|f| (f.name.clone(), f.clone()))
         .collect();
 
@@ -56,42 +52,97 @@ pub fn inline_program(program: &mut Program) -> usize {
 fn find_call_site(f: &Function, candidates: &BTreeMap<String, Function>) -> Option<(usize, usize)> {
     for (bi, bb) in f.blocks.iter().enumerate() {
         for (si, st) in bb.statements.iter().enumerate() {
-            if let Statement::Call { func, .. } = st {
-                if candidates.contains_key(func) && *func != f.name {
-                    return Some((bi, si));
-                }
+            let func = match st {
+                Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => func,
+                _ => continue,
+            };
+            if candidates.contains_key(func) && *func != f.name {
+                return Some((bi, si));
             }
         }
     }
     None
 }
 
-/// Ersetzt den Call in Block `blk` an Index `idx` durch den Rumpf des Callees:
-/// Block wird am Call geteilt, Callee-Blöcke (mit umnummerierten Locals und
-/// Blöcken) angehängt, Returns auf den Fortsetzungsblock umgebogen.
+/// Ersetzt den (ggf. bewachten) Call in Block `blk` an Index `idx` durch den
+/// Rumpf des Callees: Block wird am Call geteilt, Callee-Blöcke (mit
+/// umnummerierten Locals und Blöcken) angehängt, Returns auf den
+/// Fortsetzungsblock umgebogen. Für `CallGuarded` wird ein Null-Check des
+/// Receivers als Wächter vorangestellt (abfangbare NPE bleibt erhalten).
 fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String, Function>) {
-    let Statement::Call { dest, func, args } = f.blocks[blk].statements[idx].clone() else {
-        unreachable!()
+    let (dest, func, args, guarded) = match f.blocks[blk].statements[idx].clone() {
+        Statement::Call { dest, func, args } => (dest, func, args, false),
+        Statement::CallGuarded { dest, func, args } => (dest, func, args, true),
+        _ => unreachable!(),
     };
     let callee = &candidates[&func];
 
     let local_off = f.locals.len() as u32;
-    let block_off = f.blocks.len() as u32;
-    let cont_block = Block(block_off + callee.blocks.len() as u32);
-
     f.locals.extend(callee.locals.iter().copied());
+    // Bei bewachtem Aufruf: zwei zusätzliche synthetische Blöcke (npe, arg)
+    // vor den Callee-Blöcken; sonst beginnen die Callee-Blöcke direkt.
+    let extra = if guarded { 2u32 } else { 0 };
+    let block_off = f.blocks.len() as u32;
+    let callee_first = block_off + extra;
+    let cont_block = Block(callee_first + callee.blocks.len() as u32);
 
-    // Aufrufer-Block teilen: [0..idx) + Argument-Zuweisungen + Sprung in
-    // den Callee; Rest wandert in den Fortsetzungsblock.
     let tail: Vec<Statement> = f.blocks[blk].statements.split_off(idx + 1);
-    f.blocks[blk].statements.pop(); // der Call selbst
+    f.blocks[blk].statements.pop(); // der (bewachte) Call selbst
+
+    if guarded {
+        // Aufrufer-Block: Receiver == null? → npe-Block, sonst arg-Block.
+        let cmp = f.locals.len() as u32;
+        f.locals.push(Ty::I32);
+        f.blocks[blk].statements.push(Statement::Assign(
+            Local(cmp),
+            Rvalue::Binary(BinOp::CmpEq, args[0].clone(), Operand::ConstNull),
+        ));
+        let cont_term = std::mem::replace(
+            &mut f.blocks[blk].terminator,
+            Terminator::Branch {
+                cond: Operand::Copy(Local(cmp)),
+                then_blk: Block(block_off),     // npe
+                else_blk: Block(block_off + 1), // arg
+            },
+        );
+        // npe-Block.
+        f.blocks.push(BasicBlock {
+            statements: vec![Statement::Call { dest: None, func: "jrt_throw_npe".into(), args: vec![] }],
+            terminator: Terminator::Goto(cont_block),
+        });
+        // arg-Block: Argument-Zuweisungen, dann in den Callee.
+        let arg_assigns = args
+            .into_iter()
+            .enumerate()
+            .map(|(k, arg)| Statement::Assign(Local(local_off + k as u32), Rvalue::Use(arg)))
+            .collect();
+        f.blocks.push(BasicBlock { statements: arg_assigns, terminator: Terminator::Goto(Block(callee_first)) });
+        splice_callee(f, callee, dest, local_off, callee_first, cont_block);
+        f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
+        return;
+    }
+
+    // Ungewachter Call: Argument-Zuweisungen direkt im Aufrufer-Block.
     for (k, arg) in args.into_iter().enumerate() {
         f.blocks[blk]
             .statements
             .push(Statement::Assign(Local(local_off + k as u32), Rvalue::Use(arg)));
     }
-    let cont_term = std::mem::replace(&mut f.blocks[blk].terminator, Terminator::Goto(Block(block_off)));
+    let cont_term = std::mem::replace(&mut f.blocks[blk].terminator, Terminator::Goto(Block(callee_first)));
+    splice_callee(f, callee, dest, local_off, callee_first, cont_block);
+    f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
+}
 
+/// Hängt die (umnummerierten) Callee-Blöcke an; Returns werden zu Sprüngen
+/// in den Fortsetzungsblock (mit Zuweisung des Rückgabewerts an `dest`).
+fn splice_callee(
+    f: &mut Function,
+    callee: &Function,
+    dest: Option<Local>,
+    local_off: u32,
+    block_off: u32,
+    cont_block: Block,
+) {
     for cb in &callee.blocks {
         let mut statements: Vec<Statement> = cb.statements.clone();
         for st in &mut statements {
@@ -119,8 +170,6 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
         };
         f.blocks.push(BasicBlock { statements, terminator });
     }
-
-    f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
 }
 
 fn remap_local(l: &mut Local, off: u32) {
