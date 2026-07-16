@@ -24,6 +24,7 @@
 
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
+void *jrt_alloc(int64_t size);
 
 /* Vtable für zur Laufzeit erzeugte Strings. Ihr Layout (mit Type-Descriptor
  * und den Object-Methoden-Slots) ist programmabhängig, daher wird sie im
@@ -142,10 +143,84 @@ void *jrt_obj_tostring(void *o) {
     return str_from_buf("object", 6);
 }
 
+/* --- Wrapper-Klassen (Autoboxing) -----------------------------------
+ * Integer/Long/Boolean sind reguläre Objekte (RC-verwaltet) mit einem
+ * eingepackten Primitivwert und generierter Vtable (Object-Methoden).
+ * Die Vtable-Zeiger setzt @main beim Start (programmabhängiges Layout).
+ * Kein Wertecache (-128..127) → boxed-Identität kann von Java abweichen;
+ * equals ist korrekt. */
+void *jrt_integer_vt = NULL;
+void *jrt_long_vt = NULL;
+void *jrt_boolean_vt = NULL;
+
+typedef struct {
+    int64_t refcount, rcflags;
+    void *vtable;
+    int32_t value;
+} JInteger;
+typedef struct {
+    int64_t refcount, rcflags;
+    void *vtable;
+    int64_t value;
+} JLong;
+
+void *jrt_integer_valueof(int32_t v) {
+    JInteger *o = (JInteger *)jrt_alloc((int64_t)sizeof(JInteger));
+    o->vtable = jrt_integer_vt;
+    o->value = v;
+    return o;
+}
+int32_t jrt_integer_intvalue(void *o) { return ((JInteger *)o)->value; }
+int32_t jrt_integer_hashcode(void *o) { return ((JInteger *)o)->value; }
+int32_t jrt_integer_equals(void *a, void *b) {
+    if (!b || ((JInteger *)b)->vtable != jrt_integer_vt) return 0;
+    return ((JInteger *)a)->value == ((JInteger *)b)->value;
+}
+void *jrt_integer_tostring(void *o) {
+    char buf[16];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%d", ((JInteger *)o)->value));
+}
+
+void *jrt_long_valueof(int64_t v) {
+    JLong *o = (JLong *)jrt_alloc((int64_t)sizeof(JLong));
+    o->vtable = jrt_long_vt;
+    o->value = v;
+    return o;
+}
+int64_t jrt_long_longvalue(void *o) { return ((JLong *)o)->value; }
+int32_t jrt_long_hashcode(void *o) {
+    int64_t v = ((JLong *)o)->value;
+    return (int32_t)(v ^ (v >> 32)); /* Java Long.hashCode */
+}
+int32_t jrt_long_equals(void *a, void *b) {
+    if (!b || ((JLong *)b)->vtable != jrt_long_vt) return 0;
+    return ((JLong *)a)->value == ((JLong *)b)->value;
+}
+void *jrt_long_tostring(void *o) {
+    char buf[24];
+    return str_from_buf(buf, snprintf(buf, sizeof buf, "%lld", (long long)((JLong *)o)->value));
+}
+
+/* Boolean nutzt dasselbe Layout wie Integer (0/1). */
+void *jrt_boolean_valueof(int32_t v) {
+    JInteger *o = (JInteger *)jrt_alloc((int64_t)sizeof(JInteger));
+    o->vtable = jrt_boolean_vt;
+    o->value = v ? 1 : 0;
+    return o;
+}
+int32_t jrt_boolean_booleanvalue(void *o) { return ((JInteger *)o)->value; }
+int32_t jrt_boolean_hashcode(void *o) { return ((JInteger *)o)->value ? 1231 : 1237; }
+int32_t jrt_boolean_equals(void *a, void *b) {
+    if (!b || ((JInteger *)b)->vtable != jrt_boolean_vt) return 0;
+    return ((JInteger *)a)->value == ((JInteger *)b)->value;
+}
+void *jrt_boolean_tostring(void *o) {
+    return ((JInteger *)o)->value ? str_from_buf("true", 4) : str_from_buf("false", 5);
+}
+
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
  * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
  * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */
-void *jrt_alloc(int64_t size);
 
 static JStr *str_alloc(int64_t len) {
     JStr *s = (JStr *)jrt_alloc((int64_t)sizeof(JStr) + len);

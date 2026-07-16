@@ -52,6 +52,21 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_obj_equals", "i32 (ptr, ptr)"),
     ("jrt_obj_hashcode", "i32 (ptr)"),
     ("jrt_obj_tostring", "ptr (ptr)"),
+    ("jrt_integer_valueof", "ptr (i32)"),
+    ("jrt_integer_intvalue", "i32 (ptr)"),
+    ("jrt_integer_equals", "i32 (ptr, ptr)"),
+    ("jrt_integer_hashcode", "i32 (ptr)"),
+    ("jrt_integer_tostring", "ptr (ptr)"),
+    ("jrt_long_valueof", "ptr (i64)"),
+    ("jrt_long_longvalue", "i64 (ptr)"),
+    ("jrt_long_equals", "i32 (ptr, ptr)"),
+    ("jrt_long_hashcode", "i32 (ptr)"),
+    ("jrt_long_tostring", "ptr (ptr)"),
+    ("jrt_boolean_valueof", "ptr (i32)"),
+    ("jrt_boolean_booleanvalue", "i32 (ptr)"),
+    ("jrt_boolean_equals", "i32 (ptr, ptr)"),
+    ("jrt_boolean_hashcode", "i32 (ptr)"),
+    ("jrt_boolean_tostring", "ptr (ptr)"),
     ("jrt_str_concat", "ptr (ptr, ptr)"),
     ("jrt_int_to_str", "ptr (i32)"),
     ("jrt_long_to_str", "ptr (i64)"),
@@ -266,6 +281,9 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
     writeln!(w, "@jrt_dyn_string_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_integer_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_long_vt = external global ptr").unwrap();
+    writeln!(w, "@jrt_boolean_vt = external global ptr").unwrap();
     // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
     // aber refcount -1 = immortal → retain/release/Collector No-Op, die
     // Read-only-Konstante bleibt unberührt. Vtable = @vt.java_lang_String
@@ -359,11 +377,30 @@ pub fn emit(program: &Program) -> String {
             _ => None,
         })
         .collect();
-    // Strings nehmen am virtuellen Dispatch teil (equals/hashCode/toString)
-    // → eigene Vtable, obwohl sie nicht via `new` erzeugt werden.
+    // Strings/Wrapper nehmen am virtuellen Dispatch teil (equals/hashCode/
+    // toString) → eigene Vtable, obwohl sie nicht via `new` erzeugt werden.
     let mut instantiated = instantiated;
     if program.class("java/lang/String").is_some() {
         instantiated.insert("java/lang/String");
+    }
+    let calls_fn = |sym: &str| {
+        program
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.statements)
+            .any(|st| matches!(st, Statement::Call { func, .. } if func == sym))
+    };
+    // (valueOf-Funktion, Klasse, dynamischer Vtable-Zeiger)
+    let wrappers = [
+        ("jrt_integer_valueof", "java/lang/Integer", "jrt_integer_vt"),
+        ("jrt_long_valueof", "java/lang/Long", "jrt_long_vt"),
+        ("jrt_boolean_valueof", "java/lang/Boolean", "jrt_boolean_vt"),
+    ];
+    for (vf, cls, _) in &wrappers {
+        if calls_fn(vf) {
+            instantiated.insert(cls);
+        }
     }
     for class in &instantiated {
         // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); dann die globalen
@@ -472,8 +509,13 @@ pub fn emit(program: &Program) -> String {
 
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
-        // Vtable für zur Laufzeit erzeugte Strings bekanntmachen.
+        // Vtable-Zeiger für zur Laufzeit erzeugte String-/Wrapper-Objekte.
         writeln!(w, "  store ptr @vt.java_lang_String, ptr @jrt_dyn_string_vt").unwrap();
+        for (vf, cls, vt) in &wrappers {
+            if calls_fn(vf) {
+                writeln!(w, "  store ptr @vt.{}, ptr @{vt}", sanitize(cls)).unwrap();
+            }
+        }
         // Statische Initialisierer vor main, Superklasse vor Subklasse.
         let mut emitted: BTreeSet<String> = BTreeSet::new();
         for c in &program.classes {

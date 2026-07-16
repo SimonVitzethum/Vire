@@ -111,20 +111,24 @@ pub fn register_builtins(program: &mut Program) {
         has_body: true,
         mangled: mangled.to_string(),
     };
-    program.classes.push(ClassInfo {
-        name: "java/lang/String".to_string(),
+    let builtin = |name: &str, prefix: &str| ClassInfo {
+        name: name.to_string(),
         super_name: None,
         is_interface: false,
         interfaces: Vec::new(),
         fields: Vec::new(),
         static_fields: Vec::new(),
         methods: vec![
-            m("equals", "(Ljava/lang/Object;)Z", "jrt_str_equals"),
-            m("hashCode", "()I", "jrt_str_hashcode"),
-            m("toString", "()Ljava/lang/String;", "jrt_str_tostring"),
+            m("equals", "(Ljava/lang/Object;)Z", &format!("jrt_{prefix}_equals")),
+            m("hashCode", "()I", &format!("jrt_{prefix}_hashcode")),
+            m("toString", "()Ljava/lang/String;", &format!("jrt_{prefix}_tostring")),
         ],
         has_clinit: false,
-    });
+    };
+    program.classes.push(builtin("java/lang/String", "str"));
+    program.classes.push(builtin("java/lang/Integer", "integer"));
+    program.classes.push(builtin("java/lang/Long", "long"));
+    program.classes.push(builtin("java/lang/Boolean", "boolean"));
 }
 
 /// Phase 2: alle Methodenrümpfe absenken.
@@ -1117,6 +1121,24 @@ fn lower_block(
                     });
                     continue;
                 }
+                // Unboxing: Wrapper.<prim>Value() → eingepackter Wert.
+                let unbox = match (class, name, desc) {
+                    ("java/lang/Integer", "intValue", "()I") => Some(("jrt_integer_intvalue", Ty::I32)),
+                    ("java/lang/Long", "longValue", "()J") => Some(("jrt_long_longvalue", Ty::I64)),
+                    ("java/lang/Boolean", "booleanValue", "()Z") => Some(("jrt_boolean_booleanvalue", Ty::I32)),
+                    _ => None,
+                };
+                if let Some((f, rty)) = unbox {
+                    let recv = pop!();
+                    let l = ml.stack_slot(stack.len(), rty);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: f.to_string(),
+                        args: vec![Operand::Copy(recv)],
+                    });
+                    stack.push(rty);
+                    continue;
+                }
                 // String-Methoden als Runtime-Intrinsics (Receiver ist ein
                 // echtes Argument, kein Dummy). UTF-8/Byte-Semantik: charAt
                 // liefert das Byte — für ASCII korrekt (Java: UTF-16-Einheit).
@@ -1262,9 +1284,25 @@ fn lower_block(
                         "Z" => str_conv(ml, &mut stmts, "jrt_bool_to_str", val),
                         "J" => str_conv(ml, &mut stmts, "jrt_long_to_str", val),
                         "D" => str_conv(ml, &mut stmts, "jrt_double_to_str", val),
+                        // Beliebiges Objekt (Wrapper, user-Klasse) → virtueller
+                        // toString. (null-Argument → NPE statt "null"; der
+                        // StringConcatFactory-Sonderfall ist nicht abgebildet.)
+                        _ if pd.starts_with('L') => {
+                            let l = ml.fresh(Ty::Ref);
+                            stmts.push(Statement::CallVirtual {
+                                dest: Some(l),
+                                class: "java/lang/Object".to_string(),
+                                name: "toString".to_string(),
+                                desc: "()Ljava/lang/String;".to_string(),
+                                params: vec![Ty::Ref],
+                                ret: Ty::Ref,
+                                args: vec![Operand::Copy(val)],
+                            });
+                            Operand::Copy(l)
+                        }
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "Konkatenation von Argument-Typ {pd} (Teilmenge: int, long, double, char, boolean, String)"
+                                "Konkatenation von Argument-Typ {pd}"
                             )))
                         }
                     };
@@ -1407,6 +1445,54 @@ fn lower_block(
                     }
                     program.intern_class_object(&target);
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target)));
+                    continue;
+                }
+                // Autoboxing: Wrapper.valueOf(primitive) → Runtime-Box.
+                let box_fn = match (class, name, desc) {
+                    ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => Some("jrt_integer_valueof"),
+                    ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => Some("jrt_long_valueof"),
+                    ("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;") => Some("jrt_boolean_valueof"),
+                    _ => None,
+                };
+                if let Some(f) = box_fn {
+                    let arg = pop!();
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: f.to_string(),
+                        args: vec![Operand::Copy(arg)],
+                    });
+                    stack.push(Ty::Ref);
+                    continue;
+                }
+                // String.valueOf(x): primitive → *_to_str, Objekt → toString.
+                if class == "java/lang/String" && name == "valueOf" {
+                    let arg = pop!();
+                    let part = match desc {
+                        "(I)Ljava/lang/String;" | "(S)Ljava/lang/String;" | "(B)Ljava/lang/String;" => {
+                            str_conv(ml, &mut stmts, "jrt_int_to_str", arg)
+                        }
+                        "(C)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_char_to_str", arg),
+                        "(Z)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_bool_to_str", arg),
+                        "(J)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_long_to_str", arg),
+                        "(D)Ljava/lang/String;" => str_conv(ml, &mut stmts, "jrt_double_to_str", arg),
+                        "(Ljava/lang/Object;)Ljava/lang/String;"
+                        | "(Ljava/lang/String;)Ljava/lang/String;" => {
+                            let l = ml.fresh(Ty::Ref);
+                            stmts.push(Statement::CallVirtual {
+                                dest: Some(l),
+                                class: "java/lang/Object".to_string(),
+                                name: "toString".to_string(),
+                                desc: "()Ljava/lang/String;".to_string(),
+                                params: vec![Ty::Ref],
+                                ret: Ty::Ref,
+                                args: vec![Operand::Copy(arg)],
+                            });
+                            Operand::Copy(l)
+                        }
+                        _ => return Err(FrontendError::Unsupported(format!("String.valueOf{desc}"))),
+                    };
+                    push!(Ty::Ref, Rvalue::Use(part));
                     continue;
                 }
                 let (ptys, rty) = parse_descriptor(desc)?;

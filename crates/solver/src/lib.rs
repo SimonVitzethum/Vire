@@ -63,6 +63,25 @@ pub fn run(program: &mut Program) -> Stats {
     if program.class("java/lang/String").is_some() {
         instantiated.insert("java/lang/String".to_string());
     }
+    // Autoboxing-Wrapper gelten als instanziiert, sobald ihre valueOf-Box
+    // aufgerufen wird (sie entstehen nicht via `new`).
+    let calls_fn = |sym: &str| {
+        program
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.statements)
+            .any(|st| matches!(st, Statement::Call { func, .. } if func == sym))
+    };
+    for (vf, cls) in [
+        ("jrt_integer_valueof", "java/lang/Integer"),
+        ("jrt_long_valueof", "java/lang/Long"),
+        ("jrt_boolean_valueof", "java/lang/Boolean"),
+    ] {
+        if calls_fn(vf) {
+            instantiated.insert(cls.to_string());
+        }
+    }
     let mut sites: BTreeSet<SiteKey> = BTreeSet::new();
     let mut worklist: Vec<String> = roots;
 
