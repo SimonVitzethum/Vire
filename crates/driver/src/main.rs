@@ -59,6 +59,7 @@ fn main() {
             return die(&format!("{}: {e}", path.display()));
         }
     }
+    fastllvm_frontend::register_builtins(&mut program);
     for (path, cf) in &classfiles {
         if let Err(e) = fastllvm_frontend::lower_class(cf, &mut program) {
             return die(&format!("{}: {e}", path.display()));

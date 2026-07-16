@@ -108,6 +108,8 @@ pub enum Statement {
     /// Laufzeit-checkcast auf eine modellierte Klasse: wirft
     /// ClassCastException bei Mismatch, sonst passthrough.
     CheckCast { obj: Operand, class: String },
+    /// `dest = (obj instanceof class) ? 1 : 0`.
+    InstanceOf { dest: Local, obj: Operand, class: String },
     /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
     NewArray { dest: Local, elem: Ty, len: Operand },
     ArrayLen { dest: Local, arr: Operand },

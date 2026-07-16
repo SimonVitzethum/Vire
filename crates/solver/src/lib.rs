@@ -57,6 +57,12 @@ pub fn run(program: &mut Program) -> Stats {
 
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut instantiated: BTreeSet<String> = BTreeSet::new();
+    // Strings entstehen aus Literalen/Konkatenation, nicht via `new`; sie
+    // sind aber als Object-Subtyp instanziiert und dürfen Object-Methoden-
+    // Calls nicht fälschlich devirtualisieren lassen.
+    if program.class("java/lang/String").is_some() {
+        instantiated.insert("java/lang/String".to_string());
+    }
     let mut sites: BTreeSet<SiteKey> = BTreeSet::new();
     let mut worklist: Vec<String> = roots;
 
@@ -166,6 +172,9 @@ fn resolve_targets_ref(
     let class_of = |n: &str| classes.iter().find(|c| c.name == n);
     // Erbt/implementiert `sub` den Typ `sup` (Klasse oder Interface)?
     let is_subtype = |sub: &str, sup: &str| -> bool {
+        if sup == "java/lang/Object" {
+            return true; // implizite Wurzel aller Klassen
+        }
         let mut stack = vec![sub.to_string()];
         let mut seen = BTreeSet::new();
         while let Some(c) = stack.pop() {

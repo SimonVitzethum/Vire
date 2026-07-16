@@ -25,13 +25,11 @@
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
 
-/* Vtable für Strings (keine Ref-Felder → No-Op-Drop/Trace). Von den
- * String-Literalen im generierten Code und von zur Laufzeit erzeugten
- * Strings gemeinsam genutzt. */
-void (*const jrt_string_vtable[2])(void) = {
-    (void (*)(void))jrt_noop_drop,
-    (void (*)(void))jrt_noop_trace,
-};
+/* Vtable für zur Laufzeit erzeugte Strings. Ihr Layout (mit Type-Descriptor
+ * und den Object-Methoden-Slots) ist programmabhängig, daher wird sie im
+ * generierten Code als @vt.java_lang_String erzeugt; @main setzt diesen
+ * Zeiger beim Start. String-Literale referenzieren dieselbe Vtable direkt. */
+void *jrt_dyn_string_vt = NULL;
 
 /* --- Ausgabe --------------------------------------------------------- */
 
@@ -113,6 +111,37 @@ int32_t jrt_str_equals(const JStr *a, const JStr *b) {
     return 1;
 }
 
+/* --- Object-Wurzelmethoden (virtueller Dispatch) --------------------
+ * Default-Implementierungen für Klassen, die equals/hashCode/toString
+ * nicht überschreiben, plus die String-Überschreibungen. */
+int32_t jrt_obj_equals(void *a, void *b) {
+    return a == b; /* Referenzidentität */
+}
+int32_t jrt_obj_hashcode(void *o) {
+    uintptr_t p = (uintptr_t)o;
+    return (int32_t)(p ^ (p >> 32));
+}
+
+/* String.hashCode (JLS): s[0]*31^(n-1) + … + s[n-1]. */
+int32_t jrt_str_hashcode(const JStr *s) {
+    int32_t h = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        h = 31 * h + (int32_t)s->bytes[i];
+    }
+    return h;
+}
+/* String.toString gibt sich selbst zurück. */
+void *jrt_str_tostring(void *s) {
+    return s;
+}
+
+/* Vorwärtsdeklaration (str_from_buf ist weiter unten definiert). */
+static JStr *str_from_buf(const char *buf, int n);
+void *jrt_obj_tostring(void *o) {
+    (void)o;
+    return str_from_buf("object", 6);
+}
+
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
  * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
  * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */
@@ -120,7 +149,7 @@ void *jrt_alloc(int64_t size);
 
 static JStr *str_alloc(int64_t len) {
     JStr *s = (JStr *)jrt_alloc((int64_t)sizeof(JStr) + len);
-    s->vtable = (void *)jrt_string_vtable;
+    s->vtable = jrt_dyn_string_vt;
     s->len = len;
     return s;
 }

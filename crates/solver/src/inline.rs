@@ -188,5 +188,9 @@ fn remap_statement(st: &mut Statement, off: u32) {
         Statement::PutStatic { value, .. } => remap_operand(value, off),
         Statement::InstanceOfPending { dest, .. } => remap_local(dest, off),
         Statement::CheckCast { obj, .. } => remap_operand(obj, off),
+        Statement::InstanceOf { dest, obj, .. } => {
+            remap_local(dest, off);
+            remap_operand(obj, off);
+        }
     }
 }

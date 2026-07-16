@@ -95,6 +95,38 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     Ok(())
 }
 
+/// Registriert die eingebauten Klassen, deren Methoden am virtuellen
+/// Dispatch teilnehmen. Aktuell `java/lang/String` mit `equals`/`hashCode`/
+/// `toString` (Runtime-Implementierungen `jrt_str_*`), damit ein
+/// `Object`-typisierter Aufruf `obj.equals(x)` auf einen String korrekt
+/// dispatcht (Grundlage für equals-basierte Collections).
+pub fn register_builtins(program: &mut Program) {
+    if program.class("java/lang/String").is_some() {
+        return;
+    }
+    let m = |name: &str, desc: &str, mangled: &str| MethodInfo {
+        name: name.to_string(),
+        desc: desc.to_string(),
+        is_static: false,
+        has_body: true,
+        mangled: mangled.to_string(),
+    };
+    program.classes.push(ClassInfo {
+        name: "java/lang/String".to_string(),
+        super_name: None,
+        is_interface: false,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        methods: vec![
+            m("equals", "(Ljava/lang/Object;)Z", "jrt_str_equals"),
+            m("hashCode", "()I", "jrt_str_hashcode"),
+            m("toString", "()Ljava/lang/String;", "jrt_str_tostring"),
+        ],
+        has_clinit: false,
+    });
+}
+
 /// Phase 2: alle Methodenrümpfe absenken.
 pub fn lower_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     for m in &cf.methods {
@@ -1157,7 +1189,16 @@ fn lower_block(
                     continue;
                 }
                 let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
-                if program.class(&class).is_none() {
+                // java/lang/Object-Wurzelmethoden (equals/hashCode/toString)
+                // dispatchen global über die Vtable jeder Klasse.
+                let is_object_root = class == "java/lang/Object"
+                    && matches!(
+                        (name.as_str(), desc.as_str()),
+                        ("equals", "(Ljava/lang/Object;)Z")
+                            | ("hashCode", "()I")
+                            | ("toString", "()Ljava/lang/String;")
+                    );
+                if program.class(&class).is_none() && !is_object_root {
                     return Err(FrontendError::Unsupported(format!(
                         "invokevirtual {class}.{name}{desc}"
                     )));
@@ -1324,6 +1365,18 @@ fn lower_block(
                 params.extend(ptys);
                 stmts.push(Statement::CallVirtual { dest, class, name, desc, params, ret: rty, args });
                 throw_after = Some(*pc);
+            }
+            Instr::InstanceOf(idx) => {
+                let target = ml.cf.class_name(*idx)?.to_string();
+                let obj = pop!();
+                let l = ml.stack_slot(stack.len(), Ty::I32);
+                if program.class(&target).is_some() {
+                    stmts.push(Statement::InstanceOf { dest: l, obj: Operand::Copy(obj), class: target });
+                } else {
+                    // Nicht modellierte Zielklasse → konservativ false.
+                    stmts.push(Statement::Assign(l, Rvalue::Use(Operand::ConstI32(0))));
+                }
+                stack.push(Ty::I32);
             }
             Instr::InvokeStatic(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;

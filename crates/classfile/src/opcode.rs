@@ -100,6 +100,7 @@ pub enum Instr {
     InvokeDynamic(u16),
     New(u16),
     CheckCast(u16),
+    InstanceOf(u16),
     /// newarray mit primitivem Elementtyp (atype-Code, hier nur int=10).
     NewArrayInt,
     /// anewarray: Array von Referenzen (Klassenindex, hier ignoriert).
@@ -274,6 +275,7 @@ pub fn decode_code(
             0xBE => (Instr::ArrayLength, 1),
             0xBF => (Instr::AThrow, 1),
             0xC0 => (Instr::CheckCast(u16_at(pc + 1)?), 3),
+            0xC1 => (Instr::InstanceOf(u16_at(pc + 1)?), 3),
             0xC6 => (Instr::IfRefNull(Cond::Eq, branch(pc + 1)?), 3),
             0xC7 => (Instr::IfRefNull(Cond::Ne, branch(pc + 1)?), 3),
             _ => return Err(ParseError::UnsupportedOpcode(op, pc)),

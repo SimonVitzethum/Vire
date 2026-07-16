@@ -47,6 +47,11 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_str_is_empty", "i32 (ptr)"),
     ("jrt_str_char_at", "i32 (ptr, i32)"),
     ("jrt_str_equals", "i32 (ptr, ptr)"),
+    ("jrt_str_hashcode", "i32 (ptr)"),
+    ("jrt_str_tostring", "ptr (ptr)"),
+    ("jrt_obj_equals", "i32 (ptr, ptr)"),
+    ("jrt_obj_hashcode", "i32 (ptr)"),
+    ("jrt_obj_tostring", "ptr (ptr)"),
     ("jrt_str_concat", "ptr (ptr, ptr)"),
     ("jrt_int_to_str", "ptr (i32)"),
     ("jrt_long_to_str", "ptr (i64)"),
@@ -75,6 +80,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_take_pending", "ptr ()"),
     ("jrt_check_uncaught", "void ()"),
     ("jrt_pending_instanceof", "i32 (ptr)"),
+    ("jrt_instanceof", "i32 (ptr, ptr)"),
     ("jrt_checkcast", "void (ptr, ptr)"),
     ("jrt_alloc_array", "ptr (i64, i64, ptr)"),
     ("jrt_bounds_check", "void (ptr, i32)"),
@@ -148,6 +154,12 @@ impl<'a> Ctx<'a> {
             .position(|(i, n, d)| i == iface && n == name && d == desc)
     }
 
+    /// Wird `class` global (über konsistente Vtable-Slots) dispatcht?
+    /// Interfaces und die Object-Wurzelmethoden.
+    fn is_global_dispatch(&self, class: &str) -> bool {
+        class == "java/lang/Object" || self.class(class).map(|c| c.is_interface).unwrap_or(false)
+    }
+
     fn struct_name(&self, class: &str) -> String {
         format!("%class.{}", sanitize(class))
     }
@@ -216,7 +228,7 @@ impl<'a> Ctx<'a> {
     /// GEP-Index eines Methoden-Slots in der Vtable. Interface-Methoden
     /// liegen in den globalen Interface-Slots, virtuelle danach.
     fn vtable_index(&self, class: &str, name: &str, desc: &str) -> Option<usize> {
-        if self.class(class).map(|c| c.is_interface).unwrap_or(false) {
+        if self.is_global_dispatch(class) {
             return self.iface_index(class, name, desc).map(|i| VTABLE_METHOD_OFFSET + i);
         }
         self.vtable_slots(class)
@@ -237,7 +249,9 @@ pub fn emit(program: &Program) -> String {
         for bb in &f.blocks {
             for st in &bb.statements {
                 if let Statement::CallVirtual { class, name, desc, .. } = st {
-                    if program.class(class).map(|c| c.is_interface).unwrap_or(false) {
+                    let global = class == "java/lang/Object"
+                        || program.class(class).map(|c| c.is_interface).unwrap_or(false);
+                    if global {
                         let key = (class.clone(), name.clone(), desc.clone());
                         if !iface_slots.contains(&key) {
                             iface_slots.push(key);
@@ -251,15 +265,16 @@ pub fn emit(program: &Program) -> String {
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
-    writeln!(w, "@jrt_string_vtable = external constant [2 x ptr]").unwrap();
+    writeln!(w, "@jrt_dyn_string_vt = external global ptr").unwrap();
     // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
     // aber refcount -1 = immortal → retain/release/Collector No-Op, die
-    // Read-only-Konstante bleibt unberührt.
+    // Read-only-Konstante bleibt unberührt. Vtable = @vt.java_lang_String
+    // (Object-Methoden-Slots), damit obj.equals/hashCode auf Strings greift.
     for (i, s) in program.strings.iter().enumerate() {
         let bytes = s.as_bytes();
         writeln!(
             w,
-            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} {{ i64 -1, i64 0, ptr @jrt_string_vtable, i64 {n}, [{n} x i8] c\"{esc}\" }}",
+            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} {{ i64 -1, i64 0, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
             n = bytes.len(),
             esc = escape_ll(bytes),
         )
@@ -344,6 +359,12 @@ pub fn emit(program: &Program) -> String {
             _ => None,
         })
         .collect();
+    // Strings nehmen am virtuellen Dispatch teil (equals/hashCode/toString)
+    // → eigene Vtable, obwohl sie nicht via `new` erzeugt werden.
+    let mut instantiated = instantiated;
+    if program.class("java/lang/String").is_some() {
+        instantiated.insert("java/lang/String");
+    }
     for class in &instantiated {
         // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); dann die globalen
         // Interface-Slots, dann die klassen-eigenen virtuellen Methoden.
@@ -352,12 +373,21 @@ pub fn emit(program: &Program) -> String {
             format!("ptr @trace.{}", sanitize(class)),
             format!("ptr @td.{}", sanitize(class)),
         ];
+        // jrt_*-Symbole sind Runtime-Funktionen (extern), gelten als gültig.
         let sym_entry = |sym: Option<String>| match sym {
-            Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
+            Some(s) if s.starts_with("jrt_") || defined.contains(s.as_str()) => format!("ptr @{s}"),
             _ => "ptr null".to_string(),
         };
         for (iface, name, desc) in &ctx.iface_slots {
-            let sym = if program.implements(class, iface) {
+            let sym = if iface == "java/lang/Object" {
+                // Wurzelmethode: Überschreibung der Klasse oder Object-Default.
+                Some(
+                    program
+                        .resolve_method(class, name, desc)
+                        .map(|(_, mi)| mi.mangled.clone())
+                        .unwrap_or_else(|| object_default(name)),
+                )
+            } else if program.implements(class, iface) {
                 program.resolve_method(class, name, desc).map(|(_, mi)| mi.mangled.clone())
             } else {
                 None
@@ -442,6 +472,8 @@ pub fn emit(program: &Program) -> String {
 
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
+        // Vtable für zur Laufzeit erzeugte Strings bekanntmachen.
+        writeln!(w, "  store ptr @vt.java_lang_String, ptr @jrt_dyn_string_vt").unwrap();
         // Statische Initialisierer vor main, Superklasse vor Subklasse.
         let mut emitted: BTreeSet<String> = BTreeSet::new();
         for c in &program.classes {
@@ -491,6 +523,16 @@ fn emit_clinit_chain(
             }
         }
     }
+}
+
+/// Runtime-Default-Implementierung einer Object-Wurzelmethode.
+fn object_default(name: &str) -> String {
+    match name {
+        "hashCode" => "jrt_obj_hashcode",
+        "toString" => "jrt_obj_tostring",
+        _ => "jrt_obj_equals",
+    }
+    .to_string()
 }
 
 fn operand_ty(f: &Function, op: &Operand) -> Ty {
@@ -787,6 +829,12 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         Statement::CheckCast { obj, class } => {
             let o = e.operand(w, obj);
             writeln!(w, "  call void @jrt_checkcast(ptr {o}, ptr @td.{})", sanitize(class)).unwrap();
+        }
+        Statement::InstanceOf { dest, obj, class } => {
+            let o = e.operand(w, obj);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i32 @jrt_instanceof(ptr {o}, ptr @td.{})", sanitize(class)).unwrap();
+            writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
         }
         Statement::NewArray { dest, elem, len } => {
             let n = e.operand(w, len);
