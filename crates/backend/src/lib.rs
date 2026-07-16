@@ -94,6 +94,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_sb_tostring", "ptr (ptr)"),
     ("jrt_sb_length", "i32 (ptr)"),
     ("jrt_sb_init_str", "void (ptr, ptr)"),
+    ("jrt_str_format", "ptr (ptr, ptr)"),
     ("jrt_int_to_str", "ptr (i32)"),
     ("jrt_long_to_str", "ptr (i64)"),
     ("jrt_char_to_str", "ptr (i32)"),

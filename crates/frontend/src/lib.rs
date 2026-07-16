@@ -1454,6 +1454,29 @@ fn lower_block(
                     });
                     continue;
                 }
+                // System.out.printf(fmt, Object[]) → formatieren + ausgeben,
+                // gibt den Stream (Dummy) zurück.
+                if class == "java/io/PrintStream"
+                    && name == "printf"
+                    && desc == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"
+                {
+                    let array = pop!();
+                    let fmt = pop!();
+                    pop!(); // Receiver-Dummy
+                    let s = ml.fresh(Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(s),
+                        func: "jrt_str_format".to_string(),
+                        args: vec![Operand::Copy(fmt), Operand::Copy(array)],
+                    });
+                    stmts.push(Statement::Call {
+                        dest: None,
+                        func: "jrt_print_str".to_string(),
+                        args: vec![Operand::Copy(s)],
+                    });
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
+                    continue;
+                }
                 // print(ln)(Object): virtueller toString, dann als String
                 // ausgeben.
                 if class == "java/io/PrintStream"
@@ -1899,6 +1922,22 @@ fn lower_block(
                     program.intern_class_object(&target);
                     let l = push!(Ty::Ref, Rvalue::Use(Operand::ConstClass(target.clone())));
                     ml.class_const.insert(l, target);
+                    continue;
+                }
+                // String.format(fmt, Object[]) → Runtime-Formatter.
+                if class == "java/lang/String"
+                    && name == "format"
+                    && desc == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                {
+                    let array = pop!();
+                    let fmt = pop!();
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: "jrt_str_format".to_string(),
+                        args: vec![Operand::Copy(fmt), Operand::Copy(array)],
+                    });
+                    stack.push(Ty::Ref);
                     continue;
                 }
                 // Autoboxing: Wrapper.valueOf(primitive) → Runtime-Box.

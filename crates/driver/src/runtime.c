@@ -431,6 +431,86 @@ JStr *jrt_sb_tostring(void *p) {
     return str_from_buf((const char *)sb->buf, (int)sb->len);
 }
 int32_t jrt_sb_length(void *p) { return (int32_t)((JSB *)p)->len; }
+
+/* String.format / printf: parst den Format-String und interpretiert die
+ * Object[]-Argumente je Spezifizierer (%d/%i/%s/%f/%x/%c/%b/%%). Optionale
+ * Flags/Breite/Präzision werden an snprintf durchgereicht. %s erwartet einen
+ * String (Byte-Kopie); Wrapper-Werte über %d/%f/… (Autoboxing im Aufrufer). */
+void jrt_retain(void *p);
+void jrt_release(void *p);
+JStr *jrt_str_format(const JStr *fmt, void *argsp) {
+    /* Object[]-Layout: { rc, rcflags, vtable, length, elems… }; length bei
+     * Offset 24, Elemente ab 32 (JArray ist weiter unten definiert). */
+    int64_t nargs = argsp ? *(int64_t *)((char *)argsp + 24) : 0;
+    void **elems = argsp ? (void **)((char *)argsp + 32) : NULL;
+    JSB *sb = (JSB *)jrt_sb_new();
+    int ai = 0;
+    for (int64_t i = 0; i < fmt->len; i++) {
+        char c = fmt->bytes[i];
+        if (c != '%') { sb_append(sb, &c, 1); continue; }
+        /* Spezifizierer bis zum Konversionszeichen sammeln. */
+        char spec[16];
+        int sl = 0;
+        spec[sl++] = '%';
+        i++;
+        while (i < fmt->len && sl < 14) {
+            char s = fmt->bytes[i];
+            spec[sl++] = s;
+            if (s == 'd' || s == 'i' || s == 's' || s == 'f' || s == 'x'
+                || s == 'X' || s == 'c' || s == 'b' || s == '%' || s == 'n')
+                break;
+            i++;
+        }
+        char conv = spec[sl - 1];
+        spec[sl] = '\0';
+        char buf[64];
+        if (conv == '%') {
+            sb_append(sb, "%", 1);
+            continue;
+        }
+        if (conv == 'n') { /* plattformunabhängiger Zeilenumbruch, kein Arg */
+            sb_append(sb, "\n", 1);
+            continue;
+        }
+        void *arg = (ai < nargs) ? elems[ai++] : NULL;
+        switch (conv) {
+        case 'd':
+        case 'i': {
+            spec[sl - 1] = 'd';
+            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JInteger *)arg)->value : 0));
+            break;
+        }
+        case 'x':
+        case 'X':
+            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JInteger *)arg)->value : 0));
+            break;
+        case 'f': {
+            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JDouble *)arg)->value : 0.0));
+            break;
+        }
+        case 'c': {
+            char ch = arg ? (char)((JInteger *)arg)->value : '?';
+            sb_append(sb, &ch, 1);
+            break;
+        }
+        case 'b': {
+            int t = arg && ((JInteger *)arg)->value;
+            sb_append(sb, t ? "true" : "false", t ? 4 : 5);
+            break;
+        }
+        case 's':
+        default: {
+            JStr *s = (JStr *)arg;
+            if (s) sb_append(sb, s->bytes, s->len);
+            else sb_append(sb, "null", 4);
+            break;
+        }
+        }
+    }
+    JStr *r = jrt_sb_tostring(sb);
+    jrt_release(sb); /* temporären Puffer freigeben */
+    return r;
+}
 /* StringBuilder(String)-Konstruktor: anhängen ohne retain (Rückgabe
  * verworfen, der Receiver ist geborgt). */
 void jrt_sb_init_str(void *p, const JStr *s) {
