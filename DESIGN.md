@@ -182,6 +182,10 @@ Stand der Garantien (umgesetzt):
 
 **Autoboxing** ✅: `Integer`/`Long`/`Boolean` als eingebaute Wrapper-Klassen (`register_builtins`) mit eingepacktem Primitivwert und generierter Vtable. `Wrapper.valueOf(prim)` → Runtime-Box, `.<prim>Value()` → Unboxing, `equals`/`hashCode`/`toString` virtuell (Wert-Semantik). Wrapper in Konkatenation über virtuellen `toString`; `String.valueOf`-Überladungen als Intrinsics. Kein Wertecache (`-128..127`) → boxed-Identität kann abweichen, `equals` ist korrekt. Verifiziert: Boxing/Unboxing, `Integer` als Map-Value (mit Unboxing) und als Map-Key (hashCode/equals). **HashMap** ✅ mit echten `hashCode`-Buckets (`examples/MiniHashMap.java`, open addressing + Rehashing) — reine Java-Bibliothek, kein Compiler-Umbau. Offen: `Double`/`Character`-Wrapper, `hashCode`-Wertecache.
 
+**Enum** ✅ (`examples/Enum1.java`): `java.lang.Enum` als eingebaute Basisklasse (`register_enum`) mit `$name`/`$ordinal`-Feldern und generierten IR-Rümpfen (`name`/`ordinal`/`toString`/`<init>(String,int)`). Der von javac erzeugte `values()`-Rumpf klont das `$VALUES`-Array via `[…].clone()` → `jrt_array_clone` (flache Kopie, retained Ref-Elemente, elem_size aus dem Array-Deskriptor). `valueOf(String)` läuft über `jrt_enum_valueof`, das das statisch bekannte `values()`-Array nach `$name` durchsucht (`IllegalArgumentException` sonst). Verifiziert: `name`/`ordinal`/for-each über `values()`/`valueOf`/Identitätsvergleich, RC-sauber.
+
+**try-with-resources** ✅ (`examples/Twr.java`): javac entzuckert es bereits vollständig zu `try/catch(Throwable)` + `close()` in umgekehrter Reihenfolge + `addSuppressed` + `athrow` — das vorhandene pending-Exception-Modell trägt es unverändert; es fehlte nur `Throwable.addSuppressed` (rein diagnostisch → no-op). Verifiziert: Normal- und Exception-Pfad schließen mehrere `AutoCloseable`-Ressourcen in umgekehrter Reihenfolge, Heap-Bilanz sauber.
+
 ---
 
 ## 7. Priorisierung (Kosten/Nutzen)
