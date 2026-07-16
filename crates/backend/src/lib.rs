@@ -121,11 +121,27 @@ const VTABLE_METHOD_OFFSET: usize = 2;
 /// Klassen-Kontext: Layouts und Vtables, aus `Program::classes` berechnet.
 struct Ctx<'a> {
     program: &'a Program,
+    /// Globale Vtable-Slots für aufgerufene Interface-Methoden, damit
+    /// dieselbe Interface-Methode in jeder implementierenden Klasse am
+    /// selben Slot liegt. Schlüssel: (interface, name, desc).
+    iface_slots: Vec<(String, String, String)>,
 }
 
 impl<'a> Ctx<'a> {
     fn class(&self, name: &str) -> Option<&'a ClassInfo> {
         self.program.class(name)
+    }
+
+    /// Erster Vtable-Slot der klassen-eigenen virtuellen Methoden (hinter
+    /// drop, trace und den globalen Interface-Slots).
+    fn method_base(&self) -> usize {
+        VTABLE_METHOD_OFFSET + self.iface_slots.len()
+    }
+
+    fn iface_index(&self, iface: &str, name: &str, desc: &str) -> Option<usize> {
+        self.iface_slots
+            .iter()
+            .position(|(i, n, d)| i == iface && n == name && d == desc)
     }
 
     fn struct_name(&self, class: &str) -> String {
@@ -193,19 +209,41 @@ impl<'a> Ctx<'a> {
         slots
     }
 
-    /// GEP-Index eines Methoden-Slots in der Vtable (nach dem Drop-Slot).
+    /// GEP-Index eines Methoden-Slots in der Vtable. Interface-Methoden
+    /// liegen in den globalen Interface-Slots, virtuelle danach.
     fn vtable_index(&self, class: &str, name: &str, desc: &str) -> Option<usize> {
+        if self.class(class).map(|c| c.is_interface).unwrap_or(false) {
+            return self.iface_index(class, name, desc).map(|i| VTABLE_METHOD_OFFSET + i);
+        }
         self.vtable_slots(class)
             .iter()
             .position(|(n, d, _)| n == name && d == desc)
-            .map(|i| i + VTABLE_METHOD_OFFSET)
+            .map(|i| i + self.method_base())
     }
 }
 
 pub fn emit(program: &Program) -> String {
     let mut out = String::new();
     let w = &mut out;
-    let ctx = Ctx { program };
+
+    // Aufgerufene Interface-Methoden global sammeln (für konsistente
+    // Vtable-Slots über alle implementierenden Klassen).
+    let mut iface_slots: Vec<(String, String, String)> = Vec::new();
+    for f in &program.functions {
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                if let Statement::CallVirtual { class, name, desc, .. } = st {
+                    if program.class(class).map(|c| c.is_interface).unwrap_or(false) {
+                        let key = (class.clone(), name.clone(), desc.clone());
+                        if !iface_slots.contains(&key) {
+                            iface_slots.push(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ctx = Ctx { program, iface_slots };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -290,16 +328,27 @@ pub fn emit(program: &Program) -> String {
         })
         .collect();
     for class in &instantiated {
-        let slots = ctx.vtable_slots(class);
-        // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); danach Methoden.
+        // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); dann die globalen
+        // Interface-Slots, dann die klassen-eigenen virtuellen Methoden.
         let mut entries = vec![
             format!("ptr @drop.{}", sanitize(class)),
             format!("ptr @trace.{}", sanitize(class)),
         ];
-        entries.extend(slots.iter().map(|(_, _, sym)| match sym {
+        let sym_entry = |sym: Option<String>| match sym {
             Some(s) if defined.contains(s.as_str()) => format!("ptr @{s}"),
             _ => "ptr null".to_string(),
-        }));
+        };
+        for (iface, name, desc) in &ctx.iface_slots {
+            let sym = if program.implements(class, iface) {
+                program.resolve_method(class, name, desc).map(|(_, mi)| mi.mangled.clone())
+            } else {
+                None
+            };
+            entries.push(sym_entry(sym));
+        }
+        for (_, _, sym) in ctx.vtable_slots(class) {
+            entries.push(sym_entry(sym));
+        }
         writeln!(
             w,
             "@vt.{} = internal unnamed_addr constant [{} x ptr] [{}]",

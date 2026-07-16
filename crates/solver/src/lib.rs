@@ -164,21 +164,31 @@ fn resolve_targets_ref(
     desc: &str,
 ) -> BTreeSet<String> {
     let class_of = |n: &str| classes.iter().find(|c| c.name == n);
-    let is_subclass = |sub: &str, sup: &str| -> bool {
-        let mut cur = sub;
-        loop {
-            if cur == sup {
+    // Erbt/implementiert `sub` den Typ `sup` (Klasse oder Interface)?
+    let is_subtype = |sub: &str, sup: &str| -> bool {
+        let mut stack = vec![sub.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(c) = stack.pop() {
+            if c == sup {
                 return true;
             }
-            match class_of(cur).and_then(|c| c.super_name.as_deref()) {
-                Some(s) => cur = s,
-                None => return false,
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if let Some(ci) = class_of(&c) {
+                if let Some(s) = &ci.super_name {
+                    stack.push(s.clone());
+                }
+                for i in &ci.interfaces {
+                    stack.push(i.clone());
+                }
             }
         }
+        false
     };
     let mut targets = BTreeSet::new();
     for inst in instantiated {
-        if !is_subclass(inst, class) {
+        if !is_subtype(inst, class) {
             continue;
         }
         // Methodenauflösung ab der konkreten Klasse aufwärts (JVMS 5.4.6).

@@ -85,6 +85,8 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     program.classes.push(ClassInfo {
         name: cf.this_class.clone(),
         super_name: cf.super_class.clone().filter(|s| s != "java/lang/Object"),
+        is_interface: cf.access_flags & 0x0200 != 0,
+        interfaces: cf.interfaces.clone(),
         fields,
         static_fields,
         methods,
@@ -1212,6 +1214,34 @@ fn lower_block(
                     )));
                 }
                 // Beweisbar → kein Code nötig.
+            }
+            Instr::InvokeInterface(idx) => {
+                let (class, name, desc) = ml.cf.member_ref(*idx)?;
+                let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
+                if program.class(&class).is_none() {
+                    return Err(FrontendError::Unsupported(format!(
+                        "invokeinterface {class}.{name}{desc} (Interface nicht im Input)"
+                    )));
+                }
+                let (ptys, rty) = parse_descriptor(&desc)?;
+                let mut args = Vec::new();
+                for _ in &ptys {
+                    args.push(Operand::Copy(pop!()));
+                }
+                let recv = pop!();
+                args.push(Operand::Copy(recv));
+                args.reverse();
+                let dest = if rty == Ty::Void {
+                    None
+                } else {
+                    let l = ml.stack_slot(stack.len(), rty);
+                    stack.push(rty);
+                    Some(l)
+                };
+                let mut params = vec![Ty::Ref];
+                params.extend(ptys);
+                stmts.push(Statement::CallVirtual { dest, class, name, desc, params, ret: rty, args });
+                throw_after = Some(*pc);
             }
             Instr::InvokeStatic(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;

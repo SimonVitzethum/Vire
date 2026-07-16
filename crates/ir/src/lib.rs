@@ -188,6 +188,9 @@ pub struct ClassInfo {
     pub name: String,
     /// None nur bei java/lang/Object (implizit, nicht registriert).
     pub super_name: Option<String>,
+    pub is_interface: bool,
+    /// Direkt implementierte/erweiterte Interfaces (JVM-Namen).
+    pub interfaces: Vec<String>,
     /// Nur deklarierte Instanzfelder; Superklassen-Felder über die Kette.
     pub fields: Vec<FieldInfo>,
     pub static_fields: Vec<StaticFieldInfo>,
@@ -280,6 +283,30 @@ impl Program {
                 None => return false,
             }
         }
+    }
+
+    /// Alle Interfaces, die `class` (transitiv über Super-Kette und
+    /// Interface-Vererbung) implementiert.
+    pub fn all_interfaces(&self, class: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut stack = vec![class.to_string()];
+        while let Some(c) = stack.pop() {
+            let Some(ci) = self.class(&c) else { continue };
+            for i in &ci.interfaces {
+                if out.insert(i.clone()) {
+                    stack.push(i.clone());
+                }
+            }
+            if let Some(s) = &ci.super_name {
+                stack.push(s.clone());
+            }
+        }
+        out
+    }
+
+    /// Implementiert `class` das Interface `iface` (oder ist gleich)?
+    pub fn implements(&self, class: &str, iface: &str) -> bool {
+        class == iface || self.all_interfaces(class).contains(iface)
     }
 }
 
