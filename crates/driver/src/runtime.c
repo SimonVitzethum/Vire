@@ -25,6 +25,8 @@
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
 void *jrt_alloc(int64_t size);
+void jrt_throw_npe(void);
+void jrt_throw_sioobe(void);
 
 /* Vtable für zur Laufzeit erzeugte Strings. Ihr Layout (mit Type-Descriptor
  * und den Object-Methoden-Slots) ist programmabhängig, daher wird sie im
@@ -75,30 +77,32 @@ void jrt_println_char(int32_t c) {
     fputc('\n', stdout);
 }
 
-/* String-Methoden (Byte-/ASCII-Semantik, s. Frontend-Kommentar). */
+/* String-Methoden (Byte-/ASCII-Semantik, s. Frontend-Kommentar).
+ * NPE/StringIndexOutOfBounds sind abfangbar (pending statt exit). */
 int32_t jrt_str_length(const JStr *s) {
     if (!s) {
-        fputs("Exception in thread \"main\" java.lang.NullPointerException\n", stderr);
-        exit(1);
+        jrt_throw_npe();
+        return 0;
     }
     return (int32_t)s->len;
 }
 
 int32_t jrt_str_is_empty(const JStr *s) {
-    return jrt_str_length(s) == 0;
+    if (!s) {
+        jrt_throw_npe();
+        return 0;
+    }
+    return s->len == 0;
 }
 
 int32_t jrt_str_char_at(const JStr *s, int32_t i) {
     if (!s) {
-        fputs("Exception in thread \"main\" java.lang.NullPointerException\n", stderr);
-        exit(1);
+        jrt_throw_npe();
+        return 0;
     }
     if (i < 0 || i >= s->len) {
-        fprintf(stderr,
-                "Exception in thread \"main\" "
-                "java.lang.StringIndexOutOfBoundsException: index %d, length %lld\n",
-                i, (long long)s->len);
-        exit(1);
+        jrt_throw_sioobe();
+        return 0;
     }
     return (int32_t)s->bytes[i];
 }
@@ -563,6 +567,9 @@ static void throw_runtime(void *sentinel, const char *msg) {
  * danach pending. */
 void jrt_throw_npe(void) {
     throw_runtime(&npe_exc_obj, "java.lang.NullPointerException");
+}
+void jrt_throw_sioobe(void) {
+    throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");
 }
 int32_t jrt_pending_set(void) {
     return pending_exception != NULL;

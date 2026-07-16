@@ -1176,6 +1176,11 @@ fn lower_block(
                     let l = ml.stack_slot(stack.len(), Ty::I32);
                     stack.push(Ty::I32);
                     stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
+                    // length/charAt/isEmpty werfen NPE/StringIndexOutOfBounds
+                    // bei null/OOB → abfangbar (equals ist null-tolerant).
+                    if func != "jrt_str_equals" {
+                        throw_after = Some(*pc);
+                    }
                     continue;
                 }
                 // Reflection auf einem statisch bekannten Class-Objekt.
