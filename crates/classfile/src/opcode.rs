@@ -101,6 +101,9 @@ pub enum Instr {
     /// if<cond>: vergleicht einen Stack-Wert mit 0.
     IfZero(Cond, usize),
     Goto(usize),
+    /// tableswitch/lookupswitch: (default-Ziel, [(Schlüssel, Ziel)]) mit
+    /// absoluten Bytecode-Offsets.
+    Switch(usize, Vec<(i32, usize)>),
     IReturn,
     LReturn,
     FReturn,
@@ -286,6 +289,40 @@ pub fn decode_code(
             0xA5 => (Instr::IfACmp(Cond::Eq, branch(pc + 1)?), 3),
             0xA6 => (Instr::IfACmp(Cond::Ne, branch(pc + 1)?), 3),
             0xA7 => (Instr::Goto(branch(pc + 1)?), 3),
+            // tableswitch: Padding auf 4-Byte-Grenze, dann default/low/high
+            // und (high-low+1) Offsets (alle relativ zum Opcode-Start).
+            0xAA => {
+                let base = pc + 1 + ((4 - ((pc + 1) % 4)) % 4);
+                let u32_at = |i: usize| -> Result<u32, ParseError> {
+                    Ok(u32::from_be_bytes([u8_at(i)?, u8_at(i + 1)?, u8_at(i + 2)?, u8_at(i + 3)?]))
+                };
+                let default = (start as i64 + u32_at(base)? as i32 as i64) as usize;
+                let low = u32_at(base + 4)? as i32;
+                let high = u32_at(base + 8)? as i32;
+                let count = (high - low + 1) as usize;
+                let mut cases = Vec::with_capacity(count);
+                for k in 0..count {
+                    let off = u32_at(base + 12 + k * 4)? as i32 as i64;
+                    cases.push((low + k as i32, (start as i64 + off) as usize));
+                }
+                (Instr::Switch(default, cases), base + 12 + count * 4 - pc)
+            }
+            // lookupswitch: Padding, dann default/npairs und npairs (key, offset).
+            0xAB => {
+                let base = pc + 1 + ((4 - ((pc + 1) % 4)) % 4);
+                let u32_at = |i: usize| -> Result<u32, ParseError> {
+                    Ok(u32::from_be_bytes([u8_at(i)?, u8_at(i + 1)?, u8_at(i + 2)?, u8_at(i + 3)?]))
+                };
+                let default = (start as i64 + u32_at(base)? as i32 as i64) as usize;
+                let npairs = u32_at(base + 4)? as usize;
+                let mut cases = Vec::with_capacity(npairs);
+                for k in 0..npairs {
+                    let key = u32_at(base + 8 + k * 8)? as i32;
+                    let off = u32_at(base + 12 + k * 8)? as i32 as i64;
+                    cases.push((key, (start as i64 + off) as usize));
+                }
+                (Instr::Switch(default, cases), base + 8 + npairs * 8 - pc)
+            }
             0xAC => (Instr::IReturn, 1),
             0xAD => (Instr::LReturn, 1),
             0xAE => (Instr::FReturn, 1),

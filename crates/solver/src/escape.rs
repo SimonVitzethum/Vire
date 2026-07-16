@@ -133,6 +133,11 @@ fn cyclic_blocks(f: &Function) -> Vec<bool> {
             Terminator::Branch { then_blk, else_blk, .. } => {
                 vec![then_blk.0 as usize, else_blk.0 as usize]
             }
+            Terminator::Switch { default, cases, .. } => {
+                let mut v = vec![default.0 as usize];
+                v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                v
+            }
             Terminator::Return(_) => vec![],
         })
         .collect();

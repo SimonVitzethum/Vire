@@ -137,6 +137,12 @@ pub enum Terminator {
         then_blk: Block,
         else_blk: Block,
     },
+    /// Mehrweg-Verzweigung (tableswitch/lookupswitch) auf einen i32-Wert.
+    Switch {
+        value: Operand,
+        default: Block,
+        cases: Vec<(i32, Block)>,
+    },
     Return(Option<Operand>),
 }
 

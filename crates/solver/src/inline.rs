@@ -159,6 +159,15 @@ fn splice_callee(
                     else_blk: Block(else_blk.0 + block_off),
                 }
             }
+            Terminator::Switch { value, default, cases } => {
+                let mut value = value.clone();
+                remap_operand(&mut value, local_off);
+                Terminator::Switch {
+                    value,
+                    default: Block(default.0 + block_off),
+                    cases: cases.iter().map(|(k, b)| (*k, Block(b.0 + block_off))).collect(),
+                }
+            }
             Terminator::Return(op) => {
                 if let (Some(d), Some(op)) = (dest, op.as_ref()) {
                     let mut op = op.clone();

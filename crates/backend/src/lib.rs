@@ -727,6 +727,15 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 writeln!(w, "  {b} = icmp ne i32 {c}, 0").unwrap();
                 writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}", then_blk.0, else_blk.0).unwrap();
             }
+            Terminator::Switch { value, default, cases } => {
+                let v = e.operand(w, value);
+                let arms: String = cases
+                    .iter()
+                    .map(|(k, b)| format!("i32 {k}, label %bb{}", b.0))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                writeln!(w, "  switch i32 {v}, label %bb{} [{arms}]", default.0).unwrap();
+            }
             Terminator::Return(None) => {
                 emit_cleanup(w, &mut e);
                 writeln!(w, "  ret void").unwrap();

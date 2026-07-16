@@ -576,6 +576,15 @@ fn lower_method(
                     leaders.push(*next_pc);
                 }
             }
+            Instr::Switch(default, cases) => {
+                leaders.push(*default);
+                for (_, t) in cases {
+                    leaders.push(*t);
+                }
+                if let Some((next_pc, _)) = instrs.get(i + 1) {
+                    leaders.push(*next_pc);
+                }
+            }
             Instr::Return | Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn
             | Instr::FReturn | Instr::AThrow => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
@@ -1222,6 +1231,24 @@ fn lower_block(
                 succs.push((blk, stack.clone()));
                 terminator = Some(Terminator::Goto(blk));
             }
+            Instr::Switch(default, cases) => {
+                let value = pop!();
+                let default_blk = block_of_pc[default];
+                succs.push((default_blk, stack.clone()));
+                let case_blks: Vec<(i32, Block)> = cases
+                    .iter()
+                    .map(|(k, t)| {
+                        let b = block_of_pc[t];
+                        succs.push((b, stack.clone()));
+                        (*k, b)
+                    })
+                    .collect();
+                terminator = Some(Terminator::Switch {
+                    value: Operand::Copy(value),
+                    default: default_blk,
+                    cases: case_blks,
+                });
+            }
             Instr::Return => terminator = Some(Terminator::Return(None)),
             Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn | Instr::FReturn => {
                 let v = pop!();
@@ -1510,9 +1537,10 @@ fn lower_block(
                         ("charAt", "(I)C") => "jrt_str_char_at",
                         ("equals", "(Ljava/lang/Object;)Z") => "jrt_str_equals",
                         ("isEmpty", "()Z") => "jrt_str_is_empty",
+                        ("hashCode", "()I") => "jrt_str_hashcode",
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "String.{name}{desc} (Teilmenge: length, charAt, equals, isEmpty)"
+                                "String.{name}{desc} (Teilmenge: length, charAt, equals, isEmpty, hashCode)"
                             )))
                         }
                     };
