@@ -118,6 +118,11 @@ run stdlibdemo    0 StdlibDemo StdlibDemo @stdlib
 run colldemo      0 CollDemo CollDemo @stdlib
 run streams       0 Streams Streams @stdlib
 run streams2      0 Streams2 Streams2 @stdlib
+run intstreams    0 IntStreams IntStreams @stdlib
+
+# --- Sprachfeatures ---
+run switch        0 Switch Switch
+run format        0 Format Format
 
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"
