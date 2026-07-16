@@ -28,6 +28,7 @@ fn llty(ty: Ty) -> &'static str {
     match ty {
         Ty::I32 => "i32",
         Ty::I64 => "i64",
+        Ty::F64 => "double",
         Ty::Ref => "ptr",
         Ty::Void => "void",
     }
@@ -54,6 +55,17 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_double_to_str", "ptr (double)"),
     ("jrt_idiv", "i32 (i32, i32)"),
     ("jrt_irem", "i32 (i32, i32)"),
+    ("jrt_ldiv", "i64 (i64, i64)"),
+    ("jrt_lrem", "i64 (i64, i64)"),
+    ("jrt_lcmp", "i32 (i64, i64)"),
+    ("jrt_dcmpl", "i32 (double, double)"),
+    ("jrt_dcmpg", "i32 (double, double)"),
+    ("jrt_d2i", "i32 (double)"),
+    ("jrt_d2l", "i64 (double)"),
+    ("jrt_print_long", "void (i64)"),
+    ("jrt_println_long", "void (i64)"),
+    ("jrt_print_double", "void (double)"),
+    ("jrt_println_double", "void (double)"),
     ("jrt_alloc", "ptr (i64)"),
     ("jrt_null_check", "void (ptr)"),
     ("jrt_retain", "void (ptr)"),
@@ -342,6 +354,7 @@ fn operand_ty(f: &Function, op: &Operand) -> Ty {
         Operand::Copy(l) => f.locals[l.0 as usize],
         Operand::ConstI32(_) => Ty::I32,
         Operand::ConstI64(_) => Ty::I64,
+        Operand::ConstF64(_) => Ty::F64,
         Operand::ConstStr(_) | Operand::ConstClass(_) | Operand::ConstNull => Ty::Ref,
     }
 }
@@ -367,10 +380,9 @@ impl<'a> FnEmitter<'a> {
                 t
             }
             Operand::ConstI32(v) => v.to_string(),
-            // ConstI64(0) dient dem Frontend als Ref-Dummy (System.out);
-            // in Ref-Kontexten muss daraus null werden.
-            Operand::ConstI64(0) => "null".to_string(),
             Operand::ConstI64(v) => v.to_string(),
+            // LLVM verlangt exakte double-Literale → Bit-Muster als Hex.
+            Operand::ConstF64(v) => format!("0x{:016X}", v.to_bits()),
             Operand::ConstStr(i) => format!("@jstr.{i}"),
             Operand::ConstClass(c) => format!("@jclass.{}", sanitize(c)),
             Operand::ConstNull => "null".to_string(),
@@ -463,9 +475,14 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let val = match rv {
                 Rvalue::Use(op) => e.operand(w, op),
                 Rvalue::Neg(op) => {
+                    let ty = operand_ty(e.f, op);
                     let v = e.operand(w, op);
                     let t = e.fresh();
-                    writeln!(w, "  {t} = sub i32 0, {v}").unwrap();
+                    if ty == Ty::F64 {
+                        writeln!(w, "  {t} = fneg double {v}").unwrap();
+                    } else {
+                        writeln!(w, "  {t} = sub {} 0, {v}", llty(ty)).unwrap();
+                    }
                     t
                 }
                 Rvalue::Binary(op, a, b) => {
@@ -473,6 +490,20 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     let av = e.operand(w, a);
                     let bv = e.operand(w, b);
                     emit_binop(w, e, *op, aty, &av, &bv)
+                }
+                Rvalue::Convert(op) => {
+                    let from = operand_ty(e.f, op);
+                    let to = e.f.locals[dest.0 as usize];
+                    let v = e.operand(w, op);
+                    let t = e.fresh();
+                    let inst = match (from, to) {
+                        (Ty::I32, Ty::I64) => "sext",
+                        (Ty::I32, Ty::F64) | (Ty::I64, Ty::F64) => "sitofp",
+                        (Ty::I64, Ty::I32) => "trunc",
+                        _ => panic!("unerwartete Konvertierung {from:?} -> {to:?}"),
+                    };
+                    writeln!(w, "  {t} = {inst} {} {v} to {}", llty(from), llty(to)).unwrap();
+                    t
                 }
             };
             let _ = dty;
@@ -693,49 +724,77 @@ fn call_args(w: &mut String, e: &mut FnEmitter, args: &[Operand]) -> String {
 }
 
 fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b: &str) -> String {
-    // Shift-Beträge maskieren (JLS 15.19): b & 31 vor shl/ashr/lshr,
-    // sonst wäre der LLVM-Wert bei b >= 32 poison.
-    let masked = |w: &mut String, e: &mut FnEmitter, b: &str| -> String {
-        let m = e.fresh();
-        writeln!(w, "  {m} = and i32 {b}, 31").unwrap();
-        m
-    };
     let t = e.fresh();
+    // Vergleiche liefern immer i32 (0/1); Operanden sind i32 oder ptr
+    // (long/double-Vergleiche laufen über Runtime-lcmp/dcmp).
+    if matches!(op, BinOp::CmpEq | BinOp::CmpNe | BinOp::CmpLt | BinOp::CmpGe | BinOp::CmpGt | BinOp::CmpLe) {
+        let cc = match op {
+            BinOp::CmpEq => "eq",
+            BinOp::CmpNe => "ne",
+            BinOp::CmpLt => "slt",
+            BinOp::CmpGe => "sge",
+            BinOp::CmpGt => "sgt",
+            _ => "sle",
+        };
+        let c = e.fresh();
+        writeln!(w, "  {c} = icmp {cc} {} {a}, {b}", llty(aty)).unwrap();
+        writeln!(w, "  {t} = zext i1 {c} to i32").unwrap();
+        return t;
+    }
+
+    // double-Arithmetik.
+    if aty == Ty::F64 {
+        let inst = match op {
+            BinOp::Add => "fadd",
+            BinOp::Sub => "fsub",
+            BinOp::Mul => "fmul",
+            BinOp::Div => "fdiv",
+            BinOp::Rem => "frem",
+            _ => panic!("Bit-/Shift-Operation auf double"),
+        };
+        writeln!(w, "  {t} = {inst} double {a}, {b}").unwrap();
+        return t;
+    }
+
+    // int/long-Arithmetik. div/rem laufen für beide über Runtime (nicht hier).
+    let ty = llty(aty);
+    // Shift-Beträge maskieren (JLS 15.19): & 31 (int) bzw. & 63 (long); der
+    // Betrag ist immer int und wird für long auf i64 erweitert.
+    let masked = |w: &mut String, e: &mut FnEmitter, b: &str| -> String {
+        if aty == Ty::I64 {
+            let ext = e.fresh();
+            writeln!(w, "  {ext} = zext i32 {b} to i64").unwrap();
+            let m = e.fresh();
+            writeln!(w, "  {m} = and i64 {ext}, 63").unwrap();
+            m
+        } else {
+            let m = e.fresh();
+            writeln!(w, "  {m} = and i32 {b}, 31").unwrap();
+            m
+        }
+    };
     match op {
-        BinOp::Add => writeln!(w, "  {t} = add i32 {a}, {b}").unwrap(),
-        BinOp::Sub => writeln!(w, "  {t} = sub i32 {a}, {b}").unwrap(),
-        BinOp::Mul => writeln!(w, "  {t} = mul i32 {a}, {b}").unwrap(),
+        BinOp::Add => writeln!(w, "  {t} = add {ty} {a}, {b}").unwrap(),
+        BinOp::Sub => writeln!(w, "  {t} = sub {ty} {a}, {b}").unwrap(),
+        BinOp::Mul => writeln!(w, "  {t} = mul {ty} {a}, {b}").unwrap(),
         BinOp::Div => writeln!(w, "  {t} = call i32 @jrt_idiv(i32 {a}, i32 {b})").unwrap(),
         BinOp::Rem => writeln!(w, "  {t} = call i32 @jrt_irem(i32 {a}, i32 {b})").unwrap(),
-        BinOp::And => writeln!(w, "  {t} = and i32 {a}, {b}").unwrap(),
-        BinOp::Or => writeln!(w, "  {t} = or i32 {a}, {b}").unwrap(),
-        BinOp::Xor => writeln!(w, "  {t} = xor i32 {a}, {b}").unwrap(),
+        BinOp::And => writeln!(w, "  {t} = and {ty} {a}, {b}").unwrap(),
+        BinOp::Or => writeln!(w, "  {t} = or {ty} {a}, {b}").unwrap(),
+        BinOp::Xor => writeln!(w, "  {t} = xor {ty} {a}, {b}").unwrap(),
         BinOp::Shl => {
             let m = masked(w, e, b);
-            writeln!(w, "  {t} = shl i32 {a}, {m}").unwrap();
+            writeln!(w, "  {t} = shl {ty} {a}, {m}").unwrap();
         }
         BinOp::Shr => {
             let m = masked(w, e, b);
-            writeln!(w, "  {t} = ashr i32 {a}, {m}").unwrap();
+            writeln!(w, "  {t} = ashr {ty} {a}, {m}").unwrap();
         }
         BinOp::UShr => {
             let m = masked(w, e, b);
-            writeln!(w, "  {t} = lshr i32 {a}, {m}").unwrap();
+            writeln!(w, "  {t} = lshr {ty} {a}, {m}").unwrap();
         }
-        BinOp::CmpEq | BinOp::CmpNe | BinOp::CmpLt | BinOp::CmpGe | BinOp::CmpGt | BinOp::CmpLe => {
-            let cc = match op {
-                BinOp::CmpEq => "eq",
-                BinOp::CmpNe => "ne",
-                BinOp::CmpLt => "slt",
-                BinOp::CmpGe => "sge",
-                BinOp::CmpGt => "sgt",
-                _ => "sle",
-            };
-            let c = e.fresh();
-            // Ref-Vergleiche (ifnull, if_acmpeq) laufen über ptr.
-            writeln!(w, "  {c} = icmp {cc} {} {a}, {b}", llty(aty)).unwrap();
-            writeln!(w, "  {t} = zext i1 {c} to i32").unwrap();
-        }
+        _ => unreachable!("Vergleich bereits behandelt"),
     }
     t
 }

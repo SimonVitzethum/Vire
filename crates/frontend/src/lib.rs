@@ -179,6 +179,7 @@ fn field_ty(
         // boolean/byte/short/char sind auf Stack und in Locals int (JVMS 2.11.1).
         'I' | 'Z' | 'B' | 'S' | 'C' => Ok(Ty::I32),
         'J' => Ok(Ty::I64),
+        'D' => Ok(Ty::F64),
         'L' => {
             for c in rest.by_ref() {
                 if c == ';' {
@@ -316,7 +317,7 @@ fn lower_method(
                     leaders.push(*next_pc);
                 }
             }
-            Instr::Return | Instr::IReturn => {
+            Instr::Return | Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
                 }
@@ -475,9 +476,42 @@ fn lower_block(
                     _ => return Err(FrontendError::Unsupported(format!("ldc auf CP-Index {idx}"))),
                 }
             }
+            Instr::LConst(v) => {
+                push!(Ty::I64, Rvalue::Use(Operand::ConstI64(*v)));
+            }
+            Instr::DConst(v) => {
+                push!(Ty::F64, Rvalue::Use(Operand::ConstF64(*v)));
+            }
+            Instr::Ldc2W(idx) => match ml.cf.constant_pool.get(*idx as usize) {
+                Some(Const::Long(v)) => {
+                    push!(Ty::I64, Rvalue::Use(Operand::ConstI64(*v)));
+                }
+                Some(Const::Double(v)) => {
+                    push!(Ty::F64, Rvalue::Use(Operand::ConstF64(*v)));
+                }
+                _ => return Err(FrontendError::Unsupported(format!("ldc2_w auf CP-Index {idx}"))),
+            },
             Instr::ILoad(slot) => {
                 let l = ml.jvm_slot(*slot, Ty::I32);
                 push!(Ty::I32, Rvalue::Use(Operand::Copy(l)));
+            }
+            Instr::LLoad(slot) => {
+                let l = ml.jvm_slot(*slot, Ty::I64);
+                push!(Ty::I64, Rvalue::Use(Operand::Copy(l)));
+            }
+            Instr::DLoad(slot) => {
+                let l = ml.jvm_slot(*slot, Ty::F64);
+                push!(Ty::F64, Rvalue::Use(Operand::Copy(l)));
+            }
+            Instr::LStore(slot) => {
+                let v = pop!();
+                let l = ml.jvm_slot(*slot, Ty::I64);
+                stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
+            }
+            Instr::DStore(slot) => {
+                let v = pop!();
+                let l = ml.jvm_slot(*slot, Ty::F64);
+                stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
             }
             Instr::ALoad(slot) => {
                 let l = ml.jvm_slot(*slot, Ty::Ref);
@@ -504,6 +538,104 @@ fn lower_block(
                 let v = pop!();
                 push!(Ty::I32, Rvalue::Neg(Operand::Copy(v)));
             }
+            Instr::LNeg => {
+                let v = pop!();
+                push!(Ty::I64, Rvalue::Neg(Operand::Copy(v)));
+            }
+            Instr::DNeg => {
+                let v = pop!();
+                push!(Ty::F64, Rvalue::Neg(Operand::Copy(v)));
+            }
+            Instr::LAdd | Instr::LSub | Instr::LMul | Instr::LAnd | Instr::LOr | Instr::LXor
+            | Instr::LShl | Instr::LShr | Instr::LUShr => {
+                let op = match instr {
+                    Instr::LAdd => BinOp::Add,
+                    Instr::LSub => BinOp::Sub,
+                    Instr::LMul => BinOp::Mul,
+                    Instr::LAnd => BinOp::And,
+                    Instr::LOr => BinOp::Or,
+                    Instr::LXor => BinOp::Xor,
+                    Instr::LShl => BinOp::Shl,
+                    Instr::LShr => BinOp::Shr,
+                    _ => BinOp::UShr,
+                };
+                let b = pop!();
+                let a = pop!();
+                push!(Ty::I64, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
+            }
+            Instr::DAdd | Instr::DSub | Instr::DMul | Instr::DDiv | Instr::DRem => {
+                let op = match instr {
+                    Instr::DAdd => BinOp::Add,
+                    Instr::DSub => BinOp::Sub,
+                    Instr::DMul => BinOp::Mul,
+                    Instr::DDiv => BinOp::Div,
+                    _ => BinOp::Rem,
+                };
+                let b = pop!();
+                let a = pop!();
+                push!(Ty::F64, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
+            }
+            // long-Division/Rest über Runtime (Java: /0 wirft, MIN/-1 definiert).
+            Instr::LDiv | Instr::LRem => {
+                let func = if matches!(instr, Instr::LDiv) { "jrt_ldiv" } else { "jrt_lrem" };
+                let b = pop!();
+                let a = pop!();
+                let l = ml.stack_slot(stack.len(), Ty::I64);
+                stmts.push(Statement::Call {
+                    dest: Some(l),
+                    func: func.to_string(),
+                    args: vec![Operand::Copy(a), Operand::Copy(b)],
+                });
+                stack.push(Ty::I64);
+            }
+            Instr::LCmp | Instr::DCmpL | Instr::DCmpG => {
+                let func = match instr {
+                    Instr::LCmp => "jrt_lcmp",
+                    Instr::DCmpL => "jrt_dcmpl",
+                    _ => "jrt_dcmpg",
+                };
+                let b = pop!();
+                let a = pop!();
+                let l = ml.stack_slot(stack.len(), Ty::I32);
+                stmts.push(Statement::Call {
+                    dest: Some(l),
+                    func: func.to_string(),
+                    args: vec![Operand::Copy(a), Operand::Copy(b)],
+                });
+                stack.push(Ty::I32);
+            }
+            Instr::I2L => {
+                let v = pop!();
+                push!(Ty::I64, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::I2D => {
+                let v = pop!();
+                push!(Ty::F64, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::L2I => {
+                let v = pop!();
+                push!(Ty::I32, Rvalue::Convert(Operand::Copy(v)));
+            }
+            Instr::L2D => {
+                let v = pop!();
+                push!(Ty::F64, Rvalue::Convert(Operand::Copy(v)));
+            }
+            // d2i/d2l saturieren (Java-Semantik) → Runtime.
+            Instr::D2I | Instr::D2L => {
+                let (func, ty) = if matches!(instr, Instr::D2I) {
+                    ("jrt_d2i", Ty::I32)
+                } else {
+                    ("jrt_d2l", Ty::I64)
+                };
+                let v = pop!();
+                let l = ml.stack_slot(stack.len(), ty);
+                stmts.push(Statement::Call {
+                    dest: Some(l),
+                    func: func.to_string(),
+                    args: vec![Operand::Copy(v)],
+                });
+                stack.push(ty);
+            }
             Instr::IAdd | Instr::ISub | Instr::IMul | Instr::IDiv | Instr::IRem
             | Instr::IShl | Instr::IShr | Instr::IUShr | Instr::IAnd | Instr::IOr | Instr::IXor => {
                 let op = match instr {
@@ -526,12 +658,39 @@ fn lower_block(
             Instr::Pop => {
                 pop!();
             }
+            Instr::Pop2 => {
+                // Kategorie-2 (long/double) belegt einen Stack-Eintrag; zwei
+                // Kategorie-1-Werte zwei.
+                let top = *stack.last().ok_or_else(|| {
+                    FrontendError::Unsupported("pop2 auf leerem Stack".into())
+                })?;
+                pop!();
+                if top != Ty::I64 && top != Ty::F64 {
+                    pop!();
+                }
+            }
             Instr::Dup => {
                 let ty = *stack.last().ok_or_else(|| {
                     FrontendError::Unsupported("dup auf leerem Stack".into())
                 })?;
                 let src = ml.stack_slot(stack.len() - 1, ty);
                 push!(ty, Rvalue::Use(Operand::Copy(src)));
+            }
+            Instr::Dup2 => {
+                let top = *stack.last().ok_or_else(|| {
+                    FrontendError::Unsupported("dup2 auf leerem Stack".into())
+                })?;
+                if top == Ty::I64 || top == Ty::F64 {
+                    let src = ml.stack_slot(stack.len() - 1, top);
+                    push!(top, Rvalue::Use(Operand::Copy(src)));
+                } else {
+                    let t_lo = stack[stack.len() - 2];
+                    let t_hi = stack[stack.len() - 1];
+                    let s_lo = ml.stack_slot(stack.len() - 2, t_lo);
+                    let s_hi = ml.stack_slot(stack.len() - 1, t_hi);
+                    push!(t_lo, Rvalue::Use(Operand::Copy(s_lo)));
+                    push!(t_hi, Rvalue::Use(Operand::Copy(s_hi)));
+                }
             }
             Instr::IfICmp(cond, target)
             | Instr::IfZero(cond, target)
@@ -578,7 +737,7 @@ fn lower_block(
                 terminator = Some(Terminator::Goto(blk));
             }
             Instr::Return => terminator = Some(Terminator::Return(None)),
-            Instr::IReturn | Instr::AReturn => {
+            Instr::IReturn | Instr::AReturn | Instr::LReturn | Instr::DReturn => {
                 let v = pop!();
                 terminator = Some(Terminator::Return(Some(Operand::Copy(v))));
             }
@@ -695,7 +854,7 @@ fn lower_block(
                 let (class, name, _) = ml.cf.member_ref(*idx)?;
                 if class == "java/lang/System" && (name == "out" || name == "err") {
                     // Receiver-Dummy; das println-Intrinsic ignoriert ihn.
-                    push!(Ty::Ref, Rvalue::Use(Operand::ConstI64(0)));
+                    push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                 } else {
                     return Err(FrontendError::Unsupported(format!("getstatic {class}.{name}")));
                 }
@@ -710,6 +869,10 @@ fn lower_block(
                     ("java/io/PrintStream", "print", "(I)V") => Some("jrt_print_int"),
                     ("java/io/PrintStream", "println", "(C)V") => Some("jrt_println_char"),
                     ("java/io/PrintStream", "print", "(C)V") => Some("jrt_print_char"),
+                    ("java/io/PrintStream", "println", "(J)V") => Some("jrt_println_long"),
+                    ("java/io/PrintStream", "print", "(J)V") => Some("jrt_print_long"),
+                    ("java/io/PrintStream", "println", "(D)V") => Some("jrt_println_double"),
+                    ("java/io/PrintStream", "print", "(D)V") => Some("jrt_print_double"),
                     _ => None,
                 };
                 if let Some(intrinsic) = intrinsic {
@@ -821,7 +984,7 @@ fn lower_block(
             Instr::InvokeDynamic(idx) => {
                 // Nur String-Konkatenation (StringConcatFactory) wird statisch
                 // aufgelöst — Closed World, DESIGN.md §1.3.
-                let (dname, ddesc, bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
+                let (dname, ddesc, _bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
                         "invokedynamic {dname} (nur String-Konkatenation unterstützt)"
@@ -855,9 +1018,11 @@ fn lower_block(
                         "I" | "S" | "B" => str_conv(ml, &mut stmts, "jrt_int_to_str", val),
                         "C" => str_conv(ml, &mut stmts, "jrt_char_to_str", val),
                         "Z" => str_conv(ml, &mut stmts, "jrt_bool_to_str", val),
+                        "J" => str_conv(ml, &mut stmts, "jrt_long_to_str", val),
+                        "D" => str_conv(ml, &mut stmts, "jrt_double_to_str", val),
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "Konkatenation von Argument-Typ {pd} (Teilmenge: int, char, boolean, String)"
+                                "Konkatenation von Argument-Typ {pd} (Teilmenge: int, long, double, char, boolean, String)"
                             )))
                         }
                     };

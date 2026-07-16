@@ -9,6 +9,7 @@ use std::fmt;
 pub enum Ty {
     I32,
     I64,
+    F64,
     /// Referenztyp; vorerst opak (Zeiger). Für String-Literale genutzt.
     Ref,
     Void,
@@ -27,6 +28,7 @@ pub enum Operand {
     Copy(Local),
     ConstI32(i32),
     ConstI64(i64),
+    ConstF64(f64),
     /// Verweis auf ein String-Literal in `Program::strings`.
     ConstStr(u32),
     /// Class-Objekt einer zur Compile-Zeit aufgelösten Klasse (Reflection,
@@ -63,6 +65,10 @@ pub enum Rvalue {
     Use(Operand),
     Binary(BinOp, Operand, Operand),
     Neg(Operand),
+    /// Numerische Konvertierung; Quelltyp = Typ des Operanden, Zieltyp =
+    /// Typ des Ziel-Locals. Nur verlustfreie/definierte Fälle inline
+    /// (i2l/i2d/l2d/l2i); saturating d2i/d2l laufen über Runtime-Calls.
+    Convert(Operand),
 }
 
 #[derive(Debug, Clone)]

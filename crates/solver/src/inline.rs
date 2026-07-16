@@ -126,7 +126,7 @@ fn remap_operand(op: &mut Operand, off: u32) {
 
 fn remap_rvalue(rv: &mut Rvalue, off: u32) {
     match rv {
-        Rvalue::Use(op) | Rvalue::Neg(op) => remap_operand(op, off),
+        Rvalue::Use(op) | Rvalue::Neg(op) | Rvalue::Convert(op) => remap_operand(op, off),
         Rvalue::Binary(_, a, b) => {
             remap_operand(a, off);
             remap_operand(b, off);

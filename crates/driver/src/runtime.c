@@ -461,3 +461,66 @@ int32_t jrt_irem(int32_t a, int32_t b) {
         return 0;
     return a % b;
 }
+
+/* --- long/double --------------------------------------------------- */
+
+int64_t jrt_ldiv(int64_t a, int64_t b) {
+    if (b == 0) {
+        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
+        exit(1);
+    }
+    if (a == INT64_MIN && b == -1)
+        return INT64_MIN;
+    return a / b;
+}
+
+int64_t jrt_lrem(int64_t a, int64_t b) {
+    if (b == 0) {
+        fputs("Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n", stderr);
+        exit(1);
+    }
+    if (a == INT64_MIN && b == -1)
+        return 0;
+    return a % b;
+}
+
+/* lcmp: -1/0/1. */
+int32_t jrt_lcmp(int64_t a, int64_t b) {
+    return (a > b) - (a < b);
+}
+
+/* dcmpl/dcmpg unterscheiden sich nur bei NaN (JVMS 6.5): dcmpl → -1,
+ * dcmpg → 1, damit NaN-Vergleiche stets "falsch" liefern. */
+int32_t jrt_dcmpl(double a, double b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == b) return 0;
+    return -1; /* mindestens ein NaN */
+}
+int32_t jrt_dcmpg(double a, double b) {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == b) return 0;
+    return 1; /* mindestens ein NaN */
+}
+
+/* d2i/d2l saturieren (JLS 5.1.3): NaN → 0, außerhalb des Bereichs auf
+ * MIN/MAX geklemmt. */
+int32_t jrt_d2i(double d) {
+    if (d != d) return 0;
+    if (d >= 2147483647.0) return INT32_MAX;
+    if (d <= -2147483648.0) return INT32_MIN;
+    return (int32_t)d;
+}
+int64_t jrt_d2l(double d) {
+    if (d != d) return 0;
+    if (d >= 9223372036854775807.0) return INT64_MAX;
+    if (d <= -9223372036854775808.0) return INT64_MIN;
+    return (int64_t)d;
+}
+
+void jrt_print_long(int64_t v) { printf("%lld", (long long)v); }
+void jrt_println_long(int64_t v) { printf("%lld\n", (long long)v); }
+/* %g-Näherung; nicht Javas kürzestes rundreisesicheres Format (DESIGN.md §6). */
+void jrt_print_double(double d) { printf("%g", d); }
+void jrt_println_double(double d) { printf("%g\n", d); }
