@@ -1,11 +1,12 @@
 package java.util.stream;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Consumer;
+import java.util.function.BinaryOperator;
 
-// Eager-Implementierung über einer ArrayList (Stub).
 public class StreamImpl<T> implements Stream<T> {
     private ArrayList<T> data;
 
@@ -38,5 +39,19 @@ public class StreamImpl<T> implements Stream<T> {
 
     public long count() {
         return data.size();
+    }
+
+    public List<T> toList() {
+        ArrayList<T> out = new ArrayList<>();
+        for (int i = 0; i < data.size(); i++) out.add(data.get(i));
+        return out;
+    }
+
+    public T reduce(T identity, BinaryOperator<T> op) {
+        T acc = identity;
+        for (int i = 0; i < data.size(); i++) {
+            acc = op.apply(acc, data.get(i));
+        }
+        return acc;
     }
 }
