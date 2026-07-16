@@ -184,6 +184,12 @@ struct Ctx<'a> {
     /// dieselbe Interface-Methode in jeder implementierenden Klasse am
     /// selben Slot liegt. Schlüssel: (interface, name, desc).
     iface_slots: Vec<(String, String, String)>,
+    /// TBAA-Zugriffs-Tag (Metadaten-Nummer `!N`) pro deklariertem Instanzfeld
+    /// (Owner-Klasse, Feldname). Verschiedene Felder → Geschwister-Typknoten →
+    /// beweisbar alias-frei; gleiches Feld → selber Knoten → LLVM bleibt
+    /// konservativ. Nicht getaggte Zugriffe (RC-Header, Vtable, Arrays über die
+    /// Runtime) aliasieren konservativ mit allem — daher soundness-neutral.
+    tbaa: BTreeMap<(String, String), usize>,
 }
 
 impl<'a> Ctx<'a> {
@@ -195,6 +201,14 @@ impl<'a> Ctx<'a> {
     /// drop, trace und den globalen Interface-Slots).
     fn method_base(&self) -> usize {
         VTABLE_METHOD_OFFSET + self.iface_slots.len()
+    }
+
+    /// TBAA-Zugriffs-Tag-Suffix (`, !tbaa !N`) für ein Feld, sonst leer.
+    fn tbaa_suffix(&self, owner: &str, field: &str) -> String {
+        match self.tbaa.get(&(owner.to_string(), field.to_string())) {
+            Some(n) => format!(", !tbaa !{n}"),
+            None => String::new(),
+        }
     }
 
     fn iface_index(&self, iface: &str, name: &str, desc: &str) -> Option<usize> {
@@ -310,7 +324,19 @@ pub fn emit(program: &Program) -> String {
             }
         }
     }
-    let ctx = Ctx { program, iface_slots };
+    // TBAA-Registry: jedem deklarierten Instanzfeld ein Zugriffs-Tag zuweisen.
+    // Layout der Metadaten: !0 = Wurzel; Feld k → Typknoten !(1+2k), Tag !(2+2k).
+    let mut tbaa: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for c in &program.classes {
+        for f in &c.fields {
+            let key = (c.name.clone(), f.name.clone());
+            if !tbaa.contains_key(&key) {
+                let k = tbaa.len();
+                tbaa.insert(key, 2 + 2 * k);
+            }
+        }
+    }
+    let ctx = Ctx { program, iface_slots, tbaa };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -593,6 +619,18 @@ pub fn emit(program: &Program) -> String {
         writeln!(w, "  call void @jrt_check_uncaught()").unwrap();
         writeln!(w, "  ret i32 0").unwrap();
         writeln!(w, "}}").unwrap();
+    }
+
+    // TBAA-Metadatenbaum: Wurzel !0, pro Feld ein Typknoten + Zugriffs-Tag.
+    if !ctx.tbaa.is_empty() {
+        writeln!(w, "\n!0 = !{{!\"fastllvm-tbaa\"}}").unwrap();
+        let mut fields: Vec<(&(String, String), &usize)> = ctx.tbaa.iter().collect();
+        fields.sort_by_key(|(_, n)| **n);
+        for ((owner, field), tag) in fields {
+            let tynode = tag - 1;
+            writeln!(w, "!{tynode} = !{{!\"fld.{}.{}\", !0}}", sanitize(owner), sanitize(field)).unwrap();
+            writeln!(w, "!{tag} = !{{!{tynode}, !{tynode}, i64 0}}").unwrap();
+        }
     }
 
     out
@@ -1054,7 +1092,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let t = e.fresh();
-            writeln!(w, "  {t} = load {}, ptr {p}", llty(ty)).unwrap();
+            writeln!(w, "  {t} = load {}, ptr {p}{}", llty(ty), ctx.tbaa_suffix(&owner, field)).unwrap();
             // Feldwert ist geborgt; die Kopie ins Local wird owned → retain.
             store_dest(w, e, *dest, &t, true);
             writeln!(w, "  br label %{cont}").unwrap();
@@ -1076,15 +1114,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "{ok}:").unwrap();
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
+            let tb = ctx.tbaa_suffix(&owner, field);
             if ty == Ty::Ref {
                 // Feld übernimmt eine owning-Referenz: retain neu, release alt.
                 writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 let old = e.fresh();
-                writeln!(w, "  {old} = load ptr, ptr {p}").unwrap();
-                writeln!(w, "  store ptr {v}, ptr {p}").unwrap();
+                writeln!(w, "  {old} = load ptr, ptr {p}{tb}").unwrap();
+                writeln!(w, "  store ptr {v}, ptr {p}{tb}").unwrap();
                 writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
             } else {
-                writeln!(w, "  store {} {v}, ptr {p}", llty(ty)).unwrap();
+                writeln!(w, "  store {} {v}, ptr {p}{tb}", llty(ty)).unwrap();
             }
             writeln!(w, "  br label %{cont}").unwrap();
             writeln!(w, "{cont}:").unwrap();
