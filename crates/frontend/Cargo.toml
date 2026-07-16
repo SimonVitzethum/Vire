@@ -1,0 +1,8 @@
+[package]
+name = "fastllvm-frontend"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+fastllvm-classfile = { path = "../classfile" }
+fastllvm-ir = { path = "../ir" }

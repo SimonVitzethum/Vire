@@ -1,0 +1,9 @@
+# rustc-Quellcheckout: nur Referenzlektüre, keine Abhängigkeit (DESIGN.md §1.2)
+/rustc-src
+
+# Rust
+/target/
+
+# javac-/fastjavac-Ausgaben in den Beispielen: alles außer den Quellen
+examples/*
+!examples/*.java

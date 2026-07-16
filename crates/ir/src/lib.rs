@@ -1,0 +1,251 @@
+//! Mittel-IR nach rustc-MIR-Vorbild (siehe DESIGN.md §2): Funktionen aus
+//! Basic Blocks, Locals statt Operandenstack, expliziter Terminator pro
+//! Block. Auf dieser IR laufen später Devirtualisierung, Escape-Analyse,
+//! Inlining und guarded speculation — vor der LLVM-Absenkung.
+
+use std::fmt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ty {
+    I32,
+    I64,
+    /// Referenztyp; vorerst opak (Zeiger). Für String-Literale genutzt.
+    Ref,
+    Void,
+}
+
+/// Index eines Locals in `Function::locals`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Local(pub u32);
+
+/// Index eines Basic Blocks in `Function::blocks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Block(pub u32);
+
+#[derive(Debug, Clone)]
+pub enum Operand {
+    Copy(Local),
+    ConstI32(i32),
+    ConstI64(i64),
+    /// Verweis auf ein String-Literal in `Program::strings`.
+    ConstStr(u32),
+    ConstNull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    /// Java-Semantik: wirft bei Divisor 0; Absenkung fügt den Check ein.
+    Div,
+    Rem,
+    Shl,
+    Shr,
+    UShr,
+    And,
+    Or,
+    Xor,
+    CmpEq,
+    CmpNe,
+    CmpLt,
+    CmpGe,
+    CmpGt,
+    CmpLe,
+}
+
+#[derive(Debug, Clone)]
+pub enum Rvalue {
+    Use(Operand),
+    Binary(BinOp, Operand, Operand),
+    Neg(Operand),
+}
+
+#[derive(Debug, Clone)]
+pub enum Statement {
+    Assign(Local, Rvalue),
+    /// Direkter Aufruf (statisch, devirtualisiert oder Runtime-Intrinsic).
+    Call {
+        dest: Option<Local>,
+        func: String,
+        args: Vec<Operand>,
+    },
+    /// Virtueller Aufruf über die Vtable; `args[0]` ist der Receiver.
+    /// `class` ist der statische Typ des Call-Sites; der Solver ersetzt
+    /// monomorphe Sites durch `Call` (CHA-Devirtualisierung).
+    CallVirtual {
+        dest: Option<Local>,
+        class: String,
+        name: String,
+        desc: String,
+        params: Vec<Ty>,
+        ret: Ty,
+        args: Vec<Operand>,
+    },
+    /// Objektallokation; Felder sind genullt (Java-Default), Header gesetzt.
+    New { dest: Local, class: String },
+    GetField { dest: Local, obj: Operand, class: String, field: String },
+    PutField { obj: Operand, class: String, field: String, value: Operand },
+}
+
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    Goto(Block),
+    /// if op != 0 → then_blk sonst else_blk (Vergleiche liefern 0/1).
+    Branch {
+        cond: Operand,
+        then_blk: Block,
+        else_blk: Block,
+    },
+    Return(Option<Operand>),
+}
+
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub statements: Vec<Statement>,
+    pub terminator: Terminator,
+}
+
+#[derive(Debug, Clone)]
+pub struct Function {
+    /// Gemangelter, linkbarer Name (z. B. `J_Hello_main_...`).
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+    /// Locals[0..params.len()] sind die Parameter.
+    pub locals: Vec<Ty>,
+    pub blocks: Vec<BasicBlock>,
+}
+
+// --- Klassenmodell (Closed World: alle Klassen sind zur Build-Zeit bekannt) ---
+
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    pub name: String,
+    pub ty: Ty,
+}
+
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    pub name: String,
+    pub desc: String,
+    pub is_static: bool,
+    /// false bei abstract (kein Code-Attribut).
+    pub has_body: bool,
+    /// Gemangelter Funktionsname der Definition in dieser Klasse.
+    pub mangled: String,
+}
+
+impl MethodInfo {
+    /// Virtuell = nimmt am Dispatch teil (Instanzmethode, kein Konstruktor).
+    pub fn is_virtual(&self) -> bool {
+        !self.is_static && self.name != "<init>"
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    /// Interner JVM-Name (z. B. `pkg/Foo`).
+    pub name: String,
+    /// None nur bei java/lang/Object (implizit, nicht registriert).
+    pub super_name: Option<String>,
+    /// Nur deklarierte Instanzfelder; Superklassen-Felder über die Kette.
+    pub fields: Vec<FieldInfo>,
+    pub methods: Vec<MethodInfo>,
+}
+
+#[derive(Debug, Default)]
+pub struct Program {
+    pub functions: Vec<Function>,
+    pub classes: Vec<ClassInfo>,
+    /// String-Literal-Pool; `Operand::ConstStr` indiziert hierher.
+    pub strings: Vec<String>,
+}
+
+impl Program {
+    pub fn intern_string(&mut self, s: &str) -> u32 {
+        if let Some(i) = self.strings.iter().position(|x| x == s) {
+            return i as u32;
+        }
+        self.strings.push(s.to_string());
+        (self.strings.len() - 1) as u32
+    }
+
+    pub fn class(&self, name: &str) -> Option<&ClassInfo> {
+        self.classes.iter().find(|c| c.name == name)
+    }
+
+    /// Feld-Auflösung: läuft die Superklassen-Kette von `class` hoch bis zur
+    /// deklarierenden Klasse (JVMS 5.4.3.2). Liefert (Besitzerklasse, Typ).
+    pub fn resolve_field(&self, class: &str, field: &str) -> Option<(&str, Ty)> {
+        let mut cur = self.class(class)?;
+        loop {
+            if let Some(f) = cur.fields.iter().find(|f| f.name == field) {
+                return Some((cur.name.as_str(), f.ty));
+            }
+            cur = self.class(cur.super_name.as_deref()?)?;
+        }
+    }
+
+    /// Methoden-Auflösung: findet die Implementierung von `name`+`desc`
+    /// ab `class` aufwärts. Liefert die definierende ClassInfo + MethodInfo.
+    pub fn resolve_method(&self, class: &str, name: &str, desc: &str) -> Option<(&ClassInfo, &MethodInfo)> {
+        let mut cur = self.class(class)?;
+        loop {
+            if let Some(m) = cur.methods.iter().find(|m| m.name == name && m.desc == desc && m.has_body) {
+                return Some((cur, m));
+            }
+            cur = self.class(cur.super_name.as_deref()?)?;
+        }
+    }
+
+    /// Ist `sub` gleich `sup` oder eine (transitive) Subklasse?
+    pub fn is_subclass(&self, sub: &str, sup: &str) -> bool {
+        let mut cur = sub;
+        loop {
+            if cur == sup {
+                return true;
+            }
+            match self.class(cur).and_then(|c| c.super_name.as_deref()) {
+                Some(s) => cur = s,
+                None => return false,
+            }
+        }
+    }
+}
+
+/// Macht aus einem JVM-Namen einen linkbaren Bezeichner.
+pub fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
+// --- Textuelle Ausgabe für Debugging (`--emit-ir`) ---
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, s) in self.strings.iter().enumerate() {
+            writeln!(f, "str{i} = {s:?}")?;
+        }
+        for func in &self.functions {
+            write!(f, "{func}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Function {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "\nfn {}({:?}) -> {:?} {{", self.name, self.params, self.ret)?;
+        for (i, ty) in self.locals.iter().enumerate() {
+            writeln!(f, "  let _{i}: {ty:?};")?;
+        }
+        for (i, bb) in self.blocks.iter().enumerate() {
+            writeln!(f, "  bb{i}:")?;
+            for st in &bb.statements {
+                writeln!(f, "    {st:?}")?;
+            }
+            writeln!(f, "    {:?}", bb.terminator)?;
+        }
+        writeln!(f, "}}")
+    }
+}

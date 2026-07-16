@@ -1,0 +1,178 @@
+# FastLLVM — Design-Dokument
+
+Java-zu-Native-Compiler (AOT, ohne JVM/JIT) mit Whole-Program-Solver als erster Pipeline-Phase und LLVM als Backend.
+
+Stand: 2026-07-13. Konsolidiert aus der Machbarkeitsanalyse (rustc-Backend-Frage) und der Solver-Architektur-Bewertung.
+
+---
+
+## 1. Grundsatzentscheidungen
+
+### 1.1 Eingabe: Java-Bytecode, nicht Java-Quelltext
+
+javac bleibt das Frontend. Damit sind Syntax-Kompatibilität, Generics-Erasure, Überladungsauflösung (JLS §15.12) und Typinferenz geschenkt — deren Nachbau wäre mehrere Personenjahre ohne fachlichen Gewinn. Eingabe der Pipeline sind JARs/Classfiles.
+
+### 1.2 rustc ist kein verwendbares Backend
+
+Der Teil-Checkout in `rustc-src/` (`rustc_abi`, `rustc_middle`, `rustc_mir_transform`, `rustc_ty_utils`) ist **Referenzlektüre, keine Abhängigkeit**. Gründe:
+
+- Der MIR-Pass-Trait (`rustc_mir_transform/src/pass_manager.rs`) verlangt `TyCtxt` — den Query-Kontext eines *Rust-Crates*, gekoppelt an `Definitions`/DefIds aus HIR, internierte `ty::Ty`, Trait-Solver und `layout_of`. Java-Klassen müssten als synthetische Rust-`AdtDef`s eingeschleust werden; es gibt keine MIR-*Eingabe*-API (StableMIR ist bewusst nur Export).
+- Alles ist `rustc_private`, nightly-only, ohne Stabilitätsgarantie.
+
+**Mitnehmen als Vorlage:** Layout-Algorithmus aus `rustc_abi/src/layout.rs` (Feldanordnung, Nischen, ABI-Klassifizierung) und die MIR-Struktur (CFG aus Basic Blocks, Locals, Places/Rvalues, expliziter Drop) als Muster für die eigene Mittel-IR. Abschreiben statt anlinken.
+
+Verworfene Alternative „Java → unsafe-Rust-Quelltext → rustc": schneller Prototyp, aber kein Zugang zu `gc.statepoint`/Stackmaps, Kampf gegen den Borrow-Checker bei Vererbung/Zyklen/null, Sicherheitsgarantien durch `unsafe` ohnehin verloren.
+
+**Entscheidung:** Bytecode → eigene IR → LLVM direkt (via `inkwell` o. ä.).
+
+### 1.3 Closed World als Kontrakt
+
+Alle Klassen sind die zur Build-Zeit gegebenen JARs; kein dynamisches Nachladen. Das ist der Hebel, der aus heuristischen Analysen *sounde* Beweisverfahren macht (insb. CHA-Devirtualisierung, Dean/Grove/Chambers 1995) — derselbe Zuschnitt wie GraalVM Native Image. Verletzungen (unauflösbare Reflection, `Class.forName` mit dynamischem String) sind **Build-Fehler oder Nutzerdeklaration** (Konfigurationsdatei à la `reachability-metadata.json`), nicht „der Solver löst das schon".
+
+---
+
+## 2. Pipeline
+
+```text
+JARs (javac-Ausgabe)
+   │
+   ▼
+1. Whole-Program Solver        — Fakten HERLEITEN
+   │   Reachability, Callgraph, Points-to, Escape, CHA,
+   │   Reflection-/indy-Auflösung, Immutabilität, <clinit>-Vorausrechnung,
+   │   PGO-Einbindung; SMT nur als On-Demand-Orakel
+   ▼
+2. High-Level-Optimierer auf eigener Mittel-IR — Fakten ANWENDEN
+   │   Devirt, Inlining, Heap→Stack, Lock-Elision, Bounds-Check-Elim.,
+   │   Layout-Optimierung, guarded speculation (Guard + Slow-Path)
+   ▼
+3. LLVM-IR-Erzeugung (reich annotiert: TBAA, noalias, !prof, WPD-Metadaten, …)
+   ▼
+4. LLVM-Optimierung + Codegen
+   ▼
+5. Natives Binary (+ Mini-Runtime, no_std-fähig)
+```
+
+Wichtigste Korrektur gegenüber dem ursprünglichen Entwurf: **Solver (Analyse) und High-Level-Optimierer (Transformation) sind getrennte Phasen auf einer eigenen Mittel-IR.** „Solver liefert Metadaten, LLVM macht den Rest" unterschätzt, wie viele Optimierungen semantisches Java-Wissen brauchen, das in LLVM-IR verloren ist. Native Image (Graal IR) und HotSpot (C2 Ideal Graph) arbeiten aus genau diesem Grund so.
+
+---
+
+## 3. Solver-Komponenten nach Evidenzlage
+
+### 3.1 Bewährt, tragend (Stand der Technik, produktiv erprobt)
+
+| Komponente | Beleg / Verfahren |
+|---|---|
+| Callgraph + Devirtualisierung | RTA/XTA/points-to-basiert; CHA unter Closed World sound. Größter Einzelhebel, weil er Inlining freischaltet |
+| Escape-Analyse → Stack-/Skalarallokation | Choi et al. OOPSLA 1999; Kotzmann/Mössenböck 2005. Statisch unter Closed World sogar sounder als im JIT |
+| Immutabilität, Purity, tote Klassen/Methoden | Standard; „nie nach `<clinit>` geschrieben" ist stärker als `final` und lohnt sich |
+| `<clinit>`-Vorausberechnung zur Build-Zeit | Native-Image-Praxis (Image Heap) |
+| Lock-Elision via Escape-Analyse | thread-lokale Objekte brauchen keine Monitore; HotSpot-erprobt |
+| PGO | AOT+PGO drückt den Abstand zum JIT auf typ. einstellige Prozent (Native-Image-Datenlage) |
+
+### 3.2 Machbar, aber nur selektiv/geschichtet
+
+- **Kontextsensitivität:** k-CFA ist EXPTIME-vollständig (Van Horn/Mairson 2008). Sweet Spot: **objektsensitive** Points-to (Milanova 2005; Smaragdakis POPL 2011, Doop), 2obj+heap für mittlere Programme, sonst selektiv.
+- **Flow-Sensitivität:** global flow-insensitive Points-to + flow-sensitiv nur intraprozedural in SSA. Kein globales flow-sensitives Java-Whole-Program anstreben (für C skaliert sparse FS — Hardekopf/Lin CGO 2011, SVF — für Java-Whole-Program unüblich).
+- **„Whole-Program-SSA":** existiert so nicht und ist unnötig — SSA pro Methode + interprozedurale Summaries (Standardarchitektur).
+- **Reflection/MethodHandle/invokedynamic:** Best-Effort per Konstantenpropagation (Lambda-Bootstraps fast immer vollständig statisch auflösbar; String-Konkatenation via `-XDstringConcat=inline` teils vermeidbar). Allgemeiner Fall nachweislich unlösbar (Livshits 2005; Smaragdakis 2015). Rest: Nutzerdeklaration, s. 1.3.
+
+### 3.3 Spekulativ / im Entwurf falsch dimensioniert
+
+- **SMT/SAT + Symbolic Execution als Whole-Program-Phase:** Pfadexplosion, skaliert nicht (KLEE/SAGE-Befund). Stattdessen **On-Demand-Orakel** des Optimierers für punktuelle Anfragen (Bounds-Check-Beweis, einzelne Alias-Kanten, Nicht-Null).
+- **Ownership-/Lifetime-Inferenz für unrestringiertes Java:** Forschungsstand ohne skalierendes sound-präzises Verfahren; die Mehrheit realer Heap-Objekte hat keinen eindeutigen Besitzer (Region-Inferenz à la Tofte/Talpin 1997 funktionierte für ML, Java-Äquivalent fehlt). Pipeline muss **ohne** diese Komponente funktionieren; sie ist optionales Forschungsmodul am Ende.
+- **Sicherheits-/Thread-Analyse als Optimierungsquelle:** jenseits Escape-basierter Lock-Elision Forschungsniveau; nicht als tragende Optimierung einplanen.
+
+---
+
+## 4. Theoretische Grenzen: Solver vs. JIT
+
+Harte Resultate:
+
+1. **Rice 1953:** jede nichttriviale semantische Eigenschaft ist unentscheidbar → jeder Solver ist konservative Approximation.
+2. **Präzisions-Kosten-Wand** (s. 3.2).
+3. **Eingabeabhängigkeit:** PGO liefert *ein* Profil; ein JIT misst den tatsächlichen Lauf und passt sich Phasenwechseln an.
+
+Der strukturelle Unterschied: **Ein JIT beweist nicht, er spekuliert mit Deoptimierungs-Fallback.** Ein statischer Compiler muss jede Annahme beweisen oder als Guard mit statisch mitkompiliertem Slow-Path absichern.
+
+Substitutionsgrad der vier JIT-Stärken:
+
+| JIT-Quelle | statischer Ersatz | Grad |
+|---|---|---|
+| Typspekulation (Inline-Caches) | CHA beweist viele Sites monomorph; Rest: PGO-gestützte guarded devirtualization (Guard bleibt stehen → kleine, messbare Kosten) | ~90 % |
+| Wertspekulation / Quasi-Konstanten | nur beweisbar Konstantes (final / „nie nach `<clinit>` geschrieben"); für laufzeitkonstante, unbeweisbare Werte kein Äquivalent | teilweise |
+| Profilgesteuerte Entscheidungen (Inlining, Layout) | statisches PGO — solange das Trainingsprofil repräsentativ ist | hoch |
+| **Adaptivität** (Phasenwechsel, OSR, Re-Kompilierung) | **prinzipiell nicht substituierbar** | 0 % |
+
+Gegenläufige *Stärken* des statischen Ansatzes, die kein JIT hat: unbegrenztes Analysebudget, globale Koordination (Whole-Program-Objektlayout-Umordnung, Dead-Field-Elimination — für JITs unmöglich, da Layouts nach dem Laden fixiert sind), Startzeit, Speicher.
+
+**Gesamturteil** (Einschätzung, gestützt auf Native-Image-Datenlage): Closed-World-Solver + PGO ≈ 85–100 % der JIT-Peak-Performance auf regulären Server-/Embedded-Workloads (stabile Phasen — passt zum seL4-Ziel); 20–40 % Lücke bei hochdynamischen Workloads (Interpreter, Regelengines). „Solver ersetzt JIT vollständig" ist durch die Adaptivitätslücke widerlegbar; „praktisch überflüssig für statisch geartete Workloads" ist durch Native Image belegt.
+
+---
+
+## 5. LLVM-Anbindung
+
+Grundregel: **Metadaten, die kein LLVM-Pass konsumiert, sind wertlos.** Für jede Information prüfen, welcher Pass sie liest — sonst selbst auf der Mittel-IR transformieren.
+
+| Solver-Ergebnis | LLVM-Mechanismus |
+|---|---|
+| Devirt (bewiesen) | direkter Call — keine Metadaten nötig |
+| Devirt (Kandidatenmenge) | `!callees`; oder WPD-Infrastruktur: `llvm.type.test` / `llvm.type.checked.load` + Type-Metadata an Vtables (gebaut für Clang `-fwhole-program-vtables`, vom Java-Frontend wiederverwendbar) |
+| Profilverteilung polymorpher Sites | Value-Profile (`!prof` VP) → Indirect-Call-Promotion erzeugt guarded devirt |
+| Aliasfreiheit | `noalias`-Parameter, `!alias.scope`/`!noalias`; **eigener TBAA-Baum für Javas Typhierarchie** (Felder verschiedener Klassen aliassen nie, `int[]`/`float[]` aliassen nie) — vermutlich größter Einzelhebel im Backend |
+| Immutabilität / Vtable-Loads | `!invariant.load`, `!invariant.group` (Clang-C++-Vtable-Muster), `readonly`/`readnone` |
+| Nicht-Null, Ranges, Fakten | `!nonnull`, `!range`, `!dereferenceable(N)`; `llvm.assume` sparsam (verlangsamt LLVM-Passes) |
+| Heap→Stack | im Optimierer entscheiden, direkt `alloca` + `llvm.lifetime.*` emittieren (nicht dem Attributor überlassen) |
+| Sync/Thread | `nosync`; elidierte Monitore gar nicht emittieren; `volatile` → LLVM-Atomics (Mapping JMM→LLVM wohldefiniert) |
+| Inlining | heiße Pfade schon auf Mittel-IR inlinen; LLVM via `!prof`-Weights + Hints nachputzen lassen |
+| GC-Wurzeln | `gc.statepoint`/Stackmaps — einziger Bereich mit echter LLVM-Spezialinfrastruktur |
+
+Ownership über Funktionsgrenzen auf Heap-Objekten hat in LLVM kein Vokabular → nicht als Metadaten ausdrücken, sondern selbst absenken (Freigabe/Arena-Zuordnung direkt emittieren).
+
+**Guarded speculation als expliziter Mechanismus der Mittel-IR** („speculative edge mit Fallback"): jede nur profilgestützte Annahme braucht Guard + statisch mitkompilierten Slow-Path. Deopt-Ersatz; ohne expliziten Mechanismus wuchert das.
+
+---
+
+## 6. Java-Semantik ohne Runtime
+
+„Literally zero Runtime" gibt es nur bei Spracheinschränkung (keine Allokation nach Init, Arena-only — Java-Card-/SCJ-Weg; für seL4 ggf. der ehrlichste). Realistisch: einige hundert Zeilen `no_std`-Rust (Allokator, Wurzeln, Startup, `<clinit>`-Reihenfolge).
+
+| Feature | Auflösung |
+|---|---|
+| GC | s. u. |
+| Exceptions | Desugaring zu `Result<T, Throwable>`, implizite Propagation — kein Unwinder/Personality nötig |
+| Vererbung/Interfaces | Vtables/Itables, rein statisch |
+| Reflection/`forName`/dyn. Laden | Closed World + Deklaration (s. 1.3) |
+| `null` | explizite Checks (Segfault-Handler-Trick = Runtime) |
+| Integer | `wrapping_*`; div/0 → `ArithmeticException`; Array → Bounds-Check |
+| Floats | striktes IEEE — nie Fast-Math/FMA-Contraction |
+| `synchronized`/`volatile` | JMM → LLVM-Atomics-Ordering |
+| `<clinit>` | Startup in definierter Reihenfolge; wo möglich zur Build-Zeit vorausgerechnet |
+
+**GC-Optionen** (Reihenfolge = Implementierungsplan):
+1. **Referenzzählung** — deterministisch, keine Stackmaps, leakt Zyklen; für Embedded oft ausreichend; billigster Einstieg. **Erster GC.**
+2. Escape-Analyse + Regionen/Arenen — eliminiert je nach Programm 20–60 % der Allokationen, ersetzt den Kollektor aber nicht.
+3. Präzises Mark-Sweep via Statepoints — realistisch 2–5k LOC.
+4. Arena-only per Spracheinschränkung (SCJ-Modell).
+
+**Klassenbibliothek:** „läuft echter Java-Code" heißt `java.base` (String = UTF-16, Collections, Math, IO). OpenJDK `java.base` ist GPLv2 **mit Classpath Exception** → statisches Linken erlaubt. Alternativen: TeaVM-Classlib (Apache-2.0, Teilmenge), GNU Classpath.
+
+---
+
+## 7. Priorisierung (Kosten/Nutzen)
+
+1. Classfile-Parser + Mittel-IR (MIR-Vorbild) + naive LLVM-Absenkung — „Hello World läuft" ✅ **umgesetzt** (Cargo-Workspace `crates/`, Binary `fastjavac`; Teilmenge: statische Methoden, int-Arithmetik, Kontrollfluss, println-Intrinsics; textuelles LLVM-IR + clang statt Bindings, da inkwell/llvm-sys LLVM 22 noch nicht abdecken)
+2. Closed-World-Reachability + CHA-Devirt + Inlining (größter Hebel, geringste Forschungsunsicherheit) ✅ **umgesetzt** (`crates/solver`: RTA-Fixpunkt nach Bacon/Sweeney, Devirtualisierung monomorpher Sites mit erhaltenem Null-Check, Pruning unerreichbarer Funktionen, Mid-IR-Inliner; dazu Objektmodell: Prefix-Layout `{vtable-ptr, super-Felder, eigene Felder}`, Vtables mit geerbten Slots, `jrt_alloc` nullt Felder — noch ohne GC, Objekte leben bis Prozessende; Interfaces/`invokeinterface`, Arrays, statische Felder und `<clinit>` weiterhin außerhalb der Teilmenge)
+3. TBAA-Baum + Escape-Analyse (Heap→Stack, Lock-Elision)
+4. RC-GC + Mini-Runtime (`no_std`, seL4-Target)
+5. PGO + guarded devirtualization
+6. Objektsensitive Points-to zur Präzisionsverschärfung
+7. Forschungsmodule (optional): Ownership/Regionen, SMT-Orakel-Ausbau
+
+Prototyp für eine Java-Teilmenge (Schritte 1–4): grob 3–6 Monate Ein-Personen-Arbeit.
+
+---
+
+## 8. Präzedenzfälle
+
+GCJ, Excelsior JET, RoboVM, **GraalVM Native Image** (Architektur-Vorbild: Closed World, Points-to vor Codegen, Image Heap, Reachability-Metadaten), TeaVM, ParparVM. Kernliteratur: Dean/Grove/Chambers 1995 (CHA); Choi 1999 (EA); Milanova 2005 & Smaragdakis 2011 (Objektsensitivität, Doop); Van Horn/Mairson 2008 (k-CFA-Komplexität); Livshits 2005 / Smaragdakis 2015 (Reflection-Grenzen); Tofte/Talpin 1997 (Region-Inferenz).

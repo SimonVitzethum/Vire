@@ -1,0 +1,15 @@
+[package]
+name = "fastllvm-driver"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "fastjavac"
+path = "src/main.rs"
+
+[dependencies]
+fastllvm-classfile = { path = "../classfile" }
+fastllvm-ir = { path = "../ir" }
+fastllvm-frontend = { path = "../frontend" }
+fastllvm-backend = { path = "../backend" }
+fastllvm-solver = { path = "../solver" }

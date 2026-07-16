@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/classfile",
+    "crates/ir",
+    "crates/frontend",
+    "crates/backend",
+    "crates/driver",
+    "crates/solver",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[profile.release]
+lto = true

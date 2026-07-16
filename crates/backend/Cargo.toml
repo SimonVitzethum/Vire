@@ -1,0 +1,7 @@
+[package]
+name = "fastllvm-backend"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+fastllvm-ir = { path = "../ir" }
