@@ -806,6 +806,24 @@ static void free_obj(JObjHeader *h) {
     CNT_DEC(live_objects);
 }
 
+/* Iterative Drop-Kaskade (Soundness, M0): rekursives Release über einen großen
+ * gültigen Objektgraphen sprengte den Stack (Crash = „sicher"-Verletzung). Statt
+ * `jrt_release → run_drop → jrt_release …` rekursiv abzusteigen, sammeln die
+ * Einthread-Pfade die auf 0 gefallenen Objekte in einem expliziten Puffer und
+ * arbeiten sie in einer Schleife ab — Stacktiefe O(1) statt O(Graphtiefe). */
+#if !defined(FASTLLVM_THREADS)
+static JObjHeader **dropbuf = NULL;
+static size_t droplen = 0, dropcap = 0;
+static int draining = 0;
+static void drop_enq(JObjHeader *h) {
+    if (droplen == dropcap) {
+        dropcap = dropcap ? dropcap * 2 : 256;
+        dropbuf = (JObjHeader **)plat_realloc(dropbuf, dropcap * sizeof(*dropbuf));
+    }
+    dropbuf[droplen++] = h;
+}
+#endif
+
 #ifdef FASTLLVM_COLLECTOR
 /* Kandidaten-Wurzeln für die Zyklensuche (purple-Objekte). */
 static JObjHeader **roots = NULL;
@@ -828,7 +846,14 @@ static void possible_root(JObjHeader *h) {
         if (!BUFFERED(h)) {
             SET_BUFFERED(h, 1);
             roots_push(h);
-            if (roots_len >= ROOTS_THRESHOLD) jrt_collect_cycles();
+            /* Adaptive Schwelle: eine Zyklensuche scannt die Kandidaten samt
+             * transitiver Hülle — bei fixer Schwelle läuft sie auf großen
+             * lebenden Mengen O(n)-mal → O(n²) (M0). Schwelle mit der lebenden
+             * Menge skalieren lassen begrenzt die Häufigkeit → amortisiert linear.
+             * Korrektheit unberührt: der Shutdown-Collect fängt alles ab (0 live). */
+            size_t thresh = (size_t)(live_objects > 0 ? live_objects * 2 : 0);
+            if (thresh < ROOTS_THRESHOLD) thresh = ROOTS_THRESHOLD;
+            if (roots_len >= thresh) jrt_collect_cycles();
         }
     }
 }
@@ -901,8 +926,15 @@ void jrt_release(void *p) {
     JObjHeader *h = (JObjHeader *)p;
     if (h->refcount < 0) return; /* immortal */
     if (--h->refcount == 0) {
-        run_drop(h);
-        free_obj(h);
+        if (draining) { drop_enq(h); return; }   /* in Kaskade: nur einreihen */
+        draining = 1;
+        drop_enq(h);
+        while (droplen) {
+            JObjHeader *x = dropbuf[--droplen];
+            run_drop(x);                          /* Kinder-Release reiht ein */
+            free_obj(x);
+        }
+        draining = 0;
     }
 }
 #else
@@ -920,11 +952,19 @@ void jrt_release(void *p) {
     if (h->refcount < 0) return; /* immortal */
     if (--h->refcount == 0) {
         /* Release: Kinder dekrementieren (drop), dann ggf. freigeben.
+         * Iterativ (Drop-Puffer) statt rekursiv — s. drop_enq (Soundness).
          * Ein noch gepuffertes Objekt bleibt liegen — der Collector holt
          * es in MarkRoots ab (color black, rc 0). */
-        run_drop(h);
-        SET_COLOR(h, COL_BLACK);
-        if (!BUFFERED(h)) free_obj(h);
+        if (draining) { drop_enq(h); return; }
+        draining = 1;
+        drop_enq(h);
+        while (droplen) {
+            JObjHeader *x = dropbuf[--droplen];
+            run_drop(x);
+            SET_COLOR(x, COL_BLACK);
+            if (!BUFFERED(x)) free_obj(x);
+        }
+        draining = 0;
     } else {
         possible_root(h);
     }
@@ -994,62 +1034,91 @@ static void scan(JObjHeader *h);
 static void scan_black(JObjHeader *h);
 static void collect_white(JObjHeader *h);
 
-static void visit_mark_gray(void *p) {
-    if (!p) return;
-    JObjHeader *h = (JObjHeader *)p;
-    if (h->refcount < 0) return; /* immortal: nicht antasten */
-    h->refcount--;
-    mark_gray(h);
-}
-static void mark_gray(JObjHeader *h) {
-    if (COLOR(h) == COL_GRAY) return;
-    SET_COLOR(h, COL_GRAY);
-    trace_fn t = trace_of(h);
-    if (t) t(h, visit_mark_gray);
+/* Iterative Zyklensuche (Soundness, M0): die Bacon-Rajan-Traversierungen liefen
+ * rekursiv über den Objektgraphen und sprengten bei großen gültigen Zyklen den
+ * Stack. Hier über explizite Worklists — Stacktiefe O(1). `cwork` bedient die
+ * sequenziellen Traversierungen (mark_gray/scan/collect_white), `bwork` das in
+ * `scan` geschachtelte scan_black, `fwork` die post-order-Freigabe. */
+static JObjHeader **cwork = NULL; static size_t cwl = 0, cwc = 0;
+static JObjHeader **bwork = NULL; static size_t bwl = 0, bwc = 0;
+static JObjHeader **fwork = NULL; static size_t fwl = 0, fwc = 0;
+static void wl_push(JObjHeader ***buf, size_t *len, size_t *cap, JObjHeader *h) {
+    if (*len == *cap) { *cap = *cap ? *cap * 2 : 256; *buf = (JObjHeader **)plat_realloc(*buf, *cap * sizeof(**buf)); }
+    (*buf)[(*len)++] = h;
 }
 
-static void visit_scan(void *p) {
-    if (!p) return;
+/* --- MarkGray: je Kante Kind dekrementieren, Knoten grau; iterativ. --- */
+static void visit_mark_gray(void *p) {
     JObjHeader *h = (JObjHeader *)p;
-    if (h->refcount < 0) return;
-    scan(h);
+    if (!h || h->refcount < 0) return;
+    h->refcount--;                       /* Trial-Deletion je Kante */
+    wl_push(&cwork, &cwl, &cwc, h);
 }
-static void scan(JObjHeader *h) {
-    if (COLOR(h) != COL_GRAY) return;
-    if (h->refcount > 0) {
-        scan_black(h);
-    } else {
-        SET_COLOR(h, COL_WHITE);
+static void mark_gray(JObjHeader *root) {
+    wl_push(&cwork, &cwl, &cwc, root);
+    while (cwl) {
+        JObjHeader *h = cwork[--cwl];
+        if (COLOR(h) == COL_GRAY) continue;
+        SET_COLOR(h, COL_GRAY);
         trace_fn t = trace_of(h);
-        if (t) t(h, visit_scan);
+        if (t) t(h, visit_mark_gray);    /* schiebt Kinder auf cwork */
     }
 }
 
+/* --- ScanBlack: Refcounts wiederherstellen, schwarz; eigener Stack (bwork). --- */
 static void visit_scan_black(void *p) {
-    if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
-    if (h->refcount < 0) return;
+    if (!h || h->refcount < 0) return;
     h->refcount++;
-    if (COLOR(h) != COL_BLACK) scan_black(h);
+    wl_push(&bwork, &bwl, &bwc, h);
 }
-static void scan_black(JObjHeader *h) {
-    SET_COLOR(h, COL_BLACK);
-    trace_fn t = trace_of(h);
-    if (t) t(h, visit_scan_black);
-}
-
-static void visit_collect_white(void *p) {
-    if (!p) return;
-    JObjHeader *h = (JObjHeader *)p;
-    if (h->refcount < 0) return;
-    collect_white(h);
-}
-static void collect_white(JObjHeader *h) {
-    if (COLOR(h) == COL_WHITE && !BUFFERED(h)) {
+static void scan_black(JObjHeader *root) {
+    wl_push(&bwork, &bwl, &bwc, root);
+    while (bwl) {
+        JObjHeader *h = bwork[--bwl];
+        if (COLOR(h) == COL_BLACK) continue;
         SET_COLOR(h, COL_BLACK);
         trace_fn t = trace_of(h);
+        if (t) t(h, visit_scan_black);
+    }
+}
+
+/* --- Scan: grau→weiß (rc==0) bzw. schwarz (rc>0); iterativ über cwork. --- */
+static void visit_scan(void *p) {
+    JObjHeader *h = (JObjHeader *)p;
+    if (!h || h->refcount < 0) return;
+    wl_push(&cwork, &cwl, &cwc, h);
+}
+static void scan(JObjHeader *root) {
+    wl_push(&cwork, &cwl, &cwc, root);
+    while (cwl) {
+        JObjHeader *h = cwork[--cwl];
+        if (COLOR(h) != COL_GRAY) continue;
+        if (h->refcount > 0) {
+            scan_black(h);               /* nutzt bwork, läuft voll leer */
+        } else {
+            SET_COLOR(h, COL_WHITE);
+            trace_fn t = trace_of(h);
+            if (t) t(h, visit_scan);
+        }
+    }
+}
+
+/* --- CollectWhite: weiße Zyklen einsammeln; post-order via Free-Liste. --- */
+static void visit_collect_white(void *p) {
+    JObjHeader *h = (JObjHeader *)p;
+    if (!h || h->refcount < 0) return;
+    wl_push(&cwork, &cwl, &cwc, h);
+}
+static void collect_white(JObjHeader *root) {
+    wl_push(&cwork, &cwl, &cwc, root);
+    while (cwl) {
+        JObjHeader *h = cwork[--cwl];
+        if (!(COLOR(h) == COL_WHITE && !BUFFERED(h))) continue;
+        SET_COLOR(h, COL_BLACK);
+        wl_push(&fwork, &fwl, &fwc, h);  /* erst am Ende freigeben (post-order) */
+        trace_fn t = trace_of(h);
         if (t) t(h, visit_collect_white);
-        free_obj(h);
     }
 }
 
@@ -1071,13 +1140,17 @@ static void jrt_collect_cycles(void) {
     /* ScanRoots. */
     for (size_t i = 0; i < roots_len; i++) scan(roots[i]);
 
-    /* CollectRoots: Buffer leeren, weiße Zyklen einsammeln. */
+    /* CollectRoots: Buffer leeren, weiße Zyklen einsammeln (in fwork gesammelt). */
     for (size_t i = 0; i < roots_len; i++) {
         JObjHeader *h = roots[i];
         SET_BUFFERED(h, 0);
         collect_white(h);
     }
     roots_len = 0;
+    /* Post-order-Freigabe: erst nach allen Traversierungen, damit kein Tracen
+     * auf ein bereits freigegebenes Zyklen-Mitglied trifft. */
+    for (size_t i = 0; i < fwl; i++) free_obj(fwork[i]);
+    fwl = 0;
 }
 #endif /* FASTLLVM_COLLECTOR */
 
