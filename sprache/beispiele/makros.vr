@@ -1,20 +1,21 @@
-// Hygienische Makros (AST-basiert, keine Namens-Einfänge) + comptime statt
-// C-Präprozessor. Makros nur für echte SYNTAKTISCHE Abstraktion.
+// Hygienische UND typsichere Makros (AST-basiert, typisierte Parameter, voll
+// typgeprüft nach Expansion) + comptime statt C-Präprozessor. Keine Token-Suppe:
+// falsche Verwendung ist ein Compilefehler AM AUFRUFORT.
 
-// Eigenes Kontrollkonstrukt:
-macro unless(cond, body) { if not (cond) { body } }
+// Eigenes Kontrollkonstrukt. Parameter-Arten: cond ist ein Ausdruck, body ein Block.
+macro unless(cond: expr, body: block) { if not (cond) { body } }
 
 // Block-Timing: `body` wird eingesetzt, `t0`/`r` sind hygienisch (kollidieren
-// nicht mit Namen am Aufrufort):
-macro timed(label, body) {
+// nicht mit Namen am Aufrufort); der Ergebnistyp wird von `body` geerbt & geprüft.
+macro timed(label: expr, body: block) {
     t0 = now()
-    r = body
+    r  = body
     log.debug("{label}", ms: now() - t0)
     r
 }
 
-// Retry mit fester Anzahl — Makro, weil es den Block mehrfach einsetzt:
-macro retry(times, body) {
+// Retry mit fester Anzahl — Makro, weil es den Block mehrfach einsetzt.
+macro retry(times: expr, body: block) {
     mut last = Err("nie versucht")
     for _ in 0..times {
         last = body
@@ -22,6 +23,8 @@ macro retry(times, body) {
     }
     last
 }
+
+// unless(42) { ... }   // FEHLER am Aufruf: `cond: expr` muss Bool sein (typgeprüft)
 
 // Bedingte Compilierung ohne #ifdef: comptime-if (der Zweig wird gar nicht erst
 // übersetzt, wenn die Bedingung false ist).

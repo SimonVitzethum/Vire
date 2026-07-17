@@ -92,9 +92,13 @@ Andock: Whole-Program-Typgraph (P2) + `comptime` (P3).
 
 ### [4] Eigener optionaler Präprozessor 🟢 *(= comptime/@if/Makros, kein C-Text)*
 Andock: P3.
-- [ ] Hygienische Makros (`macro name(args) { … }`).
-- [ ] `@if`/`@when` (bedingte Compilierung, Plattform-Weichen).
-- [ ] `const`/`comptime {}` (Compilezeit-Werte/Codegen). Doku: kein `#define`.
+- [ ] Hygienische Makros (`macro name(args) { … }`), **hygienisch + typsicher**:
+  - [ ] **typisierte Parameter** (`cond: expr`, `body: block`, `ident`, `pat`,
+    `type`, oder konkreter Typ) → Fehlverwendung = Compilefehler am Aufrufort.
+  - [ ] **volle Typprüfung nach Expansion** (kein ill-typisiertes Ergebnis möglich).
+  - [ ] Hygiene (keine Namens-Einfänge), Diagnose-Spans bis in die Expansion.
+- [ ] `@if`/`@when` (bedingte Compilierung, Plattform-Weichen) — ausdrucksbasiert, geprüft.
+- [ ] `const`/`comptime {}` (Compilezeit-Werte/Codegen), voll typgeprüft. Doku: kein `#define`.
 
 ### [5] Build-Interop, Meson first-class 🟢🟡
 Andock: clang→Objekt (vorhanden).

@@ -137,12 +137,16 @@ Konkret sind es drei zusammengehörige, *optionale* Mechanismen:
   eine Präprozessor-Phase, nur getypt und in derselben Sprache.
 - **`@if`/`@when`** — bedingte Compilierung (Plattform-/Feature-Weichen) als
   Direktiven, ersetzen `#ifdef` — aber ausdrucksbasiert und geprüft.
-- **hygienische Makros** — syntaktische Abstraktion auf dem AST (keine
-  Namens-Einfänge).
+- **hygienische *und typsichere* Makros** — syntaktische Abstraktion auf dem AST
+  (keine Namens-Einfänge), mit **typisierten Parametern** (`cond: expr`,
+  `body: block`, …) und **voller Typprüfung nach Expansion**. Falsche Verwendung =
+  Compilefehler *am Aufrufort*, kein ill-typisiertes Ergebnis (Details:
+  [REFERENZ.md](REFERENZ.md) §8).
 
 **Bewusst *nicht* der C-Text-Präprozessor** (`#define`-Tokenkleben): unhygienisch
-(fängt Namen ein), typ-blind, debugger-feindlich, bricht Werkzeuge. Ein *eigener*
-Präprozessor ja — aber als AST/`comptime`, nicht als Text. Was man klassisch mit dem
+(fängt Namen ein), **typ-blind**, debugger-feindlich, bricht Werkzeuge. Vires
+Präprozessor ist das genaue Gegenteil: **typsicher an jeder Stelle**. Ein *eigener*
+Präprozessor ja — aber als getyptes AST/`comptime`, nicht als Text. Was man klassisch mit dem
 Präprozessor macht, geht damit sauberer:
 
 | Präprozessor-Zweck | Vire-Ersatz |
@@ -156,7 +160,8 @@ Präprozessor macht, geht damit sauberer:
 
 Wo echte **syntaktische Abstraktion** nötig ist (eigene Kontrollkonstrukte, DSL-
 artige Blöcke), bietet Vire **hygienische Makros** (Rust-/Scheme-Stil): sie
-operieren auf dem AST, fangen keine Namen ein, sind typgeprüft nach Expansion:
+operieren auf dem AST, fangen keine Namen ein, haben **typisierte Parameter** und
+sind **voll typgeprüft nach Expansion** (kein ill-typisiertes Ergebnis möglich):
 
 ```vire
 macro unless(cond, body) { if not (cond) { body } }   // hygienisch, AST-basiert

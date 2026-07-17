@@ -182,21 +182,49 @@ type User { id: Int, name: Str }
 ```
 Reflection ist rein statisch — **keine** Laufzeit-Metadaten, kein RTTI-Overhead.
 
-## 8. Makros (hygienisch) — *Punkt 4*
+## 8. Makros (hygienisch **und typsicher**) — *Punkt 4*
 
-Kein C-Präprozessor. `macro` operiert auf dem AST, hygienisch (keine
-Namens-Einfänge), typgeprüft **nach** Expansion:
+Kein C-Präprozessor. `macro` operiert auf dem AST — und ist an **jeder** Stelle
+typsicher. Genau das trennt Vires „Präprozessor" vom C-Textersetzer, der typ-blind
+ist. Die Garantien:
+
+1. **Typisierte Parameter.** Ein Makro-Parameter hat eine Art (`expr`, `type`,
+   `ident`, `pat`, `block`) *oder* einen konkreten Typ. Wird das Makro mit dem
+   falschen Fragment aufgerufen, ist das ein **Compilefehler am Aufrufort** — nicht
+   irgendwo tief in der Expansion.
+2. **Typgeprüft nach Expansion.** Das *expandierte* Ergebnis durchläuft die volle
+   Typprüfung wie normaler Code. Ein Makro kann **kein** ill-typisiertes oder
+   ill-geformtes Programm erzeugen (anders als `#define`).
+3. **Hygienisch.** Im Makro gebundene Namen (`t0`, `r` unten) kollidieren nie mit
+   Namen am Aufrufort; referenzierte freie Namen binden am Definitionsort.
+4. **Diagnosen am Aufrufort** mit Span bis in die Expansion (kein „Fehler in
+   generiertem Code, Zeile ???"); volle Debug-Info (Feature 8).
+
 ```vire
-macro unless(cond, body) { if not (cond) { body } }
-macro timed(label, body) {
-    t0 = now(); r = body; log.debug("{label}", ms: now() - t0); r
+// Parameter mit Art: cond ist ein Ausdruck, body ein Block.
+macro unless(cond: expr, body: block) {
+    if not (cond) { body }
 }
+
+macro timed(label: expr, body: block) {
+    t0 = now()                                   // hygienisch: kollidiert nie mit
+    r  = body                                    // Namen am Aufrufort
+    log.debug("{label}", ms: now() - t0)
+    r
+}
+
 unless(ready) { wait() }
-x = timed("compute") { heavy() }
+x = timed("compute") { heavy() }                 // x erbt den geprüften Typ von heavy()
+
+// Falsche Verwendung wird GEPRÜFT:
+// unless(42) { … }        // FEHLER am Aufruf: `cond: expr` muss Bool sein
+// timed("l", 5)           // FEHLER am Aufruf: `body: block` erwartet, `5` ist Ausdruck
 ```
+
 Für 95 % der „Makro"-Fälle (Konstanten, bedingte Compilierung, Ableitungen,
-Code-Erzeugung) nimmt man `const`/`comptime`/`@derive` (Punkt 7) — Makros nur für
-echte **syntaktische** Abstraktion.
+Code-Erzeugung) nimmt man `const`/`comptime`/`@derive` (Punkt 7) — die ebenfalls
+voll typgeprüft sind. Makros bleiben für echte **syntaktische** Abstraktion. In
+*keinem* dieser Fälle gibt es untypisierte Token-Suppe wie beim C-Präprozessor.
 
 ## 9. Speichermodell
 
