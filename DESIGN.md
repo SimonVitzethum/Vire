@@ -202,6 +202,19 @@ Stand der Garantien (umgesetzt):
 
 Prototyp für eine Java-Teilmenge (Schritte 1–4): grob 3–6 Monate Ein-Personen-Arbeit.
 
+### Stand Richtung „JARs mit Libs → performante, speichersichere Binary"
+
+**Umgesetzt:** JAR-/Classpath-Ingestion (entpacken, Manifest-`Main-Class`, `--main`; automatische Closed-World-Sammlung aller `.class`); freestanding/seL4-Runtime (libc-frei, statischer Heap, verifiziert bit-gleich zu hosted); Intrinsics `System.arraycopy` (ref-/größenkorrekt), `Integer.parseInt`/`Long.parseLong`, `Math.abs/max/min/sqrt`, `System.currentTimeMillis/nanoTime`; `synchronized` (Einthread-No-Op-Monitore); erweiterte `String`-Methoden (indexOf/substring/startsWith/endsWith/trim/concat/compareTo). Dazu die frühere Basis: Solver (RTA/CHA + bikonditionale Devirt, Inlining, feld-sensitive Escape-Analyse, TBAA), RC + Zyklen-Collector, Exceptions, enum, Lambdas/Streams, Generics-Erasure, statisch auflösbare Reflection.
+
+**Noch offen (nach Hebel):**
+- **Standardbibliothek** (dominant): nur Ausschnitt (`stdlib/`-Stubs + Intrinsics). Realer Weg zu `java.base`: TeaVM-Classlib/GNU Classpath adaptieren; JNI-artige C-Shims für native Methoden. Betrifft auch echtes UTF-16 (aktuell Byte/ASCII).
+- **Reflection-Metamodell**: `Method.invoke`/`Field.get/set`/`getDeclared*`, laufzeit-`getClass()`/`getName()`, `Proxy`, `ServiceLoader`/SPI. Bräuchte eine Reachability-getriebene Reflection-Registry + generierte Dispatch-/Metadatentabellen (Native-Image-Stil); die Type-Descriptoren müssten je Klasse auf ein `@jclass`-Objekt zeigen.
+- **Echte Nebenläufigkeit**: `synchronized` kompiliert, aber die nicht-atomare RC wäre unter Threads unsound → atomare Refcounts oder thread-lokale Regionen (GC-/Sicherheits-Redesign), `java.lang.Thread`, `java.util.concurrent`, Speichermodell.
+- **Performance-Kür**: Array-Zugriffe direkt (statt Runtime-Calls) inline + Array-Element-TBAA für Vektorisierung; RC-Elision (Borrow-/Ownership-Analyse) — bewusst zurückgestellt, um die per Leak-Detektor verifizierte RC-Korrektheit nicht zu gefährden; PGO.
+- **Sprach-Rest**: `new java.lang.Object`, echte Stacktraces/`getCause`, innere Klassen mit `this$0`, `ArrayStoreException`, Records/Sealed/Pattern-Matching.
+
+Kurzfassung: **Compiler-Technik weitgehend gelöst; „Java-Plattform" (v.a. `java.base` + Reflection-Metamodell + atomare Nebenläufigkeit) bleibt der Hauptaufwand.** Die 51 Regressionstests laufen grün mit Heap-Bilanz 0 live, hosted **und** freestanding.
+
 ---
 
 ## 8. Präzedenzfälle
