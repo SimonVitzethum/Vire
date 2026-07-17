@@ -93,6 +93,7 @@ run sb            0 SB SB
 
 # --- Reflection ---
 run refl          0 Refl Refl Widget
+run refl2         0 Refl2 Refl2 Animal Dog
 
 # --- Exceptions ---
 run exc           0 Exc Exc MyException

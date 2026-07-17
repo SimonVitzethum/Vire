@@ -150,6 +150,9 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_arraycopy", "void (ptr, i32, ptr, i32, i32)"),
     ("jrt_enum_valueof", "ptr (ptr, ptr)"),
     ("jrt_throwable_message", "ptr (ptr)"),
+    ("jrt_get_class", "ptr (ptr)"),
+    ("jrt_class_getname", "ptr (ptr)"),
+    ("jrt_class_getsimplename", "ptr (ptr)"),
     ("jrt_parse_int", "i32 (ptr)"),
     ("jrt_parse_long", "i64 (ptr)"),
     ("jrt_math_abs_i", "i32 (i32)"),
@@ -384,13 +387,21 @@ pub fn emit(program: &Program) -> String {
         )
         .unwrap();
     }
-    // Class-Objekt-Singletons (Reflection): immortaler Header + Namens-String.
-    // Pointer-Identität ersetzt Javas Class-Gleichheit.
-    for (class, sid) in &program.class_objects {
+    // Class-Objekt-Singletons für JEDE Klasse (Reflection: getClass/getName/
+    // getSimpleName). Immortaler Header {refcount=-1, rcflags, vtable=null},
+    // dann name- und simpleName-JStr-Zeiger. Pointer-Identität ersetzt Javas
+    // Class-Gleichheit; die Type-Descriptoren verlinken hierauf (getClass).
+    let _ = &program.class_objects; // (früherer Reflection-Pfad, jetzt generell)
+    for c in &program.classes {
+        let dotted = c.name.replace('/', ".");
+        let simple = dotted.rsplit(['.', '$']).next().unwrap_or(&dotted).to_string();
+        let s = sanitize(&c.name);
+        emit_jstr_const(w, &format!("jclassname.{s}"), dotted.as_bytes());
+        emit_jstr_const(w, &format!("jclasssimple.{s}"), simple.as_bytes());
         writeln!(
             w,
-            "@jclass.{} = internal unnamed_addr constant {{ i64, ptr }} {{ i64 -1, ptr @jstr.{sid} }}",
-            sanitize(class),
+            "@jclass.{s} = internal unnamed_addr constant {{ i64, i64, ptr, ptr, ptr }} \
+             {{ i64 -1, i64 0, ptr null, ptr @jclassname.{s}, ptr @jclasssimple.{s} }}",
         )
         .unwrap();
     }
@@ -405,8 +416,9 @@ pub fn emit(program: &Program) -> String {
     // Array-Typen (Header + i64 Länge + flexibles Elementfeld) und ihre
     // Vtables. int[] hat keine Ref-Elemente → No-Op-Drop/Trace; ref[]
     // released/besucht seine Elemente über Runtime-Helfer.
-    writeln!(w, "%arr.int = type {{ i64, i64, ptr, i64, [0 x i32] }}").unwrap();
-    writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, [0 x ptr] }}").unwrap();
+    // Header: refcount, rcflags, vtable, length, elem_size (dann Elemente).
+    writeln!(w, "%arr.int = type {{ i64, i64, ptr, i64, i64, [0 x i32] }}").unwrap();
+    writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
     // Arrays haben keinen Type-Descriptor (Slot 2 = null → instanceof false).
     writeln!(w, "@vt.array.int = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
     writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
@@ -432,7 +444,8 @@ pub fn emit(program: &Program) -> String {
         .unwrap();
         writeln!(
             w,
-            "@td.{} = internal constant {{ ptr, ptr }} {{ ptr {super_td}, ptr @cname.{} }}",
+            "@td.{} = internal constant {{ ptr, ptr, ptr }} {{ ptr {super_td}, ptr @cname.{}, ptr @jclass.{} }}",
+            sanitize(&c.name),
             sanitize(&c.name),
             sanitize(&c.name),
         )
@@ -1390,6 +1403,19 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         _ => unreachable!("Vergleich bereits behandelt"),
     }
     t
+}
+
+/// Emittiert einen immortalen JStr-Konstanten `@<sym>` (voller Objekt-Header
+/// + Länge + Bytes), wie ein String-Literal — für Reflection-Namen.
+fn emit_jstr_const(w: &mut String, sym: &str, bytes: &[u8]) {
+    let n = bytes.len();
+    writeln!(
+        w,
+        "@{sym} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} \
+         {{ i64 -1, i64 0, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
+        esc = escape_ll(bytes),
+    )
+    .unwrap();
 }
 
 fn escape_ll(bytes: &[u8]) -> String {

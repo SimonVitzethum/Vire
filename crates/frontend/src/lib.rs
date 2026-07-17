@@ -1772,6 +1772,19 @@ fn lower_block(
                     pop!(); // receiver
                     continue;
                 }
+                // Object.getClass(): Class-Singleton über den Type-Descriptor
+                // (Laufzeit-Reflection der Objektidentität).
+                if name == "getClass" && desc == "()Ljava/lang/Class;" {
+                    let recv = pop!();
+                    let l = ml.stack_slot(stack.len(), Ty::Ref);
+                    stack.push(Ty::Ref);
+                    stmts.push(Statement::Call {
+                        dest: Some(l),
+                        func: "jrt_get_class".to_string(),
+                        args: vec![Operand::Copy(recv)],
+                    });
+                    continue;
+                }
                 // Throwable.getMessage(): $message-Feld lesen (Sentinel-sicher
                 // über die Runtime, die den Type-Descriptor prüft).
                 if name == "getMessage" && desc == "()Ljava/lang/String;" {
@@ -1810,8 +1823,30 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Reflection auf einem statisch bekannten Class-Objekt.
+                // Reflection auf einem Class-Objekt.
                 if class == "java/lang/Class" {
+                    // getName/getSimpleName laufen auf JEDEM Class-Wert (statisch
+                    // via ConstClass oder Laufzeit via getClass()) → das @jclass
+                    // trägt die Namens-Strings, Zugriff über die Runtime.
+                    if desc == "()Ljava/lang/String;"
+                        && (name == "getName" || name == "getSimpleName")
+                    {
+                        let recv = pop!();
+                        let func = if name == "getName" {
+                            "jrt_class_getname"
+                        } else {
+                            "jrt_class_getsimplename"
+                        };
+                        let l = ml.stack_slot(stack.len(), Ty::Ref);
+                        stack.push(Ty::Ref);
+                        stmts.push(Statement::Call {
+                            dest: Some(l),
+                            func: func.to_string(),
+                            args: vec![Operand::Copy(recv)],
+                        });
+                        continue;
+                    }
+                    // newInstance u.ä. brauchen den statisch bekannten Zieltyp.
                     let recv = pop!();
                     let target = match origin_of(&stmts, recv) {
                         Origin::Op(Operand::ConstClass(c)) => c.clone(),
@@ -1827,10 +1862,6 @@ fn lower_block(
                         },
                     };
                     match (name, desc) {
-                        ("getName", "()Ljava/lang/String;") => {
-                            let sid = program.intern_class_object(&target);
-                            push!(Ty::Ref, Rvalue::Use(Operand::ConstStr(sid)));
-                        }
                         ("newInstance", "()Ljava/lang/Object;") => {
                             let ctor = program
                                 .resolve_method(&target, "<init>", "()V")

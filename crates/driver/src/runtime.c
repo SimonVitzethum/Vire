@@ -1029,7 +1029,36 @@ void *jrt_take_pending(void) {
 typedef struct TypeDesc {
     struct TypeDesc *super;
     const char *cname; /* gepunkteter Klassenname für Uncaught-Meldung */
+    void *jclass;      /* Class-Objekt-Singleton dieser Klasse (Reflection) */
 } TypeDesc;
+
+/* Reflection: obj.getClass() → das Class-Singleton über den Type-Descriptor.
+ * getName/getSimpleName lesen die JStr-Felder des Class-Objekts (Layout:
+ * {refcount,rcflags,vtable,name,simpleName} → Offsets 24/32). */
+void *jrt_get_class(void *obj) {
+    if (!obj) {
+        jrt_throw_npe();
+        return NULL;
+    }
+    void **vt = (void **)((JObjHeader *)obj)->vtable;
+    if (!vt) return NULL;
+    TypeDesc *td = (TypeDesc *)vt[2];
+    return td ? td->jclass : NULL;
+}
+void *jrt_class_getname(void *jc) {
+    if (!jc) {
+        jrt_throw_npe();
+        return NULL;
+    }
+    return *(void **)((char *)jc + 24);
+}
+void *jrt_class_getsimplename(void *jc) {
+    if (!jc) {
+        jrt_throw_npe();
+        return NULL;
+    }
+    return *(void **)((char *)jc + 32);
+}
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
     if (!obj) return 0;
