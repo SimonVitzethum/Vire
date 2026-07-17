@@ -17,8 +17,21 @@ Stelle einen *erklärenden* Fehler + Fix-Vorschlag geben.
 Vire ist bewusst so entworfen, dass der Parser **kaum Rückverfolgung** braucht:
 
 - **Generics mit `[]`, nicht `<>`.** `List[Int]`, `max[T](…)`. Damit entfällt die
-  berüchtigte C++/Rust-Mehrdeutigkeit `a < b > c`. `[` nach einem Typ-/Fn-Namen =
-  Generics; `[` nach einem Ausdruck = Indexierung/Literal — per Kontext eindeutig.
+  berüchtigte C++/Rust-Mehrdeutigkeit `a < b > c`. Aber `[]` trägt jetzt zwei
+  Bedeutungen (Typargumente vs. Indexierung); beide werden **vor** der Namensauflösung
+  entschieden, durch zwei harte Regeln:
+  1. **Großschreibung = Typ (erzwungene Lexikregel, nicht Konvention).** Bezeichner,
+     die mit Großbuchstaben beginnen, sind Typen/Konstruktoren; kleingeschrieben =
+     Werte/Funktionen/Variablen. So ist `List[Int]` (Groß `[` …) eindeutig Generics,
+     `xs[i]` (klein `[` …) eindeutig Indexierung — der Parser entscheidet ohne
+     Typwissen.
+  2. **Keine expliziten Typargumente an *Werten*.** `wert[Typ]` ist **immer**
+     Indexierung. Funktions-Typargumente werden **nicht** am Aufruf geschrieben — die
+     Inferenz + der Rückgabetyp-Kontext liefern sie (`xs: List[Int] = parse(s)` statt
+     `parse[Int](s)`). Für die seltenen rückgabetyp-getriebenen Fälle (`collect`) gibt
+     es eine **dedizierte Turbofish-artige Syntax** `parse#[Int](s)` (das `#` trennt
+     eindeutig von Indexierung) — oder man annotiert das Ziel. Rusts `::<>` existiert
+     genau aus diesem Grund; Vire macht denselben Schnitt sichtbar statt implizit.
 - **Blöcke immer `{ }`, Ausdruck-orientiert.** Der letzte Ausdruck eines Blocks ist
   sein Wert. `if`/`match`/`{}` sind Ausdrücke.
 - **Zeilenumbruch trennt Anweisungen** (Semikolon optional). Der Lexer erzeugt

@@ -6,26 +6,29 @@ Front-End. Legende: `[ ]` offen · `[~]` teilweise · `[x]` fertig.
 
 ---
 
-## M0 — Risiko-Messung ZUERST (Gate, vor jedem Front-End-Aufwand)
+## M0 — Risiko-Messung (Gate) — ✅ AUSGEFÜHRT, Urteil: **bedingtes Weiter**
 
-Die Bewertung ([sprache/BEWERTUNG.md](sprache/BEWERTUNG.md) §7) hat zwei unbelegte
-Kernannahmen offengelegt. Sie werden **gemessen, nicht designt**, bevor gebaut wird:
+Vollständiger Bericht: **[sprache/M0-MESSUNG.md](sprache/M0-MESSUNG.md)**. Programme:
+[benchmarks/m0/](benchmarks/m0/). Gemessen über die **reale automatische Pipeline**
+(Solver macht die Inferenz — nicht Hand-Absenkung), Oracle↔Automatisch-Spread.
 
-- [ ] **M0.1 Alias-Präzisions-Spike.** Ein kleines, *idiomatisch-realistisches*
-  Programm mit **geteiltem, entkommendem, mutierendem** Zustand (Graph/Cache/
-  Event-Bus — *kein* Sieb, *kein* Wortzähler) von Hand nach `crates/ir` absenken.
-  Messen: (a) Anteil der Allokationen/Zugriffe, der **RC-frei** bleibt (Escape/
-  Borrow-Elision greift), (b) Rate der **atomar contended** retain/release unter
-  `--threads`. → entscheidet, ob „Rust-Niveau ohne Annotationen" Ergebnis oder
-  Slogan ist.
-- [ ] **M0.2 Compile-Zeit-Skalierung.** Generierten IR-Umfang für 10k/50k/100k LOC
-  synthetisieren und Solver+Backend-Zeit/Speicher messen. → belegt/widerlegt den
-  Whole-Program-Compile-Zeit-Vorwurf (§7.3), bevor die Modulgrenzen-Entscheidung
-  fällt.
-- [ ] **M0.3 Zielentscheidung** aus M0.1/M0.2: (i) Analyse-Caching pro Funktion nötig?
-  (ii) `comptime`-Budgets? (iii) getrennte „schnell bauen" / „optimiert bauen"-Ebene?
+- [x] **M0.1 Alias-Präzision.** Adversarialer PageRank-Objektgraph (geteilt/
+  entkommend/mutierend/zyklisch). Ergebnis: **>1000× langsamer** als Rust bei 100k
+  (Kollektor super-linear/Timeout), **4,4×** ohne Kollektor, **6,3×** atomare RC
+  (uncontended). Der Spread Oracle(=0 RC)↔Automatisch ist maximal → die Inferenz
+  gewinnt die Borrow-Fakten im geteilt/zyklischen Fall **nicht** zurück. „Rust-
+  Niveau ohne Annotationen" = **Slogan** auf dieser Teilmenge.
+- [x] **M0.2 Compile-Zeit.** Solver+Backend super-linear (~O(n^1,4)): 50k LOC =
+  1,8 s, extrapoliert ~5–7 s bei 100k — **ohne** inkrementelles Caching.
+- [~] **M0.1-Contention** (Rest): echte Multithread-Contention als separater Versuch
+  offen; 6,3× uncontended ist die Untergrenze.
+- [x] **M0.3 Entscheidung:** **nicht grün.** Pflicht VOR dem Front-End: (i)
+  **Kollektor-Skalierung** (O(n²)-Full-Scan → inkrementell/generationell), (ii)
+  **Borrow-/Region-Inferenz** schärfen (dauerhaft-lebendig→borgen), (iii) Overflow-
+  Default + `+%`-Kultur (Vektorisierung, s. M0-Bericht), (iv) Analyse-Caching für
+  Compile-Zeit. Dann M0.1 erneut messen.
 
-**Ohne M0 kein grünes Licht für das Front-End.** Alles darunter ist bedingt.
+**Kernrisiko rot bestätigt.** Front-End (P1+) ist bis (i)+(ii) **zurückgestellt**.
 
 ---
 

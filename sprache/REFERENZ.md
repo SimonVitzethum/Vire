@@ -59,6 +59,13 @@ verstecken darf. Wer Wrapping *will*, sagt es explizit — über Wrap-Operatoren
 nur global abschaltbar (`--unchecked-arith`) — dokumentierte, bewusste Gefahr, nicht
 Default. Keine impliziten numerischen Konversionen — explizit mit `as`.
 
+> **Leistungshinweis (gemessen, [M0-MESSUNG.md](M0-MESSUNG.md)):** Overflow-Checks
+> sind Branches, die die **Autovektorisierung hemmen** — auf einer heißen
+> Arithmetik-Schleife empirisch **4,6× langsamer**, AVX2-Pfad gebrochen. Der
+> checked-Default ist die sichere Wahl; **heiße numerische Kernels opten explizit
+> aus** über `+%`/`Wrapping[T]`, um den Vektorpfad zu behalten. Diese `+%`-Kultur in
+> Kernels ist Teil des Designs, nicht ein Schlupfloch.
+
 ### 3.2 Zusammengesetzte Typen — `type`
 **Produkttyp** (struct, Werttyp, kein Objekt-Header):
 ```vire
@@ -256,10 +263,21 @@ iterierte Sammlung (oder einen lokalen Alias) mutiert:
   for i in 0..xs.len() { xs[i] = f(xs[i]) } // Index-Zugriff, bounds-geprüft
   ```
 
-Dieser *eine-Sammlung-eine-Schleife*-Check ist weit einfacher als allgemeine
-Alias-/Borrow-Analyse (er betrachtet eine Sammlung und lokale Aliase in *einer*
-Funktion), aber er ist echte Analyse. Er ist dieselbe Frage wie „darf dieser Wert an
-`spawn`" (§10) — nur lokaler.
+**Der harte Fall ist nicht lokal.** `for x in xs { xs.push(x) }` sieht man sofort.
+`for x in xs { f(xs) }` — wo `f` `xs` (oder einen Alias) mutiert — **nicht**: das ist
+interprozedurale Mutations-Info, also wieder Whole-Program. „Lokal" verdeckt das nur.
+Explizite Entscheidung (sound gewählt, Kosten akzeptiert):
+> **Ein Aufruf im Schleifenkörper, der die iterierte Sammlung (oder einen Alias)
+> erreichen kann, erzwingt einen Beweis der Nicht-Mutation — sonst Compilefehler
+> (`snapshot()` verlangt).** Der Beweis kommt aus der **interprozeduralen
+> Mutations-Summary**, die der Solver für Escape ohnehin bildet („schreibt `f` durch
+> Parameter p?"). Fehlt sie (opaker/externer Aufruf) → konservativ Fehler.
+
+Das ist bewusst *sound-aber-konservativ* (lieber ein Fehlalarm + `snapshot()` als ein
+Loch) und **dieselbe tragende Alias-Präzision aus §7**, die an der Iterationsstelle
+wieder auftaucht — und dieselbe Analyse wie „darf dieser Wert an `spawn`" (§10). Die
+Qualität dieser Summary bestimmt, wie oft die Ergonomie-Steuer (`snapshot()`) anfällt;
+das ist Teil des M0-Risikos, nicht davon getrennt.
 
 ## 10. Nebenläufigkeit — *Punkt 1*
 

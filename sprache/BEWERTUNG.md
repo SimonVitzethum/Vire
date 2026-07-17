@@ -118,7 +118,11 @@ Codegen, Speichermodell und die Sicherheits-Check-Elision. Das ist **fertig und
 gemessen**:
 
 - **LLVM-Backend** (textuelles IR + clang, `-march=native`, LTO): Rust-/C-Niveau,
-  in Arithmetik AVX2-vektorisiert schneller als beides.
+  in Arithmetik AVX2-vektorisiert schneller als beides.\* *(\* Diese Zahl gilt für
+  **wrapping**-Arithmetik. Vires checked-Overflow-Default (REFERENZ §3.1) bricht die
+  Autovektorisierung — empirisch **4,6×** langsamer, s. [M0-MESSUNG.md](M0-MESSUNG.md).
+  Heiße numerische Kernels müssen explizit `+%`/`Wrapping[T]` nutzen, um den
+  Vektorpfad zu behalten.)*
 - **Speichermodell:** RC + Zyklen-Kollektor, Escape-Analyse→Stack, RC-Elision,
   Azyklizität→Kollektor-Elimination. Heap-Bilanz überall 0 live.
 - **Sicherheits-Check-Elision:** Bounds-Check-Elision via GVN (Schleifenwächter,
@@ -249,6 +253,13 @@ Feature-Fahrplan (Punkte 1–8): [../TODO.md](../TODO.md).
 *Nachtrag nach externer Kritik. Die §§1–6 bleiben gültig, aber die Risikoverteilung
 ist verschoben: das Restrisiko liegt **nicht** im Front-End als Fleißarbeit
 („Lexer/Parser Wochen"), sondern an zwei unbelegten Stellen.*
+
+> **Inzwischen gemessen ([M0-MESSUNG.md](M0-MESSUNG.md)):** Der adversariale
+> geteilt/zyklische Fall ist **>1000× langsamer** als Rust (Zyklen-Kollektor
+> super-linear, → Timeout bei 100k Knoten), selbst ohne Kollektor 4,4×, atomare RC
+> 6,3×. Die Vermutungen von §7.1/7.3 sind damit **belegt**, nicht mehr nur benannt.
+> Gate-Urteil: **bedingtes Weiter** — erst Kollektor-Skalierung + Borrow-Inferenz,
+> dann Front-End.
 
 ### 7.1 Die eine tragende, unbewiesene Annahme — Alias-Präzision
 Alles hängt daran, dass der Solver Aliasing/Escape/Ownership **präzise genug ohne
