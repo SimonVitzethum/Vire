@@ -327,10 +327,24 @@ Bounds-Anteil braucht die Range-Analyse.
 
 ### Kompilierbarkeit komplexer Programme (Stand)
 
-**Läuft:** Interfaces, Generics-Erasure, Lambdas/Funktionsinterfaces, rekursive
-Strukturen, enums, try-with-resources, switch, Exceptions, Methoden-Referenzen,
-**innere Klassen** (`Objects.requireNonNull`), **Primitiv-Arrays aller Typen**,
-**`Comparable`-Bounds** (direkt). **Offen:** Records (`invokedynamic
-ObjectMethods`-Bootstrap → feldweise equals/hashCode/toString erzeugen),
-Sealed+Pattern-Switch (`SwitchBootstraps`), Comparable × ArrayList-Stub
-(Stub-seitiger ClassCast), `java.time`/volle `java.base`.
+**Läuft:** Interfaces + **instanceof/checkcast gegen Interfaces** (Type-
+Descriptor trägt die transitive Interface-Menge), Generics-Erasure +
+`Comparable`-Bounds, Lambdas/Funktionsinterfaces, rekursive Strukturen, enums,
+try-with-resources, switch, Exceptions, Methoden-Referenzen, **innere Klassen**
+(`Objects.requireNonNull`), **Primitiv-Arrays aller Typen**, **Records**
+(ObjectMethods-indy → feldweise toString/hashCode/equals via memcmp),
+**Sealed + Pattern-Switch** (`SwitchBootstraps.typeSwitch` → instanceof-Index +
+lookupswitch, `MatchException`). Alle bit-gleich zur JVM.
+**Offen:** guarded/constant patterns (`when`), `java.time`/volle `java.base`,
+und die eine Perf-Lücke Sieb (s.o.). Records mit Ref-Feldern vergleichen per
+Identität (memcmp-Grenze).
+
+**Was Sieb ≤1,1× braucht (zwei Features, beide substanziell):** (1) **Bounds-
+Check-Elision** per Range-/Wertanalyse — Array-Länge symbolisch verfolgen
+(`arr = new T[n]` ⇒ `arr.length == n`) und gegen die Schleifenschranke beweisen,
+dann Zugriff *unchecked* + throw-frei (pending-Check entfällt). LTO allein hilft
+kaum, weil nicht der Call-Overhead, sondern die Bounds-/pending-Prüfungen
+dominieren, die LLVM ohne den Range-Beweis nicht entfernt. (2) **Schmale Array-
+Breiten** — `byte[]`/`boolean[]` liegen aktuell als `int[]` (4 Byte, wertkorrekt
+weil javac trunkiert); für bandbreitengebundenen Code wie das Sieb wären 1-Byte-
+Elemente nötig (Rusts `Vec<u8>` liest 4× weniger Speicher).
