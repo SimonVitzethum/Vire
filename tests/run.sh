@@ -136,6 +136,7 @@ run enumswitch    0 EnumSwitch EnumSwitch Dir
 run escfields     0 EscapeFields EscapeFields Node2
 run intrinsics    0 Intrinsics Intrinsics
 run sync          0 Sync Sync
+run threads_seq   0 Threads Threads
 run strs          0 Strs Strs
 
 # --- JAR-Ingestion: Klassen + Manifest-Main-Class aus einem JAR ---
@@ -188,6 +189,28 @@ fstest() {
     echo "ok   $name"; pass=$((pass+1))
 }
 fstest freestanding  0 Cycle Box
+
+# --- Echte Nebenläufigkeit: --threads (pthreads + Monitor + atomare RC) ---
+thtest() {
+    name="$1"; want_out="$2"; main="$3"; shift 3
+    rm -f "$work"/*.class "$work/th.bin"
+    if ! javac -sourcepath "$ex" -d "$work" "$ex/$main.java" >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (javac)"; fail=$((fail+1)); return
+    fi
+    if ! $fastjavac --threads -o "$work/th.bin" "$work"/*.class >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (fastjavac): $(head -1 "$work/err")"; fail=$((fail+1)); return
+    fi
+    out="$(FASTLLVM_HEAPSTATS=1 "$work/th.bin" 2>&1)"; code=$?
+    got="$(echo "$out" | grep -v '\[heap\]' | head -1)"
+    if [ "$got" != "$want_out" ]; then
+        echo "FAIL $name (Ausgabe '$got', erwartet '$want_out' — Race?)"; fail=$((fail+1)); return
+    fi
+    if [ "$code" = "0" ] && echo "$out" | grep -q '\[heap\]' && ! echo "$out" | grep -q '0 noch live'; then
+        echo "FAIL $name (Heap-Leak)"; fail=$((fail+1)); return
+    fi
+    echo "ok   $name"; pass=$((pass+1))
+}
+thtest threads_par   200000 Threads
 
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"

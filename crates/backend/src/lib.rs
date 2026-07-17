@@ -151,6 +151,10 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_enum_valueof", "ptr (ptr, ptr)"),
     ("jrt_throwable_message", "ptr (ptr)"),
     ("jrt_get_class", "ptr (ptr)"),
+    ("jrt_monitor_enter", "void (ptr)"),
+    ("jrt_monitor_exit", "void (ptr)"),
+    ("jrt_thread_start", "void (ptr)"),
+    ("jrt_thread_join", "void (ptr)"),
     ("jrt_class_getname", "ptr (ptr)"),
     ("jrt_class_getsimplename", "ptr (ptr)"),
     ("jrt_parse_int", "i32 (ptr)"),
@@ -348,6 +352,15 @@ pub fn emit(program: &Program) -> String {
                     }
                 }
             }
+        }
+    }
+    // Runnable.run() wird nur über die native Thread-Trampoline dispatcht
+    // (kein CallVirtual im IR) → globalen Vtable-Slot erzwingen, damit
+    // @jrt_invoke_runnable ihn findet.
+    if program.class("java/lang/Runnable").is_some() {
+        let key = ("java/lang/Runnable".to_string(), "run".to_string(), "()V".to_string());
+        if !iface_slots.contains(&key) {
+            iface_slots.push(key);
         }
     }
     // TBAA-Registry: jedem deklarierten Instanzfeld ein Zugriffs-Tag zuweisen.
@@ -623,6 +636,19 @@ pub fn emit(program: &Program) -> String {
 
     for f in &program.functions {
         emit_function(w, &ctx, f);
+    }
+
+    // Thread-Trampoline: von der Runtime (pthread bzw. synchron) aufgerufen,
+    // dispatcht run() auf dem Runnable über den globalen Vtable-Slot.
+    if let Some(slot) = ctx.vtable_index("java/lang/Runnable", "run", "()V") {
+        writeln!(w, "define void @jrt_invoke_runnable(ptr %r) {{").unwrap();
+        writeln!(w, "  %vtp = getelementptr ptr, ptr %r, i64 {VTABLE_WORD}").unwrap();
+        writeln!(w, "  %vt = load ptr, ptr %vtp").unwrap();
+        writeln!(w, "  %sp = getelementptr ptr, ptr %vt, i64 {slot}").unwrap();
+        writeln!(w, "  %fn = load ptr, ptr %sp").unwrap();
+        writeln!(w, "  call void %fn(ptr %r)").unwrap();
+        writeln!(w, "  ret void").unwrap();
+        writeln!(w, "}}").unwrap();
     }
 
     if defined.contains("java_main") {

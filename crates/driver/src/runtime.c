@@ -770,6 +770,16 @@ static void run_drop(JObjHeader *h) {
  * die Bilanz bei Prozessende gedruckt. */
 static int64_t total_allocated = 0;
 static int64_t live_objects = 0;
+/* Zähler unter Threads atomar (sonst Datenrennen der Heap-Bilanz). */
+#ifdef FASTLLVM_THREADS
+#define CNT_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
+#define CNT_DEC(x) __atomic_sub_fetch(&(x), 1, __ATOMIC_RELAXED)
+#define CNT_POST_INC(x) __atomic_fetch_add(&(x), 1, __ATOMIC_RELAXED)
+#else
+#define CNT_INC(x) (++(x))
+#define CNT_DEC(x) (--(x))
+#define CNT_POST_INC(x) ((x)++)
+#endif
 
 /* Kandidaten-Wurzeln für die Zyklensuche (purple-Objekte). */
 static JObjHeader **roots = NULL;
@@ -780,7 +790,7 @@ static void jrt_collect_cycles(void);
 
 static void free_obj(JObjHeader *h) {
     plat_free(h);
-    live_objects--;
+    CNT_DEC(live_objects);
 }
 
 static void roots_push(JObjHeader *h) {
@@ -823,16 +833,37 @@ void *jrt_alloc(int64_t size) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
         plat_abort();
     }
-    if (total_allocated++ == 0) {
+    if (CNT_POST_INC(total_allocated) == 0) {
 #ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
 #endif
     }
-    live_objects++;
+    CNT_INC(live_objects);
     ((JObjHeader *)p)->refcount = 1; /* der Erzeuger hält die erste Referenz */
     return p;
 }
 
+#ifdef FASTLLVM_THREADS
+/* Threaded: atomare Refcounts. Inkrementelle Zyklen-Erkennung ist unter
+ * Threads nicht thread-safe → deaktiviert; azyklischer Müll wird prompt
+ * freigegeben, Zyklen bleiben bis Programmende liegen (dokumentierte Grenze,
+ * echte nebenläufige Collection wäre Bacon-Rajans concurrent-Variante). */
+void jrt_retain(void *p) {
+    if (!p) return;
+    JObjHeader *h = (JObjHeader *)p;
+    if (__atomic_load_n(&h->refcount, __ATOMIC_RELAXED) < 0) return; /* immortal */
+    __atomic_add_fetch(&h->refcount, 1, __ATOMIC_RELAXED);
+}
+void jrt_release(void *p) {
+    if (!p) return;
+    JObjHeader *h = (JObjHeader *)p;
+    if (__atomic_load_n(&h->refcount, __ATOMIC_RELAXED) < 0) return; /* immortal */
+    if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+        run_drop(h);
+        free_obj(h);
+    }
+}
+#else
 void jrt_retain(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
@@ -856,6 +887,62 @@ void jrt_release(void *p) {
         possible_root(h);
     }
 }
+#endif
+
+/* --- Nebenläufigkeit: Monitore + Thread ------------------------------
+ * Thread-Layout (Frontend): {header(3 Worte), $runnable@24, $handle@32}.
+ * run() ruft die generierte Trampoline @jrt_invoke_runnable auf. Unter
+ * --threads echte pthreads + rekursiver globaler Monitor; sonst läuft
+ * start() synchron (gültiger sequentieller Schedule), Monitore sind No-Ops. */
+void jrt_invoke_runnable(void *runnable); /* vom generierten Code definiert */
+
+#ifdef FASTLLVM_THREADS
+#include <pthread.h>
+static pthread_mutex_t g_monitor;
+static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
+static void init_monitor(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_monitor, &a);
+}
+void jrt_monitor_enter(void *o) {
+    (void)o;
+    pthread_once(&g_monitor_once, init_monitor);
+    pthread_mutex_lock(&g_monitor);
+}
+void jrt_monitor_exit(void *o) {
+    (void)o;
+    pthread_mutex_unlock(&g_monitor);
+}
+static void *thread_tramp(void *runnable) {
+    jrt_invoke_runnable(runnable);
+    jrt_release(runnable); /* die beim Start genommene Referenz */
+    return NULL;
+}
+void jrt_thread_start(void *thread) {
+    if (!thread) return;
+    void *runnable = *(void **)((char *)thread + 24);
+    jrt_retain(runnable); /* überlebt bis der Thread endet */
+    pthread_t tid;
+    pthread_create(&tid, NULL, thread_tramp, runnable);
+    *(int64_t *)((char *)thread + 32) = (int64_t)tid;
+}
+void jrt_thread_join(void *thread) {
+    if (!thread) return;
+    pthread_t tid = (pthread_t) * (int64_t *)((char *)thread + 32);
+    if (tid) pthread_join(tid, NULL);
+}
+#else
+void jrt_monitor_enter(void *o) { (void)o; }
+void jrt_monitor_exit(void *o) { (void)o; }
+void jrt_thread_start(void *thread) {
+    if (!thread) return;
+    /* Ohne Threads: synchroner Lauf — ein gültiger sequentieller Schedule. */
+    jrt_invoke_runnable(*(void **)((char *)thread + 24));
+}
+void jrt_thread_join(void *thread) { (void)thread; }
+#endif
 
 /* --- Bacon-Rajan: MarkRoots / ScanRoots / CollectRoots --------------- */
 
@@ -1131,12 +1218,12 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
         plat_abort();
     }
-    if (total_allocated++ == 0) {
+    if (CNT_POST_INC(total_allocated) == 0) {
 #ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
 #endif
     }
-    live_objects++;
+    CNT_INC(live_objects);
     JArray *a = (JArray *)p;
     a->refcount = 1;
     a->vtable = vtable;

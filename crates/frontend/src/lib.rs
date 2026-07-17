@@ -134,6 +134,66 @@ pub fn register_builtins(program: &mut Program) {
     program.classes.push(builtin("java/lang/Float", "float"));
     register_enum(program);
     register_throwables(program);
+    register_concurrency(program);
+}
+
+/// java.lang.Runnable (Funktionsinterface) + java.lang.Thread. Thread hält den
+/// Runnable und ein natives Handle; `start()`/`join()` sind Frontend-Intrinsics
+/// (jrt_thread_start/join). `run()` wird von der Runtime-Trampoline über den
+/// globalen Runnable-Vtable-Slot aufgerufen.
+fn register_concurrency(program: &mut Program) {
+    program.classes.push(ClassInfo {
+        name: "java/lang/Runnable".to_string(),
+        super_name: None,
+        is_interface: true,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        methods: vec![MethodInfo {
+            name: "run".into(),
+            desc: "()V".into(),
+            is_static: false,
+            has_body: false,
+            mangled: mangle("java/lang/Runnable", "run", "()V"),
+        }],
+        has_clinit: false,
+    });
+    let init = mangle("java/lang/Thread", "<init>", "(Ljava/lang/Runnable;)V");
+    program.classes.push(ClassInfo {
+        name: "java/lang/Thread".to_string(),
+        super_name: None,
+        is_interface: false,
+        interfaces: Vec::new(),
+        fields: vec![
+            FieldInfo { name: "$runnable".to_string(), ty: Ty::Ref },
+            FieldInfo { name: "$handle".to_string(), ty: Ty::I64 },
+        ],
+        static_fields: Vec::new(),
+        methods: vec![MethodInfo {
+            name: "<init>".into(),
+            desc: "(Ljava/lang/Runnable;)V".into(),
+            is_static: false,
+            has_body: true,
+            mangled: init.clone(),
+        }],
+        has_clinit: false,
+    });
+    // Thread.<init>(runnable): this.$runnable = runnable.
+    program.functions.push(Function {
+        name: init,
+        params: vec![Ty::Ref, Ty::Ref],
+        ret: Ty::Void,
+        locals: vec![Ty::Ref, Ty::Ref],
+        blocks: vec![BasicBlock {
+            statements: vec![Statement::PutField {
+                obj: Operand::Copy(Local(0)),
+                class: "java/lang/Thread".to_string(),
+                field: "$runnable".into(),
+                value: Operand::Copy(Local(1)),
+            }],
+            terminator: Terminator::Return(None),
+        }],
+    });
 }
 
 /// Throwable/Exception/RuntimeException als eingebaute Basisklassen: Throwable
@@ -1319,10 +1379,23 @@ fn lower_block(
             Instr::Pop => {
                 pop!();
             }
-            // monitorenter/monitorexit: Einthread-Modell → objectref poppen,
-            // keine Sperre. Für echte Threads bräuchte es atomare RC.
-            Instr::MonitorOp => {
-                pop!();
+            // monitorenter/monitorexit → Runtime-Sperre (rekursiver globaler
+            // Mutex unter --threads, sonst No-Op). objectref ist geborgt.
+            Instr::MonitorEnter => {
+                let obj = pop!();
+                stmts.push(Statement::Call {
+                    dest: None,
+                    func: "jrt_monitor_enter".to_string(),
+                    args: vec![Operand::Copy(obj)],
+                });
+            }
+            Instr::MonitorExit => {
+                let obj = pop!();
+                stmts.push(Statement::Call {
+                    dest: None,
+                    func: "jrt_monitor_exit".to_string(),
+                    args: vec![Operand::Copy(obj)],
+                });
             }
             Instr::Pop2 => {
                 // Kategorie-2 (long/double) belegt einen Stack-Eintrag; zwei
@@ -1770,6 +1843,18 @@ fn lower_block(
                 if name == "addSuppressed" && desc == "(Ljava/lang/Throwable;)V" {
                     pop!(); // suppressed throwable
                     pop!(); // receiver
+                    continue;
+                }
+                // Thread.start()/join(): Runtime übernimmt (pthread bzw.
+                // synchroner Lauf ohne --threads). objectref geborgt.
+                if class == "java/lang/Thread" && (name == "start" || name == "join") && desc == "()V" {
+                    let recv = pop!();
+                    let func = if name == "start" { "jrt_thread_start" } else { "jrt_thread_join" };
+                    stmts.push(Statement::Call {
+                        dest: None,
+                        func: func.to_string(),
+                        args: vec![Operand::Copy(recv)],
+                    });
                     continue;
                 }
                 // Object.getClass(): Class-Singleton über den Type-Descriptor

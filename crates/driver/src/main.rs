@@ -17,6 +17,7 @@ fn main() {
     let mut stats = false;
     let mut no_solver = false;
     let mut freestanding = false;
+    let mut threads = false;
     let mut main_override: Option<String> = None;
     let mut raw_inputs: Vec<PathBuf> = Vec::new();
 
@@ -36,6 +37,7 @@ fn main() {
             "--stats" => stats = true,
             "--no-solver" => no_solver = true,
             "--freestanding" => freestanding = true,
+            "--threads" => threads = true,
             "-h" | "--help" => {
                 println!("Aufruf: fastjavac [-o BIN] [--main KLASSE] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] (KLASSE.class | LIB.jar) ...");
                 return;
@@ -152,6 +154,9 @@ fn main() {
     // zusammenlinkt.
     let mut cmd = Command::new("clang");
     cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
+    if threads {
+        cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
+    }
     if freestanding {
         cmd.args([
             "-r",

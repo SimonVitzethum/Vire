@@ -59,6 +59,19 @@ pub fn run(program: &mut Program) -> Stats {
             }
         }
     }
+    // Runnable.run()-Implementierungen werden über die native Thread-Trampoline
+    // aufgerufen (für RTA unsichtbar) → als Wurzeln behandeln.
+    if program.class("java/lang/Runnable").is_some() {
+        for c in &program.classes {
+            let implements_runnable = c.interfaces.iter().any(|i| i == "java/lang/Runnable");
+            if implements_runnable {
+                let run = fastllvm_ir::mangle(&c.name, "run", "()V");
+                if func_index.contains_key(&run) {
+                    roots.push(run);
+                }
+            }
+        }
+    }
 
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut instantiated: BTreeSet<String> = BTreeSet::new();
