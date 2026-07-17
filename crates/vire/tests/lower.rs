@@ -87,6 +87,16 @@ fn produkttyp_new_und_feldzugriff() {
 }
 
 #[test]
+fn feldmutation_erzeugt_putfield() {
+    let src = "type C {\n n: Int\n}\nfn main() {\n mut c = C(0)\n c.n = 5\n c.n += 1\n}\n";
+    let p = lower(src);
+    let puts = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .filter(|s| matches!(s, fastllvm_ir::Statement::PutField { field, .. } if field == "n")).count();
+    // 1× Konstruktion + `= 5` + `+= 1` = 3 PutField auf n.
+    assert_eq!(puts, 3);
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());

@@ -275,8 +275,8 @@ impl<'a> FnLower<'a> {
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
             }
-            Stmt::Assign { target, op, value, .. } => {
-                if let Expr::Ident(name, _) = target {
+            Stmt::Assign { target, op, value, .. } => match target {
+                Expr::Ident(name, _) => {
                     if let Some((l, _ty)) = self.lookup(name) {
                         let (rhs, _) = self.lower_expr(value);
                         let rv = match op {
@@ -287,10 +287,42 @@ impl<'a> FnLower<'a> {
                     } else {
                         self.errs.push(format!("unbekannte Variable: {name}"));
                     }
-                } else {
-                    self.errs.push("Zuweisungsziel M2: nur einfache Variablen".into());
                 }
-            }
+                // Feldmutation `p.x = v` bzw. `p.x op= v` → (Get)+Binary+PutField.
+                Expr::Field { base, name, .. } => {
+                    let (obj, _) = self.lower_expr(base);
+                    let class = match self.class_of_operand(&obj) {
+                        Some(c) => c,
+                        None => {
+                            self.errs.push(format!("Feldzuweisung `.{name}`: Typ des Objekts unbekannt (annotieren)"));
+                            return;
+                        }
+                    };
+                    let fty = match self.types.get(&class).and_then(|l| l.iter().find(|(n, ..)| n == name)) {
+                        Some((_, ty, _)) => *ty,
+                        None => {
+                            self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
+                            return;
+                        }
+                    };
+                    let (mut v, _) = self.lower_expr(value);
+                    if let Some(o) = op {
+                        // compound: alten Wert lesen, verrechnen.
+                        let cur = self.new_local(fty);
+                        self.emit(Statement::GetField { dest: cur, obj: obj.clone(), class: class.clone(), field: name.clone() });
+                        let d = self.new_local(fty);
+                        self.emit(Statement::Assign(d, Rvalue::Binary(map_op(*o), Operand::Copy(cur), v)));
+                        v = Operand::Copy(d);
+                    }
+                    if fty == Ty::I64 {
+                        v = to_i64(v);
+                    }
+                    self.emit(Statement::PutField { obj, class, field: name.clone(), value: v });
+                }
+                _ => {
+                    self.errs.push("Zuweisungsziel M2: nur Variablen und Felder".into());
+                }
+            },
             Stmt::Expr(e) => {
                 self.lower_expr(e);
             }
