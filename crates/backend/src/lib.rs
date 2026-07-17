@@ -805,6 +805,8 @@ struct FnEmitter<'a> {
     f: &'a Function,
     tmp: u32,
     label: u32,
+    /// Laufender Index der StackNew-Slots (%sn<k>), im Entry-Block reserviert.
+    sn: u32,
     /// Geborgte Ref-Parameter-Slots (nie neu zugewiesen): RC-Elision — kein
     /// Entry-retain, keine Cleanup-release. Der Aufrufer hält die Referenz für
     /// die Aufrufdauer (Argumente sind geborgt), Kopien in andere Locals
@@ -916,9 +918,21 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
             writeln!(w, "  call void @jrt_retain(ptr %p{i})").unwrap();
         }
     }
+    // StackNew-Objektspeicher vorab im Entry-Block reservieren (%sn<k>), in
+    // Statement-Reihenfolge — so ist der Slot in Schleifen ein fester,
+    // wiederverwendeter Alloca statt einer Allokation je Iteration.
+    let mut snk = 0u32;
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            if let Statement::StackNew { class, .. } = st {
+                writeln!(w, "  %sn{snk} = alloca {}", ctx.struct_name(class)).unwrap();
+                snk += 1;
+            }
+        }
+    }
     writeln!(w, "  br label %bb0").unwrap();
 
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0 };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -1178,11 +1192,12 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         }
         Statement::StackNew { dest, class } => {
             let sn = ctx.struct_name(class);
-            let t = e.fresh();
-            // Escape-Analyse hat funktions-lokale Lebenszeit bewiesen:
-            // alloca statt Heap. refcount=-1 macht das Objekt immortal —
-            // retain/release sind No-Ops, es wird nie freigegeben.
-            writeln!(w, "  {t} = alloca {sn}").unwrap();
+            // Der Alloca-Slot ist im Entry-Block vorab reserviert (%sn<k>) —
+            // sonst würde ein StackNew in einer Schleife je Iteration Stack
+            // allozieren (Überlauf). Hier nur (re)initialisieren: refcount=-1
+            // macht das Objekt immortal (retain/release = No-Op, nie befreit).
+            let t = format!("%sn{}", e.sn);
+            e.sn += 1;
             writeln!(w, "  store {sn} zeroinitializer, ptr {t}").unwrap();
             writeln!(w, "  store i64 -1, ptr {t}").unwrap();
             store_vtable(w, e, &t, class);

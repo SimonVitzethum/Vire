@@ -253,6 +253,25 @@ fn run_function(
         }
     }
 
+    // Schleifen-Sicherheit (Phase 3): ein Objekt in einem Zyklus-Block darf nur
+    // stack-alloziert werden (Slot je Iteration wiederverwendet), wenn beim New
+    // kein Alias aus einer früheren Iteration mehr lebt. Sonst „entkommt" es
+    // (bleibt Heap). Als direkte Escape-Quelle behandelt, damit die Komponenten-
+    // Propagation unten die both-or-neither-Invariante wahrt: ein unsicheres
+    // Loop-Objekt zieht seine ganze Komponente auf Heap (verhindert, dass ein
+    // Zyklus-Partner promoviert wird, während der andere Heap bleibt → dangling).
+    if news.iter().any(|(bi, _, _, _)| cyclic[*bi]) {
+        let live_in = liveness(f);
+        for (idx, (bi, si, dest, _)) in news.iter().enumerate() {
+            if cyclic[*bi] {
+                let live = &live_in[*bi][*si];
+                if aliases[idx].iter().any(|a| *a != *dest && live.contains(a)) {
+                    direct[idx] = true;
+                }
+            }
+        }
+    }
+
     // Fixpunkt: Entkommen über die ungerichteten Kanten propagieren — eine
     // Zusammenhangskomponente entkommt, sobald ein Mitglied entkommt.
     let mut escape = direct;
@@ -269,10 +288,11 @@ fn run_function(
         }
     }
 
-    // Nicht entkommende, nicht in Schleifen liegende Objekte stack-allozieren.
+    // Nicht entkommende Objekte stack-allozieren (Schleifen-Sicherheit steckt
+    // bereits in `escape`, s.o.).
     let mut count = 0;
     for (idx, (bi, si, _, _)) in news.iter().enumerate() {
-        if escape[idx] || cyclic[*bi] {
+        if escape[idx] {
             continue;
         }
         let Statement::New { dest, class } = f.blocks[*bi].statements[*si].clone() else {
@@ -282,6 +302,174 @@ fn run_function(
         count += 1;
     }
     count
+}
+
+/// Rückwärts-Liveness: `live_in[block][stmt]` = die vor Statement `stmt` (im
+/// Block) lebendigen Locals. Standard-Datenfluss (live-out = ∪ live-in der
+/// Nachfolger; live-in = use ∪ (live-out ∖ def)).
+fn liveness(f: &Function) -> Vec<Vec<BTreeSet<Local>>> {
+    let nb = f.blocks.len();
+    let succs: Vec<Vec<usize>> = f
+        .blocks
+        .iter()
+        .map(|bb| match &bb.terminator {
+            Terminator::Goto(b) => vec![b.0 as usize],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+            Terminator::Switch { default, cases, .. } => {
+                let mut v = vec![default.0 as usize];
+                v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                v
+            }
+            Terminator::Return(_) => vec![],
+        })
+        .collect();
+    let term_uses: Vec<BTreeSet<Local>> = f
+        .blocks
+        .iter()
+        .map(|bb| {
+            let mut u = BTreeSet::new();
+            match &bb.terminator {
+                Terminator::Branch { cond, .. } => add_use(&mut u, cond),
+                Terminator::Switch { value, .. } => add_use(&mut u, value),
+                Terminator::Return(Some(op)) => add_use(&mut u, op),
+                _ => {}
+            }
+            u
+        })
+        .collect();
+    let mut live_out_block = vec![BTreeSet::<Local>::new(); nb];
+    // Fixpunkt über live-out je Block.
+    loop {
+        let mut changed = false;
+        for bi in (0..nb).rev() {
+            let mut out = BTreeSet::new();
+            for &s in &succs[bi] {
+                out.extend(block_live_in(f, s, &term_uses[s], &live_out_block[s]));
+            }
+            if out != live_out_block[bi] {
+                live_out_block[bi] = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Pro Statement rückwärts auflösen.
+    let mut result: Vec<Vec<BTreeSet<Local>>> = Vec::with_capacity(nb);
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        let mut cur = live_out_block[bi].clone();
+        cur.extend(term_uses[bi].iter().copied());
+        let mut per_stmt = vec![BTreeSet::new(); bb.statements.len()];
+        for si in (0..bb.statements.len()).rev() {
+            let (def, uses) = stmt_def_use(&bb.statements[si]);
+            if let Some(d) = def {
+                cur.remove(&d);
+            }
+            cur.extend(uses);
+            per_stmt[si] = cur.clone();
+        }
+        result.push(per_stmt);
+    }
+    result
+}
+
+/// Live-in eines ganzen Blocks (für die Block-Fixpunkt-Iteration).
+fn block_live_in(
+    f: &Function,
+    bi: usize,
+    term_uses: &BTreeSet<Local>,
+    live_out: &BTreeSet<Local>,
+) -> BTreeSet<Local> {
+    let mut cur = live_out.clone();
+    cur.extend(term_uses.iter().copied());
+    for st in f.blocks[bi].statements.iter().rev() {
+        let (def, uses) = stmt_def_use(st);
+        if let Some(d) = def {
+            cur.remove(&d);
+        }
+        cur.extend(uses);
+    }
+    cur
+}
+
+fn add_use(set: &mut BTreeSet<Local>, op: &Operand) {
+    if let Operand::Copy(l) = op {
+        set.insert(*l);
+    }
+}
+
+/// (definiertes Local, benutzte Locals) eines Statements.
+fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
+    let mut uses = Vec::new();
+    let mut u = |op: &Operand| {
+        if let Operand::Copy(l) = op {
+            uses.push(*l);
+        }
+    };
+    let def = match st {
+        Statement::Assign(d, rv) => {
+            match rv {
+                Rvalue::Use(op) | Rvalue::Neg(op) | Rvalue::Convert(op) => u(op),
+                Rvalue::Binary(_, a, b) => {
+                    u(a);
+                    u(b);
+                }
+            }
+            Some(*d)
+        }
+        Statement::Call { dest, args, .. }
+        | Statement::CallGuarded { dest, args, .. }
+        | Statement::CallVirtual { dest, args, .. }
+        | Statement::CallPoly { dest, args, .. } => {
+            args.iter().for_each(&mut u);
+            *dest
+        }
+        Statement::New { dest, .. } | Statement::StackNew { dest, .. } => Some(*dest),
+        Statement::GetField { dest, obj, .. } => {
+            u(obj);
+            Some(*dest)
+        }
+        Statement::PutField { obj, value, .. } => {
+            u(obj);
+            u(value);
+            None
+        }
+        Statement::GetStatic { dest, .. } => Some(*dest),
+        Statement::PutStatic { value, .. } => {
+            u(value);
+            None
+        }
+        Statement::NewArray { dest, len, .. } => {
+            u(len);
+            Some(*dest)
+        }
+        Statement::ArrayLen { dest, arr } => {
+            u(arr);
+            Some(*dest)
+        }
+        Statement::ArrayLoad { dest, arr, index, .. } => {
+            u(arr);
+            u(index);
+            Some(*dest)
+        }
+        Statement::ArrayStore { arr, index, value, .. } => {
+            u(arr);
+            u(index);
+            u(value);
+            None
+        }
+        Statement::InstanceOf { dest, obj, .. } => {
+            u(obj);
+            Some(*dest)
+        }
+        Statement::InstanceOfPending { dest, .. } => Some(*dest),
+        Statement::CheckCast { obj, .. } => {
+            u(obj);
+            None
+        }
+    };
+    (def, uses)
 }
 
 /// Alias-Fixpunkt: alle Locals, die den Wert von `root` halten können.
