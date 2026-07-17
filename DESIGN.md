@@ -206,14 +206,19 @@ Prototyp für eine Java-Teilmenge (Schritte 1–4): grob 3–6 Monate Ein-Person
 
 **Umgesetzt:** JAR-/Classpath-Ingestion (entpacken, Manifest-`Main-Class`, `--main`; automatische Closed-World-Sammlung aller `.class`); freestanding/seL4-Runtime (libc-frei, statischer Heap, verifiziert bit-gleich zu hosted); Intrinsics `System.arraycopy` (ref-/größenkorrekt), `Integer.parseInt`/`Long.parseLong`, `Math.abs/max/min/sqrt`, `System.currentTimeMillis/nanoTime`; `synchronized` (Einthread-No-Op-Monitore); erweiterte `String`-Methoden (indexOf/substring/startsWith/endsWith/trim/concat/compareTo). Dazu die frühere Basis: Solver (RTA/CHA + bikonditionale Devirt, Inlining, feld-sensitive Escape-Analyse, TBAA), RC + Zyklen-Collector, Exceptions, enum, Lambdas/Streams, Generics-Erasure, statisch auflösbare Reflection.
 
-**Noch offen (nach Hebel):**
-- **Standardbibliothek** (dominant): nur Ausschnitt (`stdlib/`-Stubs + Intrinsics). Realer Weg zu `java.base`: TeaVM-Classlib/GNU Classpath adaptieren; JNI-artige C-Shims für native Methoden. Betrifft auch echtes UTF-16 (aktuell Byte/ASCII).
-- **Reflection-Metamodell**: `Method.invoke`/`Field.get/set`/`getDeclared*`, laufzeit-`getClass()`/`getName()`, `Proxy`, `ServiceLoader`/SPI. Bräuchte eine Reachability-getriebene Reflection-Registry + generierte Dispatch-/Metadatentabellen (Native-Image-Stil); die Type-Descriptoren müssten je Klasse auf ein `@jclass`-Objekt zeigen.
-- **Echte Nebenläufigkeit**: `synchronized` kompiliert, aber die nicht-atomare RC wäre unter Threads unsound → atomare Refcounts oder thread-lokale Regionen (GC-/Sicherheits-Redesign), `java.lang.Thread`, `java.util.concurrent`, Speichermodell.
-- **Performance-Kür**: Array-Zugriffe direkt (statt Runtime-Calls) inline + Array-Element-TBAA für Vektorisierung; RC-Elision (Borrow-/Ownership-Analyse) — bewusst zurückgestellt, um die per Leak-Detektor verifizierte RC-Korrektheit nicht zu gefährden; PGO.
-- **Sprach-Rest**: `new java.lang.Object`, echte Stacktraces/`getCause`, innere Klassen mit `this$0`, `ArrayStoreException`, Records/Sealed/Pattern-Matching.
+**Inzwischen zusätzlich umgesetzt:**
+- **Performance/RC-Elision**: nie neu zugewiesene Ref-Parameter (v.a. `this`) bleiben geborgt — kein Entry-retain/Cleanup-release (−12% RC-Aufrufe auf Shapes, sound per Heap-Bilanz). Array-Zugriffe brauchen kein manuelles Inlining: clang -O2 inlinet die Runtime-Helfer vollständig.
+- **Laufzeit-Reflection**: jede Klasse hat ein immortales `@jclass`-Objekt (Name + simpleName), der Type-Descriptor verlinkt darauf; `obj.getClass()`/`getName()`/`getSimpleName()` funktionieren am echten Laufzeittyp, Class-Identität per Pointer-Vergleich.
+- **Echte Nebenläufigkeit** (`--threads`): `java.lang.Thread`/`Runnable` mit pthreads (run() über generierte Trampoline), rekursiver globaler Monitor, **atomare Refcounts** + atomare Heap-Zähler — verifiziert mit zwei OS-Threads (200000, keine Race, 0 live). Ohne `--threads` läuft `start()` synchron. Die inkrementelle Zyklen-Erkennung ist unter Threads deaktiviert (dokumentierte Grenze).
+- **stdlib**: `java.util.Arrays` (fill/copyOf/sort/toString).
 
-Kurzfassung: **Compiler-Technik weitgehend gelöst; „Java-Plattform" (v.a. `java.base` + Reflection-Metamodell + atomare Nebenläufigkeit) bleibt der Hauptaufwand.** Die 51 Regressionstests laufen grün mit Heap-Bilanz 0 live, hosted **und** freestanding.
+**Weiterhin offen (nach Hebel):**
+- **Standardbibliothek** (dominant): weiterhin nur Ausschnitt. Realer Weg zu vollem `java.base`: TeaVM-Classlib/GNU Classpath adaptieren; JNI-artige C-Shims. **UTF-16**: Strings sind Byte/ASCII — echtes UTF-16 ist ein Refactor des String-Runtime + aller String-Intrinsics.
+- **Reflection-Metamodell (Rest)**: `Method.invoke`/`Field.get/set`/`getDeclared*`, `Proxy`, `ServiceLoader`/SPI — Member-Metadatentabellen + generischer Invoke (Native-Image-Stil).
+- **Nebenläufige Zyklen-Collection**: Bacon-Rajans concurrent-Variante (aktuell unter Threads deaktiviert), feingranulare Monitore statt eines globalen, `java.util.concurrent`, formales Speichermodell.
+- **Sprach-Rest**: `new java.lang.Object`, echte Stacktraces/`getCause`, innere Klassen mit `this$0`, `ArrayStoreException`, Records/Sealed/Pattern-Matching; PGO.
+
+Kurzfassung: **Compiler-Technik + Speichersicherheits-/Nebenläufigkeits-*Fundamente* stehen; der stehende Großaufwand ist die Breite von `java.base` (inkl. UTF-16) und das vollständige Reflection-Metamodell.** Die 55 Regressionstests laufen grün mit Heap-Bilanz 0 live — hosted, freestanding/seL4 **und** unter echten Threads.
 
 ---
 
