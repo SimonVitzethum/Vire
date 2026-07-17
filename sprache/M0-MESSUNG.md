@@ -159,6 +159,31 @@ umgesetzt: die Aussage trägt jetzt ein Sternchen ([BEWERTUNG.md](BEWERTUNG.md) 
 
 ---
 
+## M0.1c — Kollektor repariert (die sichere Hälfte umgesetzt)
+
+Zwei **sichere** Runtime-Fixes umgesetzt (Suite 65/65, 0 live, Graph korrekt —
+keine Borrow-Logik angetastet):
+1. **Adaptive Schwelle:** Kollektor-Trigger = 2× lebende Objekte statt fix 10000 →
+   Häufigkeit begrenzt → amortisiert **linear** statt O(n²). 0-live unberührt (der
+   Shutdown-Collect fängt alles).
+2. **Iterativer Drop/Collect (SOUNDNESS):** rekursives Release + die vier
+   Bacon-Rajan-Traversierungen sprengten bei N=200k den Stack auf **gültigem**
+   Graphen. Jetzt Worklists (Stacktiefe O(1)). N=200k: **Segfault → läuft, 0 live.**
+
+| N | vorher (Default) | **nachher** | vs Rust |
+|---|---|---|---|
+| 16 000 | 0,90 s | **0,055 s** | 6,7× |
+| 100 000 | Timeout >60 s | **0,37 s** | 6,7× |
+| 200 000 | **Segfault** | **0,86 s** | 7,4× |
+
+**108× → ~7×, linear, korrekt, crash-frei.** Das ist die vom Review vorhergesagte
+Kollektor-Hälfte (~4–7×). Der Rest auf 1,1× ist die Borrow-Inferenz (M0.1b) — und
+die ist auf dem javac-IR durch **Slot-Reuse blockiert**: `Local(3)` ist im selben
+Slot der `NewArray`-Owner (setup) **und** der `ArrayLoad`-Borrow (Loop). Per-Slot-
+Borrow ist damit unmöglich; es braucht **SSA/Slot-Splitting** — genau was Vires
+Front-End nativ liefert und der Java-Bootstrap nicht hat. **Der Bootstrap hat hier
+seine Optimierungsdecke für diese Klasse erreicht.**
+
 ## M0.3 — Entscheidung
 
 **Gate-Urteil: bedingtes Weiter, mit zwei Pflicht-Vorarbeiten — nicht „grün".**

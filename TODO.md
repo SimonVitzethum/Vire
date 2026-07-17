@@ -36,13 +36,12 @@ Vollständiger Bericht: **[sprache/M0-MESSUNG.md](sprache/M0-MESSUNG.md)**. Prog
   Soundness-heikel (0-live!): nur mit region-/dominanz-scopiertem „kein Store setzt
   den geborgten Slot um"-Beweis. **Das ist das Ownership-Inferenz-Modul** — sorgfältig,
   nicht schnell.
-- [ ] **(i) Kollektor-Skalierung** ist danach für dieses Muster **nicht mehr nötig**;
+- [x] **(i) Kollektor-Skalierung** — UMGESETZT (adaptive Schwelle 2×live → linear; 108×→~7×) + iterativer Drop/Collect (Soundness: N=200k Crash→läuft). Für dieses Muster danach **nicht mehr nötig**;
   bleibt relevant für *echt* zyklische Programme. **Achtung Zielkonflikt:**
   inkrementell/generationell = Write-Barriers je Mutation (re-inflationiert den Floor)
   **+ mehr Runtime** → zieht gegen „~runtime-frei" (Feature 5) und Teil von Feature 3.
-- [ ] **(iii) SOUNDNESS-Bug, unabhängig von Tempo:** rekursives Release/Collect
-  sprengt bei N=200k den Stack (großer *gültiger* Graph → Crash = „sicher"-Verletzung).
-  **Iterativer Worklist-Release** nötig — kleiner Runtime-Zuwachs, aber Pflicht.
+- [x] **(iii) SOUNDNESS-Bug BEHOBEN:** iterativer Worklist-Release + iterative
+  Kollektor-Traversierungen (cwork/bwork/fwork). N=200k Crash → läuft, 0 live.
 - [ ] **(iv) Feld-/interproz. Bounds-Elision** für `out[k]` (Länge eines Feld-Arrays)
   → schließt einen Teil der Rest-1,5× Richtung ~1,1×.
 - [ ] **(v) Overflow-Default + `+%`-Kultur** (Vektorisierung, M0-Bericht) und
