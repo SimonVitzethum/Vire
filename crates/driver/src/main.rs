@@ -168,6 +168,13 @@ fn main() {
     // Linken strippen — so zieht z.B. `Hello` nur die tatsächlich gerufenen
     // jrt_-Funktionen statt der ganzen Runtime.
     cmd.args(["-ffunction-sections", "-fdata-sections"]);
+    // LTO: das generierte Programm und runtime.c werden als getrennte Objekte
+    // übersetzt — ohne LTO inlinet clang die Runtime-Helfer (jrt_iaload,
+    // jrt_pending_set, jrt_lcmp …) NICHT über die Dateigrenze in die heißen
+    // Schleifen. LTO ermöglicht genau dieses cross-file-Inlining.
+    if !freestanding {
+        cmd.arg("-flto");
+    }
     if !freestanding {
         cmd.arg("-Wl,--gc-sections");
     }
