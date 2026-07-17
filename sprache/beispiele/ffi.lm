@@ -1,0 +1,25 @@
+# C-Interop — der universelle Bibliotheks-Zugang. Direkte extern-Deklaration
+# oder Header-Binding. `unsafe` markiert nur die tatsächliche FFI-Zeile.
+
+# Direkte Deklaration einzelner C-Funktionen:
+extern "C":
+    fn sqrt(x: F64) -> F64
+    fn clock() -> Int
+
+# Ganze Bibliothek über generierte Bindings (C-ABI):
+use c "sqlite3.h" as sql
+
+fn open_db(path: Str) -> Result[Ptr[sql.sqlite3], Str]:
+    unsafe:
+        mut handle: Ptr[sql.sqlite3] = null_ptr()
+        rc = sql.sqlite3_open(path.c_str(), &handle)
+        if rc == 0: Ok(handle) else: Err("konnte {path} nicht öffnen")
+
+fn main() -> Result[Unit, Str]:
+    # C-Mathematik direkt, zero-cost:
+    print("sqrt(2) = {sqrt(2.0)}")
+
+    # C-Bibliothek nutzen:
+    db = open_db("app.db")?
+    unsafe: sql.sqlite3_close(db)
+    Ok(())

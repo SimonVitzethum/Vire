@@ -1,0 +1,24 @@
+# Hochsprachen-Domäne (Python/Go): Textverarbeitung mit Maps, Iteratoren,
+# Comprehensions, Option und Fehlern — liest wie Python, kompiliert nativ.
+
+use std.io
+
+fn word_counts(text: Str) -> Map[Str, Int]:
+    mut counts = {}                                  # Map[Str, Int] inferiert
+    for word in text.lower().split_whitespace():
+        counts[word] = counts.get(word).or(0) + 1    # Option.or liefert Default
+    counts
+
+fn top_n(counts: Map[Str, Int], n: Int) -> List[(Str, Int)]:
+    counts.items()
+          .sorted_by(pair -> -pair.1)                # nach Häufigkeit absteigend
+          .take(n)
+
+fn main() -> Result[Unit, Error]:
+    text = read_file("buch.txt")?                    # ? propagiert Err
+    counts = word_counts(text)
+    unique = [w for w, _ in counts.items()].len()
+    print("{unique} verschiedene Wörter, Top 10:")
+    for word, n in top_n(counts, 10):
+        print("{n:6}  {word}")
+    Ok(())
