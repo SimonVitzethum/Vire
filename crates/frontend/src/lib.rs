@@ -2379,6 +2379,22 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(part));
                     continue;
                 }
+                // Objects.requireNonNull(x[, msg]) → x (NPE bei null). javac
+                // fügt es u.a. beim Zugriff auf die äußere Instanz innerer
+                // Klassen ein. Der Message-Overload verwirft das zweite Argument.
+                if class == "java/util/Objects" && name == "requireNonNull" {
+                    if desc == "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;" {
+                        pop!(); // Message
+                    }
+                    let obj = pop!();
+                    stmts.push(Statement::Call {
+                        dest: None,
+                        func: "jrt_null_check".to_string(),
+                        args: vec![Operand::Copy(obj)],
+                    });
+                    push!(Ty::Ref, Rvalue::Use(Operand::Copy(obj)));
+                    continue;
+                }
                 // System.arraycopy: flache Kopie über die Runtime (bei
                 // NPE/Bounds/Store-Mismatch bricht sie ab — nicht abfangbar).
                 if class == "java/lang/System"
