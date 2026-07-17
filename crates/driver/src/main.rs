@@ -159,6 +159,13 @@ fn main() {
     // zusammenlinkt.
     let mut cmd = Command::new("clang");
     cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
+    // Phase 2: jede Funktion/Datenobjekt in eigene Section, ungenutzte beim
+    // Linken strippen — so zieht z.B. `Hello` nur die tatsächlich gerufenen
+    // jrt_-Funktionen statt der ganzen Runtime.
+    cmd.args(["-ffunction-sections", "-fdata-sections"]);
+    if !freestanding {
+        cmd.arg("-Wl,--gc-sections");
+    }
     if threads {
         cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
     }
