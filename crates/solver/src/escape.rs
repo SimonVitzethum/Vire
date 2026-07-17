@@ -73,6 +73,12 @@ fn arg_escapes(func: &str, j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool
     }
 }
 
+/// Entkommt Argument `j` an einen der (bekannten) Ziele eines polymorphen
+/// Calls? Nur wenn ES BEI KEINEM Ziel entkommt, ist es sicher lokal.
+fn poly_arg_escapes(targets: &[(String, String)], j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool {
+    targets.iter().any(|(_, sym)| arg_escapes(sym, j, summ))
+}
+
 /// Fixpunkt über den Aufrufgraphen: für jede Funktion die Ref-Parameter, die
 /// entkommen (Return / Feld-/Statik-/Array-Store / Weitergabe an einen Call,
 /// der sie entkommen lässt / virtueller Call mit unbekanntem Ziel).
@@ -114,7 +120,14 @@ fn param_escapes(f: &Function, root: Local, summ: &BTreeMap<String, Vec<bool>>) 
                         }
                     }
                 }
-                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
+                Statement::CallPoly { args, targets, .. } => {
+                    for (j, a) in args.iter().enumerate() {
+                        if is_alias(a) && poly_arg_escapes(targets, j, summ) {
+                            return true;
+                        }
+                    }
+                }
+                Statement::CallVirtual { args, .. } => {
                     if args.iter().any(is_alias) {
                         return true;
                     }
@@ -206,9 +219,21 @@ fn run_function(
                         }
                     }
                 }
-                // Virtuelle/polymorphe Sites: Ziel(e) nicht eindeutig →
-                // konservativ entkommend.
-                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
+                // Polymorpher Call mit bekannten Zielen: entkommt nur, wenn es
+                // bei mindestens einem Ziel entkommt (interprozedural). Leck-
+                // Sicherheit wie bei direkten Calls (Ref-Feld-Objekte → Heap).
+                Statement::CallPoly { args, targets, .. } => {
+                    for (j, a) in args.iter().enumerate() {
+                        let esc = poly_arg_escapes(targets, j, summ);
+                        for oi in objs_of(a) {
+                            if esc || ref_field_classes.contains(&news[oi].3) {
+                                direct[oi] = true;
+                            }
+                        }
+                    }
+                }
+                // Virtueller Call mit unbekanntem Ziel → konservativ entkommend.
+                Statement::CallVirtual { args, .. } => {
                     for a in args {
                         mark(&mut direct, a);
                     }
