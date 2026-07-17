@@ -32,6 +32,9 @@ pub struct Stats {
     pub poly_devirtualized: usize,
     pub inlined_calls: usize,
     pub stack_allocated: usize,
+    /// Kein instanziierter Typ kann in einem Referenzzyklus liegen → der
+    /// Zyklen-Collector ist überflüssig (Phase 1 der Runtime-Elimination).
+    pub acyclic: bool,
 }
 
 /// Schlüssel eines virtuellen Call-Sites: statische Klasse + Name + Deskriptor.
@@ -147,6 +150,7 @@ pub fn run(program: &mut Program) -> Stats {
         }
     }
 
+    stats.acyclic = is_acyclic(&program.classes, &instantiated);
     stats.instantiated_classes = instantiated.len();
     stats.virtual_sites = sites.len();
 
@@ -265,6 +269,102 @@ fn resolve_targets_ref(
         }
     }
     targets
+}
+
+/// Phase 1 der Runtime-Elimination: Kann *irgendein* instanziierter Typ in
+/// einem Referenzzyklus liegen? Baut den Typ-Referenzgraphen (Kante C→S, wenn
+/// C ein Ref-Feld vom Typ T hat und S ein instanziierter Subtyp von T ist;
+/// Arrays leiten über ihr Element durch) und sucht einen gerichteten Zyklus.
+/// Ist er azyklisch, genügt reine RC — der Zyklen-Collector entfällt.
+/// Konservativ: unbekannte/breite Feldtypen (`Object`) erzeugen Kanten zu
+/// allen Subtypen (lieber einen Zyklus zu viel annehmen als einen zu wenig).
+fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
+    let class_of = |n: &str| classes.iter().find(|c| c.name == n);
+    let is_subtype = |sub: &str, sup: &str| -> bool {
+        if sup == "java/lang/Object" {
+            return true;
+        }
+        let mut stack = vec![sub.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(c) = stack.pop() {
+            if c == sup {
+                return true;
+            }
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if let Some(ci) = class_of(&c) {
+                if let Some(s) = &ci.super_name {
+                    stack.push(s.clone());
+                }
+                stack.extend(ci.interfaces.iter().cloned());
+            }
+        }
+        false
+    };
+    let insts: Vec<&str> = instantiated.iter().map(|s| s.as_str()).collect();
+    let n = insts.len();
+    // Adjazenz über instanziierte Klassen.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (ci, &c) in insts.iter().enumerate() {
+        // Ref-Feld-Ziele inkl. geerbter Felder einsammeln.
+        let mut targets: Vec<String> = Vec::new();
+        let mut cur = Some(c.to_string());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            let Some(info) = class_of(&cn) else { break };
+            for f in &info.fields {
+                if let Some(t) = &f.ref_target {
+                    targets.push(t.clone());
+                }
+            }
+            cur = info.super_name.clone();
+        }
+        for t in &targets {
+            for (si, &s) in insts.iter().enumerate() {
+                if is_subtype(s, t) {
+                    adj[ci].push(si);
+                }
+            }
+        }
+    }
+    !has_cycle(&adj)
+}
+
+/// Gerichtete Zyklen-Suche (weiß/grau/schwarz-DFS, iterativ).
+fn has_cycle(adj: &[Vec<usize>]) -> bool {
+    let n = adj.len();
+    let mut color = vec![0u8; n]; // 0=weiß, 1=grau, 2=schwarz
+    for start in 0..n {
+        if color[start] != 0 {
+            continue;
+        }
+        // Stack aus (Knoten, nächster-Nachbar-Index).
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        color[start] = 1;
+        while let Some((u, i)) = stack.last().copied() {
+            if i < adj[u].len() {
+                stack.last_mut().unwrap().1 += 1;
+                let v = adj[u][i];
+                match color[v] {
+                    1 => return true, // grauer Nachbar → Rückkante → Zyklus
+                    0 => {
+                        color[v] = 1;
+                        stack.push((v, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                color[u] = 2;
+                stack.pop();
+            }
+        }
+    }
+    false
 }
 
 /// Wie `resolve_targets_ref`, aber (konkrete Klasse → Symbol)-Paare: für die

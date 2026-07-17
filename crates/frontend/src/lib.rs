@@ -38,6 +38,14 @@ impl From<fastllvm_classfile::ParseError> for FrontendError {
 
 type Result<T> = std::result::Result<T, FrontendError>;
 
+/// Referenzierter Zieltyp eines Feld-Deskriptors (für die Azyklizitäts-
+/// Analyse): `LNode;`/`[LNode;` → `Node`; Primitive und Primitiv-Arrays
+/// (`I`, `[I`) → `None` (referenzieren nichts, keine Zyklus-Kante).
+fn ref_target_of(desc: &str) -> Option<String> {
+    let elem = desc.trim_start_matches('[');
+    elem.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string())
+}
+
 /// Phase 1: Klassenmodell registrieren (vor dem Absenken aller Methoden,
 /// damit Feld-/Methodenauflösung über Klassengrenzen funktioniert).
 pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
@@ -66,7 +74,7 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
             };
             static_fields.push(StaticFieldInfo { name: f.name.clone(), ty, init });
         } else {
-            fields.push(FieldInfo { name: f.name.clone(), ty });
+            fields.push(FieldInfo { name: f.name.clone(), ty, ref_target: ref_target_of(&f.descriptor) });
         }
     }
     let methods = cf
@@ -165,8 +173,8 @@ fn register_concurrency(program: &mut Program) {
         is_interface: false,
         interfaces: Vec::new(),
         fields: vec![
-            FieldInfo { name: "$runnable".to_string(), ty: Ty::Ref },
-            FieldInfo { name: "$handle".to_string(), ty: Ty::I64 },
+            FieldInfo { name: "$runnable".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/Runnable".to_string()) },
+            FieldInfo { name: "$handle".to_string(), ty: Ty::I64, ref_target: None },
         ],
         static_fields: Vec::new(),
         methods: vec![MethodInfo {
@@ -213,7 +221,7 @@ fn register_throwables(program: &mut Program) {
         let init0 = mangle(cls, "<init>", "()V");
         let init1 = mangle(cls, "<init>", "(Ljava/lang/String;)V");
         let fields = if cls == "java/lang/Throwable" {
-            vec![FieldInfo { name: "$message".to_string(), ty: Ty::Ref }]
+            vec![FieldInfo { name: "$message".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()) }]
         } else {
             Vec::new()
         };
@@ -282,8 +290,8 @@ fn register_enum(program: &mut Program) {
         is_interface: false,
         interfaces: Vec::new(),
         fields: vec![
-            FieldInfo { name: "$name".to_string(), ty: Ty::Ref },
-            FieldInfo { name: "$ordinal".to_string(), ty: Ty::I32 },
+            FieldInfo { name: "$name".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()) },
+            FieldInfo { name: "$ordinal".to_string(), ty: Ty::I32, ref_target: None },
         ],
         static_fields: Vec::new(),
         methods: vec![
@@ -410,7 +418,13 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         .captures
         .iter()
         .enumerate()
-        .map(|(i, &ty)| FieldInfo { name: format!("cap{i}"), ty })
+        // Eingefangene Ref-Variablen konservativ als Object-Referenz werten
+        // (breite Zyklus-Kante — sound für die Azyklizitäts-Analyse).
+        .map(|(i, &ty)| FieldInfo {
+            name: format!("cap{i}"),
+            ty,
+            ref_target: (ty == Ty::Ref).then(|| "java/lang/Object".to_string()),
+        })
         .collect();
 
     let (sam_params, sam_ret) = parse_descriptor(&info.sam_desc)?;

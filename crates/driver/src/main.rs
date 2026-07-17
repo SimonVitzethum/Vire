@@ -105,15 +105,19 @@ fn main() {
         }
     }
 
+    // Azyklisch beweisbar → Zyklen-Collector entfällt (nur wenn der Solver
+    // lief; ohne ihn konservativ Collector behalten).
+    let mut acyclic = false;
     if !no_solver {
         let mut s = fastllvm_solver::run(&mut program);
         s.inlined_calls = fastllvm_solver::inline_program(&mut program);
         s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
+        acyclic = s.acyclic;
         if stats {
             eprintln!(
                 "solver: {} Klassen instanziiert, {} Funktionen erreichbar ({} entfernt), \
                  {} virtuelle Sites, {} devirtualisiert, {} bikonditional, {} Calls geinlinet, \
-                 {} Allokationen auf den Stack",
+                 {} Allokationen auf den Stack, Zyklen-Collector: {}",
                 s.instantiated_classes,
                 s.reachable_functions,
                 s.pruned_functions,
@@ -122,6 +126,7 @@ fn main() {
                 s.poly_devirtualized,
                 s.inlined_calls,
                 s.stack_allocated,
+                if s.acyclic { "entfällt (azyklisch)" } else { "nötig" },
             );
         }
     }
@@ -156,6 +161,11 @@ fn main() {
     cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
     if threads {
         cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
+    }
+    if acyclic {
+        // Phase 1: kein Typ zyklenfähig → Zyklen-Collector wird nicht mitgelinkt,
+        // retain/release werden farb-/pufferfrei.
+        cmd.arg("-DFASTLLVM_NO_CYCLES");
     }
     if freestanding {
         cmd.args([

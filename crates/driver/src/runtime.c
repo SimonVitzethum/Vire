@@ -781,17 +781,25 @@ static int64_t live_objects = 0;
 #define CNT_POST_INC(x) ((x)++)
 #endif
 
+/* Der synchrone Zyklen-Collector läuft nur, wenn er gebraucht wird: nicht
+ * unter Threads (nicht thread-safe) und nicht, wenn der Solver das Programm
+ * als azyklisch bewiesen hat (Phase 1 der Runtime-Elimination → reine RC). */
+#if !defined(FASTLLVM_THREADS) && !defined(FASTLLVM_NO_CYCLES)
+#define FASTLLVM_COLLECTOR 1
+#endif
+
+static void free_obj(JObjHeader *h) {
+    plat_free(h);
+    CNT_DEC(live_objects);
+}
+
+#ifdef FASTLLVM_COLLECTOR
 /* Kandidaten-Wurzeln für die Zyklensuche (purple-Objekte). */
 static JObjHeader **roots = NULL;
 static size_t roots_len = 0, roots_cap = 0;
 #define ROOTS_THRESHOLD 10000
 
 static void jrt_collect_cycles(void);
-
-static void free_obj(JObjHeader *h) {
-    plat_free(h);
-    CNT_DEC(live_objects);
-}
 
 static void roots_push(JObjHeader *h) {
     if (roots_len == roots_cap) {
@@ -811,9 +819,12 @@ static void possible_root(JObjHeader *h) {
         }
     }
 }
+#endif /* FASTLLVM_COLLECTOR */
 
 static void jrt_shutdown(void) {
+#ifdef FASTLLVM_COLLECTOR
     jrt_collect_cycles();
+#endif
 #ifndef FASTLLVM_FREESTANDING
     /* Leak-Detektor nur hosted (getenv/Prozess-Exit). */
     if (getenv("FASTLLVM_HEAPSTATS")) {
@@ -859,6 +870,24 @@ void jrt_release(void *p) {
     JObjHeader *h = (JObjHeader *)p;
     if (__atomic_load_n(&h->refcount, __ATOMIC_RELAXED) < 0) return; /* immortal */
     if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+        run_drop(h);
+        free_obj(h);
+    }
+}
+#elif defined(FASTLLVM_NO_CYCLES)
+/* Solver-bewiesen azyklisch → reine RC ohne Farb-/Puffer-Buchhaltung: nur
+ * inc/dec, bei 0 freigeben. Der Zyklen-Collector ist gar nicht mitgelinkt. */
+void jrt_retain(void *p) {
+    if (!p) return;
+    JObjHeader *h = (JObjHeader *)p;
+    if (h->refcount < 0) return; /* immortal */
+    h->refcount++;
+}
+void jrt_release(void *p) {
+    if (!p) return;
+    JObjHeader *h = (JObjHeader *)p;
+    if (h->refcount < 0) return; /* immortal */
+    if (--h->refcount == 0) {
         run_drop(h);
         free_obj(h);
     }
@@ -945,6 +974,7 @@ void jrt_thread_join(void *thread) { (void)thread; }
 #endif
 
 /* --- Bacon-Rajan: MarkRoots / ScanRoots / CollectRoots --------------- */
+#ifdef FASTLLVM_COLLECTOR
 
 static void mark_gray(JObjHeader *h);
 static void scan(JObjHeader *h);
@@ -1036,6 +1066,7 @@ static void jrt_collect_cycles(void) {
     }
     roots_len = 0;
 }
+#endif /* FASTLLVM_COLLECTOR */
 
 void jrt_null_check(const void *p) {
     if (!p) {

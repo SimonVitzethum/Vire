@@ -180,6 +180,11 @@ pub struct Function {
 pub struct FieldInfo {
     pub name: String,
     pub ty: Ty,
+    /// Für Ref-Felder: interner Name des referenzierten Typs (Element-Typ bei
+    /// Arrays), `java/lang/Object` wenn unbekannt/breit. `None` bei Primitiven
+    /// UND bei Primitiv-Arrays (`int[]` referenziert nichts → keine Zyklus-
+    /// Kante). Grundlage der Azyklizitäts-Analyse (Zyklen-Collector-Elimination).
+    pub ref_target: Option<String>,
 }
 
 /// Compile-Zeit-Initialwert eines statischen Feldes (ConstantValue).
