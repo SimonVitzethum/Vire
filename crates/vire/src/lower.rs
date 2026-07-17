@@ -500,6 +500,14 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Block(b) => self.lower_block_val(b),
+            // capsule: M2-AUSFÜHRUNGS-STUB — der Rumpf wird transparent inline
+            // abgesenkt (Eingaben sind bereits im Scope sichtbar, Blockwert raus).
+            // Die REINE Semantik (eigene Arena, Deep-Copy-in/-out, Isolation +
+            // Fault-Containment; CAPSULE-BEWERTUNG.md) ist NOCH NICHT umgesetzt:
+            // hier gibt es keine Arena und keine Kopie → für wert-rein/wert-raus
+            // (Skalar-Ergebnis) beobachtungsgleich, aber OHNE die Isolations-/
+            // Perf-Garantien. Arena-Runtime + Copy-Maschinerie = eigener Meilenstein.
+            Expr::Capsule { body, .. } => self.lower_block_val(body),
             Expr::Range { .. } => {
                 self.errs.push("Range nur als for-Iterator (M2)".into());
                 (Operand::ConstI64(0), Ty::I64)

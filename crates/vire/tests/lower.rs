@@ -97,6 +97,15 @@ fn feldmutation_erzeugt_putfield() {
 }
 
 #[test]
+fn capsule_stub_senkt_rumpf_transparent_ab() {
+    // M2-Stub: capsule-Rumpf inline; Blockwert kommt raus. (Arena/Deep-Copy folgt.)
+    let p = lower("fn f(n) {\n capsule(n) {\n mut s = 0\n s = s + n\n s\n }\n}\n");
+    let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+    assert_eq!(f.ret, Ty::I64);
+    assert!(f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(Some(_)))));
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());
