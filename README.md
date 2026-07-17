@@ -40,7 +40,8 @@ Vire = **neues Front-End** auf einem **bereits gebauten, gemessenen Backend**:
 
 | Schicht | Status |
 |---|---|
-| **Vire-Front-End** (Lexer, Parser, Typinferenz, `comptime`, Makros → SSA-IR) | **spezifiziert** (dieser Ordner `sprache/`), noch nicht implementiert |
+| **Vire-Front-End** (`crates/vire`) — Lexer, Parser, AST | **im Aufbau** (Lexer + Parser lauffähig, `vire parse` dumpt AST; `sieb.vr`/`formen.vr` parsen sauber) |
+| Vire-Front-End — Resolve, Typinferenz, `comptime`, Makros → SSA-IR | spezifiziert ([sprache/FRONTEND-PLAN.md](sprache/FRONTEND-PLAN.md)), folgt |
 | **Mittel-IR** (`crates/ir`) | gebaut |
 | **Whole-Program-Solver** (Devirt, Inlining, Escape/RC-Elision, Bounds-/Null-Check-Elision, Azyklizität) | gebaut |
 | **LLVM-Backend** (textuelles IR + clang, `-march=native`, LTO; hosted/freestanding/threads) | gebaut |

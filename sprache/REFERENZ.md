@@ -21,8 +21,12 @@ Solver existieren). Beispiele zeigen die Zielsemantik.
   - Ganzzahl: `42`, `0xFF`, `0b1010`, `0o17`, `1_000_000`, Suffix `42i32`, `7u8`.
   - Gleitkomma: `3.14`, `1e-9`, `6.022e23`, `2.0f32`.
   - Bool: `true`, `false`. Char: `'a'`, `'\n'`, `'\u{1F600}'`.
-  - String: `"…"` mit Interpolation `{ausdruck}` und Format `{x:6}`, `{x:.2}`,
-    `{x:x}` (hex). Roh: `r"C:\pfad"`. Mehrzeilig: `"""…"""`.
+  - String: `"…"` mit Interpolation `{ausdruck}` (auf **jedem** String, kein `f`-
+    Präfix) und Format `{x:6}`, `{x:.2}`, `{x:x}` (hex). **Literale Klammern
+    verdoppeln:** `{{` → `{`, `}}` → `}`. Roh: `r"C:\pfad"`. Mehrzeilig: `"""…"""`.
+- **Namensklassen (Grammatik, [PARSER.md](PARSER.md) §1.1):** `UpperCamel` = Typ/
+  Konstruktor (`Point`), `SCREAMING_SNAKE` = const-Wert (`MAX`), `lower_snake` =
+  Wert/Fn/Variable (`xs`). Rein lexikalisch — trägt die `[]`-Disambiguierung.
 - **Schlüsselwörter:** `fn type trait impl mut const use pub extern unsafe
   match if elif else while for in break continue return spawn macro comptime
   and or not self Self as`.
@@ -30,14 +34,19 @@ Solver existieren). Beispiele zeigen die Zielsemantik.
 ## 2. Bindungen und Veränderlichkeit
 
 ```vire
-x = 5              // unveränderlich (Default), Typ inferiert
-mut y = 0          // veränderlich
-y = y + 1          // ok
-x = 6              // FEHLER: x ist unveränderlich
-const MAX = 1024   // Compilezeit-Konstante (comptime-Wert)
+x = 5              // Bindung (erstes `x` im Scope), unveränderlich, Typ inferiert
+mut y = 0          // veränderliche Bindung
+y = y + 1          // Zuweisung (y ist `mut`) — ok
+x = 6              // FEHLER: `x` unveränderlich, kein stilles Rebind
+const MAX = 1024   // Compilezeit-Konstante (SCREAMING_SNAKE = const-Wert)
 ```
 
-Bindungen sind block-skopiert; Schatten (`x` in innerem Block neu binden) erlaubt.
+**Bindung vs. Zuweisung ohne `let`** ([PARSER.md](PARSER.md) §1.4): das **erste**
+`name =` in einem Scope **bindet**; jedes **weitere** im selben Scope ist eine
+**Zuweisung** und verlangt `mut` — sonst Fehler. **Shadowing** nur über *innere*
+Scopes (ein inneres `x = …` verdeckt das äußere, verändert es nicht). Damit ist
+Absicht ausdrückbar und der Tippfehler gefangen — der bewusste Preis für ein
+Keyword weniger als Rust.
 
 ## 3. Typen
 
@@ -91,7 +100,7 @@ type Vec2 {
 ```
 
 ### 3.3 Eingebaute Generische Typen
-`List[T]` (`[1,2,3]`), `Map[K,V]` (`{"a":1}`), `Set[T]` (`{1,2}`),
+`List[T]` (`[1,2,3]`), `Map[K,V]` (`["a": 1]`, leer `[:]`), `Set[T]` (`Set[1, 2]`),
 `Option[T]` (`Some(x)`/`None`), `Result[T,E]` (`Ok`/`Err`), Tupel `(A, B)`,
 Fixarray `[T; N]` (N comptime-Int, Stack-liegend).
 
@@ -177,7 +186,7 @@ fn to_json[T](v: T) -> Str {
             comptime for f in info.fields {
                 parts.push("\"{f.name}\":" + to_json(v.@field(f.name)))
             }
-            "{" + parts.join(",") + "}"
+            "{{" + parts.join(",") + "}}"
         }
         .Sum   -> …
         .Int   -> int_to_str(v)

@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vire",       # Vire-Front-End (Lexer/Parser/AST → SSA-IR); im Aufbau
+    "crates/ir",         # geteilte Mittel-IR (Absenkziel)
+    "crates/solver",     # geteilt: Devirt/Escape/RC/Bounds
+    "crates/backend",    # geteilt: LLVM-Emission
+    # --- Bootstrap (Java→IR): Backend-Soundness-Wächter + M0-Messbasis,
+    #     wird nach FRONTEND-PLAN §„Java-Ablöse-Kriterien" entfernt ---
     "crates/classfile",
-    "crates/ir",
     "crates/frontend",
-    "crates/backend",
     "crates/driver",
-    "crates/solver",
 ]
 
 [workspace.package]

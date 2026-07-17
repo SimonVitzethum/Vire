@@ -16,37 +16,67 @@ Stelle einen *erklärenden* Fehler + Fix-Vorschlag geben.
 
 Vire ist bewusst so entworfen, dass der Parser **kaum Rückverfolgung** braucht:
 
-- **Generics mit `[]`, nicht `<>`.** `List[Int]`, `max[T](…)`. Damit entfällt die
-  berüchtigte C++/Rust-Mehrdeutigkeit `a < b > c`. Aber `[]` trägt jetzt zwei
-  Bedeutungen (Typargumente vs. Indexierung); beide werden **vor** der Namensauflösung
-  entschieden, durch zwei harte Regeln:
-  1. **Großschreibung = Typ (erzwungene Lexikregel, nicht Konvention).** Bezeichner,
-     die mit Großbuchstaben beginnen, sind Typen/Konstruktoren; kleingeschrieben =
-     Werte/Funktionen/Variablen. So ist `List[Int]` (Groß `[` …) eindeutig Generics,
-     `xs[i]` (klein `[` …) eindeutig Indexierung — der Parser entscheidet ohne
-     Typwissen.
-  2. **Keine expliziten Typargumente an *Werten*.** `wert[Typ]` ist **immer**
-     Indexierung. Funktions-Typargumente werden **nicht** am Aufruf geschrieben — die
-     Inferenz + der Rückgabetyp-Kontext liefern sie (`xs: List[Int] = parse(s)` statt
-     `parse[Int](s)`). Für die seltenen rückgabetyp-getriebenen Fälle (`collect`) gibt
-     es eine **dedizierte Turbofish-artige Syntax** `parse#[Int](s)` (das `#` trennt
-     eindeutig von Indexierung) — oder man annotiert das Ziel. Rusts `::<>` existiert
-     genau aus diesem Grund; Vire macht denselben Schnitt sichtbar statt implizit.
-- **Blöcke immer `{ }`, Ausdruck-orientiert.** Der letzte Ausdruck eines Blocks ist
-  sein Wert. `if`/`match`/`{}` sind Ausdrücke.
-- **Zeilenumbruch trennt Anweisungen** (Semikolon optional). Der Lexer erzeugt
-  „weiche" Statement-Terminatoren (s. §2.3), sodass der Parser nicht raten muss.
-- **Keyword-geführte Items.** Jede Top-Level-/Block-Deklaration beginnt mit einem
-  Schlüsselwort (`fn type trait impl use const macro extern`) → der Parser
-  verzweigt mit einem Token Lookahead, nie mehr.
-- **`->` nur an zwei klaren Stellen**: Rückgabetyp (`fn f() -> T`) und Lambda/
-  match-Arm (`x -> e`, `Pat -> e`). Kontext (nach `)`/Param-Liste vs. in `match`/
-  Ausdrucksposition) trennt sie.
+### 1.1 Das Namens-Gesetz — **drei** lexikalische Klassen (Grammatik, nicht Konvention)
+Die Groß-/Kleinschreibung trägt einen großen Teil der Disambiguierung (Typ-
+Applikation `List[Int]` vs. Indexing `xs[i]`, Produkt- vs. Summenvariante im
+`type`-Body). „Großschreibung = Typ" **allein bricht aber an Konstanten**:
+`const MAX = 1024` ist ein großgeschriebener *Wert*, `MAX[0]` wäre fälschlich
+Typ-Applikation. Deshalb **drei** rein lexikalisch unterscheidbare Klassen:
 
-Mehrdeutigkeiten, die *explizit* aufgelöst werden (Regeln unten):
-1. `{` = Block **oder** Map/Set-Literal → §4.2.
-2. Lambda `x -> e` **oder** geklammerter Ausdruck → §4.3.
-3. Struktur-Literal `Point { … }` **oder** Block nach Bedingung → §4.4.
+| Klasse | Form | Bedeutung | Beispiel |
+|---|---|---|---|
+| `UpperCamel` | Großbuchstabe, danach **mind. ein Kleinbuchstabe** | **Typ / Konstruktor** | `List`, `Point`, `Circle` |
+| `SCREAMING_SNAKE` | nur Großbuchstaben/Ziffern/`_` | **const-Wert** | `MAX`, `PI`, `CRC_TABLE` |
+| `lower_snake` | beginnt klein | **Wert / Funktion / Variable** | `xs`, `parse`, `count` |
+
+Damit ist `List[Int]` (UpperCamel `[`) Typargument, `MAX[0]`/`xs[i]`
+(SCREAMING/lower `[`) Indexing — **ohne Namensauflösung** entscheidbar. Das ist ein
+**verbindliches** Stil-Korsett (ein falsch benannter Bezeichner ist ein Fehler,
+kein Lint) und Teil der Grammatik.
+
+### 1.2 `[]` — vier Rollen, alle über Position + Namensklasse aufgelöst
+`[]` ist Generics, Indexing, Listen-Literal und Fixarray `[T; N]`:
+- Nach `UpperCamel`/Fn-Name in Typ-/Deklarationsposition → **Generics** (`List[Int]`, `fn max[T]`).
+- Nach einem Wert-Ausdruck → **Indexing** (`xs[i]`).
+- In Ausdrucksposition, öffnend → **Listen-/Map-Literal** (§1.3).
+- `[T; N]` in Typposition → **Fixarray** (Semikolon trennt).
+- **Keine Typargumente an Werten**: `wert[Typ]` ist *immer* Indexing. Explizite
+  Fn-Typargumente nur über **Turbofish `#[T]`** (`collect#[List[Int]]()`) für die
+  seltenen rückgabetyp-getriebenen Fälle; sonst Inferenz. (Rusts `::<>` existiert
+  aus genau diesem Grund.)
+
+### 1.3 `{}` = **nur Block.** Map/Set sind markiert (Entscheidung)
+`{}` ist **ausschließlich** ein Block (Anweisungen; letzter Ausdruck = Wert). Die
+Python-Zweideutigkeit `{}` = dict-oder-set-oder-block wird **nicht** übernommen —
+sie lässt den Leser erst nach dem `{` wissen, was aufgemacht wird. Stattdessen
+(Swift-Modell, `:` trennt eindeutig):
+- **Liste:** `[a, b, c]`, leer `[]`.
+- **Map:** `[k: v, k2: v2]`, leer `[:]`.
+- **Set:** `Set[a, b]` (Konstruktor-Literal, `UpperCamel[` → eindeutig).
+So ist `{` **immer** Block — kein Lookahead, kein später Aha-Effekt für den Leser.
+
+### 1.4 Bindung vs. Zuweisung ohne `let` (Entscheidung)
+Kein `let`: `x = 5` bindet, `x = 6` weist zu. Die Zweideutigkeit wird durch **eine
+Regel** aufgelöst (in `resolve`, nicht im Parser): das **erste** `x =` in einem
+Scope ist eine **Bindung** (unveränderlich, außer `mut x`); jedes **weitere** `x =`
+im selben Scope ist eine **Zuweisung** und verlangt, dass `x` `mut` ist — sonst
+**Fehler** (kein stilles Rebind). **Shadowing** existiert nur über *innere* Scopes.
+Damit ist Absicht ausdrückbar und der Tippfehler gefangen. (Bewusster Tausch: ein
+Keyword weniger als Rust, dafür die Scope-Regel als Ersatz.)
+
+### 1.5 Sonstige harte Regeln
+- **`{ }`-Blöcke sind Ausdrücke** (`if`/`match`/Block liefern Werte).
+- **`->` an drei klaren Stellen**, per Position getrennt: Rückgabetyp
+  (`fn f() -> T`), Lambda (`x -> e`), match-Arm (`Pat -> e`).
+- **Keyword-geführte Items** (`fn type trait impl use const macro extern`) → ein
+  Token Lookahead.
+- **String-Interpolation** ist auf *jedem* String aktiv (`"{name}"`, kein `f`-
+  Präfix). Literale Klammern werden **verdoppelt**: `{{` → `{`, `}}` → `}`.
+
+### 1.6 Zwei Ausdrucks-Ambiguitäten (Detailregeln unten)
+1. Lambda `x -> e` / `(a,b) -> e` **oder** geklammerter Ausdruck → §4.3.
+2. Struktur-Konstruktion vs. Block nach `if`/`for`/`while`-Skrutinee → §4.4
+   (Konstruktion ist ohnehin `Point(…)`, nicht `Point { … }` — kein Konflikt).
 
 ---
 
@@ -79,19 +109,35 @@ Newline  Eof
   Roh: `r"…"`; mehrzeilig: `"""…"""`.
 - **Kommentare:** `//` bis Zeilenende; `/* … */` **schachtelbar** (Tiefe zählen).
 
-### 2.3 Newline-Handling (der einzige Trick)
-Python-leicht ohne Einrück-Regeln: **ein `Newline`-Token wird nur dort emittiert, wo
-es eine Anweisung beenden kann.** Regel (wie Go): Newline zählt als Terminator, wenn
-das *letzte signifikante Token der Zeile* einen Ausdruck/eine Anweisung abschließen
-kann — also nach Ident, Literal, `)` `]` `}`, `?`, `return`/`break`/`continue`.
-Nicht nach binärem Operator, `,`, `.`, `(` `[` `{`, `->`, `=`. So darf man Ketten
-umbrechen:
+### 2.3 Newline-Handling — das **volle** Go-Fortsetzungsmodell
+Einrückungs-*un*empfindlich, newline-*empfindlich* (Gos Modell, nicht „whitespace-
+insensitiv"). Zwei Regeln, beide gebraucht — Chains sind real mehrzeilig:
+
+**(a) Zeilenende — wann *kein* Terminator (Fortsetzung).** Ein `Newline` wird
+**nicht** emittiert, wenn das *letzte signifikante Token der Zeile* eine Anweisung
+nicht abschließen kann: binärer/unärer Operator, `,`, `.`, offene Klammer
+`(` `[` `{`, `->`, `=`/`+=`/…. Emittiert wird nach: Ident, Literal, `)` `]` `}`, `?`,
+`self`, `true`/`false`, `return`/`break`/`continue`.
+
+**(b) Zeilenanfang — führendes Token unterdrückt den Terminator.** Auch wenn (a)
+einen Terminator setzen würde: beginnt die *nächste* Zeile mit `.` (Method-Chain),
+wird der Terminator **unterdrückt** (Fortsetzung). Umgekehrt sind führendes
+`(`/`[`/`-` **kein** Fortsetzungssignal — sonst würde `g()\n(x)` zu `g()(x)` und
+`a\n-b` zu `a-b` verschmelzen; sie starten eine neue Anweisung.
 ```vire
-xs.map(x -> x*2)      // kein Terminator nach `.map(` …
-  .filter(x -> x>3)   // … Fortsetzung erlaubt
+x = foo
+    .bar()      // führendes `.` → Fortsetzung
+    .baz()
+y = g()
+(x)             // führendes `(` → NEUE Anweisung (nicht g()(x))
 ```
-Der Parser behandelt `Newline` und `;` gleich als *StmtEnd* und ignoriert
-überzählige.
+Umsetzung: Regel (a) im Lexer (letztes Token merken); Regel (b) als Lookahead —
+vor dem Emittieren eines Terminators das nächste signifikante Zeichen prüfen, bei
+`.` unterdrücken. Der Parser behandelt `Newline`/`;` als *StmtEnd* und erlaubt in
+der Postfix-Position ein `Newline` vor `.` (redundant abgesichert). *(Führendes `[`
+ist der fieseste Fall — kollidiert mit Indexing; deshalb bewusst **kein**
+Fortsetzungssignal: Zeilenanfang-`[` ist immer ein neues Listen-/Map-Literal-
+Statement.)*
 
 ---
 
@@ -141,24 +187,27 @@ Ausdrücke über **Pratt-Parsing**: jede Token-Art hat eine `prefix`- und/oder
 `?` ist postfix (Fehler-Propagation). Vergleiche sind **nicht** verkettbar
 (`a < b < c` = Fehler) — vermeidet Bugs und Grammatik-Ambiguität.
 
-### 4.2 `{` — Block oder Map/Set?
-Nach einem Token, das einen **Wert erwartet** (Ausdrucksposition), entscheidet der
-erste Inhalt:
-- `{}` → leere Map. `{ a: b, … }` (Ident/Expr **gefolgt von `:`**) → Map.
-  `{ x, y, … }` (Kommas, kein `:`) → Set.
-- sonst (Anweisung/Deklaration als erstes) → **Block**.
-Ein Lookahead von 2 (`{` Ident `:`) reicht. In *Statement*-Position ist `{` immer
-Block.
+### 4.2 `{` ist **immer** Block (Entscheidung §1.3)
+Kein Block-vs-Map/Set-Lookahead: `{` öffnet ausschließlich einen Block. Map/Set
+stehen in `[]` (`[k: v]`, `Set[…]`, §1.3). Damit ist `{` an *jeder* Stelle
+eindeutig — kein später Aha-Effekt.
 
-### 4.3 Lambda vs. Klammerung
+### 4.3 Listen- vs. Map-Literal (`[…]`)
+In Ausdrucksposition öffnet `[` ein Literal; der Inhalt entscheidet (Swift-Modell):
+- `[]` → leere Liste, `[:]` → leere Map.
+- `[a, b, …]` (Kommas, kein Top-`:`) → Liste.
+- `[k: v, …]` (erstes Element `expr : expr`) → Map.
+Lookahead: nach dem ersten Ausdruck auf `:` (Map) vs. `,`/`]` (Liste) prüfen.
+
+### 4.4 Lambda vs. Klammerung
 `x -> e` (Ident direkt gefolgt von `->`) → Lambda mit einem Param. `(a, b) -> e`
 (Klammer-Param-Liste gefolgt von `->`) → Lambda. `(e)` ohne folgendes `->` →
 geklammerter Ausdruck. Entscheidung beim `->`-Lookahead nach der schließenden `)`.
 
-### 4.4 Struktur-Literal vs. Block nach `if`/`for`/`while`
-`Name { … }` ist ein Struktur-Literal **nur in reiner Ausdrucksposition**. Direkt
-nach `if`/`while`/`for`/`match`-Skrutinee ist `{` **immer** der Body-Block (wie
-Rust). Wer dort ein Struct-Literal braucht, klammert: `if (P { x: 1 }).ok { … }`.
+### 4.5 Konstruktion (kein `Name { … }`-Struct-Literal)
+Vire konstruiert mit **Klammern**: `Point(1.0, 2.0)` / `Point(x: 3.0, y: 4.0)` —
+nicht `Point { … }`. Damit entfällt Rusts Ambiguität „Struct-Literal vs. Block nach
+`if`-Skrutinee" komplett: nach `if`/`for`/`while`/`match` ist `{` immer der Body.
 
 ### 4.5 `comptime`/`@`-Formen
 `comptime <expr|block>`, `@typeinfo(T)`, `@field(x, name)`, `@derive(...)`,

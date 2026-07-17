@@ -42,3 +42,7 @@ version = "0.1.0"
 dependencies = [
  "fastllvm-ir",
 ]
+
+[[package]]
+name = "vire"
+version = "0.1.0"

@@ -176,8 +176,8 @@ Typkombination) — zero-cost wie C++-Templates/Rust, ohne deren Syntaxlast.
 
 ```vire
 xs = [1, 2, 3, 4]                 // List[Int]
-m  = {"a": 1, "b": 2}             // Map[Str, Int]
-s  = {1, 2, 3}                    // Set[Int]
+m  = ["a": 1, "b": 2]             // Map[Str, Int] (`:` → Map; `[:]` = leer)
+s  = Set[1, 2, 3]                 // Set[Int] (`{}` ist NUR Block)
 
 for x in xs { print(x) }
 for k, v in m { print("{k}={v}") }
@@ -299,7 +299,7 @@ Inferenz-Anker); innen bleibt alles inferiert.
 use std.io
 
 fn word_counts(text: Str) -> Map[Str, Int] {
-    mut counts = {}                                  // Map[Str, Int] inferiert
+    mut counts = [:]                                 // leere Map[Str, Int]
     for word in text.lower().split_whitespace() {
         counts[word] = counts.get(word).or(0) + 1    // Option.or → Default
     }

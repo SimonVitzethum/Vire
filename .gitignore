@@ -11,3 +11,9 @@ examples/*
 # kompilierte Stub-Klassenbibliothek
 /stdlib/out/
 benchmarks/m0/q[0-9]*
+
+# Java-Bootstrap Build-Artefakte
+examples/*.class
+examples/*.bin
+examples/bench
+tests/work/

@@ -1,0 +1,11 @@
+[package]
+name = "vire"
+edition = "2021"
+version = "0.1.0"
+
+[[bin]]
+name = "vire"
+path = "src/main.rs"
+
+[dependencies]
+# Absenkziel (später): fastllvm-ir = { path = "../ir" }

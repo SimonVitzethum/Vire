@@ -74,10 +74,18 @@ Leichtigkeit **ohne** Pythons Dynamikkosten.
 def add(a, b): return a + b
 ```
 ```vire
-// Vire — sieht identisch aus, ist aber statisch monomorphisiert, AOT, zero-cost
+// Vire — statisch monomorphisiert, AOT, zero-cost
 fn add(a, b) = a + b        // a, b: inferiert; für jede benutzte Typkombination
                             // eine spezialisierte Maschinencode-Variante
 ```
+
+**Ehrlich zur Oberfläche:** Das *sieht nicht identisch* aus (`fn`≠`def`, `=`≠`:`+
+`return`). Vires Syntax ist überwiegend **Rust-geformt** (`fn`, `impl Ord for
+Point`, `match`, `->`, `Self`, `?`, `..`, Block-als-Ausdruck) mit **Python-Würze**
+(`elif`, `and/or/not`, Comprehensions, Interpolation ohne `f`) — ein *Rust/Python-
+Kreol*. Was sich **leicht anfühlt**, ist nicht die Token-Ähnlichkeit zu Python,
+sondern die **Abwesenheit von Typannotationen** durch Inferenz. Genau das ist der
+Hebel:
 
 → **Die „Einfachheit von Python" ist erreichbar, wenn man Dynamik durch Inferenz
 ersetzt.** Der Preis: keine echte Laufzeit-`eval`/Monkey-Patching (das braucht
