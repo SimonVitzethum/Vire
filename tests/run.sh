@@ -85,6 +85,7 @@ run cycle3        0 Cycle3 Cycle3 Box
 
 # --- Arrays / Zahlen / Strings ---
 run arr2          0 Arr2 Arr2 Box
+run bounds        0 Bounds Bounds
 run nums          0 Nums Nums
 run floats        0 Floats Floats
 run strings       0 Strings Strings

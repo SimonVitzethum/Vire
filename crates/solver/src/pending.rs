@@ -161,7 +161,9 @@ fn can_throw(st: &Statement, throw_free: &BTreeMap<String, bool>, non_null: &BTr
         Statement::CallVirtual { .. } | Statement::CallPoly { .. } => true,
         Statement::GetField { obj, .. } => obj_may_null(obj),
         Statement::PutField { obj, .. } => obj_may_null(obj),
-        Statement::ArrayLoad { .. } | Statement::ArrayStore { .. } | Statement::ArrayLen { .. } => true,
+        // Bounds-bewiesene (unchecked) Zugriffe sind throw-frei.
+        Statement::ArrayLoad { checked, .. } | Statement::ArrayStore { checked, .. } => *checked,
+        Statement::ArrayLen { .. } => true,
         Statement::InstanceOfPending { .. } | Statement::CheckCast { .. } => true,
         _ => false,
     }

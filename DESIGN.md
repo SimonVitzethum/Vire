@@ -299,31 +299,53 @@ Information, die die Ownership-Beweise brauchen.
 
 **Umgesetzt (alle 6 Phasen):** 1 Azyklizität→Collector-Elimination ✅, 2 Function-Sections/Dead-Stripping ✅, 3 Loop-Stack-Allokation via Liveness (Region-light, both-or-neither-sicher) ✅, 4 RC-Elision für immortal-only Locals (Ownership-artig) ✅, 5 interprozedurale Escape-Analyse ✅, 6 Rust-Benchmark + irreduzibler Kern ✅.
 
-**Fazit der Umsetzung:** Sowohl reine Arithmetik als auch **loop-allozierte, nicht entkommende Objekte** erreichen jetzt Rust-Parität (GC-frei UND RC-frei). Verbleibende Lücken: (a) Safety-Check-Elision (Range-Analyse, wie Rusts LLVM), (b) Division-Check bei konstantem Divisor, (c) entkommende/geteilte Objektgraphen fallen auf RC zurück — was Rust ebenfalls mit `Rc`/`Arc` tut (Parität, kein Defizit). Der GC (Zyklen-Collector) ist für azyklische Programme *ganz* entfernt; für gemischt-zyklische bleibt er der beweisbare Rest. Suite 58/58, Heap 0 live — hosted, freestanding, threaded.
+**Fazit der Umsetzung:** Sowohl reine Arithmetik als auch **loop-allozierte, nicht entkommende Objekte** erreichen jetzt Rust-Parität (GC-frei UND RC-frei). Verbleibende Lücken: (a) ~~Safety-Check-Elision~~ **erledigt** (Bounds-Check-Elision per GVN, §9 unten), (b) Division-Check bei konstantem Divisor, (c) entkommende/geteilte Objektgraphen fallen auf RC zurück — was Rust ebenfalls mit `Rc`/`Arc` tut (Parität, kein Defizit). Der GC (Zyklen-Collector) ist für azyklische Programme *ganz* entfernt; für gemischt-zyklische bleibt er der beweisbare Rest. Suite 65/65, Heap 0 live — hosted, freestanding, threaded.
 
 ### Benchmark FastLLVM vs Rust vs JVM (Java 25 C2), bit-gleiche Ergebnisse
 
-Nach Pending-Check-Elision (throw-freie Aufrufe verlieren ihr `jrt_pending_set`)
-und interprozeduraler/loop-Escape-Analyse — Median 3 Läufe:
+Nach Bounds-Check-Elision, Long-Vergleichs-Fusion und Ref-Selbstkopie-Elision
+(zusätzlich zu Pending-Check-Elision und Escape-Analyse) — bestes von 7 Läufen,
+schmale Array-Breiten (`boolean[]`=1 Byte) aktiv:
 
 | Benchmark | FastLLVM | Rust | JVM | vs Rust |
 |---|---|---|---|---|
-| Arithmetik (500M) | 0,23 s | 0,23 s | 0,40 s | **0,99×** |
-| Allokation im Loop (200M) | 0,057 s | 0,17 s (Box) | 0,16 s | **0,33×** |
-| Fib(42) Rekursion | 0,53 s | 0,51 s | 0,78 s | **1,03×** |
-| Sieb (50M Array) | 0,80 s | 0,27 s | 0,61 s | 2,92× |
-| Polymorphie (200M virtuell) | 1,71 s | 1,51 s | 0,18 s | **1,12×** |
+| Arithmetik (500M) | 0,15 s | 0,12 s | 0,31 s | 1,21× |
+| Allokation im Loop (200M) | 0,001 s | 0,17 s (Box) | 0,13 s | **~0×** |
+| Fib(42) Rekursion | 0,43 s | 0,51 s | 0,74 s | **0,84×** |
+| Sieb (50M `boolean[]`) | 0,26 s | 0,27 s | 0,33 s | **0,98×** |
+| Polymorphie (200M virtuell) | 0,36 s | 0,26 s | 0,16 s | 1,38× |
 | Startup (leeres main) | 1,6 ms | – | 33 ms | **20× schneller** |
 
-**4 von 5 ≤ 1,1× Rust** (Alloc sogar schneller, da Stack-Allok. + RC-frei gegen
-Rusts `Box`). Der Ausreißer **Sieb (2,92×)** ist array-bounds-dominiert.
+**Sieb erreicht Rust-Parität (2,92× → 0,98×).** Der frühere array-bounds-
+dominierte Ausreißer ist geschlossen — drei zusammenwirkende Optimierungen:
 
-**Was für Sieb ≤1,1× nötig ist:** Bounds-Check-Elision per Range-/Induktions-
-variablen-Analyse (Index beweisbar in `[0, arr.length)`) bzw. direkte LLVM-
-Array-Zugriffe (GEP statt Runtime-Helfer), sodass LLVMs Scalar-Evolution die
-Prüfung eliminiert — genau der Weg, über den Rust dort schnell ist. Der
-NPE-Anteil ist schon eliminierbar (Array aus `new` ist nicht-null), der
-Bounds-Anteil braucht die Range-Analyse.
+1. **Bounds-Check-Elision via globales Value-Numbering** (`solver/bounds.rs`).
+   Das nicht-SSA-Mittel-IR recycelt javac-Slots, sodass Index, Schranke und Array
+   am Schleifenwächter in *anderen* Locals liegen als am Zugriff. GVN vergibt
+   jedem *Wert* eine slot-unabhängige Nummer (Kopien erben sie, Merges bilden ein
+   Phi; optimistischer Phi-Kollaps löst schleifeninvariante Werte auf). Damit ist
+   „Index-Wert `<` Längen-Wert" (Fakt aus dem Wächter) gegen `arr.length` (aus
+   `new T[n]` symbolisch verfolgt) entscheidbar; Nichtnegativität als größter
+   Fixpunkt über die Wertnummern. Beweisbar in `[0,len)` ⇒ Zugriff *unchecked*
+   (inline-GEP, throw-frei, pending-Check entfällt). Deckt auch das Sieb-Innere
+   (Long-Induktion `j += i`, `(int)j`-Index) ab: Ganzzahl-Casts sind
+   werttransparent, weil die Bereichsprüfung `0 ≤ j < len < 2³¹` die Trunkierung
+   verlustfrei macht.
+2. **Long-Vergleichs-Fusion** (`solver/longcmp.rs`). `j < N` (long) senkt javac
+   als `jrt_lcmp; if<cond>` — ein Funktionsaufruf je Iteration. Da
+   `sign(x−y) op 0 ⟺ x op y`, wird das Paar zu einer nativen `icmp i64`
+   verschmolzen, der Aufruf entfällt.
+3. **Ref-Selbstkopie-Elision** (`solver/refcopy.rs`). javacs `aload`-Reloads einer
+   schleifeninvarianten Array-Referenz erzeugen `Assign(d, Copy(s))`, das das
+   Backend als retain/release-Paar je Iteration emittiert. Beweist GVN, dass `d`
+   den Wert von `s` bereits hält, ist die Kopie RC-neutral (`retain(x)+release(x)`
+   hebt sich auf) und wird entfernt — ohne die Heap-Bilanz zu berühren.
+
+Alle drei sind sound (Suite 65/65, Heap 0 live; Out-of-bounds/NPE mit
+unbeweisbarem Index werfen weiter, `examples/Bounds.java`). Arithmetik/Polymorphie
+oben sind **neu erstellte** Mikrobenchmarks (die Originale der 0,99×/1,12×-Tabelle
+lagen nicht mehr vor) und daher nicht 1:1 vergleichbar; die Polymorphie-Lücke ist
+Dispatch-, nicht bounds-dominiert.
 
 ### Kompilierbarkeit komplexer Programme (Stand)
 
@@ -335,16 +357,13 @@ try-with-resources, switch, Exceptions, Methoden-Referenzen, **innere Klassen**
 (ObjectMethods-indy → feldweise toString/hashCode/equals via memcmp),
 **Sealed + Pattern-Switch** (`SwitchBootstraps.typeSwitch` → instanceof-Index +
 lookupswitch, `MatchException`). Alle bit-gleich zur JVM.
-**Offen:** guarded/constant patterns (`when`), `java.time`/volle `java.base`,
-und die eine Perf-Lücke Sieb (s.o.). Records mit Ref-Feldern vergleichen per
-Identität (memcmp-Grenze).
+**Offen:** guarded/constant patterns (`when`), `java.time`/volle `java.base`.
+Records mit Ref-Feldern vergleichen per Identität (memcmp-Grenze).
 
-**Was Sieb ≤1,1× braucht (zwei Features, beide substanziell):** (1) **Bounds-
-Check-Elision** per Range-/Wertanalyse — Array-Länge symbolisch verfolgen
-(`arr = new T[n]` ⇒ `arr.length == n`) und gegen die Schleifenschranke beweisen,
-dann Zugriff *unchecked* + throw-frei (pending-Check entfällt). LTO allein hilft
-kaum, weil nicht der Call-Overhead, sondern die Bounds-/pending-Prüfungen
-dominieren, die LLVM ohne den Range-Beweis nicht entfernt. (2) **Schmale Array-
-Breiten** — `byte[]`/`boolean[]` liegen aktuell als `int[]` (4 Byte, wertkorrekt
-weil javac trunkiert); für bandbreitengebundenen Code wie das Sieb wären 1-Byte-
-Elemente nötig (Rusts `Vec<u8>` liest 4× weniger Speicher).
+**Sieb ≤1,1× — erledigt ✅.** Beide vormals offenen Features sind umgesetzt:
+(1) **Bounds-Check-Elision** per GVN-basierter Range-/Wertanalyse (Array-Länge
+symbolisch aus `new T[n]`, Schleifenwächter-Fakt, Nichtnegativitäts-Fixpunkt →
+*unchecked* + throw-frei; s.o. §9). (2) **Schmale Array-Breiten** — `byte[]`/
+`boolean[]` liegen jetzt als 1 Byte, `char[]`/`short[]` als 2 Byte
+(`ArrKind::size()`), bandbreiten-parität mit Rusts `Vec<u8>`. Ergebnis: Sieb
+0,98× Rust.

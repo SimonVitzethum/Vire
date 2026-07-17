@@ -110,6 +110,19 @@ fn main() {
     let mut acyclic = false;
     if !no_solver {
         let mut s = fastllvm_solver::run(&mut program);
+        // Redundante Ref-Selbstkopien (RC-neutral) entfernen: javacs `aload`-
+        // Reloads einer schleifeninvarianten Referenz erzeugen sonst je Iteration
+        // ein retain/release-Paar, das Rust nicht hat.
+        let _rcopies = fastllvm_solver::elide_redundant_ref_copies(&mut program);
+        // Long-/Double-Vergleiche mit ihrem 0-Test verschmelzen: `jrt_lcmp`-Call
+        // je Schleifeniteration → native `icmp i64`. Vor der Bounds-Elision,
+        // damit deren Schleifenwächter-Erkennung direkt auf dem i64-Vergleich
+        // arbeitet.
+        let _fused = fastllvm_solver::fuse_long_compares(&mut program);
+        // Bounds-Check-Elision vor der pending-Elision: beweisbar in-bounds
+        // markierte Array-Zugriffe sind throw-frei, sodass ihre pending-Prüfung
+        // gleich mitentfernt wird.
+        let _bounds = fastllvm_solver::elide_bounds(&mut program);
         // Tote pending-Prüfungen VOR dem Inlining entfernen: dort steht die
         // Prüfung noch im selben Block wie der (werfende) Aufruf; danach wandern
         // eingeflochtene Rümpfe über Blockgrenzen und die Block-lokale Analyse
