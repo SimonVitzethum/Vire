@@ -1306,6 +1306,38 @@ void jrt_iastore(void *arr, int32_t i, int32_t v) {
     if (!arr_ok(a, i)) return;
     ((int32_t *)(a + 1))[i] = v;
 }
+/* Typisierte primitive Arrays (long/double/float). byte/char/short laufen als
+ * int (javac trunkiert via i2b/i2c/i2s → wertkorrekt). */
+int64_t jrt_laload(void *arr, int32_t i) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return 0;
+    return ((int64_t *)(a + 1))[i];
+}
+void jrt_lastore(void *arr, int32_t i, int64_t v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    ((int64_t *)(a + 1))[i] = v;
+}
+double jrt_daload(void *arr, int32_t i) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return 0.0;
+    return ((double *)(a + 1))[i];
+}
+void jrt_dastore(void *arr, int32_t i, double v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    ((double *)(a + 1))[i] = v;
+}
+float jrt_faload(void *arr, int32_t i) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return 0.0f;
+    return ((float *)(a + 1))[i];
+}
+void jrt_fastore(void *arr, int32_t i, float v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    ((float *)(a + 1))[i] = v;
+}
 void *jrt_aaload(void *arr, int32_t i) {
     JArray *a = (JArray *)arr;
     if (!arr_ok(a, i)) return NULL;

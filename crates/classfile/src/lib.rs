@@ -5,7 +5,7 @@
 //! Teilmenge. StackMapTable, Annotations etc. werden überlesen.
 
 mod opcode;
-pub use opcode::{decode_code, Cond, Instr};
+pub use opcode::{decode_code, ArrTy, Cond, Instr};
 
 use std::fmt;
 

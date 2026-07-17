@@ -145,6 +145,12 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_iastore", "void (ptr, i32, i32)"),
     ("jrt_aaload", "ptr (ptr, i32)"),
     ("jrt_aastore", "void (ptr, i32, ptr)"),
+    ("jrt_laload", "i64 (ptr, i32)"),
+    ("jrt_lastore", "void (ptr, i32, i64)"),
+    ("jrt_daload", "double (ptr, i32)"),
+    ("jrt_dastore", "void (ptr, i32, double)"),
+    ("jrt_faload", "float (ptr, i32)"),
+    ("jrt_fastore", "void (ptr, i32, float)"),
     ("jrt_arraylen", "i32 (ptr)"),
     ("jrt_array_clone", "ptr (ptr, i64, i32)"),
     ("jrt_arraycopy", "void (ptr, i32, ptr, i32, i32)"),
@@ -188,7 +194,7 @@ fn array_vtable(elem: Ty) -> &'static str {
 /// Elementgröße in Bytes (für die Allokation).
 fn elem_size(elem: Ty) -> usize {
     match elem {
-        Ty::Ref | Ty::I64 => 8,
+        Ty::Ref | Ty::I64 | Ty::F64 => 8,
         _ => 4,
     }
 }
@@ -1374,7 +1380,13 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         Statement::ArrayLoad { dest, arr, index, elem } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
-            let (func, rty) = if *elem == Ty::Ref { ("jrt_aaload", "ptr") } else { ("jrt_iaload", "i32") };
+            let (func, rty) = match elem {
+                Ty::Ref => ("jrt_aaload", "ptr"),
+                Ty::I64 => ("jrt_laload", "i64"),
+                Ty::F64 => ("jrt_daload", "double"),
+                Ty::F32 => ("jrt_faload", "float"),
+                _ => ("jrt_iaload", "i32"),
+            };
             let t = e.fresh();
             writeln!(w, "  {t} = call {rty} @{func}(ptr {a}, i32 {i})").unwrap();
             // Ref-Element ist geborgt → Kopie ins Local wird owned (retain).
@@ -1385,7 +1397,13 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let i = e.operand(w, index);
             let v = e.operand(w, value);
             // aastore erledigt das RC (retain neu, release alt) intern.
-            let func = if *elem == Ty::Ref { "jrt_aastore" } else { "jrt_iastore" };
+            let func = match elem {
+                Ty::Ref => "jrt_aastore",
+                Ty::I64 => "jrt_lastore",
+                Ty::F64 => "jrt_dastore",
+                Ty::F32 => "jrt_fastore",
+                _ => "jrt_iastore",
+            };
             writeln!(w, "  call void @{func}(ptr {a}, i32 {i}, {} {v})", llty(*elem)).unwrap();
         }
     }

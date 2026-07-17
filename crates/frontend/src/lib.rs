@@ -10,8 +10,19 @@
 
 use std::collections::HashMap;
 
-use fastllvm_classfile::{ClassFile, Cond, Const, Instr};
+use fastllvm_classfile::{ArrTy, ClassFile, Cond, Const, Instr};
 use fastllvm_ir::*;
+
+/// Array-Elementtyp des Classfile-Decoders → IR-Typ.
+fn arrty_ty(t: ArrTy) -> Ty {
+    match t {
+        ArrTy::Int => Ty::I32,
+        ArrTy::Long => Ty::I64,
+        ArrTy::Float => Ty::F32,
+        ArrTy::Double => Ty::F64,
+        ArrTy::Ref => Ty::Ref,
+    }
+}
 
 #[derive(Debug)]
 pub enum FrontendError {
@@ -830,7 +841,7 @@ fn lower_method(
             Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_)
             | Instr::InvokeInterface(_)
             | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem
-            | Instr::IaLoad | Instr::AaLoad | Instr::IaStore | Instr::AaStore
+            | Instr::ArrLoad(_) | Instr::ArrStore(_)
             | Instr::ArrayLength | Instr::GetField(_) | Instr::PutField(_) => {
                 if let Some((next_pc, _)) = instrs.get(i + 1) {
                     leaders.push(*next_pc);
@@ -1526,8 +1537,11 @@ fn lower_block(
             Instr::AConstNull => {
                 push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
             }
-            Instr::NewArrayInt | Instr::NewArrayRef(_) => {
-                let elem = if matches!(instr, Instr::NewArrayInt) { Ty::I32 } else { Ty::Ref };
+            Instr::NewArrayPrim(_) | Instr::NewArrayRef(_) => {
+                let elem = match instr {
+                    Instr::NewArrayPrim(t) => arrty_ty(*t),
+                    _ => Ty::Ref,
+                };
                 let len = pop!();
                 let l = ml.stack_slot(stack.len(), Ty::Ref);
                 stmts.push(Statement::NewArray { dest: l, elem, len: Operand::Copy(len) });
@@ -1540,8 +1554,8 @@ fn lower_block(
                 stack.push(Ty::I32);
                 throw_after = Some(*pc); // NPE bei null-Array
             }
-            Instr::IaLoad | Instr::AaLoad => {
-                let elem = if matches!(instr, Instr::IaLoad) { Ty::I32 } else { Ty::Ref };
+            Instr::ArrLoad(t) => {
+                let elem = arrty_ty(*t);
                 let index = pop!();
                 let arr = pop!();
                 let l = ml.stack_slot(stack.len(), elem);
@@ -1554,8 +1568,8 @@ fn lower_block(
                 stack.push(elem);
                 throw_after = Some(*pc); // NPE / ArrayIndexOutOfBounds
             }
-            Instr::IaStore | Instr::AaStore => {
-                let elem = if matches!(instr, Instr::IaStore) { Ty::I32 } else { Ty::Ref };
+            Instr::ArrStore(t) => {
+                let elem = arrty_ty(*t);
                 let value = pop!();
                 let index = pop!();
                 let arr = pop!();

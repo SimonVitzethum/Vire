@@ -15,6 +15,16 @@ pub enum Cond {
     Le,
 }
 
+/// Array-Elementtyp (byte/boolean/char/short werden als `Int` geführt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrTy {
+    Int,
+    Long,
+    Float,
+    Double,
+    Ref,
+}
+
 /// Eine dekodierte Instruktion. `pc`-Angaben in Branch-Zielen sind absolute
 /// Bytecode-Offsets (bereits aus den relativen Offsets berechnet).
 #[derive(Debug, Clone)]
@@ -122,8 +132,10 @@ pub enum Instr {
     New(u16),
     CheckCast(u16),
     InstanceOf(u16),
-    /// newarray mit primitivem Elementtyp (atype-Code, hier nur int=10).
-    NewArrayInt,
+    /// newarray mit primitivem Elementtyp. byte/boolean/char/short werden als
+    /// Int-Array (4 Byte) geführt — javac trunkiert die Werte vor dem Store
+    /// (i2b/i2c/i2s), daher wertkorrekt.
+    NewArrayPrim(ArrTy),
     /// anewarray: Array von Referenzen (Klassenindex, hier ignoriert).
     NewArrayRef(u16),
     ArrayLength,
@@ -132,10 +144,9 @@ pub enum Instr {
     /// (echt unter --threads, sonst No-Op).
     MonitorEnter,
     MonitorExit,
-    IaLoad,
-    IaStore,
-    AaLoad,
-    AaStore,
+    /// Array-Load/Store mit Elementtyp (byte/char/short → Int).
+    ArrLoad(ArrTy),
+    ArrStore(ArrTy),
     AConstNull,
     /// ifnull (Eq) / ifnonnull (Ne)
     IfRefNull(Cond, usize),
@@ -216,10 +227,18 @@ pub fn decode_code(
             0x47..=0x4A => (Instr::DStore(op as u16 - 0x47), 1),
             0x3A => (Instr::AStore(u8_at(pc + 1)? as u16), 2),
             0x4B..=0x4E => (Instr::AStore(op as u16 - 0x4B), 1),
-            0x2E => (Instr::IaLoad, 1),
-            0x32 => (Instr::AaLoad, 1),
-            0x4F => (Instr::IaStore, 1),
-            0x53 => (Instr::AaStore, 1),
+            // Array-Load: byte/char/short (baload/caload/saload) → Int.
+            0x2E | 0x33 | 0x34 | 0x35 => (Instr::ArrLoad(ArrTy::Int), 1),
+            0x2F => (Instr::ArrLoad(ArrTy::Long), 1),
+            0x30 => (Instr::ArrLoad(ArrTy::Float), 1),
+            0x31 => (Instr::ArrLoad(ArrTy::Double), 1),
+            0x32 => (Instr::ArrLoad(ArrTy::Ref), 1),
+            // Array-Store: bastore/castore/sastore → Int.
+            0x4F | 0x54 | 0x55 | 0x56 => (Instr::ArrStore(ArrTy::Int), 1),
+            0x50 => (Instr::ArrStore(ArrTy::Long), 1),
+            0x51 => (Instr::ArrStore(ArrTy::Float), 1),
+            0x52 => (Instr::ArrStore(ArrTy::Double), 1),
+            0x53 => (Instr::ArrStore(ArrTy::Ref), 1),
             0x57 => (Instr::Pop, 1),
             0x58 => (Instr::Pop2, 1),
             0x59 => (Instr::Dup, 1),
@@ -345,12 +364,16 @@ pub fn decode_code(
             0xBA => (Instr::InvokeDynamic(u16_at(pc + 1)?), 5),
             0xBB => (Instr::New(u16_at(pc + 1)?), 3),
             0xBC => {
-                // newarray: atype 10 = T_INT (aktuell einzig unterstützt).
-                let atype = u8_at(pc + 1)?;
-                if atype != 10 {
-                    return Err(ParseError::UnsupportedOpcode(op, pc));
-                }
-                (Instr::NewArrayInt, 2)
+                // newarray: atype → Elementtyp. bool/byte/char/short/int → Int
+                // (4-Byte, wertkorrekt), long/float/double typisiert.
+                let elem = match u8_at(pc + 1)? {
+                    4 | 5 | 8 | 9 | 10 => ArrTy::Int, // boolean/char/byte/short/int
+                    6 => ArrTy::Float,
+                    7 => ArrTy::Double,
+                    11 => ArrTy::Long,
+                    _ => return Err(ParseError::UnsupportedOpcode(op, pc)),
+                };
+                (Instr::NewArrayPrim(elem), 2)
             }
             0xBD => (Instr::NewArrayRef(u16_at(pc + 1)?), 3),
             0xBE => (Instr::ArrayLength, 1),
