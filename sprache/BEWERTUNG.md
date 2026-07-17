@@ -71,9 +71,9 @@ Leichtigkeit **ohne** Pythons Dynamikkosten.
 def add(a, b): return a + b
 ```
 ```lume
-# Lume — sieht identisch aus, ist aber statisch monomorphisiert, AOT, zero-cost
-fn add(a, b) = a + b        # a, b: inferiert; für jede benutzte Typkombination
-                            # eine spezialisierte Maschinencode-Variante
+// Lume — sieht identisch aus, ist aber statisch monomorphisiert, AOT, zero-cost
+fn add(a, b) = a + b        // a, b: inferiert; für jede benutzte Typkombination
+                            // eine spezialisierte Maschinencode-Variante
 ```
 
 → **Die „Einfachheit von Python" ist erreichbar, wenn man Dynamik durch Inferenz

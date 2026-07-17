@@ -1,38 +1,47 @@
-# Summentypen, Traits, Generics, Pattern-Matching — die Rust-Domäne,
-# aber ohne Lifetimes/Borrow-Syntax. Alles inferiert und monomorphisiert.
+// Summentypen, Traits, Generics, Pattern-Matching — die Rust-Domäne,
+// aber ohne Lifetimes/Borrow-Syntax. Alles inferiert und monomorphisiert.
 
-type Shape:
+type Shape {
     Circle(radius: Float)
     Rect(w: Float, h: Float)
     Triangle(base: Float, height: Float)
+}
 
-fn area(s: Shape) -> Float:
-    match s:
+fn area(s: Shape) -> Float {
+    match s {
         Circle(r)      -> 3.14159265 * r * r
         Rect(w, h)     -> w * h
         Triangle(b, h) -> 0.5 * b * h
+    }
+}
 
-# Trait mit Default-Methode
-trait Describe:
+// Trait mit Default-Methode
+trait Describe {
     fn name(self) -> Str
-    fn describe(self) = "{self.name()} mit Fläche {area(self)}"   # Default
+    fn describe(self) = "{self.name()} mit Fläche {area(self)}"   // Default
+}
 
-impl Describe for Shape:
-    fn name(self):
-        match self:
-            Circle(_)      -> "Kreis"
-            Rect(_, _)     -> "Rechteck"
-            Triangle(_, _) -> "Dreieck"
+impl Describe for Shape {
+    fn name(self) = match self {
+        Circle(_)      -> "Kreis"
+        Rect(_, _)     -> "Rechteck"
+        Triangle(_, _) -> "Dreieck"
+    }
+}
 
-# Generische Funktion mit Trait-Schranke — für JEDEN Describe-Typ
-fn print_all[T: Describe](items: List[T]):
-    for it in items:
+// Generische Funktion mit Trait-Schranke — für JEDEN Describe-Typ
+fn print_all[T: Describe](items: List[T]) {
+    for it in items {
         print(it.describe())
+    }
+}
 
-fn total_area(shapes: List[Shape]) -> Float:
+fn total_area(shapes: List[Shape]) -> Float {
     shapes.map(area).fold(0.0, (a, b) -> a + b)
+}
 
-fn main():
+fn main() {
     shapes = [Circle(2.0), Rect(3.0, 4.0), Triangle(6.0, 1.0)]
     print_all(shapes)
     print("Gesamt: {total_area(shapes)}")
+}

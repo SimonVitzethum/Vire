@@ -1,18 +1,23 @@
-# Sieb des Eratosthenes — systemnaher, numerischer Bereich (C/Rust-Domäne).
-# Entspricht dem Sieve-Benchmark: gezählte Schleifen, Array, Long-Induktion.
-# Der Solver elidiert Bounds-Checks (Index beweisbar in [0, n)) → GEP ohne Prüfung.
+// Sieb des Eratosthenes — systemnaher, numerischer Bereich (C/Rust-Domäne).
+// Entspricht dem Sieve-Benchmark: gezählte Schleifen, Array, Long-Induktion.
+// Der Solver elidiert Bounds-Checks (Index beweisbar in [0, n)) → GEP ohne Prüfung.
 
-fn count_primes(n: Int) -> Int:
-    mut sieve = [false] * n          # Bool-Array der Länge n (1 Byte/Element)
+fn count_primes(n: Int) -> Int {
+    mut sieve = [false] * n          // Bool-Array der Länge n (1 Byte/Element)
     mut count = 0
-    for i in 2..n:
-        if not sieve[i]:             # unchecked: i < n aus dem Schleifenwächter
+    for i in 2..n {
+        if not sieve[i] {            // unchecked: i < n aus dem Schleifenwächter
             count = count + 1
             mut j = i * i
-            while j < n:             # Long-Induktion, unchecked (int)j
+            while j < n {            // Long-Induktion, unchecked (int)j
                 sieve[j] = true
                 j = j + i
+            }
+        }
+    }
     count
+}
 
-fn main():
-    print(count_primes(50_000_000))  # 3_001_134
+fn main() {
+    print(count_primes(50_000_000))  // 3_001_134
+}
