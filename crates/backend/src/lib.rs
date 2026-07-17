@@ -812,6 +812,62 @@ struct FnEmitter<'a> {
     /// die Aufrufdauer (Argumente sind geborgt), Kopien in andere Locals
     /// retainen selbst.
     borrowed: BTreeSet<u32>,
+    /// Locals, die nur immortale Werte halten (StackNew/Literal/null): RC-frei.
+    imm: BTreeSet<u32>,
+}
+
+/// Locals, die ausschließlich immortale Werte halten (Stack-Objekte, String-/
+/// Class-Literale, null) — dort sind retain/release beweisbar No-Ops. Monotone
+/// Invalidierung: startet optimistisch (alle Ref-Nicht-Parameter), entfernt
+/// jedes Local mit einem möglicherweise Heap-erzeugenden Def bis zum Fixpunkt.
+fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
+    let n = f.locals.len();
+    let n_params = f.params.len();
+    let mut imm = vec![false; n];
+    for l in n_params..n {
+        if f.locals[l] == Ty::Ref {
+            imm[l] = true;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                let (def, immortal): (Option<u32>, bool) = match st {
+                    Statement::StackNew { dest, .. } => (Some(dest.0), true),
+                    Statement::Assign(d, Rvalue::Use(op)) => {
+                        let ip = match op {
+                            Operand::ConstNull | Operand::ConstStr(_) | Operand::ConstClass(_) => true,
+                            Operand::Copy(s) => imm[s.0 as usize],
+                            _ => false,
+                        };
+                        (Some(d.0), ip)
+                    }
+                    Statement::Assign(d, _) => (Some(d.0), false),
+                    Statement::New { dest, .. } => (Some(dest.0), false),
+                    Statement::Call { dest, .. }
+                    | Statement::CallGuarded { dest, .. }
+                    | Statement::CallVirtual { dest, .. }
+                    | Statement::CallPoly { dest, .. } => (dest.map(|d| d.0), false),
+                    Statement::GetField { dest, .. }
+                    | Statement::GetStatic { dest, .. }
+                    | Statement::NewArray { dest, .. }
+                    | Statement::ArrayLoad { dest, .. } => (Some(dest.0), false),
+                    _ => (None, false),
+                };
+                if let Some(d) = def {
+                    if imm[d as usize] && !immortal {
+                        imm[d as usize] = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (0..n as u32).filter(|&l| imm[l as usize]).collect()
 }
 
 /// Locals, die irgendwo als Schreibziel auftreten (für die Borrow-Analyse).
@@ -932,7 +988,8 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     }
     writeln!(w, "  br label %bb0").unwrap();
 
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0 };
+    let imm = immortal_only_locals(f);
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -985,8 +1042,9 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
 /// immortale Inhalte hält — nichts, das lecken könnte.
 fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
     for (i, ty) in e.f.locals.iter().enumerate() {
-        // Geborgte Parameter wurden nie retained → nicht releasen (RC-Elision).
-        if *ty == Ty::Ref && !e.borrowed.contains(&(i as u32)) {
+        // Geborgte Parameter (nie retained) und immortal-only Slots (nur No-Op-
+        // Werte) brauchen keine Cleanup-release.
+        if *ty == Ty::Ref && !e.borrowed.contains(&(i as u32)) && !e.imm.contains(&(i as u32)) {
             let t = e.fresh();
             writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
             writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
@@ -1348,6 +1406,14 @@ fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_
     let ty = e.f.locals[dest.0 as usize];
     if ty != Ty::Ref {
         writeln!(w, "  store {} {val}, ptr %l{}", llty(ty), dest.0).unwrap();
+        return;
+    }
+    // Phase 4: hält der Slot nur immortale Werte (Stack-Objekte/Literale/null),
+    // sind retain/release beweisbar No-Ops → weglassen. Das entkoppelt das
+    // Objekt von der RC-Buchhaltung, sodass LLVM es (bei totem Objekt) ganz
+    // eliminieren kann — Rust-artiges Ownership für den Stack-Teil.
+    if e.imm.contains(&dest.0) {
+        writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
         return;
     }
     let old = e.fresh();
