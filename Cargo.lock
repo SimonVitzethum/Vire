@@ -46,3 +46,8 @@ dependencies = [
 [[package]]
 name = "vire"
 version = "0.1.0"
+dependencies = [
+ "fastllvm-backend",
+ "fastllvm-ir",
+ "fastllvm-solver",
+]

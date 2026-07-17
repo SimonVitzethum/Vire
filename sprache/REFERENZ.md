@@ -435,13 +435,17 @@ Siehe [beispiele/](beispiele/): `sieb`, `formen` (Traits/Generics), `baum`
 
 ## 9b. `capsule` — isolierter Arena-Scope (für heiße/riskante Sachen)
 
-`capsule(a, b) { … }` führt den Rumpf in einer **eigenen Arena** aus: nur die
-`()`-Variablen sind sichtbar (hineinkopiert; `&x` = geborgt/read-only, keine Kopie),
-nur der Blockwert verlässt die capsule (tief in den äußeren Heap kopiert). Im Rumpf
-allozierte Objekte sind **arena-lokal → kein RC, kein Zyklen-Kollektor**; beim
-Verlassen wird die Arena en bloc freigegeben (auch bei Panic — Fault-Containment).
+`capsule(a, b) { … }` führt den Rumpf in einer **eigenen Arena** aus (reine Form):
+die `()`-Eingaben werden **tief in die Arena kopiert** (kein `&`, kein Move — erst
+die Deep-Copy macht sie region-lokal), nur der Blockwert verlässt die capsule (tief
+in den äußeren Heap kopiert). Im Rumpf allozierte Objekte sind **arena-lokal → kein
+RC, kein Zyklen-Kollektor**; beim Verlassen wird die Arena en bloc freigegeben (auch
+bei Panic — Fault-Containment).
 
-Zweck: (a) **Performance** — der geteilt/zyklische Fall, der laut [M0-MESSUNG.md](M0-MESSUNG.md)
-RC-teuer ist, wird hier deklarativ RC-/Kollektor-frei (opt-in Region statt inferiertem RC).
-(b) **Isolation** — riskanter/untrusted Code kann per Konstruktion nur die Arena
-erreichen. Vollständige Begründung + Design: [CAPSULE-BEWERTUNG.md](CAPSULE-BEWERTUNG.md).
+Zweck: (a) **Isolation + Fault-Containment** (die harte Garantie) — riskanter/
+untrusted Code kann per Konstruktion nur die Arena erreichen, weil der Rumpf keinen
+äußeren Zeiger *besitzt*. (b) **Performance** — RC-/Kollektor-frei im Rumpf; der
+Nettogewinn hängt aber von Copy-in+Copy-out ab und lohnt nur, wenn viel Arbeit in
+einen **kleinen** Blockwert mündet (nicht großer-Graph-rein/großer-Graph-raus). Die
+kopiefreie Variante `capsule(&x)` bricht Isolation und ist offene Forschung.
+Vollständige Begründung + Design: [CAPSULE-BEWERTUNG.md](CAPSULE-BEWERTUNG.md).

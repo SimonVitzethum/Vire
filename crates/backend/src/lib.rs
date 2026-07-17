@@ -694,8 +694,12 @@ pub fn emit(program: &Program) -> String {
 
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
-        // Vtable-Zeiger für zur Laufzeit erzeugte String-/Wrapper-Objekte.
-        writeln!(w, "  store ptr @vt.java_lang_String, ptr @jrt_dyn_string_vt").unwrap();
+        // Vtable-Zeiger für zur Laufzeit erzeugte String-/Wrapper-Objekte —
+        // nur wenn die String-Klasse überhaupt vorkommt (Vire-Programme ohne
+        // Strings definieren `@vt.java_lang_String` nicht).
+        if instantiated.contains("java/lang/String") {
+            writeln!(w, "  store ptr @vt.java_lang_String, ptr @jrt_dyn_string_vt").unwrap();
+        }
         for (vf, cls, vt) in &wrappers {
             if calls_fn(vf) {
                 writeln!(w, "  store ptr @vt.{}, ptr @{vt}", sanitize(cls)).unwrap();

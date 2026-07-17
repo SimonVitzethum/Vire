@@ -35,63 +35,79 @@ out = capsule(input) {
 // Arena hier en bloc freigegeben (ein free); `out` überlebt.
 ```
 
-**Regeln (resolve/lower erzwingen sie):**
-- **Rein:** nur die `()`-Variablen; sie werden in die Arena **kopiert** (oder
-  gemoved). Damit sind sie region-lokal — kein Zeiger nach draußen.
-- **Isolation by construction:** der Rumpf darf **keinen** Namen des umgebenden
-  Scopes nennen außer den `()`-Eingaben → er kann außen liegenden Speicher gar nicht
-  adressieren (Compilezeit-Fehler sonst). Keine Hardware nötig für *sicheren* Code.
-- **Speicher:** alle `New`/Sammlungen im Rumpf → Arena-Bump-Allokation. **Kein
-  retain/release, kein Zyklen-Kollektor** (Zyklen in der Arena sind egal — sie
-  werden mit der Arena frei). Deterministisch, leckfrei.
-- **Raus:** nur der Blockwert. Da die Arena stirbt, wird er **tief in den äußeren
-  Heap kopiert** (kein Zeiger in freigegebene Arena — erzwungen).
-- **Fehler/Panic im Rumpf:** die Arena wird trotzdem freigegeben (RAII-artig) —
-  Fault-Containment.
+> **Korrektur nach Review — der Fehlschluss, den die erste Fassung machte:**
+> „Nur `()` rein" garantiert Isolation **nicht**, solange die Eingaben RC-
+> Referenzen tragen. Der Rumpf adressiert äußeren Speicher nicht über *Namen*,
+> sondern über *die Eingabe selbst*. Isolation = Namens-Sichtbarkeit ist ein
+> Trugschluss. Deshalb ist die **garantierte** Semantik die **reine** Form:
 
-## Warum „für wichtige, riskante Sachen" passt
-- **Riskant = Bugs:** ein Fehler im Rumpf (OOB, Korruption in `unsafe`) kann per
-  Konstruktion nur die Arena treffen, nicht den Rest des Programms. Beim Verlassen
-  ist alles weg → kein Leck, kein dangling.
-- **Riskant = untrusted Input** (Parser, Deserialisierer, Plugin): klare
-  Angriffsfläche (nur `()`), begrenzter Blast-Radius (die Arena).
-- **Wichtig = heiß:** genau die Stellen, wo RC weh tut (M0), holt man in eine
-  capsule und ist RC-/Kollektor-frei.
+**Regeln der reinen Form (das, was `capsule` GARANTIERT):**
+- **Rein: tiefe Kopie, kein Move, kein `&`.** Jede `()`-Eingabe wird **tief in die
+  Arena kopiert**. *Nicht* „kopiert oder gemoved": Move würde nur den *Namen*
+  moven; ein RC-Graph mit refcount>1 lebte weiter draußen (aliasiert) und der
+  arena-freie Rumpf mutierte draußen sichtbare Objekte → genau der dangling-/Race-
+  Fall, den `capsule` verhindern soll. **Erst die Deep-Copy macht die Eingabe
+  wirklich region-lokal.**
+- **Isolation + Containment folgen erst aus der Deep-Copy** (nicht aus der
+  Namensregel): weil der Rumpf **keinen** äußeren Zeiger *besitzt*, kann ein Bug/
+  OOB/Korruption im Rumpf nur die Arena treffen. Das ist das eigentliche
+  Sicherheitsversprechen — und es gilt **nur** ohne `&`-Ausnahme.
+- **Speicher:** alle `New`/Sammlungen im Rumpf → Arena-Bump. Kein retain/release,
+  kein Zyklen-Kollektor (Zyklen sterben mit der Arena). Deterministisch, leckfrei.
+- **Raus: tiefe Kopie des Blockwerts** in den äußeren Heap (die Arena stirbt). Kein
+  Zeiger in die freigegebene Arena — erzwungen.
+- **Panic:** Arena wird trotzdem frei (RAII) — Fault-Containment.
 
-## Feasibility auf FastLLVM (konkret, niedriges Risiko)
-Alle Bausteine existieren oder sind klein:
-- **Arena-Allokator** in `runtime.c`: `jrt_arena_push()`/`_pop()` + `jrt_arena_alloc`
-  (Bump). Klein, ~30 Zeilen.
-- **Allokation umrouten:** im capsule-Rumpf zeigt `jrt_alloc`/`jrt_alloc_array` auf
-  die aktive Arena statt auf den RC-Heap (thread-lokaler „aktueller Allokator"-
-  Zeiger). RC-Ops (`retain`/`release`) auf arena-lokale Objekte sind **No-Ops**
-  (Header-Flag `arena` gesetzt → wie „immortal", schon im RC-Modell vorhanden!).
-- **Deep-Copy-Out:** der Blockwert wird über die vorhandene `jrt_array_clone`/
-  Feld-Kopie-Maschinerie in den Heap kopiert (rekursiv).
-- **Isolation-Check:** reine Namensauflösungs-Regel (F3) — der Rumpf hat nur die
-  `()`-Namen im Scope. Null Runtime-Kosten, Compilezeit.
-- **Lowering:** `capsule(args){body}` → `arena_push`; body (mit umgeroutetem
-  Allokator); `out = deep_copy(bodywert)`; `arena_pop`; `out`. Als IR-Sequenz oder
-  Solver-Pass.
+## Kostenkurve — ehrlich (die „~1× wie Rust-Arena"-Behauptung ist zurückgezogen)
+Die erste Fassung verkaufte Rust-Arena-Performance mit den Sicherheitsgarantien der
+teuren Form. **Beides zusammen gibt es nicht.** Die reine Form zahlt **Copy-in
+*und* Copy-out**:
+- Eine Rust-Arena-of-Indices zahlt **kein Copy-out** — sie gibt Indizes in einen
+  *überlebenden* `Vec` zurück. `capsule` zahlt es per Konstruktion (die Arena
+  stirbt). Deshalb haben sie **nicht** dieselbe Kostenkurve.
+- Ist der Blockwert der *ganze verarbeitete Graph* (M0-PageRank wörtlich: großer
+  Graph rein, große Ranks raus), fressen Copy-in + Copy-out die Ersparnis
+  potenziell auf — **Nettogewinn ungemessen, evtl. negativ**.
+- `capsule` gewinnt, wenn **viel Arbeit auf großen internen Strukturen in ein
+  KLEINES Ergebnis mündet**: Aggregation, ein Skalar, ein kleiner Report. Parser/
+  Deserialisierer/Validierer mit kleinem Output sind der Sweet Spot.
+- **Offene Messung (M0.2):** `capsule`-PageRank *mit* Copy-in+Copy-out gegen die
+  Rust-Arena messen, bevor irgendein Perf-Versprechen im Dokument steht.
 
-Der Header trägt schon `rcflags` mit einem „immortal"-Konzept (negativer refcount) —
-arena-lokale Objekte nutzen genau diesen No-Op-Pfad. **Das RC-Modell muss dafür
-nicht angefasst werden.**
+## Feasibility auf FastLLVM
+- **Arena-Allokator** (`jrt_arena_push/_pop/_alloc`, Bump) — klein.
+- **Allokation umrouten** im Rumpf auf die aktive Arena; RC-Ops auf arena-lokale
+  Objekte No-Op (`immortal`-Flag, schon im Modell). *Innerhalb* der Arena korrekt.
+- **Deep-Copy-in + Deep-Copy-out** rekursiv über `jrt_array_clone`/Feldkopie —
+  **das ist der reale Aufwand, nicht „~30 Zeilen"**: für zyklische Eingaben/
+  Ergebnisse muss die Kopie die Zyklen erkennen (Besuchsmenge), sonst Endlosschleife/
+  Duplikate; das Ergebnis muss RC-Header rekonstruieren und ggf. beim Kollektor
+  wieder anmelden. Nicht trivial.
+- **Isolation-Check** (F3): der Rumpf sieht nur die `()`-Namen — notwendige, aber
+  (siehe Review) **nicht hinreichende** Bedingung; hinreichend ist erst die Deep-
+  Copy der Eingaben.
 
-## Grenzen / Zuschnitt (ehrlich)
-- **Copy-in/out kostet.** Große Eingaben tief zu kopieren ist real. Zuschnitt:
-  `capsule(&readonly_in)` erlaubt **geborgte, nur-lesbare** Eingaben ohne Kopie
-  (der äußere Speicher bleibt außen, read-only → sicher); nur mutierbare/besessene
-  Eingaben werden kopiert.
-- **Kein Zeiger darf raus.** Der Blockwert wird kopiert; eine capsule kann keine
-  Referenz in ihre eigene (sterbende) Arena zurückgeben — erzwungen.
-- **Nicht für alles.** Es ist *opt-in* für heiße/riskante Scopes, nicht der
-  Default. Der Default bleibt Solver-inferiertes RC/Escape.
-- **„Virtuelles RAM" = arena + Sprach-Isolation**, nicht per se Hardware-Schutz.
-  Für *sicheren* Code ist die Sprach-Isolation vollständig (kein außen-Zeiger
-  nennbar). Für `unsafe`/FFI im Rumpf kann ein **Guard-Page-Modus**
-  (`capsule guarded`) die Arena mit Schutzseiten umgeben, sodass Überläufe
-  faulten statt zu korrumpieren — starke, aber optionale Ausbaustufe.
+## Offene Forschungsfragen (NICHT als fertiger Zuschnitt verkaufen)
+- **`capsule(&readonly_in)` (kopiefrei):** bricht Isolation + Containment frontal —
+  ein `&` in den äußeren Heap *ist* der Zeiger nach draußen, den die reine Form
+  verbietet. Es braucht (a) *strikt* read-only (kein Speichern von **Arena**-
+  Zeigern in die geborgte Struktur → Escape-Check Arena→außen = die M0-Analyse) und
+  (b) die Garantie, dass **niemand draußen** die Eingabe während der `capsule`
+  mutiert/freigibt (XOR-Regel = der Borrow-Checker, den Vire *nicht* hat; sonst
+  dangling `&`, derselbe §9a-Fall über die Grenze). **Offen**, kein fertiges Feature.
+- **Move-in ohne Kopie** bei *beweisbar unaliasierten* Eingaben: verlagert das
+  Alias-Problem nicht, es *ist* die Whole-Program-Alias-Analyse aus M0/§7. Offen.
+- **Guard-Page-Modus** (`capsule guarded`) für `unsafe`/FFI: Hardware-Containment
+  gegen Überläufe. Ausbaustufe.
+
+## Was `capsule` also GARANTIERT (der feste Kern)
+Die **reine** Form — Deep-Copy-in, Deep-Copy-out, kein `&`: **deterministische,
+leckfreie, RC-/Kollektor-freie Verarbeitung mit echtem Fault-Containment**, ideal
+für riskante Verarbeitung mit **kleinem Output** (Parser, Deserialisierer, Plugins,
+Aggregationen). Das ist ein kleineres, aber **wasserdichtes** Versprechen — und die
+ehrliche Antwort auf M0: der Solver macht den Normalfall, `capsule` gibt dem
+Menschen an der bewiesenen Inferenz-Grenze ein *sicheres* Werkzeug. Der Perf-Gewinn
+gegenüber RC ist workload-abhängig und **erst zu messen** (M0.2), nicht zu behaupten.
 
 ## Einordnung
 Vale hat „regions", Rust hat Arena-Crates (`bumpalo`) + Lifetimes, Zig hat explizite

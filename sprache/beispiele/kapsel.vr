@@ -1,6 +1,9 @@
 // capsule — isolierter Arena-Scope für heiße/riskante Sachen (CAPSULE-BEWERTUNG.md).
-// Nur `()`-Variablen rein, nur der Blockwert raus (tief kopiert). Inneres läuft
-// in eigenem virtuellem RAM (Arena) → KEIN RC, KEIN Zyklen-Kollektor, en-bloc-Free.
+// REINE Form: `()`-Eingaben werden TIEF in die Arena kopiert, nur der Blockwert raus
+// (ebenfalls tief kopiert). Kein `&`, kein Move — erst die Deep-Copy macht die
+// Eingabe region-lokal und garantiert Isolation + Fault-Containment. Inneres läuft in
+// eigenem virtuellem RAM (Arena) → KEIN RC, KEIN Zyklen-Kollektor, en-bloc-Free.
+// Gewinn genau dann, wenn viel Arbeit in einen KLEINEN Blockwert mündet.
 
 type Node {
     rank: Float
@@ -27,8 +30,12 @@ fn pagerank(n: Int, iters: Int) -> Float {
 }
 
 // Riskanter Input in Isolation: ein Bug im Parser trifft nur die Arena.
-fn parse_untrusted(&data: List[Byte]) -> Result[Doc, Error] {
-    capsule(&data) {                      // read-only geborgt → keine Kopie
+// `data` wird tief in die Arena kopiert (kein `&`) — der Blast-Radius eines Bugs im
+// Parser ist damit die Arena, nichts draußen. Sweet Spot: großer Input, kleiner Doc.
+fn parse_untrusted(data: List[Byte]) -> Result[Doc, Error] {
+    capsule(data) {                       // tiefe Kopie rein → echte Isolation
         tokenize(data).then(build_doc)    // alles arena-lokal, Blast-Radius = Arena
     }
 }
+// Hinweis: die kopiefreie Variante `capsule(&data)` bricht Isolation/Containment und
+// ist offene Forschung (siehe CAPSULE-BEWERTUNG.md „Offene Forschungsfragen").

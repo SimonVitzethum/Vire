@@ -8,4 +8,6 @@ name = "vire"
 path = "src/main.rs"
 
 [dependencies]
-# Absenkziel (später): fastllvm-ir = { path = "../ir" }
+fastllvm-ir = { path = "../ir" }
+fastllvm-solver = { path = "../solver" }
+fastllvm-backend = { path = "../backend" }
