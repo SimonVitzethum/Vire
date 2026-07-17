@@ -142,6 +142,7 @@ run benchalloc    0 BenchAlloc BenchAlloc Node
 run intrinsics    0 Intrinsics Intrinsics
 run primarr       0 PrimArr PrimArr
 run cmp           0 Cmp Cmp
+run seal          0 Seal Seal
 run rec           0 Rec Rec
 run genmax        0 GenMax GenMax @stdlib
 run sync          0 Sync Sync

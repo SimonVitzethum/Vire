@@ -301,6 +301,40 @@ fn register_throwables(program: &mut Program) {
             }],
         });
     }
+    // java.lang.MatchException (exhaustive pattern-switch-Fallback) extends
+    // RuntimeException; <init>(String, Throwable) setzt $message (Cause ignoriert).
+    let me_init = mangle("java/lang/MatchException", "<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V");
+    program.classes.push(ClassInfo {
+        name: "java/lang/MatchException".to_string(),
+        super_name: Some("java/lang/RuntimeException".to_string()),
+        is_interface: false,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        methods: vec![MethodInfo {
+            name: "<init>".into(),
+            desc: "(Ljava/lang/String;Ljava/lang/Throwable;)V".into(),
+            is_static: false,
+            has_body: true,
+            mangled: me_init.clone(),
+        }],
+        has_clinit: false,
+    });
+    program.functions.push(Function {
+        name: me_init,
+        params: vec![Ty::Ref, Ty::Ref, Ty::Ref],
+        ret: Ty::Void,
+        locals: vec![Ty::Ref, Ty::Ref, Ty::Ref],
+        blocks: vec![BasicBlock {
+            statements: vec![Statement::PutField {
+                obj: Operand::Copy(Local(0)),
+                class: "java/lang/Throwable".to_string(),
+                field: "$message".into(),
+                value: Operand::Copy(Local(1)),
+            }],
+            terminator: Terminator::Return(None),
+        }],
+    });
 }
 
 /// java.lang.Enum als Basisklasse aller enums: hält name (String) und
@@ -2269,9 +2303,64 @@ fn lower_block(
                     }
                 }
 
+                // --- Pattern-Switch (SwitchBootstraps.typeSwitch) ---
+                // Liefert den Index des ersten passenden Typ-Labels (−1 bei null,
+                // N bei keinem Treffer); ein nachfolgendes lookupswitch verzweigt.
+                // Branch-frei für disjunkte Labels (sealed): idx = Σ k·(o instof
+                // Lk) + (1−Σ)·N − (o==null)·(N+1).
+                if bsm_name == "typeSwitch" && dname == "typeSwitch" {
+                    let labels: Vec<String> = bsm_args
+                        .iter()
+                        .map(|&i| ml.cf.class_name(i).map(str::to_string))
+                        .collect::<std::result::Result<_, _>>()
+                        .map_err(|_| FrontendError::Unsupported(
+                            "typeSwitch mit nicht-Klassen-Label (guarded/constant pattern)".into(),
+                        ))?;
+                    let n = labels.len() as i32;
+                    let _restart = pop!(); // Restart-Index (0 bei einfachen Mustern)
+                    let obj = pop!();
+                    let isnull = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(isnull, Rvalue::Binary(BinOp::CmpEq, Operand::Copy(obj), Operand::ConstNull)));
+                    let matched = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(matched, Rvalue::Use(Operand::ConstI32(0))));
+                    let idxsum = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(idxsum, Rvalue::Use(Operand::ConstI32(0))));
+                    for (k, label) in labels.iter().enumerate() {
+                        let inst = ml.fresh(Ty::I32);
+                        if program.class(label).is_some() {
+                            stmts.push(Statement::InstanceOf { dest: inst, obj: Operand::Copy(obj), class: label.clone() });
+                        } else {
+                            stmts.push(Statement::Assign(inst, Rvalue::Use(Operand::ConstI32(0))));
+                        }
+                        let nm = ml.fresh(Ty::I32);
+                        stmts.push(Statement::Assign(nm, Rvalue::Binary(BinOp::Add, Operand::Copy(matched), Operand::Copy(inst))));
+                        stmts.push(Statement::Assign(matched, Rvalue::Use(Operand::Copy(nm))));
+                        if k > 0 {
+                            let ki = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Assign(ki, Rvalue::Binary(BinOp::Mul, Operand::Copy(inst), Operand::ConstI32(k as i32))));
+                            let ns = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Assign(ns, Rvalue::Binary(BinOp::Add, Operand::Copy(idxsum), Operand::Copy(ki))));
+                            stmts.push(Statement::Assign(idxsum, Rvalue::Use(Operand::Copy(ns))));
+                        }
+                    }
+                    // notmatched = 1 - matched
+                    let notm = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(notm, Rvalue::Binary(BinOp::Sub, Operand::ConstI32(1), Operand::Copy(matched))));
+                    let nmN = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(nmN, Rvalue::Binary(BinOp::Mul, Operand::Copy(notm), Operand::ConstI32(n))));
+                    let r1 = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(r1, Rvalue::Binary(BinOp::Add, Operand::Copy(idxsum), Operand::Copy(nmN))));
+                    let nullpen = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(nullpen, Rvalue::Binary(BinOp::Mul, Operand::Copy(isnull), Operand::ConstI32(n + 1))));
+                    let res = ml.fresh(Ty::I32);
+                    stmts.push(Statement::Assign(res, Rvalue::Binary(BinOp::Sub, Operand::Copy(r1), Operand::Copy(nullpen))));
+                    push!(Ty::I32, Rvalue::Use(Operand::Copy(res)));
+                    continue;
+                }
+
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda, Record)"
+                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda, Record, Pattern-Switch)"
                     )));
                 }
                 let with_constants = dname == "makeConcatWithConstants";
