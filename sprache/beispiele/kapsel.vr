@@ -1,0 +1,34 @@
+// capsule — isolierter Arena-Scope für heiße/riskante Sachen (CAPSULE-BEWERTUNG.md).
+// Nur `()`-Variablen rein, nur der Blockwert raus (tief kopiert). Inneres läuft
+// in eigenem virtuellem RAM (Arena) → KEIN RC, KEIN Zyklen-Kollektor, en-bloc-Free.
+
+type Node {
+    rank: Float
+    out: List[Node]          // zyklenfähig — in der capsule egal (Arena)
+}
+
+fn pagerank(n: Int, iters: Int) -> Float {
+    // Der ganze geteilt/zyklisch/mutierende Graph lebt in der Arena:
+    // genau der M0-Fall, hier RC-frei und ohne Kollektor.
+    capsule(n, iters) {
+        mut nodes = build_graph(n)       // Knoten → Arena, kein retain/release
+        for _ in 0..iters {
+            for node in nodes {
+                mut acc = 0.0
+                for nb in node.out { acc = acc + nb.rank }
+                node.rank = 0.15 / n + 0.85 * acc
+            }
+        }
+        mut sum = 0.0
+        for node in nodes { sum = sum + node.rank }
+        sum                               // Blockwert → in den äußeren Heap kopiert
+    }
+    // Arena hier en bloc frei; nur `sum` (ein Float) überlebt.
+}
+
+// Riskanter Input in Isolation: ein Bug im Parser trifft nur die Arena.
+fn parse_untrusted(&data: List[Byte]) -> Result[Doc, Error] {
+    capsule(&data) {                      // read-only geborgt → keine Kopie
+        tokenize(data).then(build_doc)    // alles arena-lokal, Blast-Radius = Arena
+    }
+}

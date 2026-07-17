@@ -651,6 +651,23 @@ impl Parser {
             }
             Tok::Kw(Kw::If) => self.parse_if(),
             Tok::Kw(Kw::Match) => self.parse_match(),
+            Tok::Kw(Kw::Capsule) => {
+                self.bump();
+                let mut inputs = Vec::new();
+                self.expect(&Tok::LParen, "'('");
+                self.skip_nl();
+                while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+                    let borrowed = self.eat(&Tok::Amp);
+                    inputs.push((self.ident(), borrowed));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                    self.skip_nl();
+                }
+                self.expect(&Tok::RParen, "')'");
+                let body = self.parse_block();
+                Expr::Capsule { inputs, body, span: sp }
+            }
             Tok::At => {
                 // Compiler-Intrinsic @name(...) — als Call auf Ident "@name"
                 self.bump();

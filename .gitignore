@@ -17,3 +17,6 @@ examples/*.class
 examples/*.bin
 examples/bench
 tests/work/
+
+# Autonomer Arbeits-Journal (nicht committen)
+workflow.md

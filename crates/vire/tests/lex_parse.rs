@@ -116,3 +116,12 @@ fn parse_let_and_while() {
     assert!(matches!(b.stmts[0], Stmt::Let { mutable: true, .. }));
     assert!(matches!(b.stmts[1], Stmt::While { .. }));
 }
+
+#[test]
+fn parse_capsule() {
+    let src = "fn f(x) = capsule(x) {\n mut g = build(x)\n step(g)\n g\n}\n";
+    let (m, diags) = vire::parse(src);
+    assert!(diags.is_empty(), "{:?}", diags);
+    let Item::Fn(f) = &m.items[0] else { panic!() };
+    assert!(matches!(f.body.as_ref().unwrap().tail.as_ref().unwrap().as_ref(), Expr::Capsule { .. }));
+}

@@ -153,6 +153,11 @@ pub enum Expr {
     Comptime { inner: Box<Expr>, span: Span },
     /// `a..b` (exklusiv) / `a..=b` (inklusiv)
     Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool, span: Span },
+    /// `capsule(a, b) { … }` — isolierter Arena-Scope: nur `inputs` rein, nur der
+    /// Blockwert raus (tief kopiert), Inneres RC-/Kollektor-frei (eigene Arena).
+    /// `&`-markierte Inputs sind geborgt/read-only (keine Kopie). Siehe
+    /// sprache/CAPSULE-BEWERTUNG.md.
+    Capsule { inputs: Vec<(String, bool)>, body: Block, span: Span },
 }
 
 #[derive(Debug, Clone)]

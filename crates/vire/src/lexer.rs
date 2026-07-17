@@ -32,7 +32,7 @@ pub enum Tok {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kw {
     Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Unsafe, Macro, Comptime,
-    Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn,
+    Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn, Capsule,
     And, Or, Not, As, True, False, SelfLower, SelfType,
 }
 
@@ -46,7 +46,8 @@ impl Kw {
             "comptime" => Comptime, "match" => Match, "if" => If, "elif" => Elif,
             "else" => Else, "while" => While, "for" => For, "in" => In,
             "break" => Break, "continue" => Continue, "return" => Return,
-            "spawn" => Spawn, "and" => And, "or" => Or, "not" => Not, "as" => As,
+            "spawn" => Spawn, "capsule" => Capsule,
+            "and" => And, "or" => Or, "not" => Not, "as" => As,
             "true" => True, "false" => False, "self" => SelfLower, "Self" => SelfType,
             _ => return None,
         })

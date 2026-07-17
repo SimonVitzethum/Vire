@@ -432,3 +432,16 @@ Siehe [beispiele/](beispiele/): `sieb`, `formen` (Traits/Generics), `baum`
 (rekursive Generics), `wortzahl` (Maps/Iteratoren), `nebenlaeufig` (Threads/Kanäle),
 `ffi`, sowie die Feature-Demos `reflektion`, `makros`, `fehler`, `logger`,
 `comptime_matrix`.
+
+## 9b. `capsule` — isolierter Arena-Scope (für heiße/riskante Sachen)
+
+`capsule(a, b) { … }` führt den Rumpf in einer **eigenen Arena** aus: nur die
+`()`-Variablen sind sichtbar (hineinkopiert; `&x` = geborgt/read-only, keine Kopie),
+nur der Blockwert verlässt die capsule (tief in den äußeren Heap kopiert). Im Rumpf
+allozierte Objekte sind **arena-lokal → kein RC, kein Zyklen-Kollektor**; beim
+Verlassen wird die Arena en bloc freigegeben (auch bei Panic — Fault-Containment).
+
+Zweck: (a) **Performance** — der geteilt/zyklische Fall, der laut [M0-MESSUNG.md](M0-MESSUNG.md)
+RC-teuer ist, wird hier deklarativ RC-/Kollektor-frei (opt-in Region statt inferiertem RC).
+(b) **Isolation** — riskanter/untrusted Code kann per Konstruktion nur die Arena
+erreichen. Vollständige Begründung + Design: [CAPSULE-BEWERTUNG.md](CAPSULE-BEWERTUNG.md).
