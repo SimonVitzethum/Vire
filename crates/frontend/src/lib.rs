@@ -640,6 +640,67 @@ fn str_conv(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, func: &str, val
     Operand::Copy(l)
 }
 
+/// Bytegröße eines Ref-/Primitiv-Felds (für Record-memcmp-equals).
+fn ty_size(t: Ty) -> i64 {
+    match t {
+        Ty::I64 | Ty::F64 | Ty::Ref => 8,
+        _ => 4,
+    }
+}
+
+/// Feldwert → String (für Record-toString).
+fn record_val_str(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, val: Local) -> Operand {
+    match ty {
+        Ty::I32 => str_conv(ml, stmts, "jrt_int_to_str", val),
+        Ty::I64 => str_conv(ml, stmts, "jrt_long_to_str", val),
+        Ty::F64 => str_conv(ml, stmts, "jrt_double_to_str", val),
+        Ty::F32 => str_conv(ml, stmts, "jrt_float_to_str", val),
+        Ty::Ref => {
+            let l = ml.fresh(Ty::Ref);
+            stmts.push(Statement::CallVirtual {
+                dest: Some(l),
+                class: "java/lang/Object".to_string(),
+                name: "toString".to_string(),
+                desc: "()Ljava/lang/String;".to_string(),
+                params: vec![Ty::Ref],
+                ret: Ty::Ref,
+                args: vec![Operand::Copy(val)],
+            });
+            Operand::Copy(l)
+        }
+        Ty::Void => Operand::ConstNull,
+    }
+}
+
+/// Feldwert → i32-Hash (für Record-hashCode; muss nur konsistent/≠0 sein).
+fn record_val_hash(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, val: Local) -> Operand {
+    match ty {
+        Ty::I32 => Operand::Copy(val),
+        Ty::I64 => {
+            let l = ml.fresh(Ty::I32);
+            stmts.push(Statement::Assign(l, Rvalue::Convert(Operand::Copy(val))));
+            Operand::Copy(l)
+        }
+        // Float/Double: fester (konsistenter) Beitrag — gleiche Records hashen
+        // gleich; die Verteilung ist gröber, aber der Kontrakt bleibt gewahrt.
+        Ty::F32 | Ty::F64 => Operand::ConstI32(1),
+        Ty::Ref => {
+            let l = ml.fresh(Ty::I32);
+            stmts.push(Statement::CallVirtual {
+                dest: Some(l),
+                class: "java/lang/Object".to_string(),
+                name: "hashCode".to_string(),
+                desc: "()I".to_string(),
+                params: vec![Ty::Ref],
+                ret: Ty::I32,
+                args: vec![Operand::Copy(val)],
+            });
+            Operand::Copy(l)
+        }
+        Ty::Void => Operand::ConstI32(0),
+    }
+}
+
 /// Schiebt angesammelte Literalzeichen als String-Konstante in die Teileliste.
 fn flush_lit(lit: &mut String, parts: &mut Vec<Operand>, program: &mut Program) {
     if !lit.is_empty() {
@@ -1733,6 +1794,8 @@ fn lower_block(
                     ("java/io/PrintStream", "print", "(D)V") => Some("jrt_print_double"),
                     ("java/io/PrintStream", "println", "(F)V") => Some("jrt_println_float"),
                     ("java/io/PrintStream", "print", "(F)V") => Some("jrt_print_float"),
+                    ("java/io/PrintStream", "println", "(Z)V") => Some("jrt_println_bool"),
+                    ("java/io/PrintStream", "print", "(Z)V") => Some("jrt_print_bool"),
                     _ => None,
                 };
                 if let Some(intrinsic) = intrinsic {
@@ -2112,9 +2175,103 @@ fn lower_block(
                     continue;
                 }
 
+                // --- Records (java/lang/runtime/ObjectMethods.bootstrap) ---
+                // toString/hashCode/equals werden feldweise erzeugt. Feldnamen
+                // aus bsm_args[1] ("f1;f2"), Typen via resolve_field.
+                if bsm_name == "bootstrap"
+                    && (dname == "toString" || dname == "hashCode" || dname == "equals")
+                {
+                    // Empfängertyp = erster Parameter des indy-Deskriptors.
+                    let rec_class = descriptor_params(ddesc)?
+                        .first()
+                        .and_then(|p| p.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string()))
+                        .ok_or_else(|| FrontendError::Unsupported("Record-Empfängertyp".into()))?;
+                    let names = ml.cf.const_string(bsm_args[1])?;
+                    let field_names: Vec<String> = if names.is_empty() {
+                        Vec::new()
+                    } else {
+                        names.split(';').map(str::to_string).collect()
+                    };
+                    let fields: Vec<(String, Ty)> = field_names
+                        .iter()
+                        .map(|n| {
+                            let ty = program.resolve_field(&rec_class, n).map(|(_, t)| t).unwrap_or(Ty::I32);
+                            (n.clone(), ty)
+                        })
+                        .collect();
+                    match dname {
+                        "toString" => {
+                            let this = pop!();
+                            let simple = rec_class.rsplit(['/', '$']).next().unwrap_or(&rec_class);
+                            // Teile: "Simple[", "f=", <wert>, ", g=", <wert>, "]"
+                            let mut acc = {
+                                let sid = program.intern_string(&format!("{simple}["));
+                                let l = ml.fresh(Ty::Ref);
+                                stmts.push(Statement::Assign(l, Rvalue::Use(Operand::ConstStr(sid))));
+                                Operand::Copy(l)
+                            };
+                            let cat = |ml: &mut MethodLowering, stmts: &mut Vec<Statement>, a: Operand, b: Operand| {
+                                let l = ml.fresh(Ty::Ref);
+                                stmts.push(Statement::Call { dest: Some(l), func: "jrt_str_concat".into(), args: vec![a, b] });
+                                Operand::Copy(l)
+                            };
+                            for (i, (fname, fty)) in fields.iter().enumerate() {
+                                let prefix = if i == 0 { format!("{fname}=") } else { format!(", {fname}=") };
+                                let pid = program.intern_string(&prefix);
+                                let pl = ml.fresh(Ty::Ref);
+                                stmts.push(Statement::Assign(pl, Rvalue::Use(Operand::ConstStr(pid))));
+                                acc = cat(ml, &mut stmts, acc, Operand::Copy(pl));
+                                // Feldwert → String.
+                                let fv = ml.fresh(*fty);
+                                stmts.push(Statement::GetField { dest: fv, obj: Operand::Copy(this), class: rec_class.clone(), field: fname.clone() });
+                                let vs = record_val_str(ml, &mut stmts, *fty, fv);
+                                acc = cat(ml, &mut stmts, acc, vs);
+                            }
+                            let cl = program.intern_string("]");
+                            let cll = ml.fresh(Ty::Ref);
+                            stmts.push(Statement::Assign(cll, Rvalue::Use(Operand::ConstStr(cl))));
+                            acc = cat(ml, &mut stmts, acc, Operand::Copy(cll));
+                            push!(Ty::Ref, Rvalue::Use(acc));
+                            continue;
+                        }
+                        "hashCode" => {
+                            let this = pop!();
+                            // h = 0; für jedes Feld: h = h*31 + feldhash.
+                            let h = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Assign(h, Rvalue::Use(Operand::ConstI32(0))));
+                            for (fname, fty) in &fields {
+                                let fv = ml.fresh(*fty);
+                                stmts.push(Statement::GetField { dest: fv, obj: Operand::Copy(this), class: rec_class.clone(), field: fname.clone() });
+                                let fh = record_val_hash(ml, &mut stmts, *fty, fv);
+                                let h31 = ml.fresh(Ty::I32);
+                                stmts.push(Statement::Assign(h31, Rvalue::Binary(BinOp::Mul, Operand::Copy(h), Operand::ConstI32(31))));
+                                stmts.push(Statement::Assign(h, Rvalue::Binary(BinOp::Add, Operand::Copy(h31), fh)));
+                            }
+                            push!(Ty::I32, Rvalue::Use(Operand::Copy(h)));
+                            continue;
+                        }
+                        _ => {
+                            // equals(this, other): instanceof + memcmp der Felder.
+                            let other = pop!();
+                            let this = pop!();
+                            let fb: i64 = fields.iter().map(|(_, t)| ty_size(*t)).sum();
+                            let inst = ml.fresh(Ty::I32);
+                            stmts.push(Statement::InstanceOf { dest: inst, obj: Operand::Copy(other), class: rec_class.clone() });
+                            let l = ml.fresh(Ty::I32);
+                            stmts.push(Statement::Call {
+                                dest: Some(l),
+                                func: "jrt_record_memeq".into(),
+                                args: vec![Operand::Copy(this), Operand::Copy(other), Operand::Copy(inst), Operand::ConstI64(fb)],
+                            });
+                            push!(Ty::I32, Rvalue::Use(Operand::Copy(l)));
+                            continue;
+                        }
+                    }
+                }
+
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda)"
+                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda, Record)"
                     )));
                 }
                 let with_constants = dname == "makeConcatWithConstants";

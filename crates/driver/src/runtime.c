@@ -230,6 +230,8 @@ void jrt_println_int(int32_t v) {
     plat_write("\n", 1);
 }
 
+void jrt_print_bool(int32_t v) { plat_puts(v ? "true" : "false"); }
+void jrt_println_bool(int32_t v) { jrt_print_bool(v); plat_write("\n", 1); }
 void jrt_println_ln(void) {
     plat_write("\n", 1);
 }
@@ -1187,6 +1189,22 @@ void *jrt_class_getsimplename(void *jc) {
         return NULL;
     }
     return *(void **)((char *)jc + 32);
+}
+
+/* Record-equals: der Aufrufer hat instanceof(other, RecordClass) bereits in
+ * `inst` (0 bei null/falschem Typ). Bei passendem Typ Feldbereich (ab Offset 24)
+ * per memcmp vergleichen. Ref-Felder werden dabei per Identität verglichen
+ * (dokumentierte Grenze); primitive Records sind exakt. */
+static int jrt_memcmp(const void *a, const void *b, int64_t n) {
+    const unsigned char *x = a, *y = b;
+    for (int64_t i = 0; i < n; i++)
+        if (x[i] != y[i]) return 1;
+    return 0;
+}
+int32_t jrt_record_memeq(void *a, void *b, int32_t inst, int64_t field_bytes) {
+    if (!inst) return 0;
+    if (a == b) return 1;
+    return jrt_memcmp((char *)a + 24, (char *)b + 24, field_bytes) == 0;
 }
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
