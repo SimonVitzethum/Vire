@@ -48,6 +48,18 @@ fn binding_dann_zuweisung_kein_shadowing() {
 }
 
 #[test]
+fn if_als_ausdruck_liefert_wert() {
+    // `if a>b {a} else {b}` als Tail → Funktion gibt I64 zurück (nicht Void),
+    // und der merge-Block liefert ein Ergebnis-Local.
+    let p = lower("fn max(a, b) {\n if a > b { a } else { b }\n}\n");
+    let f = p.functions.iter().find(|f| f.name == "max").unwrap();
+    assert_eq!(f.ret, Ty::I64);
+    // Der letzte Block gibt einen Wert zurück (Return(Some(..))), kein Return(None).
+    let has_value_return = f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(Some(_))));
+    assert!(has_value_return, "if-Ausdruck muss einen Wert zurückgeben");
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());

@@ -86,6 +86,15 @@ fn guess_expr_ty(e: &Expr) -> Ty {
         Expr::Str(..) => Ty::Ref,
         Expr::Int(..) => Ty::I64,
         Expr::Unary { rhs, .. } => guess_expr_ty(rhs),
+        Expr::If { then, els, .. } => {
+            let t = then.tail.as_ref().map(|e| guess_expr_ty(e)).unwrap_or(Ty::Void);
+            if t != Ty::Void {
+                t
+            } else {
+                els.as_ref().and_then(|b| b.tail.as_ref()).map(|e| guess_expr_ty(e)).unwrap_or(Ty::Void)
+            }
+        }
+        Expr::Block(b) => b.tail.as_ref().map(|e| guess_expr_ty(e)).unwrap_or(Ty::Void),
         Expr::Binary { op, lhs, rhs, .. } => {
             if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
                 Ty::I32
@@ -138,14 +147,22 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_block(&mut self, b: &Block2) {
+        let _ = self.lower_block_val(b); // Void-Kontext: Tail-Wert verworfen
+    }
+
+    /// Wie `lower_block`, liefert aber den Tail-Wert (für if-/Block-Ausdrücke).
+    /// Ohne Tail → (_, Void).
+    fn lower_block_val(&mut self, b: &Block2) -> (Operand, Ty) {
         self.scopes.push(HashMap::new());
         for s in &b.stmts {
             self.lower_stmt(s);
         }
-        if let Some(t) = &b.tail {
-            self.lower_expr(t); // Wert verworfen (Void-Kontext); Return-Fälle oben
-        }
+        let v = match &b.tail {
+            Some(t) => self.lower_expr(t),
+            None => (Operand::ConstI64(0), Ty::Void),
+        };
         self.scopes.pop();
+        v
     }
 
     fn lower_stmt(&mut self, s: &Stmt) {
@@ -337,10 +354,7 @@ impl<'a> FnLower<'a> {
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
-            Expr::Block(b) => {
-                self.lower_block(b);
-                (Operand::ConstI64(0), Ty::Void)
-            }
+            Expr::Block(b) => self.lower_block_val(b),
             Expr::Range { .. } => {
                 self.errs.push("Range nur als for-Iterator (M2)".into());
                 (Operand::ConstI64(0), Ty::I64)
@@ -387,29 +401,45 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_if(&mut self, cond: &Expr, then: &Block2, elifs: &[(Expr, Block2)], els: &Option<Block2>) -> (Operand, Ty) {
-        // Als Anweisung/Void-Ausdruck (M2). Ergebniswert von if-Ausdrücken folgt.
         let (c, _) = self.lower_expr(cond);
         let thenb = self.new_block();
         let elseb = self.new_block();
         let merge = self.new_block();
         let cur = self.cur;
         self.term(cur, Terminator::Branch { cond: c, then_blk: thenb, else_blk: elseb });
+        // then-Zweig → Wert + Endblock (noch nicht terminiert).
         self.cur = thenb.0 as usize;
-        self.lower_block(then);
+        let (tv, tty) = self.lower_block_val(then);
         let te = self.cur;
-        self.term(te, Terminator::Goto(merge));
+        // else-Zweig: weitere `elif`s rekursiv, sonst `else`-Block, sonst kein Wert.
         self.cur = elseb.0 as usize;
-        if !elifs.is_empty() {
+        let (ev, ety) = if !elifs.is_empty() {
             let (ec, eb) = &elifs[0];
             let rest: Vec<(Expr, Block2)> = elifs[1..].to_vec();
-            self.lower_if(ec, eb, &rest, els);
+            self.lower_if(ec, eb, &rest, els)
         } else if let Some(e) = els {
-            self.lower_block(e);
-        }
+            self.lower_block_val(e)
+        } else {
+            (Operand::ConstI64(0), Ty::Void)
+        };
         let ee = self.cur;
-        self.term(ee, Terminator::Goto(merge));
-        self.cur = merge.0 as usize;
-        (Operand::ConstI64(0), Ty::Void)
+        // Ergebnistyp: der nicht-Void-Zweig gewinnt (beide gleich, wenn Wert-if).
+        let rty = if tty != Ty::Void { tty } else { ety };
+        if rty != Ty::Void {
+            // Phi-Ersatz: gemeinsames Ergebnis-Local, in beiden Endblöcken belegt.
+            let res = self.new_local(rty);
+            self.blocks[te].statements.push(Statement::Assign(res, Rvalue::Use(tv)));
+            self.blocks[ee].statements.push(Statement::Assign(res, Rvalue::Use(ev)));
+            self.term(te, Terminator::Goto(merge));
+            self.term(ee, Terminator::Goto(merge));
+            self.cur = merge.0 as usize;
+            (Operand::Copy(res), rty)
+        } else {
+            self.term(te, Terminator::Goto(merge));
+            self.term(ee, Terminator::Goto(merge));
+            self.cur = merge.0 as usize;
+            (Operand::ConstI64(0), Ty::Void)
+        }
     }
 }
 
