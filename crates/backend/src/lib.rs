@@ -766,6 +766,45 @@ struct FnEmitter<'a> {
     f: &'a Function,
     tmp: u32,
     label: u32,
+    /// Geborgte Ref-Parameter-Slots (nie neu zugewiesen): RC-Elision — kein
+    /// Entry-retain, keine Cleanup-release. Der Aufrufer hält die Referenz für
+    /// die Aufrufdauer (Argumente sind geborgt), Kopien in andere Locals
+    /// retainen selbst.
+    borrowed: BTreeSet<u32>,
+}
+
+/// Locals, die irgendwo als Schreibziel auftreten (für die Borrow-Analyse).
+fn written_locals(f: &Function) -> BTreeSet<u32> {
+    let mut w = BTreeSet::new();
+    let mut mark = |l: &Local| {
+        w.insert(l.0);
+    };
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            match st {
+                Statement::Assign(d, _)
+                | Statement::New { dest: d, .. }
+                | Statement::StackNew { dest: d, .. }
+                | Statement::GetField { dest: d, .. }
+                | Statement::GetStatic { dest: d, .. }
+                | Statement::NewArray { dest: d, .. }
+                | Statement::ArrayLen { dest: d, .. }
+                | Statement::ArrayLoad { dest: d, .. }
+                | Statement::InstanceOf { dest: d, .. }
+                | Statement::InstanceOfPending { dest: d, .. } => mark(d),
+                Statement::Call { dest, .. }
+                | Statement::CallGuarded { dest, .. }
+                | Statement::CallVirtual { dest, .. }
+                | Statement::CallPoly { dest, .. } => {
+                    if let Some(d) = dest {
+                        mark(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    w
 }
 
 impl<'a> FnEmitter<'a> {
@@ -824,17 +863,23 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
             writeln!(w, "  store ptr null, ptr %l{i}").unwrap();
         }
     }
+    // Borrow-Analyse: nie neu zugewiesene Ref-Parameter bleiben geborgt
+    // (RC-Elision). `this` in Instanzmethoden ist fast immer so.
+    let written = written_locals(f);
+    let borrowed: BTreeSet<u32> = (0..n_params as u32)
+        .filter(|i| f.params[*i as usize] == Ty::Ref && !written.contains(i))
+        .collect();
     for (i, ty) in f.params.iter().enumerate() {
         writeln!(w, "  store {} %p{i}, ptr %l{i}", llty(*ty)).unwrap();
-        // Ref-Parameter sind geborgt; retain macht sie zu owned, sodass das
-        // Cleanup sie uniform releasen darf (Aufrufer behält seine Referenz).
-        if *ty == Ty::Ref {
+        // Ref-Parameter: retain (→ owned, Cleanup darf uniform releasen), außer
+        // geborgte (nie neu zugewiesen) — dort ist retain/release redundant.
+        if *ty == Ty::Ref && !borrowed.contains(&(i as u32)) {
             writeln!(w, "  call void @jrt_retain(ptr %p{i})").unwrap();
         }
     }
     writeln!(w, "  br label %bb0").unwrap();
 
-    let mut e = FnEmitter { f, tmp: 0, label: 0 };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -887,7 +932,8 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
 /// immortale Inhalte hält — nichts, das lecken könnte.
 fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
     for (i, ty) in e.f.locals.iter().enumerate() {
-        if *ty == Ty::Ref {
+        // Geborgte Parameter wurden nie retained → nicht releasen (RC-Elision).
+        if *ty == Ty::Ref && !e.borrowed.contains(&(i as u32)) {
             let t = e.fresh();
             writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
             writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
