@@ -56,13 +56,18 @@ Reibung weg (siehe [sprache/BEWERTUNG.md](sprache/BEWERTUNG.md) §3).
 ## Dokumente
 
 - **[sprache/BEWERTUNG.md](sprache/BEWERTUNG.md)** — Machbarkeit ehrlich: die drei
-  Spannungen (keine Runtime / alle Libs / Python-leicht) und wie Vire sie auflöst.
+  Spannungen (keine Runtime / alle Libs / Python-leicht) und **§7 Restrisiken**
+  (Alias-Präzision, Compile-Zeit) — die zwei Zahlen, die vor dem Bau zu messen sind.
 - **[sprache/SPRACHE.md](sprache/SPRACHE.md)** — Syntax-Tour (Schnelleinstieg).
 - **[sprache/REFERENZ.md](sprache/REFERENZ.md)** — vollständige Syntax-/Feature-
-  Referenz.
+  Referenz (inkl. §9a Iterator-Mutation-Regel).
 - **[sprache/FEATURES-BEWERTUNG.md](sprache/FEATURES-BEWERTUNG.md)** — Bewertung der
   acht gewünschten Features (Multithreading, Templates, comptime-Reflection,
-  Makros, Meson, Logger, Go-Error-Handling, Debug-Crash-Pfade).
+  eigener Präprozessor, Meson, Logger, Go-Error-Handling, Debug-Crash-Pfade).
+- **[TODO.md](TODO.md)** — Fahrplan: Features 1–8 + Compiler-Pipeline, **M0 =
+  Risiko-Messung zuerst**.
+- **[sprache/PARSER.md](sprache/PARSER.md)** — Parser-/Front-End-Bauplan (Lexer,
+  Grammatik, Pratt-Ausdrücke, Fehler-Recovery).
 - **[sprache/beispiele/](sprache/beispiele/)** — lauffähig gedachte Programme über
   alle Bereiche und Features.
 - **[DESIGN.md](DESIGN.md)** — Architektur des Backends (Solver, Speichermodell,

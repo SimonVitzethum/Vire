@@ -179,7 +179,14 @@ Ein eigenes Front-End, das **direkt SSA** erzeugt, würde:
 **Was neu gebaut werden muss:**
 - Lexer + Parser (Wochen).
 - **Typinferenz** (Hindley-Milner + Traits/Typklassen-Auflösung + Monomorphisierung)
-  — das anspruchsvollste Stück, aber *gelöstes* Problem mit reichlich Literatur.
+  — das anspruchsvollste Stück. *Vanilla*-HM ist Lehrbuch; **HM + Trait-Auflösung +
+  Kohärenz + Monomorphisierungs-Soundness ist es nicht** — Rust hat daran Jahre
+  gearbeitet (chalk, neuer Trait-Solver, Kohärenzregeln). Dazu die Fehler-Ergonomie:
+  globale Inferenz meldet Unifikationsfehler notorisch *weit weg* von der Ursache
+  (der ML/Haskell-Wart) — das untergräbt „einfach wie Python" mehr als die Syntax es
+  einlöst. Gegenmittel: bidirektionale Inferenz mit lokalen Ankern (Signaturen an
+  Funktions-/Modulgrenzen) hält Fehler nah — kostet aber ein paar erwünschte
+  Annotationen. **Kein reines Lehrbuchproblem, sondern echte Integrationsarbeit.**
 - Absenkung Sprache→`crates/ir` **in SSA** (überschaubar, IR existiert).
 - Minimale Standardbibliothek (Strings, Collections, I/O — vieles über C-libc).
 - C-Header→Binding-Generator (für den Interop-Anspruch).
@@ -220,14 +227,101 @@ Innerhalb dieses Zuschnitts ist die Sprache **realistisch, differenziert von all
 Existierenden und technisch bereits zur Hälfte fertig**. Empfehlung: als
 eigenständiges Front-End auf `crates/ir` aufsetzen, mit SSA-Erzeugung von Beginn an.
 
-**Empfohlener Bauplan (Reihenfolge):**
-1. Syntax + Typsystem festzurren (dieser Ordner, [SPRACHE.md](SPRACHE.md)).
-2. Lexer/Parser → AST.
-3. Hindley-Milner-Inferenz + Trait-Auflösung + Monomorphisierung.
+**Empfohlener Bauplan (Reihenfolge) — Messung zuerst, nicht mehr Design:**
+0. **Alias-Präzisions-Spike (die entscheidende Messung, s. §7).** Ein kleines, aber
+   *idiomatisch-realistisches* Programm mit geteiltem, entkommendem, mutierendem
+   Zustand (kein Sieb, kein Wortzähler) von Hand nach `crates/ir` absenken und
+   messen: (a) welcher Anteil bleibt RC-frei, (b) wie oft feuert der RC-Pfad unter
+   Threads *atomar contended*. **Diese eine Zahl entscheidet, ob „Rust-Niveau ohne
+   Annotationen" Slogan oder Ergebnis ist** — vor jedem Front-End-Aufwand.
+1. Syntax + Typsystem festzurren ([SPRACHE.md](SPRACHE.md), [REFERENZ.md](REFERENZ.md)).
+2. Lexer/Parser → AST (Plan: [PARSER.md](PARSER.md)).
+3. Bidirektionale HM-Inferenz + Trait-Auflösung/Kohärenz + Monomorphisierung.
 4. AST→`crates/ir` in SSA (Solver/Backend unverändert wiederverwenden).
 5. Minimal-Stdlib über libc + C-FFI; danach C-Header-Binding-Generator.
 6. Selbst-Benchmark gegen die bestehende Suite (Ziel: ≤ die heutigen Java-Zahlen,
-   erwartbar besser wegen SSA).
+   erwartbar besser wegen SSA) — **plus** den §7-Compile-Zeit-Test bei 100k+ LOC.
 
-Siehe [SPRACHE.md](SPRACHE.md) für die konkrete Syntax und [beispiele/](beispiele/)
-für lauffähig gedachte Programme über alle Zielbereiche.
+Feature-Fahrplan (Punkte 1–8): [../TODO.md](../TODO.md).
+
+## 7. Restrisiken — wo die Bewertung (zu Recht) unter Druck steht
+
+*Nachtrag nach externer Kritik. Die §§1–6 bleiben gültig, aber die Risikoverteilung
+ist verschoben: das Restrisiko liegt **nicht** im Front-End als Fleißarbeit
+(„Lexer/Parser Wochen"), sondern an zwei unbelegten Stellen.*
+
+### 7.1 Die eine tragende, unbewiesene Annahme — Alias-Präzision
+Alles hängt daran, dass der Solver Aliasing/Escape/Ownership **präzise genug ohne
+Annotationen** rekonstruiert, um *gleichzeitig* sicher **und** Rust-schnell zu sein.
+Bewiesen und gemessen ist nur die **Backend-Hälfte** (Escape→Stack, RC-Elision,
+Azyklizität). Die **Front-End-Hälfte** — beherrscht die Inferenz die adversarialen
+Alias-Fälle? — ist nicht gezeigt. Entscheidend, und in §§1–6 geglättet: wo der
+Solver *nicht* beweisen kann, ist der Fallback zwar **sicher** (RC), aber **nicht
+Rust-schnell**. „Rust-Niveau ohne Annotationen" gilt also nur für die *beweisbare
+Teilmenge* — und **deren Größe in idiomatischem Code ist die eine Zahl, die nicht
+gemessen ist**. Die Benchmarks zeigen genau die escape-freundlichen Fälle
+(loop-lokal, nicht entkommend → schlägt trivial `Box`), *nicht* den RC-lastigen
+Fall. Und dort wird es teuer: **atomare Refcounts unter Threads, contended, sind
+exakt das Swift-ARC-Problem**, das heiße Pfade ausbremst. „Beweisbare RC-Elimination"
+ist stark; „der RC-Pfad konkurriert mit Rust, wo er feuert" ist eine **separate,
+unbelegte** Behauptung.
+
+### 7.2 Die konkrete Lücke — Mutation unter Aliasing / Iterator-Invalidierung
+Das Herzstück von Rusts Borrow-Checker ist die **XOR-Regel** (ein Mutable *oder*
+viele Shared) — und Vire wirft genau die Annotationen weg, die sie entscheidbar
+machen. Beispiel:
+```vire
+mut xs = [1, 2, 3]
+for x in xs { xs.push(x) }     // Backing-Store realloziert, während der Iterator
+                               // hineinzeigt
+```
+RC verhindert UAF am Listen-*Objekt*, aber der *Puffer* wird beim `push`
+umgesetzt. Sicher ist das nur mit Python-Semantik (Iterator hält RC auf den Puffer
+**+** jeder Zugriff bounds-checked) — was **frontal** mit „Iteratoren werden
+geinlint, zero-cost" (SPRACHE §7) kollidiert. Man kann Iteration nicht *zugleich* zu
+einem rohen Pointer-Walk absenken **und** Mutation-während-Iteration erlauben — es
+sei denn, der Solver **beweist Nicht-Mutation** über die Schleife. Das *ist* der
+weggewischte Borrow-Beweis. **Dieselbe Alias-Frage steckt in `spawn`** („Wert muss
+gemoved sein" = Alias-Analyse über die Thread-Grenze = Send/Sync, wofür Rust
+Auto-Traits *braucht*). **Iterator, Nebenläufigkeit, Borrow sind ein und dasselbe
+Problem.**
+
+→ **Design-Entscheidung (aufgenommen, siehe [REFERENZ.md](REFERENZ.md) §9a):** Vire
+löst das *nicht* durch stille langsame RC-Iteration, sondern **konservativ und
+lokal**: der Compiler prüft *gezielt*, ob der Schleifenkörper die iterierte Sammlung
+(oder einen lokalen Alias davon) mutiert. Beweisbar nicht-mutierend → zero-cost
+Inline-Walk. Nicht beweisbar → **Compilezeit-Fehler**, der explizite Absicht
+verlangt (`for x in xs.snapshot()` oder Index-Schleife). Dieser *eine-Sammlung-eine-
+Schleife*-Check ist weit tractabler als allgemeine Alias-Analyse — aber er ist
+**echte Analyse, kein Weglassen**, und die allgemeine Präzision aus §7.1 bleibt der
+harte Kern.
+
+### 7.3 Zwei „Vorteile", die auch Nachteile sind
+- **Whole-Program / ein Durchlauf / keine Header** (SPRACHE §12) ist für die
+  *Ergonomie* ein **Nachteil**: keine separate Kompilierung, kein brauchbares
+  inkrementelles Caching — jeder Build reanalysiert alles. Whole-Program-Escape/RC
+  **+** Monomorphisierung **+** `comptime`-Auswertung stapelt drei teure Phasen und
+  entfernt die Modulgrenzen, die Caching erlauben. Rust ist schon wegen Mono für
+  Compile-Zeiten berüchtigt; Vire legt Whole-Program *obendrauf*. Für „so leicht wie
+  Python" (= schnelle Iteration) ist das die direkte Untergrabung des Kaufarguments.
+  **Skalierung auf 100k+ LOC: ungemessen** (Zigs `comptime` zeigt, dass genau dieser
+  Weg zu Compile-Zeit-/Speicherproblemen führt). Gegenmittel zu evaluieren:
+  Analyse-Caching pro Funktion mit Invalidierung über den Call-Graphen; `comptime`-
+  Budgets; separate Analyse-Ebene für „nur schnell bauen, Optimierung später".
+- **Globale Inferenz** ist kein „gelöstes Problem" (§5, korrigiert): HM + Traits +
+  Kohärenz + Mono-Soundness ist Integrationsarbeit, und die Fehler-Lokalität leidet.
+
+### 7.4 Konsequenz
+Das Urteil „ja, machbar, halb fertig" bleibt — aber **der ehrlichste nächste Schritt
+ist Messung, nicht Design** (Bauplan-Schritt 0). Zwei Zahlen entscheiden alles:
+(1) der RC-freie Anteil in *idiomatischem* Code + die Atomic-Contention-Rate unter
+Threads (§7.1), (2) die Compile-Zeit bei 100k+ LOC (§7.3). Solange die fehlen, ist
+„Rust-Niveau ohne Annotationen" ein *begründeter Slogan*, kein Ergebnis. Was **fest
+steht**: das Sicherheitsdreieck *pro Stelle* aufzulösen ist real; die teure Hälfte
+ist fertig und gemessen (dort scheitern die meisten Sprachprojekte); die modernen
+Grundentscheidungen (Option statt null, Fehler als Werte, comptime statt RTTI,
+hygienische Makros) sind gut begründet. Das trägt — die zwei Messungen sagen, *wie
+weit*.
+
+Siehe [SPRACHE.md](SPRACHE.md)/[REFERENZ.md](REFERENZ.md) für die Syntax und
+[beispiele/](beispiele/) für Programme über alle Zielbereiche.

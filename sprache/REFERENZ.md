@@ -49,9 +49,15 @@ Bindungen sind block-skopiert; Schatten (`x` in innerem Block neu binden) erlaub
 | Gleitkomma | `Float`(=`F64`), `F32` |
 | Weitere | `Bool`, `Char`, `Str`, `Unit`(`()`), `Ptr[T]` (nur `unsafe`) |
 
-Ganzzahl-Semantik: Debug = overflow-geprüft (Panic), Release = wrapping (per Flag
-konfigurierbar). Keine impliziten numerischen Konversionen — explizit mit `as`
-(`x as I64`, geprüft/saturating je nach Ziel dokumentiert).
+Ganzzahl-Semantik: **overflow-geprüft per Default — auch in Release** (Panic bzw.
+`Result` je Operator). Das ist bewusst *nicht* Rusts „Debug geprüft, Release
+wrapping": ein in Debug korrektes Programm, das in Release still wrappt, ist genau
+der Footgun, den eine sicherheits-orientierte Sprache nicht als Konfigurationsdetail
+verstecken darf. Wer Wrapping *will*, sagt es explizit — über Wrap-Operatoren
+(`a +% b`, `a *% b`, Zig-Stil) oder den Typ `Wrapping[T]`. `checked_add`/
+`saturating_add` liefern `Option`/geklemmten Wert. Ungeprüftes Wrapping in Release
+nur global abschaltbar (`--unchecked-arith`) — dokumentierte, bewusste Gefahr, nicht
+Default. Keine impliziten numerischen Konversionen — explizit mit `as`.
 
 ### 3.2 Zusammengesetzte Typen — `type`
 **Produkttyp** (struct, Werttyp, kein Objekt-Header):
@@ -205,6 +211,28 @@ Unsichtbar per Default; der Whole-Program-Solver entscheidet und beweist:
 Keine `new`/`free`, keine Lifetime-Syntax, kein `&mut`-Zwang. Details der
 Machbarkeit: [BEWERTUNG.md](BEWERTUNG.md) §1.A.
 
+## 9a. Mutation während Iteration (die Alias-Regel)
+
+Das Problem: `for x in xs { xs.push(x) }` — RC hält das *Objekt*, aber der `push`
+setzt den Backing-Puffer um, während der Iterator hineinzeigt. Iteration kann nicht
+*zugleich* ein zero-cost Pointer-Walk sein **und** Mutation erlauben (siehe
+[BEWERTUNG.md](BEWERTUNG.md) §7.2).
+
+**Regel:** Der Compiler prüft *gezielt und lokal*, ob der Schleifenkörper die
+iterierte Sammlung (oder einen lokalen Alias) mutiert:
+- **beweisbar nicht-mutierend** → zero-cost Inline-Iteration (der Normalfall);
+- **nicht beweisbar** → **Compilezeit-Fehler**. Keine stille langsame RC-Iteration —
+  explizite Absicht ist verlangt:
+  ```vire
+  for x in xs.snapshot() { xs.push(x) }   // iteriere eine Kopie, mutiere das Original
+  for i in 0..xs.len() { xs[i] = f(xs[i]) } // Index-Zugriff, bounds-geprüft
+  ```
+
+Dieser *eine-Sammlung-eine-Schleife*-Check ist weit einfacher als allgemeine
+Alias-/Borrow-Analyse (er betrachtet eine Sammlung und lokale Aliase in *einer*
+Funktion), aber er ist echte Analyse. Er ist dieselbe Frage wie „darf dieser Wert an
+`spawn`" (§10) — nur lokaler.
+
 ## 10. Nebenläufigkeit — *Punkt 1*
 
 ```vire
@@ -226,23 +254,34 @@ sicheren Typen im Kanal-/Mutex-Stil; **kein** Deadlock-Freiheits-Versprechen.
 
 ## 11. Fehlerbehandlung — *Punkt 7*
 
-Fehler sind **Werte** (Go-Prinzip), explizit im Rückgabetyp, keine Exceptions.
+**Go-Geist, aber ohne `null`.** Fehler sind **Werte**, explizit im Rückgabetyp,
+keine Exceptions, kein verstecktes Non-Local-Control-Flow — das ist Gos Kern. Aber
+Vire benutzt **nicht** Gos `(T, error)`-Tupel mit `nil`: ein `nil`-Fehler wäre ein
+`null` durch die Hintertür und verletzt Leitprinzip 4 (kein `null`). Stattdessen
+**ein** konsistentes Modell: `Result[T, E]` (E typisiert, oft ein Summentyp oder das
+`Error`-Interface). „Fehlbar" steht damit sichtbar in der Signatur (Go-Prinzip),
+aber getypt und ohne null.
 ```vire
-fn load(path: Str) -> (Config, Error) {
-    raw = read_file(path)?                // `?`: bei Err früh mit dem Fehler zurück
-    parse(raw).wrap("Config {path}")      // Kontext an den Fehler hängen
+type ConfigError { NotFound(path: Str), BadSyntax(path: Str, line: Int) }
+
+fn load(path: Str) -> Result[Config, ConfigError] {
+    raw = read_file(path).wrap("Config {path}")?   // `?`: bei Err früh zurück + Kontext
+    parse(raw)                                       // Result als Rückgabe
 }
 
-cfg, err = load("app.cfg")                // explizite Prüfung (Go-Stil) …
-if err != nil { return err }
-
-match err {                               // … oder typisiertes Verzweigen
-    NotFound(p) -> default_at(p)
-    _           -> return err
+// Behandlung: explizit per match (das ist Gos „val, err"-Verzweigung, getypt) …
+match load("app.cfg") {
+    Ok(cfg)               -> run(cfg)
+    Err(NotFound(p))      -> run(default_at(p))
+    Err(e)                -> return Err(e)
 }
 ```
-- `?` propagiert `Err`/`None` (Ersatz für Gos `if err != nil`-Kaskade).
-- `err.wrap(msg)` behält die Kette; in Debug hängt der Erzeugungs-Pfad an (Punkt 8).
+- `?` propagiert `Err`/`None` (ersetzt Gos `if err != nil`-Kaskade), *ohne* die
+  Explizitheit zu verlieren — die Signatur zeigt weiter die Fehlbarkeit.
+- `.wrap(msg)` hängt Kontext an, behält die Kette; in Debug den Erzeugungs-Pfad
+  (Punkt 8).
+- **Kein `nil`, kein `(T, Error)`-Tupel** — historische Fassungen zeigten das; es
+  ist entfernt, weil es `null` reintroduziert.
 - `panic(msg)`/`assert(cond)` nur für **Programmierfehler**, nicht für erwartbare
   Fehler; brechen mit Crash-Pfad ab (Punkt 8).
 

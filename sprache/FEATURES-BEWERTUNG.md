@@ -123,13 +123,27 @@ Verhalten braucht, generiert es zur Compilezeit oder nutzt einen Summentyp.
 
 ---
 
-## 4. Präprozessor-Makros 🔴 → besser: hygienische Makros + `comptime`
+## 4. Eigener (optionaler) Präprozessor 🟢
 
-**Urteil (ehrlich, gegen den Wortlaut):** Einen **C-artigen Text-Präprozessor
-(`#define`, `#ifdef`, Token-Einfügung) sollte Vire *nicht* haben.** Er ist die
-Quelle halber Sprach-Katastrophen: unhygienisch (fängt Namen ein), typ-blind,
-debugger-feindlich, bricht Werkzeuge. Fast alles, wofür man historisch den
-Präprozessor nutzt, löst Vire sauberer:
+**Klarstellung (Nutzer):** Gemeint ist **nicht** der C-Präprozessor, sondern ein
+**eigener, bei Bedarf nutzbarer** Präprozessor. Damit ist die Sache klar und
+positiv: Genau das liefert Vire — nur ist der „Präprozessor" **kein Textersetzer**,
+sondern die **AST-/`comptime`-Ebene**. Das ist die moderne, sichere Form eines
+eigenen Präprozessors: opt-in, hygienisch, typgeprüft, werkzeugfreundlich.
+
+Konkret sind es drei zusammengehörige, *optionale* Mechanismen:
+- **`comptime`** — beliebiger Code, der *vor* der eigentlichen Compilierung im
+  Compiler läuft (Konstanten-Tabellen, Codegen aus Schemata, Reflection). Das *ist*
+  eine Präprozessor-Phase, nur getypt und in derselben Sprache.
+- **`@if`/`@when`** — bedingte Compilierung (Plattform-/Feature-Weichen) als
+  Direktiven, ersetzen `#ifdef` — aber ausdrucksbasiert und geprüft.
+- **hygienische Makros** — syntaktische Abstraktion auf dem AST (keine
+  Namens-Einfänge).
+
+**Bewusst *nicht* der C-Text-Präprozessor** (`#define`-Tokenkleben): unhygienisch
+(fängt Namen ein), typ-blind, debugger-feindlich, bricht Werkzeuge. Ein *eigener*
+Präprozessor ja — aber als AST/`comptime`, nicht als Text. Was man klassisch mit dem
+Präprozessor macht, geht damit sauberer:
 
 | Präprozessor-Zweck | Vire-Ersatz |
 |---|---|
@@ -153,10 +167,10 @@ macro timed(label, body) {                            // misst einen Block
 }
 ```
 
-**Verdict:** „Präprozessor-Makros" als *Fähigkeit* (Metaprogrammierung, bedingte
-Compilierung) — **ja, voll**. Als *C-Präprozessor-Mechanik* — **nein**, das wäre
-ein Rückschritt hinter Rust/Zig. Das ist eine bewusste Design-Empfehlung, kein
-Weglassen von Funktionalität.
+**Verdict:** Eigener, optionaler Präprozessor — **ja, voll** (als `comptime` +
+`@if` + hygienische Makros). Nur die *Mechanik* ist AST/getypt statt Textersetzung —
+dieselbe Fähigkeit, sicher umgesetzt. Wer möchte, nutzt ihn; wer nicht, sieht ihn
+nie.
 
 ---
 
@@ -246,30 +260,30 @@ heißt: **explizit** und **als Wert**, aber Vire behebt Gos zwei bekannte Schwä
 - **Stacktraces**: In Debug-Builds trägt jeder Fehler den Erzeugungs-Pfad (Punkt 8)
   — das, was Go schmerzlich fehlt.
 
+**Wichtig — kein `nil`, kein `(T, error)`-Tupel:** Gos Tupel mit `nil` würde `null`
+durch die Hintertür reinholen und Leitprinzip 4 verletzen. Vire behält Gos *Geist*
+(Fehler als explizite Werte, sichtbar in der Signatur, kein Exception-Fluss) in
+**einem** getypten Modell: `Result[T, E]`.
 ```vire
-// Signatur macht Fehlbarkeit sichtbar (Go-Prinzip):
-fn load(path: Str) -> (Config, Error) {          // Mehrfachrückgabe wie Go …
-    raw = read_file(path)?                        // … aber `?` statt if-err-Kaskade
-    parse(raw).wrap("Config {path}")              // Kontext an den Fehler
+type ConfigError { NotFound(path: Str), Permission(path: Str) }
+
+// Signatur macht Fehlbarkeit sichtbar (Go-Prinzip), aber getypt & ohne null:
+fn load(path: Str) -> Result[Config, ConfigError] {
+    raw = read_file(path).wrap("Config {path}")?   // `?` statt if-err-Kaskade
+    parse(raw)
 }
 
-// Explizite Behandlung, wenn gewünscht (voll Go-Stil):
-cfg, err = load("app.cfg")
-if err != nil {
-    log.error("start fehlgeschlagen", err: err)   // err trägt Kontext + Debug-Pfad
-    return err
-}
-
-// Typisierte Fehler + Pattern-Matching, wenn man verzweigen will:
-match err {
-    NotFound(p)   -> create_default(p)
-    Permission(p) -> fatal("keine Rechte: {p}")
-    _             -> return err
+// Explizite, typisierte Behandlung per match (= Gos „val, err"-Verzweigung):
+match load("app.cfg") {
+    Ok(cfg)             -> run(cfg)
+    Err(NotFound(p))    -> run(create_default(p))
+    Err(Permission(p))  -> fatal("keine Rechte: {p}")
+    Err(e)              -> { log.error("start", err: e); return Err(e) }
 }
 ```
 
-**Zuschnitt:** Vire mischt Gos *Werte-Explizitheit* mit einem `?`-Zucker und
-typisierten Fehlern (mehr als Gos nacktes `error`-Interface). Kein Panic-für-alles.
+**Zuschnitt:** Vire behält Gos *Werte-Explizitheit* + `?`-Zucker, aber getypt
+(`Result`, mehr als Gos nacktes `error`) und **ohne `nil`**. Kein Panic-für-alles.
 `panic`/`abort` bleibt für **Programmierfehler** (Invarianten-Bruch), nicht für
 erwartbare Fehler — mit Crash-Pfad (Punkt 8).
 
@@ -308,24 +322,28 @@ panic: index 7 out of bounds for length 5
 
 | # | Feature | Urteil | Kern |
 |---|---|---|---|
-| 1 | Multithreading + Race-Sicherheit | 🟡 | Ergonomie leicht; Race-Freiheit „by construction" (Kanäle/Mutex + leichte Send-Inferenz), keine Totalgarantie |
+| 1 | Multithreading + Race-Sicherheit | 🟢* | leicht + „safe by construction" (Kanäle/Mutex + Send-Inferenz) — vom Nutzer als **genug** bestätigt; keine Totalgarantie über beliebige Alias-Graphen |
 | 2 | Template-Programmierung | 🟢 | Generics+Traits (monomorphisiert) + `comptime` statt C++-Templates |
 | 3 | Compile-Time-Reflection | 🟢 | stärkster Fit (Closed-World), zero-cost, ersetzt `@derive`/Serialisierung |
-| 4 | Präprozessor-Makros | 🔴→ | **kein** C-Präprozessor; hygienische Makros + `comptime`-`@if` |
+| 4 | Eigener optionaler Präprozessor | 🟢 | als `comptime`/`@if`/hygienische Makros (AST statt Text) — nicht der C-Präprozessor |
 | 5 | Meson first-class | 🟢🟡 | Meson-Modul + stabile CLI; Empfehlung: Meson *adoptieren* statt eigenes Build |
 | 6 | Logger in gut | 🟢 | strukturiert, comptime-weggeschaltet (0 Kosten), Spans, Sinks |
-| 7 | Error handling à la Go | 🟡 | Werte+explizit (Go), aber `?`-Zucker, Wrapping, Typen, Debug-Pfade |
+| 7 | Error handling à la Go | 🟢* | Werte+explizit (Go-Geist), `?`, Wrapping, typisiert — **`Result`, kein `nil`** |
 | 8 | Debug-Symbole + Crash-Pfade | 🟢 | DWARF via LLVM + Laufzeit-Backtrace in Debug; Release 0 Overhead |
 
-**Zwei Punkte gegen den Wortlaut, mit Begründung:** (4) C-Präprozessor ist ein
-Rückschritt — hygienische Makros/`comptime` liefern dasselbe sicher; (1)
-„race-frei für alles" ist ohne Ownership-Annotationen nicht seriös versprechbar —
-„sicher by construction für den Kanal-/Mutex-Stil" schon. Beides ist *mehr*
-Ehrlichkeit, nicht weniger Feature.
+*(1) und (7) `🟢*`: freigegeben mit dem zugeschnittenen Scope — (1) leicht +
+safe-by-construction ist **genug** (Nutzer bestätigt), keine Race-Freiheit für
+beliebige Alias-Graphen; (7) Go-Geist über getyptes `Result`, **ohne** Gos `nil`.*
+
+**Ein Punkt bleibt bewusst zugeschnitten:** „race-frei für alles" ist ohne
+Ownership-Annotationen nicht seriös versprechbar — „sicher by construction für den
+Kanal-/Mutex-Stil" ist die ehrliche und **ausreichende** Zusage. Der harte Kern
+dahinter (Alias-Präzision) ist in [BEWERTUNG.md](BEWERTUNG.md) §7 offen benannt; die
+`spawn`-Send-Prüfung ist dieselbe Analyse wie die Iterator-Regel ([REFERENZ.md](REFERENZ.md) §9a), nur konservativ (im Zweifel Mutex/move verlangt).
 
 **Alle acht docken an vorhandene FastLLVM-Fähigkeiten an:** Threads/atomare RC (1),
 Monomorphisierung/Inliner (2), Whole-Program-Typgraph (3, für Reflection), der
 Solver (1, Send-Inferenz), clang→Objekt (5), comptime als Front-End-Auswerter (2,3,
-4,6), das pending-/Panic-Modell (7,8), LLVM-Debug-Metadaten (8). Neu zu bauen ist
+4,6), das Wert-/Panic-Fehlermodell (7,8), LLVM-Debug-Metadaten (8). Neu zu bauen ist
 das Front-End (Lexer/Parser/Inferenz/`comptime`-Auswerter) — der Backend-Stack
-bleibt.
+bleibt. Umsetzungsreihenfolge & Aufgaben: [../TODO.md](../TODO.md).
