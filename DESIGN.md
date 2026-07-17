@@ -225,3 +225,63 @@ Kurzfassung: **Compiler-Technik + Speichersicherheits-/Nebenläufigkeits-*Fundam
 ## 8. Präzedenzfälle
 
 GCJ, Excelsior JET, RoboVM, **GraalVM Native Image** (Architektur-Vorbild: Closed World, Points-to vor Codegen, Image Heap, Reachability-Metadaten), TeaVM, ParparVM. Kernliteratur: Dean/Grove/Chambers 1995 (CHA); Choi 1999 (EA); Milanova 2005 & Smaragdakis 2011 (Objektsensitivität, Doop); Van Horn/Mairson 2008 (k-CFA-Komplexität); Livshits 2005 / Smaragdakis 2015 (Reflection-Grenzen); Tofte/Talpin 1997 (Region-Inferenz).
+
+---
+
+## 9. Plan: Runtime-Elimination durch Solver-Ausbau
+
+**Projektziel:** JAR → Binary *ohne Runtime*, Performance auf Rust-Niveau. Maßstab
+ist Rust — das selbst nicht runtime-frei ist (liballoc, Bounds-/Overflow-Checks,
+Panic-Pfad). „Mit Rust mithalten" heißt **nicht mehr Overhead als Rust**. Die
+einzigen echten Deltas des heutigen `runtime.c` gegenüber Rust sind (1) der GC
+(RC + Zyklen-Collector — hat Rust nicht) und (2) Java-Overhead (Boxing,
+String-als-Objekt). Alles andere entspricht Rusts `std`. **Wichtig:** Rust nutzt
+für geteilte veränderliche Graphen `Rc`/`Arc` = Laufzeit-RC; Java-mit-RC gegen
+Rust-mit-`Rc` ist *Parität*. Der Rückstand ist nur dort, wo Rust plain ownership
+nutzt und der Compiler mangels Beweis auf RC zurückfällt — das schließt der Solver.
+
+**Harte Grenze (Ehrlichkeit):** präzises compilezeitliches Speichermanagement
+beliebiger Objektgraphen ist unentscheidbar (Aliasing, dynamische Lebensdauern,
+Zyklen). „Null Runtime für *jedes* Programm" ist unmöglich. Erreichbar: den
+analysierbaren Großteil auf Rust-Niveau, den GC für die meisten Programme *ganz*
+entfernen, den Rest auf minimale RC reduzieren.
+
+**Gestuftes Speichermanagement** (Objekt fällt in die höchste beweisbare Stufe):
+1. Stack/Skalar (entkommt nicht) — null Kosten. ✅ feld-sensitiv
+2. Region/Arena (LIFO-Lebensdauer, Tofte-Talpin) — Bump/Bulk-Free.
+3. Unique/Owned (linear) — Free bei letztem Gebrauch (Rust-`move`).
+4. RC ohne Collector (Typgraph azyklisch) — nur inc/dec.
+5. Voll-RC + Zyklen — nur der beweisbare Rest. ✅
+
+### Sechs Phasen (je einzeln messbar, Suite bleibt grün)
+
+1. **Azyklizitäts-Analyse → Collector-Elimination.** Typ-Referenzgraph unter
+   Closed World (Kante A→B, wenn A ein Ref-Feld vom Typ T hat und B ein
+   instanziierter Subtyp von T ist; Arrays als Durchleitung). Kein Typ auf einem
+   Zyklus → `-DFASTLLVM_NO_CYCLES`: der Zyklen-Collector (~250 Zeilen) fällt weg,
+   `retain`/`release` werden farb-/pufferfrei (billiger). Größter Runtime-Wegfall,
+   sauber beweisbar, an der Binary messbar.
+2. **Support-Bibliothek nach stdlib + Dead-Stripping.** String/StringBuilder/
+   Boxing aus C nach `stdlib/` (wie ArrayList/Arrays) → unterliegen demselben
+   Solver (Inlining, Devirt, Escape → lokaler StringBuilder wird stack-alloziert
+   wie Rusts String-Buffer). Runtime mit `-ffunction-sections -fdata-sections` +
+   `--gc-sections` → ungenutzte `jrt_`-Symbole werden gestrippt.
+3. **Region/Arena-Inferenz.** Allokationslastige Aufrufbäume/Schleifen mit
+   geschachtelter Lebensdauer in Arenen (Bump-Alloc, Bulk-Free am Region-Ende).
+   Entfernt RC aus den Hotspots. Präzedenz: RTSJ Scoped Memory, ASAP/Proust.
+4. **Uniqueness/Ownership-Inferenz → Moves.** Beweisbar eindeutige Referenzen am
+   letzten Gebrauch freigeben statt RC — Rusts Owning-Move. Verallgemeinerung der
+   Escape-Analyse auf „eindeutig, entkommt an bekannte Senke".
+5. **Objekt-sensitive Points-to (Präzision).** Milanova/Smaragdakis (Doop-Stil) +
+   interprozedurale Escape-Analyse; hebt automatisch die Trefferquote von 1–4.
+6. **Irreduzibler Kern + Rust-Benchmark.** Übrig bleibt, was Rust auch hat:
+   Allokator-Shim, Safety-Intrinsics (÷0/Bounds/NPE — per Range-Analyse
+   elidierbar), Minimal-`plat_write` — ~150–250 Zeilen, deckungsgleich mit einem
+   `no_std`-Rust-Support. Gegen äquivalente Rust-Programme messen (Allokation,
+   Traversierung, Zahl-Crunching).
+
+**Urteil:** „Null Runtime für alles" unmöglich; „GC eliminiert / Rust-Parität auf
+dem analysierbaren Großteil" realistisch — der Collector verschwindet für
+azyklische Programme ganz (Phase 1), Hot-Paths werden RC-frei (Phase 3/4), der
+C-Rest schrumpft auf Rust-Niveau. Closed World liefert genau die Whole-Program-
+Information, die die Ownership-Beweise brauchen.
