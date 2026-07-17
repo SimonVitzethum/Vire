@@ -9,25 +9,76 @@ use fastllvm_ir::{BasicBlock, BinOp as IB, Block, Function, Local, Operand, Prog
 
 use crate::ast::*;
 
+/// Feldlayout eines Nutzertyps: (Feldname, IR-Typ, Ref-Ziel-Klasse).
+type Layout = Vec<(String, Ty, Option<String>)>;
+
+/// Aufruf-Signatur einer Funktion: Parametertypen, Rückgabetyp, Rückgabe-Klasse
+/// (bei Objekt-Rückgabe der Klassenname — für Feldzugriff auf das Ergebnis).
+struct Sig {
+    params: Vec<Ty>,
+    ret: Ty,
+    ret_class: Option<String>,
+}
+
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     let mut prog = Program::default();
-    // Signatur-Tabelle (Name → (ParamTypen, RückgabeTyp)) für Aufrufe.
-    let mut sigs: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
+    let mut errs = Vec::new();
+
+    // Produkttypen (Felder, keine Varianten) → Klassen + Layout-Tabelle.
+    // Summentypen (Varianten) folgen später (getaggte Union).
+    let mut types: HashMap<String, Layout> = HashMap::new();
+    for it in &m.items {
+        if let Item::Type(t) = it {
+            if !t.variants.is_empty() {
+                errs.push(format!("Summentyp `{}` (Varianten) noch nicht abgesenkt", t.name));
+                continue;
+            }
+            let layout: Layout = t
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), ty_of(Some(&f.ty)), class_of(Some(&f.ty))))
+                .collect();
+            types.insert(t.name.clone(), layout);
+        }
+    }
+    // ClassInfo je Produkttyp registrieren (super = Object, keine Methoden).
+    for it in &m.items {
+        if let Item::Type(t) = it {
+            if t.variants.is_empty() {
+                let fields = types[&t.name]
+                    .iter()
+                    .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+                    .collect();
+                prog.classes.push(fastllvm_ir::ClassInfo {
+                    name: t.name.clone(),
+                    super_name: Some("java/lang/Object".to_string()),
+                    is_interface: false,
+                    interfaces: vec![],
+                    fields,
+                    static_fields: vec![],
+                    methods: vec![],
+                    has_clinit: false,
+                });
+            }
+        }
+    }
+
+    // Signatur-Tabelle (Name → (ParamTypen, RückgabeTyp, Rückgabe-Klasse)) für Aufrufe.
+    let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
             let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
-            sigs.insert(f.sig.name.clone(), (ps, guess_ret_ty(f)));
+            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of(f.sig.ret.as_ref()) });
         }
     }
-    let mut errs = Vec::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            match lower_fn(f, &sigs, &mut prog.strings) {
+            match lower_fn(f, &sigs, &types, &mut prog.strings) {
                 Ok(func) => prog.functions.push(func),
                 Err(mut e) => errs.append(&mut e),
             }
         }
-        // type/trait/impl/const/use/extern: M2+ — hier noch übersprungen
+        // trait/impl/const/use/extern: M2+ — hier noch übersprungen
     }
     if errs.is_empty() {
         Ok(prog)
@@ -43,8 +94,19 @@ fn ty_of(t: Option<&Type>) -> Ty {
         Some("Bool") => Ty::I32,
         Some("Str") => Ty::Ref,
         Some("I32") | Some("U32") => Ty::I32,
+        Some("Int") | Some("I64") | Some("U64") => Ty::I64,
         Some("Unit") | None => Ty::I64, // Default-Ganzzahl, wenn nichts steht
-        Some(_) => Ty::I64,
+        // Alles andere ist ein (Nutzer-)Referenztyp: Objekt auf dem Heap.
+        Some(_) => Ty::Ref,
+    }
+}
+
+/// Klassenname eines Referenztyp-Annotats (für GetField/New), sonst None.
+fn class_of(t: Option<&Type>) -> Option<String> {
+    let name = t?.name.as_str();
+    match name {
+        "Float" | "F64" | "F32" | "Bool" | "Str" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" => None,
+        _ => Some(name.to_string()),
     }
 }
 
@@ -113,7 +175,11 @@ struct FnLower<'a> {
     blocks: Vec<BasicBlock>,
     cur: usize,
     scopes: Vec<HashMap<String, (Local, Ty)>>,
-    sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
+    sigs: &'a HashMap<String, Sig>,
+    /// Nutzertyp-Layouts (Name → Felder) für New/GetField.
+    types: &'a HashMap<String, Layout>,
+    /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
+    local_class: HashMap<u32, String>,
     /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
     strings: &'a mut Vec<String>,
     errs: Vec<String>,
@@ -153,6 +219,13 @@ impl<'a> FnLower<'a> {
     }
     fn bind(&mut self, name: &str, l: Local, t: Ty) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), (l, t));
+    }
+    /// Klasse eines Operanden, falls er ein Ref-Local mit bekannter Klasse ist.
+    fn class_of_operand(&self, op: &Operand) -> Option<String> {
+        match op {
+            Operand::Copy(l) => self.local_class.get(&l.0).cloned(),
+            _ => None,
+        }
     }
 
     fn lower_block(&mut self, b: &Block2) {
@@ -195,6 +268,10 @@ impl<'a> FnLower<'a> {
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
                 let l = self.new_local(ty);
+                // Objekt-Klasse an den neuen Local weiterreichen (für p.x).
+                if let Some(c) = self.class_of_operand(&op) {
+                    self.local_class.insert(l.0, c);
+                }
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
             }
@@ -365,6 +442,29 @@ impl<'a> FnLower<'a> {
                 self.emit(Statement::Assign(d, Rvalue::Binary(map_op(*op), l, r)));
                 (Operand::Copy(d), ty)
             }
+            Expr::Field { base, name, .. } => {
+                let (obj, _) = self.lower_expr(base);
+                let class = match self.class_of_operand(&obj) {
+                    Some(c) => c,
+                    None => {
+                        self.errs.push(format!("Feldzugriff `.{name}`: Typ des Objekts unbekannt (annotieren)"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
+                };
+                let (fty, rtarget) = match self.types.get(&class).and_then(|l| l.iter().find(|(n, ..)| n == name)) {
+                    Some((_, ty, rt)) => (*ty, rt.clone()),
+                    None => {
+                        self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
+                };
+                let d = self.new_local(fty);
+                if let Some(rt) = rtarget {
+                    self.local_class.insert(d.0, rt);
+                }
+                self.emit(Statement::GetField { dest: d, obj, class, field: name.clone() });
+                (Operand::Copy(d), fty)
+            }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Block(b) => self.lower_block_val(b),
@@ -387,6 +487,29 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
+        // Konstruktor eines Nutzertyps: `Point(x, y)` → New + PutField je Feld
+        // (Feldreihenfolge = Deklarationsreihenfolge).
+        if let Some(layout) = self.types.get(&name).cloned() {
+            let obj = self.new_local(Ty::Ref);
+            self.local_class.insert(obj.0, name.clone());
+            self.emit(Statement::New { dest: obj, class: name.clone() });
+            if args.len() != layout.len() {
+                self.errs.push(format!("{name}: {} Felder erwartet, {} übergeben", layout.len(), args.len()));
+            }
+            for ((fname, fty, _), arg) in layout.iter().zip(args) {
+                let (mut v, _) = self.lower_expr(arg);
+                if *fty == Ty::I64 {
+                    v = to_i64(v);
+                }
+                self.emit(Statement::PutField {
+                    obj: Operand::Copy(obj),
+                    class: name.clone(),
+                    field: fname.clone(),
+                    value: v,
+                });
+            }
+            return (Operand::Copy(obj), Ty::Ref);
+        }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
         // Intrinsic `print`
         if name == "print" {
@@ -401,13 +524,16 @@ impl<'a> FnLower<'a> {
             return (Operand::ConstI64(0), Ty::Void);
         }
         // Aufruf einer eigenen Funktion
-        let (_, ret) = self.sigs.get(&name).cloned().unwrap_or((vec![], Ty::I64));
+        let (ret, ret_class) = self.sigs.get(&name).map(|s| (s.ret, s.ret_class.clone())).unwrap_or((Ty::I64, None));
         let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
         if ret == Ty::Void {
             self.emit(Statement::Call { dest: None, func: name, args: arg_ops });
             (Operand::ConstI64(0), Ty::Void)
         } else {
             let d = self.new_local(ret);
+            if let Some(c) = ret_class {
+                self.local_class.insert(d.0, c); // Objekt-Rückgabe: Klasse merken
+            }
             self.emit(Statement::Call { dest: Some(d), func: name, args: arg_ops });
             (Operand::Copy(d), ret)
         }
@@ -459,7 +585,12 @@ impl<'a> FnLower<'a> {
 // Der AST nennt Block; hier Alias, um Namenskollision mit ir::Block zu vermeiden.
 use crate::ast::Block as Block2;
 
-fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>, strings: &mut Vec<String>) -> Result<Function, Vec<String>> {
+fn lower_fn(
+    f: &FnDef,
+    sigs: &HashMap<String, Sig>,
+    types: &HashMap<String, Layout>,
+    strings: &mut Vec<String>,
+) -> Result<Function, Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = if f.sig.name == "main" { "java_main".to_string() } else { f.sig.name.clone() };
     let mut fl = FnLower {
@@ -468,6 +599,8 @@ fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>, strings: &mut Vec<
         cur: 0,
         scopes: vec![HashMap::new()],
         sigs,
+        types,
+        local_class: HashMap::new(),
         strings,
         errs: Vec::new(),
         loops: Vec::new(),
@@ -480,6 +613,10 @@ fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>, strings: &mut Vec<
         let t = ty_of(p.ty.as_ref());
         param_tys.push(t);
         let l = fl.new_local(t);
+        // Objekt-Parameter: Klasse aus dem Annotat für Feldzugriffe merken.
+        if let Some(c) = class_of(p.ty.as_ref()) {
+            fl.local_class.insert(l.0, c);
+        }
         fl.bind(&p.name, l, t);
     }
     if let Some(body) = &f.body {

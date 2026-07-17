@@ -619,7 +619,8 @@ pub fn emit(program: &Program) -> String {
     // java/lang/String-Klasse → deren Vtable fehlt, während die @jstr-Konstanten
     // sie referenzieren. Minimal-Vtable nachreichen (nur No-Op-Drop/Trace +
     // null-Typdeskriptor); String-Methoden-Dispatch gibt es in Vire noch nicht.
-    if !program.strings.is_empty() && !instantiated.contains("java/lang/String") {
+    // Auch die Klassennamen-Konstanten (@jclassname.*) sind @jstr → String-Vtable.
+    if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
         writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
     }
     writeln!(w).unwrap();

@@ -71,6 +71,22 @@ fn string_literale_landen_im_pool() {
 }
 
 #[test]
+fn produkttyp_new_und_feldzugriff() {
+    let src = "type P {\n x: Int\n y: Int\n}\nfn main() {\n mut p = P(3, 4)\n print(p.x)\n}\n";
+    let p = lower(src);
+    // Klasse P registriert mit zwei I64-Feldern.
+    let c = p.classes.iter().find(|c| c.name == "P").expect("Klasse P");
+    assert_eq!(c.fields.len(), 2);
+    assert_eq!(c.fields[0].name, "x");
+    assert_eq!(c.fields[0].ty, Ty::I64);
+    // Konstruktion → New + zwei PutField; Zugriff → GetField.
+    let stmts: Vec<_> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).collect();
+    assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::New { class, .. } if class == "P")));
+    assert_eq!(stmts.iter().filter(|s| matches!(s, fastllvm_ir::Statement::PutField { .. })).count(), 2);
+    assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "x")));
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());
