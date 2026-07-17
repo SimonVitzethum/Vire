@@ -605,9 +605,9 @@ void jrt_retain(void *p);
 void jrt_release(void *p);
 JStr *jrt_str_format(const JStr *fmt, void *argsp) {
     /* Object[]-Layout: { rc, rcflags, vtable, length, elems… }; length bei
-     * Offset 24, Elemente ab 32 (JArray ist weiter unten definiert). */
+     * Offset 24, Elemente ab 40 (JArray ist weiter unten definiert). */
     int64_t nargs = argsp ? *(int64_t *)((char *)argsp + 24) : 0;
-    void **elems = argsp ? (void **)((char *)argsp + 32) : NULL;
+    void **elems = argsp ? (void **)((char *)argsp + 40) : NULL;
     JSB *sb = (JSB *)jrt_sb_new();
     int ai = 0;
     for (int64_t i = 0; i < fmt->len; i++) {
@@ -771,9 +771,7 @@ void *jrt_alloc(int64_t size) {
     }
     if (total_allocated++ == 0) {
 #ifndef FASTLLVM_FREESTANDING
-#ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
-#endif
 #endif
     }
     live_objects++;
@@ -1030,12 +1028,14 @@ void jrt_check_uncaught(void) {
 
 /* --- Arrays ---------------------------------------------------------- */
 
-/* Gleicher Header wie Objekte, dann die Länge; Elemente folgen direkt. */
+/* Gleicher Header wie Objekte, dann Länge + Elementgröße (für arraycopy/
+ * clone ohne statischen Typ); Elemente folgen direkt (ab Offset 40). */
 typedef struct {
     int64_t refcount;
     int64_t rcflags;
     void *vtable;
     int64_t length;
+    int64_t elem_size;
 } JArray;
 
 void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
@@ -1050,9 +1050,7 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     }
     if (total_allocated++ == 0) {
 #ifndef FASTLLVM_FREESTANDING
-#ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
-#endif
 #endif
     }
     live_objects++;
@@ -1060,6 +1058,7 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     a->refcount = 1;
     a->vtable = vtable;
     a->length = count;
+    a->elem_size = elem_size;
     return p;
 }
 
@@ -1191,6 +1190,112 @@ void *jrt_array_clone(void *arr, int64_t elem_size, int32_t is_ref) {
     }
     return p;
 }
+
+/* System.arraycopy: elementgrößen-/ref-korrekt (elem_size + Ref-Vtable im
+ * Header). Überlappungsfest (memmove-Semantik); Ref-Arrays retainen die
+ * Quelle vor dem Freigeben des Ziels. Fehler brechen ab (nicht abfangbar). */
+void jrt_array_ref_drop(void *p);
+void jrt_arraycopy(void *src, int32_t srcPos, void *dst, int32_t dstPos, int32_t len) {
+    if (!src || !dst) {
+        plat_uncaught("java.lang.NullPointerException");
+        plat_abort();
+    }
+    JArray *s = (JArray *)src, *d = (JArray *)dst;
+    if (srcPos < 0 || dstPos < 0 || len < 0 ||
+        (int64_t)srcPos + len > s->length || (int64_t)dstPos + len > d->length) {
+        plat_uncaught("java.lang.ArrayIndexOutOfBoundsException");
+        plat_abort();
+    }
+    if (len == 0) return;
+    int64_t es = s->elem_size;
+    void **svt = (void **)s->vtable;
+    int is_ref = svt && svt[0] == (void *)jrt_array_ref_drop;
+    if (is_ref) {
+        void **se = (void **)(s + 1), **de = (void **)(d + 1);
+        for (int32_t i = 0; i < len; i++) jrt_retain(se[srcPos + i]);   /* Quelle sichern */
+        for (int32_t i = 0; i < len; i++) jrt_release(de[dstPos + i]);  /* Ziel freigeben */
+        if (dstPos < srcPos)
+            for (int32_t i = 0; i < len; i++) de[dstPos + i] = se[srcPos + i];
+        else
+            for (int32_t i = len - 1; i >= 0; i--) de[dstPos + i] = se[srcPos + i];
+    } else {
+        uint8_t *sb = (uint8_t *)(s + 1) + (int64_t)srcPos * es;
+        uint8_t *db = (uint8_t *)(d + 1) + (int64_t)dstPos * es;
+        int64_t n = (int64_t)len * es;
+        if (db < sb)
+            for (int64_t i = 0; i < n; i++) db[i] = sb[i];
+        else
+            for (int64_t i = n - 1; i >= 0; i--) db[i] = sb[i];
+    }
+}
+
+/* --- Zahl-Parsing / Math / Zeit (Runtime-Intrinsics) ----------------- */
+
+/* Integer.parseInt / Long.parseLong (Byte-/ASCII-Semantik). Ungültige
+ * Eingabe bricht ab (NumberFormatException nicht abfangbar). */
+static int64_t parse_signed(const JStr *s) {
+    if (!s || s->len == 0) {
+        plat_uncaught("java.lang.NumberFormatException");
+        plat_abort();
+    }
+    int64_t i = 0, sign = 1;
+    if (s->bytes[0] == '-') { sign = -1; i = 1; }
+    else if (s->bytes[0] == '+') { i = 1; }
+    if (i >= s->len) {
+        plat_uncaught("java.lang.NumberFormatException");
+        plat_abort();
+    }
+    int64_t v = 0;
+    for (; i < s->len; i++) {
+        uint8_t c = s->bytes[i];
+        if (c < '0' || c > '9') {
+            plat_uncaught("java.lang.NumberFormatException");
+            plat_abort();
+        }
+        v = v * 10 + (c - '0');
+    }
+    return sign * v;
+}
+int32_t jrt_parse_int(const JStr *s) { return (int32_t)parse_signed(s); }
+int64_t jrt_parse_long(const JStr *s) { return parse_signed(s); }
+
+int32_t jrt_math_abs_i(int32_t v) { return v < 0 ? -v : v; }
+int64_t jrt_math_abs_l(int64_t v) { return v < 0 ? -v : v; }
+double jrt_math_abs_d(double v) { return v < 0 ? -v : v; }
+float jrt_math_abs_f(float v) { return v < 0 ? -v : v; }
+int32_t jrt_math_max_i(int32_t a, int32_t b) { return a > b ? a : b; }
+int32_t jrt_math_min_i(int32_t a, int32_t b) { return a < b ? a : b; }
+int64_t jrt_math_max_l(int64_t a, int64_t b) { return a > b ? a : b; }
+int64_t jrt_math_min_l(int64_t a, int64_t b) { return a < b ? a : b; }
+double jrt_math_max_d(double a, double b) { return a > b ? a : b; }
+double jrt_math_min_d(double a, double b) { return a < b ? a : b; }
+/* Portables sqrt (Newton-Raphson) — libm-frei, auch freestanding. */
+double jrt_math_sqrt(double x) {
+    if (x < 0) return 0.0 / 0.0; /* NaN */
+    if (x == 0.0) return 0.0;
+    double g = x > 1.0 ? x : 1.0;
+    for (int i = 0; i < 60; i++) g = 0.5 * (g + x / g);
+    return g;
+}
+
+/* Zeit: hosted echte Monotonie, freestanding über schwachen Hook (Default 0). */
+#ifdef FASTLLVM_FREESTANDING
+__attribute__((weak)) int64_t jrt_platform_time_ns(void) { return 0; }
+int64_t jrt_nano_time(void) { return jrt_platform_time_ns(); }
+int64_t jrt_current_time_millis(void) { return jrt_platform_time_ns() / 1000000; }
+#else
+#include <time.h>
+int64_t jrt_nano_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+int64_t jrt_current_time_millis(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+#endif
 
 /* --- Java-Arithmetik-Semantik ---------------------------------------- */
 

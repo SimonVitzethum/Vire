@@ -2235,6 +2235,62 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(part));
                     continue;
                 }
+                // System.arraycopy: flache Kopie über die Runtime (bei
+                // NPE/Bounds/Store-Mismatch bricht sie ab — nicht abfangbar).
+                if class == "java/lang/System"
+                    && name == "arraycopy"
+                    && desc == "(Ljava/lang/Object;ILjava/lang/Object;II)V"
+                {
+                    let len = pop!();
+                    let dstpos = pop!();
+                    let dst = pop!();
+                    let srcpos = pop!();
+                    let src = pop!();
+                    stmts.push(Statement::Call {
+                        dest: None,
+                        func: "jrt_arraycopy".to_string(),
+                        args: vec![
+                            Operand::Copy(src),
+                            Operand::Copy(srcpos),
+                            Operand::Copy(dst),
+                            Operand::Copy(dstpos),
+                            Operand::Copy(len),
+                        ],
+                    });
+                    continue;
+                }
+                // Wertliefernde Runtime-Intrinsics (parse/Math/Zeit). clang -O2
+                // inlinet sie (gemeinsame Übersetzungseinheit mit runtime.c).
+                let simple: Option<(&str, Ty)> = match (class, name, desc) {
+                    ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => Some(("jrt_parse_int", Ty::I32)),
+                    ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => Some(("jrt_parse_long", Ty::I64)),
+                    ("java/lang/Math", "abs", "(I)I") => Some(("jrt_math_abs_i", Ty::I32)),
+                    ("java/lang/Math", "abs", "(J)J") => Some(("jrt_math_abs_l", Ty::I64)),
+                    ("java/lang/Math", "abs", "(D)D") => Some(("jrt_math_abs_d", Ty::F64)),
+                    ("java/lang/Math", "abs", "(F)F") => Some(("jrt_math_abs_f", Ty::F32)),
+                    ("java/lang/Math", "max", "(II)I") => Some(("jrt_math_max_i", Ty::I32)),
+                    ("java/lang/Math", "min", "(II)I") => Some(("jrt_math_min_i", Ty::I32)),
+                    ("java/lang/Math", "max", "(JJ)J") => Some(("jrt_math_max_l", Ty::I64)),
+                    ("java/lang/Math", "min", "(JJ)J") => Some(("jrt_math_min_l", Ty::I64)),
+                    ("java/lang/Math", "max", "(DD)D") => Some(("jrt_math_max_d", Ty::F64)),
+                    ("java/lang/Math", "min", "(DD)D") => Some(("jrt_math_min_d", Ty::F64)),
+                    ("java/lang/Math", "sqrt", "(D)D") => Some(("jrt_math_sqrt", Ty::F64)),
+                    ("java/lang/System", "currentTimeMillis", "()J") => Some(("jrt_current_time_millis", Ty::I64)),
+                    ("java/lang/System", "nanoTime", "()J") => Some(("jrt_nano_time", Ty::I64)),
+                    _ => None,
+                };
+                if let Some((func, rty)) = simple {
+                    let (ptys, _) = parse_descriptor(desc)?;
+                    let mut args = Vec::new();
+                    for _ in &ptys {
+                        args.push(Operand::Copy(pop!()));
+                    }
+                    args.reverse();
+                    let dest = push!(rty, Rvalue::Use(Operand::ConstI32(0)));
+                    stmts.pop(); // Platzhalter
+                    stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args });
+                    continue;
+                }
                 let (ptys, rty) = parse_descriptor(desc)?;
                 let mut args = Vec::new();
                 for _ in &ptys {
