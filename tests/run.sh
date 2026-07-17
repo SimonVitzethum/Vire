@@ -125,6 +125,7 @@ run colldemo      0 CollDemo CollDemo @stdlib
 run streams       0 Streams Streams @stdlib
 run streams2      0 Streams2 Streams2 @stdlib
 run intstreams    0 IntStreams IntStreams @stdlib
+run arraysdemo   0 ArraysDemo ArraysDemo @stdlib
 
 # --- Sprachfeatures ---
 run switch        0 Switch Switch
