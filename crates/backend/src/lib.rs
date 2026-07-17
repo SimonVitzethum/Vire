@@ -136,6 +136,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_alloc", "ptr (i64)"),
     ("jrt_null_check", "void (ptr)"),
     ("jrt_throw_npe", "void ()"),
+    ("jrt_throw_bounds", "void ()"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
     ("jrt_throw", "void (ptr)"),
@@ -234,6 +235,11 @@ struct Ctx<'a> {
     /// konservativ. Nicht getaggte Zugriffe (RC-Header, Vtable, Arrays über die
     /// Runtime) aliasieren konservativ mit allem — daher soundness-neutral.
     tbaa: BTreeMap<(String, String), usize>,
+    /// Je Funktion die (transitiv über Callees) geschriebenen statischen Felder.
+    /// Ein Feld, das eine Funktion (und ihre Callees) NICHT schreibt, ist während
+    /// ihrer Ausführung konstant → `GetStatic` liefert eine stabile, von der
+    /// Static-Wurzel am Leben gehaltene Referenz und braucht kein retain/release.
+    static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -389,7 +395,8 @@ pub fn emit(program: &Program) -> String {
             }
         }
     }
-    let ctx = Ctx { program, iface_slots, tbaa };
+    let static_writes = static_write_effects(program);
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -918,6 +925,79 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
     (0..n as u32).filter(|&l| imm[l as usize]).collect()
 }
 
+/// Je Funktion die transitiv geschriebenen statischen Felder (Fixpunkt über den
+/// Call-Graphen). Direkte `PutStatic` plus die Effekte aller Callees; Funktionen
+/// mit unaufgelöstem virtuellem Call gelten konservativ als „schreibt alles".
+/// Externe/`jrt_`-Aufrufe schreiben keine Java-Statics (C berührt sie nicht).
+fn static_write_effects(program: &Program) -> BTreeMap<String, BTreeSet<(String, String)>> {
+    let fn_names: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let mut all_statics: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut writes: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut callees: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut conservative: BTreeSet<String> = BTreeSet::new();
+    for f in &program.functions {
+        let mut d: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut c: BTreeSet<String> = BTreeSet::new();
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                match st {
+                    Statement::PutStatic { class, field, .. } => {
+                        d.insert((class.clone(), field.clone()));
+                        all_statics.insert((class.clone(), field.clone()));
+                    }
+                    Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => {
+                        if fn_names.contains(func.as_str()) {
+                            c.insert(func.clone());
+                        }
+                    }
+                    Statement::CallVirtual { .. } => {
+                        conservative.insert(f.name.clone());
+                    }
+                    Statement::CallPoly { targets, .. } => {
+                        for (_, sym) in targets {
+                            if fn_names.contains(sym.as_str()) {
+                                c.insert(sym.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        writes.insert(f.name.clone(), d);
+        callees.insert(f.name.clone(), c);
+    }
+    for name in &conservative {
+        writes.get_mut(name).unwrap().extend(all_statics.iter().cloned());
+    }
+    // Fixpunkt: Callee-Effekte hochziehen.
+    loop {
+        let mut changed = false;
+        let names: Vec<String> = writes.keys().cloned().collect();
+        for name in &names {
+            let cs = callees[name].clone();
+            let mut add: BTreeSet<(String, String)> = BTreeSet::new();
+            for c in &cs {
+                if let Some(w) = writes.get(c) {
+                    for x in w {
+                        if !writes[name].contains(x) {
+                            add.insert(x.clone());
+                        }
+                    }
+                }
+            }
+            if !add.is_empty() {
+                writes.get_mut(name).unwrap().extend(add);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    writes
+}
+
 /// Borrow-Slots: Nicht-Parameter-Ref-Locals, deren *jede* Definition eine Kopie
 /// eines geborgten Parameters, eines anderen Borrow-Slots oder ein immortaler
 /// Konstant-Wert (null/String-/Class-Literal) ist. Solche Slots besitzen nie
@@ -926,7 +1006,7 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
 /// aastore/PutStatic) den Wert selbst retainen und `return` ebenso — ein Borrow
 /// wird in jeder Verwendungsposition korrekt behandelt. Monotone Invalidierung
 /// bis zum Fixpunkt.
-fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>) -> BTreeSet<u32> {
+fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>, static_writes: &BTreeSet<(String, String)>) -> BTreeSet<u32> {
     let n = f.locals.len();
     let n_params = f.params.len();
     let mut b = vec![false; n];
@@ -949,10 +1029,17 @@ fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>) -> BTreeSet<u32> {
                         (Some(d.0), ok)
                     }
                     Statement::Assign(d, _) if f.locals[d.0 as usize] == Ty::Ref => (Some(d.0), false),
+                    // Stabiles statisches Feld (in dieser Funktion nicht geschrieben):
+                    // die Static-Wurzel hält den Wert am Leben → Borrow, kein RC.
+                    Statement::GetStatic { dest, class, field }
+                        if f.locals[dest.0 as usize] == Ty::Ref =>
+                    {
+                        let stable = !static_writes.contains(&(class.clone(), field.clone()));
+                        (Some(dest.0), stable)
+                    }
                     Statement::New { dest, .. }
                     | Statement::StackNew { dest, .. }
                     | Statement::GetField { dest, .. }
-                    | Statement::GetStatic { dest, .. }
                     | Statement::NewArray { dest, .. }
                     | Statement::ArrayLoad { dest, .. }
                         if f.locals[dest.0 as usize] == Ty::Ref =>
@@ -1170,7 +1257,9 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     writeln!(w, "  br label %bb0").unwrap();
 
     let imm = immortal_only_locals(f);
-    let borrow = borrow_slots(f, &borrowed);
+    let empty_writes = BTreeSet::new();
+    let sw = ctx.static_writes.get(&f.name).unwrap_or(&empty_writes);
+    let borrow = borrow_slots(f, &borrowed, sw);
     let nn = non_null_locals(f);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn };
 
@@ -1577,24 +1666,30 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
             let vty = kind.value_ty();
-            if *checked {
-                // Über Runtime-Helfer (Bounds/NPE abfangbar, pending-Modell).
-                let t = e.fresh();
-                writeln!(w, "  {t} = call {} @{}(ptr {a}, i32 {i})", llty(vty), arr_load_fn(*kind)).unwrap();
-                store_dest(w, e, *dest, &t, kind.is_ref());
+            let _ = vty;
+            // Inline (auch geprüft): null-/Bounds-Test setzen pending über
+            // jrt_throw_npe/jrt_throw_bounds, der Zugriff bleibt ein sichtbarer
+            // load — LLVM hoistet die Längenprüfung aus Schleifen und kann
+            // vektorisieren, statt einen opaken jrt_?aload-Call je Element.
+            let v = if *checked {
+                emit_array_elem_load_checked(w, e, &a, &i, *kind)
             } else {
-                // Bounds-frei (Solver-bewiesen): direkter GEP + load.
-                let v = emit_array_elem_load(w, e, &a, &i, *kind);
-                store_dest(w, e, *dest, &v, kind.is_ref());
-            }
+                emit_array_elem_load(w, e, &a, &i, *kind)
+            };
+            store_dest(w, e, *dest, &v, kind.is_ref());
         }
         Statement::ArrayStore { arr, index, value, kind, checked } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
             let v = e.operand(w, value);
             let vty = kind.value_ty();
-            if *checked {
+            // Ref-Stores geprüft über die Runtime (jrt_aastore trägt die
+            // Kovarianz-/ArrayStoreException-Prüfung, die der inline-Pfad nicht
+            // hätte). Primitive Stores werden inline geprüft.
+            if *checked && kind.is_ref() {
                 writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
+            } else if *checked {
+                emit_array_elem_store_checked(w, e, &a, &i, &v, *kind);
             } else {
                 emit_array_elem_store(w, e, &a, &i, &v, *kind);
             }
@@ -1602,19 +1697,6 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
     }
 }
 
-/// Runtime-Load-Helfer je Elementart.
-fn arr_load_fn(k: ArrKind) -> &'static str {
-    match k {
-        ArrKind::Bool | ArrKind::Byte => "jrt_baload",
-        ArrKind::Char => "jrt_caload",
-        ArrKind::Short => "jrt_saload",
-        ArrKind::Int => "jrt_iaload",
-        ArrKind::Long => "jrt_laload",
-        ArrKind::Float => "jrt_faload",
-        ArrKind::Double => "jrt_daload",
-        ArrKind::Ref => "jrt_aaload",
-    }
-}
 fn arr_store_fn(k: ArrKind) -> &'static str {
     match k {
         ArrKind::Bool | ArrKind::Byte => "jrt_bastore",
@@ -1684,6 +1766,121 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
         _ => v.to_string(),
     };
     writeln!(w, "  store {} {sv}, ptr {ep}", arr_store_ty(k)).unwrap();
+}
+
+/// Neutral-Wert (LLVM-Literal) für den Fehler-Zweig eines geprüften Loads.
+fn zero_lit(vty: Ty) -> &'static str {
+    match vty {
+        Ty::Ref => "null",
+        Ty::F32 | Ty::F64 => "0.0",
+        _ => "0",
+    }
+}
+
+/// Geprüfter Load, komplett inline: null-Test → NPE, `idx (unsigned) >= length`
+/// → Bounds (beide setzen pending und liefern einen Neutralwert; die vom Frontend
+/// eingefügte pending-Prüfung übernimmt danach den Kontrollfluss). Der eigentliche
+/// Zugriff bleibt ein LLVM-`load` (hoistbar/vektorisierbar).
+fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind) -> String {
+    let vty = k.value_ty();
+    let sty = arr_store_ty(k);
+    let (npe, ck, bd, ld, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
+    let isnull = e.fresh();
+    writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+    writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+    writeln!(w, "{npe}:").unwrap();
+    writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{ck}:").unwrap();
+    let lenp = e.fresh();
+    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 24").unwrap();
+    let len = e.fresh();
+    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    let idx = e.fresh();
+    writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
+    let oob = e.fresh();
+    writeln!(w, "  {oob} = icmp uge i64 {idx}, {len}").unwrap();
+    writeln!(w, "  br i1 {oob}, label %{bd}, label %{ld}").unwrap();
+    writeln!(w, "{bd}:").unwrap();
+    writeln!(w, "  call void @jrt_throw_bounds()").unwrap();
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{ld}:").unwrap();
+    let off = e.fresh();
+    writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
+    let base = e.fresh();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    let ep = e.fresh();
+    writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+    let raw = e.fresh();
+    writeln!(w, "  {raw} = load {sty}, ptr {ep}").unwrap();
+    let ext = match k {
+        ArrKind::Byte | ArrKind::Short => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = sext {sty} {raw} to i32").unwrap();
+            x
+        }
+        ArrKind::Bool | ArrKind::Char => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = zext {sty} {raw} to i32").unwrap();
+            x
+        }
+        _ => raw,
+    };
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{cont}:").unwrap();
+    let v = e.fresh();
+    let z = zero_lit(vty);
+    writeln!(
+        w,
+        "  {v} = phi {} [ {z}, %{npe} ], [ {z}, %{bd} ], [ {ext}, %{ld} ]",
+        llty(vty)
+    )
+    .unwrap();
+    v
+}
+
+/// Geprüfter Store, inline (primitive Elemente). Null-/Bounds-Fehler setzen
+/// pending; im gültigen Fall ein sichtbarer `store`.
+fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind) {
+    let sty = arr_store_ty(k);
+    let (npe, ck, bd, st, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
+    let isnull = e.fresh();
+    writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+    writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+    writeln!(w, "{npe}:").unwrap();
+    writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{ck}:").unwrap();
+    let lenp = e.fresh();
+    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 24").unwrap();
+    let len = e.fresh();
+    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    let idx = e.fresh();
+    writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
+    let oob = e.fresh();
+    writeln!(w, "  {oob} = icmp uge i64 {idx}, {len}").unwrap();
+    writeln!(w, "  br i1 {oob}, label %{bd}, label %{st}").unwrap();
+    writeln!(w, "{bd}:").unwrap();
+    writeln!(w, "  call void @jrt_throw_bounds()").unwrap();
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{st}:").unwrap();
+    let off = e.fresh();
+    writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
+    let base = e.fresh();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    let ep = e.fresh();
+    writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+    let sv = match k {
+        ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = trunc i32 {v} to {sty}").unwrap();
+            x
+        }
+        _ => v.to_string(),
+    };
+    writeln!(w, "  store {sty} {sv}, ptr {ep}").unwrap();
+    writeln!(w, "  br label %{cont}").unwrap();
+    writeln!(w, "{cont}:").unwrap();
 }
 
 /// Speichert die Vtable im Objektheader (hinter refcount + rcflags).

@@ -189,6 +189,7 @@ void jrt_noop_trace(void *p, void (*visit)(void *));
 void *jrt_alloc(int64_t size);
 void jrt_retain(void *p);
 void jrt_throw_npe(void);
+void jrt_throw_bounds(void);
 void jrt_throw_sioobe(void);
 static void jrt_sb_drop(void *p);
 
@@ -1123,6 +1124,12 @@ static void throw_runtime(void *sentinel, const char *msg) {
  * danach pending. */
 void jrt_throw_npe(void) {
     throw_runtime(&npe_exc_obj, "java.lang.NullPointerException");
+}
+/* Inline-Bounds-Prüfung im generierten Code setzt bei Fehler pending über diesen
+ * Helfer (statt eines jrt_?aload-Calls je Zugriff — so bleibt der Zugriff für
+ * LLVM ein sichtbarer load/store: hoistbar, vektorisierbar). */
+void jrt_throw_bounds(void) {
+    throw_runtime(&bounds_exc_obj, "java.lang.ArrayIndexOutOfBoundsException");
 }
 void jrt_throw_sioobe(void) {
     throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");

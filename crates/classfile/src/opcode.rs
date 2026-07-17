@@ -308,6 +308,26 @@ pub fn decode_code(
             0x97 => (Instr::DCmpL, 1),
             0x98 => (Instr::DCmpG, 1),
             0x84 => (Instr::IInc(u8_at(pc + 1)? as u16, u8_at(pc + 2)? as i8 as i32), 3),
+            // `wide`: verbreitert den Index (und bei iinc die Konstante) auf 16 Bit.
+            // Format: 0xc4 <op> <index:u16> [<const:i16> nur bei iinc].
+            0xc4 => {
+                let sub = u8_at(pc + 1)?;
+                let idx = u16_at(pc + 2)?;
+                match sub {
+                    0x15 => (Instr::ILoad(idx), 4),
+                    0x16 => (Instr::LLoad(idx), 4),
+                    0x17 => (Instr::FLoad(idx), 4),
+                    0x18 => (Instr::DLoad(idx), 4),
+                    0x19 => (Instr::ALoad(idx), 4),
+                    0x36 => (Instr::IStore(idx), 4),
+                    0x37 => (Instr::LStore(idx), 4),
+                    0x38 => (Instr::FStore(idx), 4),
+                    0x39 => (Instr::DStore(idx), 4),
+                    0x3A => (Instr::AStore(idx), 4),
+                    0x84 => (Instr::IInc(idx, u16_at(pc + 4)? as i16 as i32), 6),
+                    _ => return Err(ParseError::UnsupportedOpcode(sub, pc)),
+                }
+            }
             0x99 => (Instr::IfZero(Cond::Eq, branch(pc + 1)?), 3),
             0x9A => (Instr::IfZero(Cond::Ne, branch(pc + 1)?), 3),
             0x9B => (Instr::IfZero(Cond::Lt, branch(pc + 1)?), 3),
