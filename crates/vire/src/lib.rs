@@ -3,10 +3,12 @@
 
 pub mod ast;
 pub mod diag;
+pub mod infer;
 pub mod lexer;
 pub mod lower;
 pub mod parser;
 
 pub use diag::Diag;
+pub use infer::infer_module;
 pub use lower::lower_module;
 pub use parser::parse;

@@ -107,13 +107,15 @@ fn build_or_run(args: &[String]) {
     };
 
     // Front-End: lexen/parsen.
-    let (module, diags) = vire::parse(&src);
+    let (mut module, diags) = vire::parse(&src);
     if !diags.is_empty() {
         for d in &diags {
             eprintln!("{}", d.render(&src));
         }
         exit(1);
     }
+    // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen.
+    vire::infer_module(&mut module);
     // Absenkung nach crates/ir.
     let mut program = match vire::lower_module(&module) {
         Ok(p) => p,
