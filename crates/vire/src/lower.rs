@@ -22,7 +22,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     let mut errs = Vec::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            match lower_fn(f, &sigs) {
+            match lower_fn(f, &sigs, &mut prog.strings) {
                 Ok(func) => prog.functions.push(func),
                 Err(mut e) => errs.append(&mut e),
             }
@@ -114,6 +114,8 @@ struct FnLower<'a> {
     cur: usize,
     scopes: Vec<HashMap<String, (Local, Ty)>>,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
+    /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
+    strings: &'a mut Vec<String>,
     errs: Vec<String>,
     /// Ziel-Blöcke der umgebenden Schleifen: (continue → header, break → exit).
     loops: Vec<(Block, Block)>,
@@ -123,6 +125,13 @@ impl<'a> FnLower<'a> {
     fn new_local(&mut self, ty: Ty) -> Local {
         self.locals.push(ty);
         Local((self.locals.len() - 1) as u32)
+    }
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(i) = self.strings.iter().position(|x| x == s) {
+            return i as u32;
+        }
+        self.strings.push(s.to_string());
+        (self.strings.len() - 1) as u32
     }
     fn new_block(&mut self) -> Block {
         self.blocks.push(BasicBlock { statements: vec![], terminator: Terminator::Return(None) });
@@ -318,6 +327,10 @@ impl<'a> FnLower<'a> {
             Expr::Int(v, _) => (Operand::ConstI64(*v as i64), Ty::I64),
             Expr::Float(v, _) => (Operand::ConstF64(*v), Ty::F64),
             Expr::Bool(b, _) => (Operand::ConstI32(if *b { 1 } else { 0 }), Ty::I32),
+            Expr::Str(s, _) => {
+                let id = self.intern(s);
+                (Operand::ConstStr(id), Ty::Ref)
+            }
             Expr::Ident(name, _) => match self.lookup(name) {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
@@ -446,7 +459,7 @@ impl<'a> FnLower<'a> {
 // Der AST nennt Block; hier Alias, um Namenskollision mit ir::Block zu vermeiden.
 use crate::ast::Block as Block2;
 
-fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>) -> Result<Function, Vec<String>> {
+fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>, strings: &mut Vec<String>) -> Result<Function, Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = if f.sig.name == "main" { "java_main".to_string() } else { f.sig.name.clone() };
     let mut fl = FnLower {
@@ -455,6 +468,7 @@ fn lower_fn(f: &FnDef, sigs: &HashMap<String, (Vec<Ty>, Ty)>) -> Result<Function
         cur: 0,
         scopes: vec![HashMap::new()],
         sigs,
+        strings,
         errs: Vec::new(),
         loops: Vec::new(),
     };

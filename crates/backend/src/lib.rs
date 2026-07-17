@@ -615,6 +615,13 @@ pub fn emit(program: &Program) -> String {
         )
         .unwrap();
     }
+    // Vire-Programme nutzen String-Literale (print), definieren aber keine
+    // java/lang/String-Klasse → deren Vtable fehlt, während die @jstr-Konstanten
+    // sie referenzieren. Minimal-Vtable nachreichen (nur No-Op-Drop/Trace +
+    // null-Typdeskriptor); String-Methoden-Dispatch gibt es in Vire noch nicht.
+    if !program.strings.is_empty() && !instantiated.contains("java/lang/String") {
+        writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
+    }
     writeln!(w).unwrap();
 
     // Drop-Funktionen: released die Ref-Felder des Objekts (die Runtime

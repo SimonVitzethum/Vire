@@ -60,6 +60,17 @@ fn if_als_ausdruck_liefert_wert() {
 }
 
 #[test]
+fn string_literale_landen_im_pool() {
+    let p = lower("fn main() {\n print(\"a\")\n print(\"b\")\n print(\"a\")\n}\n");
+    // Zwei eindeutige Literale (a dedupliziert), print(str)→jrt_println_str.
+    assert_eq!(p.strings, vec!["a".to_string(), "b".to_string()]);
+    let calls_str = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_println_str")
+    });
+    assert!(calls_str, "print(str) muss jrt_println_str rufen");
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());
