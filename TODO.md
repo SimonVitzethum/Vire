@@ -22,13 +22,35 @@ Vollständiger Bericht: **[sprache/M0-MESSUNG.md](sprache/M0-MESSUNG.md)**. Prog
   1,8 s, extrapoliert ~5–7 s bei 100k — **ohne** inkrementelles Caching.
 - [~] **M0.1-Contention** (Rest): echte Multithread-Contention als separater Versuch
   offen; 6,3× uncontended ist die Untergrenze.
-- [x] **M0.3 Entscheidung:** **nicht grün.** Pflicht VOR dem Front-End: (i)
-  **Kollektor-Skalierung** (O(n²)-Full-Scan → inkrementell/generationell), (ii)
-  **Borrow-/Region-Inferenz** schärfen (dauerhaft-lebendig→borgen), (iii) Overflow-
-  Default + `+%`-Kultur (Vektorisierung, s. M0-Bericht), (iv) Analyse-Caching für
-  Compile-Zeit. Dann M0.1 erneut messen.
+- [x] **M0.1b (die entscheidende Zusatzmessung):** RC von Objektmodell getrennt
+  (Kollektor aus, N=16k): mit RC 4,4×, **ohne RC 1,48×**, Rust 1×. → Die RC ist
+  **3,4× und elidierbar** (Loop ist topologie-stabil = beweisbar borgbar); der Solver
+  hat die Borgbarkeit **nicht bewiesen** (Vollständigkeitslücke, nicht §7-Wand). Decke
+  = **~1,5×** (Objektmodell), nicht 1×.
 
-**Kernrisiko rot bestätigt.** Front-End (P1+) ist bis (i)+(ii) **zurückgestellt**.
+**M0.3 Entscheidung — die Reparatur ist EINE, nicht zwei parallele:**
+- [ ] **(ii) Region-Borrow-Inferenz** (der Gate-Öffner): loop-stabile Container
+  (`nodes[]`, `n.out` — im Loop nicht umgesetzt) als borgbare Region beweisen →
+  Loop-retain/release streichen. **Das entschärft den Kollektor gratis mit** (ohne
+  Loop-Releases keine Zyklen-Kandidaten → kein O(n²)). Ziel: 108× → ~1,5×.
+  Soundness-heikel (0-live!): nur mit region-/dominanz-scopiertem „kein Store setzt
+  den geborgten Slot um"-Beweis. **Das ist das Ownership-Inferenz-Modul** — sorgfältig,
+  nicht schnell.
+- [ ] **(i) Kollektor-Skalierung** ist danach für dieses Muster **nicht mehr nötig**;
+  bleibt relevant für *echt* zyklische Programme. **Achtung Zielkonflikt:**
+  inkrementell/generationell = Write-Barriers je Mutation (re-inflationiert den Floor)
+  **+ mehr Runtime** → zieht gegen „~runtime-frei" (Feature 5) und Teil von Feature 3.
+- [ ] **(iii) SOUNDNESS-Bug, unabhängig von Tempo:** rekursives Release/Collect
+  sprengt bei N=200k den Stack (großer *gültiger* Graph → Crash = „sicher"-Verletzung).
+  **Iterativer Worklist-Release** nötig — kleiner Runtime-Zuwachs, aber Pflicht.
+- [ ] **(iv) Feld-/interproz. Bounds-Elision** für `out[k]` (Länge eines Feld-Arrays)
+  → schließt einen Teil der Rest-1,5× Richtung ~1,1×.
+- [ ] **(v) Overflow-Default + `+%`-Kultur** (Vektorisierung, M0-Bericht) und
+  **Analyse-Caching** (Compile-Zeit).
+- [ ] **(vi) M0.1c Contention:** echte Multithread-Contention messen (Feature-1-Zahl).
+
+**Kernrisiko rot bestätigt, Weg aber vermessen:** ~1,1–1,5× ist erreichbar, braucht
+aber das Ownership-Modul (ii). Front-End (P1+) bleibt bis (ii)+(iii) zurückgestellt.
 
 ---
 

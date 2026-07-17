@@ -43,13 +43,18 @@ mit Indizes** (`Vec<Node>` + `usize` — Rusts Antwort auf Graphen, **kein RC**)
 ## M0.1 — Alias-Präzision & RC-Pfad (das Kernrisiko)
 
 ### Laufzeit, N=16000, 40 Iterationen
-| Variante | Zeit | vs Rust |
-|---|---|---|
-| FastLLVM **automatisch** (Default: `Node` typ-zyklisch → Kollektor an) | 0,901 s | **108×** |
-| FastLLVM, Kollektor **aus** erzwungen (`-DFASTLLVM_NO_CYCLES`) | 0,037 s | 4,4× |
-| FastLLVM, Kollektor aus, **atomare RC** (`--threads`, uncontended) | 0,233 s | 28× |
-| **Rust (Indizes, kein RC)** = das Oracle-Tempo | 0,008 s | 1× |
-| JVM (Referenz) | 0,12 s | — |
+| Variante | Zeit | vs Rust | vs nicht-atom. RC |
+|---|---|---|---|
+| FastLLVM **automatisch** (Default: `Node` typ-zyklisch → Kollektor an) | 0,901 s | **108×** | — |
+| FastLLVM, Kollektor **aus** (`-DFASTLLVM_NO_CYCLES`) | 0,037 s | 4,4× | 1× |
+| FastLLVM, Kollektor aus, **atomare RC** (`--threads`, uncontended) | 0,233 s | **29×** | **6,3×** |
+| **Rust (Indizes, kein RC)** = das Oracle-Tempo | 0,008 s | 1× | — |
+| JVM (Referenz) | 0,12 s | — | — |
+
+*(Korrektur: die atomare RC ist **29× vs Rust**; die 6,3× sind der reine
+Atomik-Aufpreis **gegen nicht-atomare RC**. Und das ist noch **uncontended** — die
+für Feature 1 relevante **contended** Zahl (mehrere Threads auf denselben Refcounts)
+ist schlechter und steht noch aus, s. M0.1c.)*
 
 ### Skalierung (Default, mit Kollektor) — **super-linear**
 | N | 2000 | 4000 | 8000 | 16000 | 100000 |
@@ -78,12 +83,44 @@ läuft nur unter `ulimit -s unlimited`, dann sehr langsam).
    *uncontended* (0,037 → 0,233 s). Contended (mehrere Threads auf denselben
    Refcounts) ist schlechter — das ist das benannte Swift-ARC-Problem, jetzt belegt.
 
+### M0.1b — brauchte dieser Graph überhaupt RC? (die entscheidende Frage)
+M0.1 misst den **RC-Fallback** — nicht, ob er **nötig** war. Der PageRank baut den
+Graphen *einmal* und ändert im heißen Loop **keine Topologie** (kein Ref-Feld, kein
+Array-Element wird umgesetzt — nur `rank`/`next`-Primitive). Der Graph *ist* also
+eine loop-stabile, borgbare Region. Test (N=16000, Kollektor aus): alle
+retain/release im IR entfernt (= „Solver borgt alles"):
+
+| Variante (Kollektor aus) | Zeit | vs Rust |
+|---|---|---|
+| mit RC (Ist-Zustand) | 0,039 s | 4,4× |
+| **ohne RC (alles geborgt)** | **0,012 s** | **1,48×** |
+| Rust (Indizes) | 0,008 s | 1× |
+
+**Antwort: der Solver hat eine Borgbarkeit *nicht bewiesen*, die beweisbar war.**
+Die RC macht **3,4× der 4,4×** aus und ist **elidierbar** (die Info ist da: keine
+Topologie-Mutation im Loop). Das ist die **ermutigende** Verzweigung der
+Review-Dichotomie: eine **Inferenz-Vollständigkeitslücke**, keine strukturelle Wand.
+
+**Und es entschärft den Kollektor gratis:** der O(n²)-Kollektor wird *durch* die
+Loop-Releases getriggert (geteilte Knoten → Zyklen-Kandidaten). Ohne Loop-Releases
+werden **keine Kandidaten gepuffert** → der Kollektor läuft im Loop nicht → die 108×
+**verschwinden mit derselben Reparatur**. (i) Kollektor-Fix und (ii) Borrow-Inferenz
+sind also **nicht parallel** — **(ii) allein öffnet das Gate** und macht (i) für
+diesen Fall überflüssig.
+
+**Die Decke ist ~1,5×, nicht 1×.** Der Rest nach RC-Elision (1,48×) ist das
+**Objektmodell**: 24-Byte-Header, verstreute Heap-Knoten (schlechtere Cache-Lage als
+Rusts flaches `Vec`), Bounds-Checks. Das ist der ehrliche „Objekte statt flacher
+Arrays"-Aufpreis — schmaler über Bounds-Elision/Layout, aber kein Gratis-1×.
+
 ### Was das bedeutet
-Das Kernversprechen „Rust-Niveau ohne Annotationen" ist auf der **escape-
-freundlichen** Teilmenge ein Ergebnis (Benchmarks §9: Alloc/Sieve/… schlagen `Box`),
-auf der **geteilt/zyklischen** Teilmenge ein **Slogan** — dort 4× (Konstant),
-6× (atomar), 100–1000×+ (Kollektor). Ein Objektgraph ist *der* Normalfall
-„idiomatischer" Anwendungslogik; die Sprache kann ihn nicht dem Nutzer verbieten.
+„Rust-Niveau ohne Annotationen" ist auf der **escape-freundlichen** Teilmenge ein
+Ergebnis (§9). Auf der **geteilt/zyklischen** Teilmenge ist es **heute** ein Slogan
+(4–108×), aber M0.1b zeigt: der Weg auf **~1,1–1,5×** ist konkret und beweisbar —
+eine Borrow-Inferenz für loop-stabile Regionen (build-once, iterate-in-place). Das
+ist ein **Engineering-Problem**, kein struktureller Riegel — *für dieses häufige
+Muster*. Der Allgemeinfall (Topologie-Mutation über Aliase im Loop) bleibt das
+§7-Problem ohne annotationsfreien Allgemein-Beweis.
 
 ---
 
