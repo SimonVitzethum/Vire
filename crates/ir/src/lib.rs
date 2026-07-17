@@ -212,6 +212,10 @@ pub struct Function {
     /// Locals[0..params.len()] sind die Parameter.
     pub locals: Vec<Ty>,
     pub blocks: Vec<BasicBlock>,
+    /// Instanzmethode: Local 0 ist `this` und beweisbar nicht-null (der Aufrufer
+    /// prüft den Receiver bzw. `this` stammt aus `new`). Erlaubt dem Backend, die
+    /// inline-Null-Prüfung bei `this`-Feldzugriffen wegzulassen.
+    pub receiver_nonnull: bool,
 }
 
 // --- Klassenmodell (Closed World: alle Klassen sind zur Build-Zeit bekannt) ---

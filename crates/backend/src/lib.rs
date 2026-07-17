@@ -848,6 +848,20 @@ struct FnEmitter<'a> {
     borrowed: BTreeSet<u32>,
     /// Locals, die nur immortale Werte halten (StackNew/Literal/null): RC-frei.
     imm: BTreeSet<u32>,
+    /// Borrow-Slots: Nicht-Parameter-Ref-Locals, die ausschließlich Kopien
+    /// geborgter Parameter (z.B. `this`) bzw. null halten — RC-frei, weil der
+    /// Aufrufer den Wert für die Aufrufdauer lebendig hält (javacs `aload_0`-
+    /// Reloads von `this` vor jedem `getfield`).
+    borrow: BTreeSet<u32>,
+    /// Beweisbar nicht-null Locals — die inline-Null-Prüfung bei Feldzugriffen
+    /// entfällt.
+    nn: BTreeSet<u32>,
+}
+
+impl FnEmitter<'_> {
+    fn nonnull(&self, op: &Operand) -> bool {
+        matches!(op, Operand::Copy(l) if self.nn.contains(&l.0))
+    }
 }
 
 /// Locals, die ausschließlich immortale Werte halten (Stack-Objekte, String-/
@@ -902,6 +916,139 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
         }
     }
     (0..n as u32).filter(|&l| imm[l as usize]).collect()
+}
+
+/// Borrow-Slots: Nicht-Parameter-Ref-Locals, deren *jede* Definition eine Kopie
+/// eines geborgten Parameters, eines anderen Borrow-Slots oder ein immortaler
+/// Konstant-Wert (null/String-/Class-Literal) ist. Solche Slots besitzen nie
+/// eine Referenz (der geborgte Ursprung lebt für die ganze Methode), also sind
+/// retain/release beweisbar überflüssig. Sound, weil Heap-Stores (PutField/
+/// aastore/PutStatic) den Wert selbst retainen und `return` ebenso — ein Borrow
+/// wird in jeder Verwendungsposition korrekt behandelt. Monotone Invalidierung
+/// bis zum Fixpunkt.
+fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let n = f.locals.len();
+    let n_params = f.params.len();
+    let mut b = vec![false; n];
+    for l in n_params..n {
+        if f.locals[l] == Ty::Ref {
+            b[l] = true;
+        }
+    }
+    loop {
+        let mut changed = false;
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                let (def, ok): (Option<u32>, bool) = match st {
+                    Statement::Assign(d, Rvalue::Use(op)) if f.locals[d.0 as usize] == Ty::Ref => {
+                        let ok = match op {
+                            Operand::ConstNull | Operand::ConstStr(_) | Operand::ConstClass(_) => true,
+                            Operand::Copy(s) => borrowed.contains(&s.0) || b[s.0 as usize],
+                            _ => false,
+                        };
+                        (Some(d.0), ok)
+                    }
+                    Statement::Assign(d, _) if f.locals[d.0 as usize] == Ty::Ref => (Some(d.0), false),
+                    Statement::New { dest, .. }
+                    | Statement::StackNew { dest, .. }
+                    | Statement::GetField { dest, .. }
+                    | Statement::GetStatic { dest, .. }
+                    | Statement::NewArray { dest, .. }
+                    | Statement::ArrayLoad { dest, .. }
+                        if f.locals[dest.0 as usize] == Ty::Ref =>
+                    {
+                        (Some(dest.0), false)
+                    }
+                    Statement::Call { dest, .. }
+                    | Statement::CallGuarded { dest, .. }
+                    | Statement::CallVirtual { dest, .. }
+                    | Statement::CallPoly { dest, .. } => (dest.map(|d| d.0), false),
+                    _ => (None, false),
+                };
+                if let Some(d) = def {
+                    if b[d as usize] && !ok {
+                        b[d as usize] = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (0..n as u32).filter(|&l| b[l as usize]).collect()
+}
+
+/// Beweisbar nicht-null Ref-Locals: `this` (bei Instanzmethoden, `receiver_
+/// nonnull`), New/StackNew-Ergebnisse und Kopien davon. Erlaubt, die inline-
+/// Null-Prüfung bei Feldzugriffen wegzulassen (der Aufrufer prüft den Receiver;
+/// `this.f` re-prüft sonst redundant je Zugriff — heiße virtuelle Methoden).
+fn non_null_locals(f: &Function) -> BTreeSet<u32> {
+    let n = f.locals.len();
+    let mut nn = vec![false; n];
+    if f.receiver_nonnull && !f.params.is_empty() && f.params[0] == Ty::Ref {
+        nn[0] = true;
+    }
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            if let Statement::New { dest, .. } | Statement::StackNew { dest, .. } = st {
+                nn[dest.0 as usize] = true;
+            }
+        }
+    }
+    // Kopien nicht-null Werte: Fixpunkt.
+    loop {
+        let mut changed = false;
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                if let Statement::Assign(d, Rvalue::Use(Operand::Copy(s))) = st {
+                    if nn[s.0 as usize] && !nn[d.0 as usize] {
+                        nn[d.0 as usize] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Locals mit irgendeinem möglicherweise-null Def wieder streichen (flow-
+    // insensitiv konservativ): jeder Nicht-nn-Def entwertet.
+    let mut maybe_null = vec![false; n];
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            let (def, ok) = match st {
+                Statement::New { dest, .. } | Statement::StackNew { dest, .. } => (Some(dest.0), true),
+                Statement::Assign(d, Rvalue::Use(Operand::Copy(s))) => (Some(d.0), nn[s.0 as usize]),
+                Statement::Assign(d, _) => (Some(d.0), false),
+                Statement::GetField { dest, .. }
+                | Statement::GetStatic { dest, .. }
+                | Statement::ArrayLoad { dest, .. }
+                | Statement::NewArray { dest, .. }
+                | Statement::InstanceOf { dest, .. }
+                | Statement::InstanceOfPending { dest, .. }
+                | Statement::ArrayLen { dest, .. } => (Some(dest.0), false),
+                Statement::Call { dest, .. }
+                | Statement::CallGuarded { dest, .. }
+                | Statement::CallVirtual { dest, .. }
+                | Statement::CallPoly { dest, .. } => (dest.map(|d| d.0), false),
+                _ => (None, false),
+            };
+            if let Some(d) = def {
+                if !ok {
+                    maybe_null[d as usize] = true;
+                }
+            }
+        }
+    }
+    // `this` (Local 0) ist trotz Nicht-Def nicht-null; wird nie neu definiert
+    // in korrektem Bytecode, aber schütze den Fall.
+    if f.receiver_nonnull && !f.params.is_empty() && f.params[0] == Ty::Ref {
+        maybe_null[0] = false;
+    }
+    (0..n as u32).filter(|&l| nn[l as usize] && !maybe_null[l as usize]).collect()
 }
 
 /// Locals, die irgendwo als Schreibziel auftreten (für die Borrow-Analyse).
@@ -1023,7 +1170,9 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     writeln!(w, "  br label %bb0").unwrap();
 
     let imm = immortal_only_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm };
+    let borrow = borrow_slots(f, &borrowed);
+    let nn = non_null_locals(f);
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -1078,7 +1227,11 @@ fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
     for (i, ty) in e.f.locals.iter().enumerate() {
         // Geborgte Parameter (nie retained) und immortal-only Slots (nur No-Op-
         // Werte) brauchen keine Cleanup-release.
-        if *ty == Ty::Ref && !e.borrowed.contains(&(i as u32)) && !e.imm.contains(&(i as u32)) {
+        if *ty == Ty::Ref
+            && !e.borrowed.contains(&(i as u32))
+            && !e.imm.contains(&(i as u32))
+            && !e.borrow.contains(&(i as u32))
+        {
             let t = e.fresh();
             writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
             writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
@@ -1299,39 +1452,54 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let (owner, idx, ty) = ctx
                 .field_slot(class, field)
                 .unwrap_or_else(|| panic!("Feld {class}.{field} fehlt"));
+            let nonnull = e.nonnull(obj);
             let o = e.operand(w, obj);
             // Abfangbare NPE: bei null zum npe-Block (pending), sonst Zugriff.
-            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
-            let isnull = e.fresh();
-            writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
-            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
-            writeln!(w, "{nb}:").unwrap();
-            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
-            writeln!(w, "  br label %{cont}").unwrap();
-            writeln!(w, "{ok}:").unwrap();
+            // Bei beweisbar nicht-null Receiver (z.B. `this`) entfällt die Prüfung.
+            let cont = if nonnull {
+                None
+            } else {
+                let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+                let isnull = e.fresh();
+                writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
+                writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+                writeln!(w, "{nb}:").unwrap();
+                writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+                writeln!(w, "  br label %{cont}").unwrap();
+                writeln!(w, "{ok}:").unwrap();
+                Some(cont)
+            };
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {p}{}", llty(ty), ctx.tbaa_suffix(&owner, field)).unwrap();
             // Feldwert ist geborgt; die Kopie ins Local wird owned → retain.
             store_dest(w, e, *dest, &t, true);
-            writeln!(w, "  br label %{cont}").unwrap();
-            writeln!(w, "{cont}:").unwrap();
+            if let Some(cont) = cont {
+                writeln!(w, "  br label %{cont}").unwrap();
+                writeln!(w, "{cont}:").unwrap();
+            }
         }
         Statement::PutField { obj, class, field, value } => {
             let (owner, idx, ty) = ctx
                 .field_slot(class, field)
                 .unwrap_or_else(|| panic!("Feld {class}.{field} fehlt"));
+            let nonnull = e.nonnull(obj);
             let o = e.operand(w, obj);
             let v = e.operand(w, value);
-            let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
-            let isnull = e.fresh();
-            writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
-            writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
-            writeln!(w, "{nb}:").unwrap();
-            writeln!(w, "  call void @jrt_throw_npe()").unwrap();
-            writeln!(w, "  br label %{cont}").unwrap();
-            writeln!(w, "{ok}:").unwrap();
+            let cont = if nonnull {
+                None
+            } else {
+                let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
+                let isnull = e.fresh();
+                writeln!(w, "  {isnull} = icmp eq ptr {o}, null").unwrap();
+                writeln!(w, "  br i1 {isnull}, label %{nb}, label %{ok}").unwrap();
+                writeln!(w, "{nb}:").unwrap();
+                writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+                writeln!(w, "  br label %{cont}").unwrap();
+                writeln!(w, "{ok}:").unwrap();
+                Some(cont)
+            };
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let tb = ctx.tbaa_suffix(&owner, field);
@@ -1345,8 +1513,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             } else {
                 writeln!(w, "  store {} {v}, ptr {p}{tb}", llty(ty)).unwrap();
             }
-            writeln!(w, "  br label %{cont}").unwrap();
-            writeln!(w, "{cont}:").unwrap();
+            if let Some(cont) = cont {
+                writeln!(w, "  br label %{cont}").unwrap();
+                writeln!(w, "{cont}:").unwrap();
+            }
         }
         Statement::GetStatic { dest, class, field } => {
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));
@@ -1537,7 +1707,7 @@ fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_
     // sind retain/release beweisbar No-Ops → weglassen. Das entkoppelt das
     // Objekt von der RC-Buchhaltung, sodass LLVM es (bei totem Objekt) ganz
     // eliminieren kann — Rust-artiges Ownership für den Stack-Teil.
-    if e.imm.contains(&dest.0) {
+    if e.imm.contains(&dest.0) || e.borrow.contains(&dest.0) {
         writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
         return;
     }

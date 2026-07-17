@@ -57,6 +57,8 @@ enum SymExpr {
     Add2(u32, u32),
     /// Produkt zweier Syms (kanonisch: id1 <= id2).
     Mul(u32, u32),
+    /// `x & m` mit Maske m ≥ 0 — Ergebnis liegt beweisbar in [0, m].
+    And(u32, i64),
 }
 
 #[derive(Default)]
@@ -148,6 +150,28 @@ fn sym_of_rvalue(rv: &Rvalue, env: &Env, it: &mut Interner, s: u32, dst: Ty, loc
             }
             _ => it.intern(SymExpr::Opaque(s)),
         },
+        // Bitmaskierung `x & m` (m ≥ 0): Ergebnis in [0, m] — häufig als
+        // Index `arr[i & (len-1)]`/`sh[i & 1]` (Potenz-von-2-Ringpuffer). Die
+        // Maske kann inline-Konstante ODER ein Const-wertiges Local sein (javac
+        // lädt `iconst` in einen Slot); daher über die Sym-Nummer auflösen.
+        Rvalue::Binary(BinOp::And, a, b) => {
+            let sa = sym_of_operand(a, env, it);
+            let sb = sym_of_operand(b, env, it);
+            let const_of = |sym: u32, it: &Interner| match it.exprs[sym as usize] {
+                SymExpr::Const(c) => Some(c),
+                _ => None,
+            };
+            let (x, m) = match (const_of(sa, it), const_of(sb, it)) {
+                (Some(m), _) => (sb, m),
+                (_, Some(m)) => (sa, m),
+                _ => (0, -1),
+            };
+            if m >= 0 {
+                it.intern(SymExpr::And(x, m))
+            } else {
+                it.intern(SymExpr::Opaque(s))
+            }
+        }
         _ => it.intern(SymExpr::Opaque(s)),
     }
 }
@@ -329,6 +353,18 @@ fn run(f: &mut Function) -> usize {
     // GVN invariante Werte, die um die Schleife fließen, sonst als Phi festhält.
     let repr = compute_repr(&it, &phi_inc, &incomplete);
     let nn = compute_nonneg(&it, &phi_inc, &repr, &incomplete);
+    // Konstante obere Schranke je Sym: Const(c≥0) → c, And(_,m≥0) → m. Für
+    // Indizes ohne Schleifenwächter (`sh[i & 1]`): in-bounds gegen konstante
+    // Länge, wenn diese Schranke < Länge ist.
+    let ub_const: Vec<Option<i64>> = it
+        .exprs
+        .iter()
+        .map(|e| match e {
+            SymExpr::Const(c) if *c >= 0 => Some(*c),
+            SymExpr::And(_, m) if *m >= 0 => Some(*m),
+            _ => None,
+        })
+        .collect();
 
     // --- Schritt 3: flusssensitive lt-Analyse über Sym-Paare. ---
     // Kanten-Fakten: (from_block, to_block) → strikte (x<y)-Paare.
@@ -404,11 +440,14 @@ fn run(f: &mut Function) -> usize {
         let stmts = &mut f.blocks[b].statements;
         for si in 0..stmts.len() {
             let elide = match &stmts[si] {
-                Statement::ArrayLoad { arr, index, kind, checked, .. }
-                | Statement::ArrayStore { arr, index, kind, checked, .. }
-                    if *checked && !kind.is_ref() =>
-                {
-                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &repr, &mut it)
+                // Ref-Loads dürfen elidiert werden (reiner GEP); Ref-Stores nicht,
+                // da `jrt_?astore` die Kovarianz-Prüfung (ArrayStoreException)
+                // trägt, die der inline-Pfad nicht hätte.
+                Statement::ArrayLoad { arr, index, checked, .. } if *checked => {
+                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &repr, &mut it)
+                }
+                Statement::ArrayStore { arr, index, kind, checked, .. } if *checked && !kind.is_ref() => {
+                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &repr, &mut it)
                 }
                 _ => false,
             };
@@ -481,6 +520,7 @@ fn step_env(st: &Statement, b: usize, si: usize, env: &mut Env, it: &mut Interne
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn provably_in_bounds(
     arr: &Operand,
     index: &Operand,
@@ -488,6 +528,7 @@ fn provably_in_bounds(
     len_of: &HashMap<u32, u32>,
     lt: &BTreeSet<(u32, u32)>,
     nn: &BTreeSet<u32>,
+    ub_const: &[Option<i64>],
     repr: &[u32],
     it: &mut Interner,
 ) -> bool {
@@ -495,7 +536,17 @@ fn provably_in_bounds(
     let Some(&lensym0) = len_of.get(&asym) else { return false };
     let lensym = canon(repr, lensym0);
     let isym = canon(repr, sym_of_operand(index, env, it));
-    lt.contains(&(isym, lensym)) && nn.contains(&isym)
+    // Pfad 1: Schleifenwächter-Fakt `i < len` + Nichtnegativität.
+    if lt.contains(&(isym, lensym)) && nn.contains(&isym) {
+        return true;
+    }
+    // Pfad 2: konstante Länge L, Index mit konstanter Schranke u ∈ [0, L).
+    if let SymExpr::Const(l) = it.exprs[lensym as usize] {
+        if let Some(Some(u)) = ub_const.get(isym as usize) {
+            return *u >= 0 && *u < l;
+        }
+    }
+    false
 }
 
 /// Repräsentant eines Syms nach Phi-Kollaps (Pfadverfolgung, bounds-sicher).
@@ -611,6 +662,7 @@ fn compute_nonneg(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32],
                 SymExpr::Add(s, c) => *c >= 0 && nn[canon(repr, *s) as usize],
                 SymExpr::Add2(a, b) => nn[canon(repr, *a) as usize] && nn[canon(repr, *b) as usize],
                 SymExpr::Mul(a, b) => nn[canon(repr, *a) as usize] && nn[canon(repr, *b) as usize],
+                SymExpr::And(_, m) => *m >= 0,
                 SymExpr::Phi(..) => !incomplete.contains(&(i as u32))
                     && phi_inc
                         .get(&(i as u32))
