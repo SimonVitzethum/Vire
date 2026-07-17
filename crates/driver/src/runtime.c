@@ -1158,6 +1158,7 @@ typedef struct TypeDesc {
     struct TypeDesc *super;
     const char *cname; /* gepunkteter Klassenname für Uncaught-Meldung */
     void *jclass;      /* Class-Objekt-Singleton dieser Klasse (Reflection) */
+    struct TypeDesc **ifaces; /* nullterminiert: transitive Interfaces (instanceof) */
 } TypeDesc;
 
 /* Reflection: obj.getClass() → das Class-Singleton über den Type-Descriptor.
@@ -1194,6 +1195,13 @@ int32_t jrt_instanceof(void *obj, void *target_td) {
     void **vt = (void **)h->vtable;
     if (!vt) return 0;
     TypeDesc *td = (TypeDesc *)vt[2];
+    /* Interface-Check: die konkrete Klasse trägt die transitive Interface-Menge. */
+    if (td && td->ifaces) {
+        for (TypeDesc **p = td->ifaces; *p; p++) {
+            if ((void *)*p == target_td) return 1;
+        }
+    }
+    /* Klassen-Kette (Superklassen). */
     while (td) {
         if ((void *)td == target_td) return 1;
         td = td->super;

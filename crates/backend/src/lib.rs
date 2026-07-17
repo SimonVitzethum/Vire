@@ -467,12 +467,32 @@ pub fn emit(program: &Program) -> String {
             esc = escape_ll(bytes),
         )
         .unwrap();
+        // Transitive Interface-Menge als nullterminiertes Array von Type-
+        // Descriptoren (für instanceof/checkcast gegen Interfaces).
+        let ifaces: Vec<String> = program
+            .all_interfaces(&c.name)
+            .iter()
+            .filter(|i| program.class(i).is_some())
+            .map(|i| format!("ptr @td.{}", sanitize(i)))
+            .collect();
+        let ifaces_ref = if ifaces.is_empty() {
+            "null".to_string()
+        } else {
+            let n = ifaces.len() + 1;
+            writeln!(
+                w,
+                "@ifaces.{} = internal constant [{n} x ptr] [{}, ptr null]",
+                sanitize(&c.name),
+                ifaces.join(", "),
+            )
+            .unwrap();
+            format!("@ifaces.{}", sanitize(&c.name))
+        };
         writeln!(
             w,
-            "@td.{} = internal constant {{ ptr, ptr, ptr }} {{ ptr {super_td}, ptr @cname.{}, ptr @jclass.{} }}",
-            sanitize(&c.name),
-            sanitize(&c.name),
-            sanitize(&c.name),
+            "@td.{s} = internal constant {{ ptr, ptr, ptr, ptr }} \
+             {{ ptr {super_td}, ptr @cname.{s}, ptr @jclass.{s}, ptr {ifaces_ref} }}",
+            s = sanitize(&c.name),
         )
         .unwrap();
     }
