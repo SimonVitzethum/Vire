@@ -311,11 +311,35 @@ Bestes von 7 Läufen, native ISA (AVX2), semantisch **gematchte** Programme
 | Arithmetik (500M, i64) | 0,052 s | 0,123 s | 0,069 s | **0,42×** | **0,74×** |
 | Allokation im Loop (200M) | 0,0014 s | 0,17 s (Box) | 0,0016 s | **~0×** | **0,86×** |
 | Fib(42) Rekursion | 0,43 s | 0,51 s | 0,24 s | **0,85×** | 1,78× |
-| Sieb (50M `boolean[]`) | 0,28 s | 0,26 s | 0,26 s | 1,07× | 1,05× |
+| Sieb (50M `boolean[]`) | 0,28 s | 0,26 s | 0,26 s | **~1,0×** | 1,05× |
 | Polymorphie (200M virtuell) | 0,26 s | 0,26 s | 0,098 s | **0,97×** | 2,61× |
+| Mandelbrot (4000²) | 1,11 s | 1,11 s | 1,05 s | **1,00×** | 1,06× |
+| Quicksort (20M) | 1,54 s | 1,48 s | 1,86 s | **1,03×** | **0,82×** |
+| Matmul (512³) | 0,18 s | 0,028 s | 0,020 s | 6,6× | 9,0× |
+| NBody (20M, static arrays) | 30 s | 0,78 s | 0,76 s | 39× | 40× |
+| binary-trees (Alloc/GC) | 4,4 s | 1,35 s | 1,23 s | 3,2× | 3,6× |
 
-**4 von 5 ≤ Rust; Arithmetik und Polymorphie liegen jetzt beide unter Rust,
-Arithmetik/Allokation auch unter C++.** Die Optimierungen im Einzelnen:
+**7 von 10 auf/über Rust-Parität** (Arith/Alloc/Fib/Quick auch ≤ C++). Die drei
+offenen Fälle und die dafür nötigen Analysen sind in
+[benchmarks/README.md](benchmarks/README.md) präzise dokumentiert: **Matmul**
+braucht affine Index-Bounds-Elision (`i·n+j < n²`, flusssensitive Obergrenzen →
+throw-frei → LLVM vektorisiert), **NBody** interprozedurale statische Array-Längen
+(RC-auf-Statics ist bereits eliminiert: 72×→39×; es fehlt die Länge), **Trees** eine
+Shape-Analyse (der `Node→Node`-Typ ist zyklisch, der Baum aber azyklisch → der
+Zyklen-Collector bleibt konservativ an). Alle drei sind gezielte Erweiterungen der
+bestehenden Infrastruktur, keine Neubauten.
+
+**Zwei allgemeine Codegen-Verbesserungen dieser Runde** (helfen breit, nicht nur
+Benchmarks): **RC-Elision auf stabilen statischen Feldern** (ein von Funktion +
+Callees ungeschriebenes static bleibt konstant → `GetStatic` ist ein Borrow, kein
+retain/release) und **inline-geprüfte Array-Zugriffe** (null-/Bounds-Test setzen
+pending inline über `jrt_throw_npe`/`jrt_throw_bounds`; der Zugriff bleibt ein
+sichtbarer `load`/`store` statt eines opaken `jrt_?aload`-Calls → hoistbar). Dazu
+`wide`-Opcode-Unterstützung (Correctness: `iinc`/Index > 8 Bit).
+
+**4 von 5 der ursprünglichen Kernbenchmarks ≤ Rust; Arithmetik und Polymorphie
+liegen beide unter Rust, Arithmetik/Allokation auch unter C++.** Die
+Optimierungen im Einzelnen:
 
 **Native Codegen** (`driver`). Der hosted-Build übersetzt mit `-march=native`
 (wie optimiertes C++ auf der Zielmaschine) — Closed-World-AOT kennt das Ziel.
