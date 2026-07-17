@@ -519,6 +519,16 @@ void *jrt_float_tostring(void *o) {
     return str_from_buf(buf, fmt_g(buf, (double)((JFloat *)o)->value));
 }
 
+/* Comparable.compareTo für die Wrapper (Vorzeichen von a−b). */
+#define CMP(av, bv) (((av) > (bv)) - ((av) < (bv)))
+int32_t jrt_integer_compareto(void *a, void *b) { return CMP(((JInteger *)a)->value, ((JInteger *)b)->value); }
+int32_t jrt_long_compareto(void *a, void *b) { return CMP(((JLong *)a)->value, ((JLong *)b)->value); }
+int32_t jrt_double_compareto(void *a, void *b) { return CMP(((JDouble *)a)->value, ((JDouble *)b)->value); }
+int32_t jrt_float_compareto(void *a, void *b) { return CMP(((JFloat *)a)->value, ((JFloat *)b)->value); }
+int32_t jrt_character_compareto(void *a, void *b) { return CMP(((JInteger *)a)->value, ((JInteger *)b)->value); }
+int32_t jrt_boolean_compareto(void *a, void *b) { return CMP(((JInteger *)a)->value, ((JInteger *)b)->value); }
+#undef CMP
+
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
  * Zur Laufzeit erzeugte Strings; refcount-verwaltet (kein immortal).
  * jrt_alloc (weiter unten definiert) setzt refcount=1 und trackt live. */

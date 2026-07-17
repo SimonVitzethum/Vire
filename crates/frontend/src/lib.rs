@@ -134,16 +134,35 @@ pub fn register_builtins(program: &mut Program) {
         name: name.to_string(),
         super_name: None,
         is_interface: false,
-        interfaces: Vec::new(),
+        interfaces: vec!["java/lang/Comparable".to_string()],
         fields: Vec::new(),
         static_fields: Vec::new(),
         methods: vec![
             m("equals", "(Ljava/lang/Object;)Z", &format!("jrt_{prefix}_equals")),
             m("hashCode", "()I", &format!("jrt_{prefix}_hashcode")),
             m("toString", "()Ljava/lang/String;", &format!("jrt_{prefix}_tostring")),
+            m("compareTo", "(Ljava/lang/Object;)I", &format!("jrt_{prefix}_compareto")),
         ],
         has_clinit: false,
     };
+    // java.lang.Comparable: Interface mit compareTo (globaler Vtable-Slot), das
+    // die Wrapper und String implementieren (für generische Comparable-Bounds).
+    program.classes.push(ClassInfo {
+        name: "java/lang/Comparable".to_string(),
+        super_name: None,
+        is_interface: true,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        static_fields: Vec::new(),
+        methods: vec![MethodInfo {
+            name: "compareTo".into(),
+            desc: "(Ljava/lang/Object;)I".into(),
+            is_static: false,
+            has_body: false,
+            mangled: mangle("java/lang/Comparable", "compareTo", "(Ljava/lang/Object;)I"),
+        }],
+        has_clinit: false,
+    });
     program.classes.push(builtin("java/lang/String", "str"));
     program.classes.push(builtin("java/lang/Integer", "integer"));
     program.classes.push(builtin("java/lang/Long", "long"));
