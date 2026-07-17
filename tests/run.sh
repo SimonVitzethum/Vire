@@ -134,6 +134,30 @@ run messages      0 Messages Messages Boom
 run enumswitch    0 EnumSwitch EnumSwitch Dir
 run escfields     0 EscapeFields EscapeFields Node2
 
+# --- JAR-Ingestion: Klassen + Manifest-Main-Class aus einem JAR ---
+jartest() {
+    name="$1"; want="$2"; main="$3"; shift 3
+    rm -f "$work"/*.class "$work"/app.jar
+    srcs="$ex/$main.java"
+    if ! javac -sourcepath "$ex" -d "$work" $srcs >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (javac): $(head -1 "$work/err")"; fail=$((fail+1)); return
+    fi
+    printf 'Main-Class: %s\n' "$main" > "$work/manifest.txt"
+    ( cd "$work" && jar cfm app.jar manifest.txt *.class >/dev/null 2>&1 )
+    if ! $fastjavac -o "$work/$main.bin" "$work/app.jar" >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (fastjavac): $(head -1 "$work/err")"; fail=$((fail+1)); return
+    fi
+    out="$(FASTLLVM_HEAPSTATS=1 "$work/$main.bin" 2>&1)"; code=$?
+    if [ "$code" != "$want" ]; then
+        echo "FAIL $name (exit $code, erwartet $want)"; fail=$((fail+1)); return
+    fi
+    if [ "$code" = "0" ] && echo "$out" | grep -q '\[heap\]' && ! echo "$out" | grep -q '0 noch live'; then
+        echo "FAIL $name (Heap-Leak)"; fail=$((fail+1)); return
+    fi
+    echo "ok   $name"; pass=$((pass+1))
+}
+jartest jar          0 Shapes
+
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"
 [ $fail -eq 0 ]

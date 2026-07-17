@@ -242,6 +242,10 @@ pub struct Program {
     /// Klassen mit Class-Objekt (durch Reflection berührt):
     /// Klassenname → String-Index des gepunkteten Namens (für getName).
     pub class_objects: Vec<(String, u32)>,
+    /// Einstiegsklasse (interner Name, z.B. `com/x/App`), falls bekannt
+    /// (JAR-Manifest `Main-Class` oder `--main`). Nur deren `main` wird zu
+    /// `java_main`; ist es `None`, gilt jede `main`-Methode (Einzeldatei-Modus).
+    pub main_class: Option<String>,
 }
 
 impl Program {

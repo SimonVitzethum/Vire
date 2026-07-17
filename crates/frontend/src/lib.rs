@@ -691,7 +691,15 @@ fn lower_method(
     program: &mut Program,
 ) -> Result<Function> {
     let (mut params, ret) = parse_descriptor(&m.descriptor)?;
-    let is_main = m.name == "main" && m.descriptor == "([Ljava/lang/String;)V";
+    // Nur die (ggf. per Manifest gewählte) Einstiegsklasse liefert java_main;
+    // sonst jede main (Einzeldatei-Modus). So kollidieren mehrere main-Methoden
+    // in einem JAR nicht.
+    let is_main = m.name == "main"
+        && m.descriptor == "([Ljava/lang/String;)V"
+        && match &program.main_class {
+            Some(mc) => cf.this_class == *mc,
+            None => true,
+        };
     if is_main {
         // args-Array wird nicht durchgereicht; Slot 0 bleibt ein
         // uninitialisiertes Ref-Local (Nutzung → Linker-/Laufzeitfehler später).
