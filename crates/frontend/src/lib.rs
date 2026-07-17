@@ -13,14 +13,18 @@ use std::collections::HashMap;
 use fastllvm_classfile::{ArrTy, ClassFile, Cond, Const, Instr};
 use fastllvm_ir::*;
 
-/// Array-Elementtyp des Classfile-Decoders → IR-Typ.
-fn arrty_ty(t: ArrTy) -> Ty {
+/// Array-Elementtyp des Classfile-Decoders → IR-Elementart.
+fn arrty_kind(t: ArrTy) -> ArrKind {
     match t {
-        ArrTy::Int => Ty::I32,
-        ArrTy::Long => Ty::I64,
-        ArrTy::Float => Ty::F32,
-        ArrTy::Double => Ty::F64,
-        ArrTy::Ref => Ty::Ref,
+        ArrTy::Bool => ArrKind::Bool,
+        ArrTy::Byte => ArrKind::Byte,
+        ArrTy::Char => ArrKind::Char,
+        ArrTy::Short => ArrKind::Short,
+        ArrTy::Int => ArrKind::Int,
+        ArrTy::Long => ArrKind::Long,
+        ArrTy::Float => ArrKind::Float,
+        ArrTy::Double => ArrKind::Double,
+        ArrTy::Ref => ArrKind::Ref,
     }
 }
 
@@ -1652,13 +1656,13 @@ fn lower_block(
                 push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
             }
             Instr::NewArrayPrim(_) | Instr::NewArrayRef(_) => {
-                let elem = match instr {
-                    Instr::NewArrayPrim(t) => arrty_ty(*t),
-                    _ => Ty::Ref,
+                let kind = match instr {
+                    Instr::NewArrayPrim(t) => arrty_kind(*t),
+                    _ => ArrKind::Ref,
                 };
                 let len = pop!();
                 let l = ml.stack_slot(stack.len(), Ty::Ref);
-                stmts.push(Statement::NewArray { dest: l, elem, len: Operand::Copy(len) });
+                stmts.push(Statement::NewArray { dest: l, kind, len: Operand::Copy(len) });
                 stack.push(Ty::Ref);
             }
             Instr::ArrayLength => {
@@ -1669,21 +1673,23 @@ fn lower_block(
                 throw_after = Some(*pc); // NPE bei null-Array
             }
             Instr::ArrLoad(t) => {
-                let elem = arrty_ty(*t);
+                let kind = arrty_kind(*t);
+                let vty = kind.value_ty();
                 let index = pop!();
                 let arr = pop!();
-                let l = ml.stack_slot(stack.len(), elem);
+                let l = ml.stack_slot(stack.len(), vty);
                 stmts.push(Statement::ArrayLoad {
                     dest: l,
                     arr: Operand::Copy(arr),
                     index: Operand::Copy(index),
-                    elem,
+                    kind,
+                    checked: true,
                 });
-                stack.push(elem);
+                stack.push(vty);
                 throw_after = Some(*pc); // NPE / ArrayIndexOutOfBounds
             }
             Instr::ArrStore(t) => {
-                let elem = arrty_ty(*t);
+                let kind = arrty_kind(*t);
                 let value = pop!();
                 let index = pop!();
                 let arr = pop!();
@@ -1691,7 +1697,8 @@ fn lower_block(
                     arr: Operand::Copy(arr),
                     index: Operand::Copy(index),
                     value: Operand::Copy(value),
-                    elem,
+                    kind,
+                    checked: true,
                 });
                 throw_after = Some(*pc); // NPE / ArrayIndexOutOfBounds
             }

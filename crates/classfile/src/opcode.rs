@@ -15,9 +15,14 @@ pub enum Cond {
     Le,
 }
 
-/// Array-Elementtyp (byte/boolean/char/short werden als `Int` geführt).
+/// Array-Elementtyp. Der Stack-/Wertetyp ist bei Bool/Byte/Char/Short int,
+/// die Speicherbreite aber 1/2 Byte (schmale Arrays, Rust-Speicherprofil).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrTy {
+    Bool,
+    Byte,
+    Char,
+    Short,
     Int,
     Long,
     Float,
@@ -227,18 +232,24 @@ pub fn decode_code(
             0x47..=0x4A => (Instr::DStore(op as u16 - 0x47), 1),
             0x3A => (Instr::AStore(u8_at(pc + 1)? as u16), 2),
             0x4B..=0x4E => (Instr::AStore(op as u16 - 0x4B), 1),
-            // Array-Load: byte/char/short (baload/caload/saload) → Int.
-            0x2E | 0x33 | 0x34 | 0x35 => (Instr::ArrLoad(ArrTy::Int), 1),
+            // Array-Load (baload deckt byte UND boolean ab).
+            0x2E => (Instr::ArrLoad(ArrTy::Int), 1),
             0x2F => (Instr::ArrLoad(ArrTy::Long), 1),
             0x30 => (Instr::ArrLoad(ArrTy::Float), 1),
             0x31 => (Instr::ArrLoad(ArrTy::Double), 1),
             0x32 => (Instr::ArrLoad(ArrTy::Ref), 1),
-            // Array-Store: bastore/castore/sastore → Int.
-            0x4F | 0x54 | 0x55 | 0x56 => (Instr::ArrStore(ArrTy::Int), 1),
+            0x33 => (Instr::ArrLoad(ArrTy::Byte), 1),
+            0x34 => (Instr::ArrLoad(ArrTy::Char), 1),
+            0x35 => (Instr::ArrLoad(ArrTy::Short), 1),
+            // Array-Store.
+            0x4F => (Instr::ArrStore(ArrTy::Int), 1),
             0x50 => (Instr::ArrStore(ArrTy::Long), 1),
             0x51 => (Instr::ArrStore(ArrTy::Float), 1),
             0x52 => (Instr::ArrStore(ArrTy::Double), 1),
             0x53 => (Instr::ArrStore(ArrTy::Ref), 1),
+            0x54 => (Instr::ArrStore(ArrTy::Byte), 1),
+            0x55 => (Instr::ArrStore(ArrTy::Char), 1),
+            0x56 => (Instr::ArrStore(ArrTy::Short), 1),
             0x57 => (Instr::Pop, 1),
             0x58 => (Instr::Pop2, 1),
             0x59 => (Instr::Dup, 1),
@@ -367,9 +378,13 @@ pub fn decode_code(
                 // newarray: atype → Elementtyp. bool/byte/char/short/int → Int
                 // (4-Byte, wertkorrekt), long/float/double typisiert.
                 let elem = match u8_at(pc + 1)? {
-                    4 | 5 | 8 | 9 | 10 => ArrTy::Int, // boolean/char/byte/short/int
+                    4 => ArrTy::Bool,
+                    5 => ArrTy::Char,
                     6 => ArrTy::Float,
                     7 => ArrTy::Double,
+                    8 => ArrTy::Byte,
+                    9 => ArrTy::Short,
+                    10 => ArrTy::Int,
                     11 => ArrTy::Long,
                     _ => return Err(ParseError::UnsupportedOpcode(op, pc)),
                 };

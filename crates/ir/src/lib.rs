@@ -130,13 +130,53 @@ pub enum Statement {
     CheckCast { obj: Operand, class: String },
     /// `dest = (obj instanceof class) ? 1 : 0`.
     InstanceOf { dest: Local, obj: Operand, class: String },
-    /// Array-Allokation der Länge `len`; `elem` ist I32 oder Ref.
-    NewArray { dest: Local, elem: Ty, len: Operand },
+    /// Array-Allokation der Länge `len`.
+    NewArray { dest: Local, kind: ArrKind, len: Operand },
     ArrayLen { dest: Local, arr: Operand },
-    /// `dest = arr[index]`; bounds-gecheckt.
-    ArrayLoad { dest: Local, arr: Operand, index: Operand, elem: Ty },
-    /// `arr[index] = value`; bounds-gecheckt.
-    ArrayStore { arr: Operand, index: Operand, value: Operand, elem: Ty },
+    /// `dest = arr[index]`; bounds-gecheckt sofern `checked`.
+    ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },
+    /// `arr[index] = value`; bounds-gecheckt sofern `checked`.
+    ArrayStore { arr: Operand, index: Operand, value: Operand, kind: ArrKind, checked: bool },
+}
+
+/// Array-Elementart: Wertetyp (Stack) + Speicherbreite. Bool/Byte = 1 Byte,
+/// Char/Short = 2 (Wert int); Int/Float = 4; Long/Double/Ref = 8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrKind {
+    Bool,
+    Byte,
+    Char,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+    Ref,
+}
+
+impl ArrKind {
+    /// Wertetyp auf dem Operandenstack.
+    pub fn value_ty(self) -> Ty {
+        match self {
+            ArrKind::Long => Ty::I64,
+            ArrKind::Float => Ty::F32,
+            ArrKind::Double => Ty::F64,
+            ArrKind::Ref => Ty::Ref,
+            _ => Ty::I32,
+        }
+    }
+    /// Speicherbreite in Bytes.
+    pub fn size(self) -> usize {
+        match self {
+            ArrKind::Bool | ArrKind::Byte => 1,
+            ArrKind::Char | ArrKind::Short => 2,
+            ArrKind::Int | ArrKind::Float => 4,
+            ArrKind::Long | ArrKind::Double | ArrKind::Ref => 8,
+        }
+    }
+    pub fn is_ref(self) -> bool {
+        matches!(self, ArrKind::Ref)
+    }
 }
 
 #[derive(Debug, Clone)]

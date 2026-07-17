@@ -151,6 +151,12 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_iastore", "void (ptr, i32, i32)"),
     ("jrt_aaload", "ptr (ptr, i32)"),
     ("jrt_aastore", "void (ptr, i32, ptr)"),
+    ("jrt_baload", "i32 (ptr, i32)"),
+    ("jrt_bastore", "void (ptr, i32, i32)"),
+    ("jrt_caload", "i32 (ptr, i32)"),
+    ("jrt_castore", "void (ptr, i32, i32)"),
+    ("jrt_saload", "i32 (ptr, i32)"),
+    ("jrt_sastore", "void (ptr, i32, i32)"),
     ("jrt_laload", "i64 (ptr, i32)"),
     ("jrt_lastore", "void (ptr, i32, i64)"),
     ("jrt_daload", "double (ptr, i32)"),
@@ -193,18 +199,11 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_noop_trace", "void (ptr, ptr)"),
 ];
 
-fn array_vtable(elem: Ty) -> &'static str {
-    match elem {
-        Ty::Ref => "@vt.array.ref",
-        _ => "@vt.array.int",
-    }
-}
-
-/// Elementgröße in Bytes (für die Allokation).
-fn elem_size(elem: Ty) -> usize {
-    match elem {
-        Ty::Ref | Ty::I64 | Ty::F64 => 8,
-        _ => 4,
+fn array_vtable(kind: ArrKind) -> &'static str {
+    if kind.is_ref() {
+        "@vt.array.ref"
+    } else {
+        "@vt.array.int"
     }
 }
 
@@ -1384,7 +1383,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {t} = call i32 @jrt_instanceof(ptr {o}, ptr @td.{})", sanitize(class)).unwrap();
             writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
         }
-        Statement::NewArray { dest, elem, len } => {
+        Statement::NewArray { dest, kind, len } => {
             let n = e.operand(w, len);
             let n64 = e.fresh();
             writeln!(w, "  {n64} = sext i32 {n} to i64").unwrap();
@@ -1392,50 +1391,129 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(
                 w,
                 "  {t} = call ptr @jrt_alloc_array(i64 {n64}, i64 {}, ptr {})",
-                elem_size(*elem),
-                array_vtable(*elem),
+                kind.size(),
+                array_vtable(*kind),
             )
             .unwrap();
             store_dest(w, e, *dest, &t, false); // alloc gab +1
         }
-        // Array-Zugriffe über Runtime-Helfer (Check + Zugriff gekapselt),
-        // damit NPE/ArrayIndexOutOfBounds abfangbar sind (pending-Modell).
         Statement::ArrayLen { dest, arr } => {
             let a = e.operand(w, arr);
             let t = e.fresh();
             writeln!(w, "  {t} = call i32 @jrt_arraylen(ptr {a})").unwrap();
             writeln!(w, "  store i32 {t}, ptr %l{}", dest.0).unwrap();
         }
-        Statement::ArrayLoad { dest, arr, index, elem } => {
+        Statement::ArrayLoad { dest, arr, index, kind, checked } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
-            let (func, rty) = match elem {
-                Ty::Ref => ("jrt_aaload", "ptr"),
-                Ty::I64 => ("jrt_laload", "i64"),
-                Ty::F64 => ("jrt_daload", "double"),
-                Ty::F32 => ("jrt_faload", "float"),
-                _ => ("jrt_iaload", "i32"),
-            };
-            let t = e.fresh();
-            writeln!(w, "  {t} = call {rty} @{func}(ptr {a}, i32 {i})").unwrap();
-            // Ref-Element ist geborgt → Kopie ins Local wird owned (retain).
-            store_dest(w, e, *dest, &t, *elem == Ty::Ref);
+            let vty = kind.value_ty();
+            if *checked {
+                // Über Runtime-Helfer (Bounds/NPE abfangbar, pending-Modell).
+                let t = e.fresh();
+                writeln!(w, "  {t} = call {} @{}(ptr {a}, i32 {i})", llty(vty), arr_load_fn(*kind)).unwrap();
+                store_dest(w, e, *dest, &t, kind.is_ref());
+            } else {
+                // Bounds-frei (Solver-bewiesen): direkter GEP + load.
+                let v = emit_array_elem_load(w, e, &a, &i, *kind);
+                store_dest(w, e, *dest, &v, kind.is_ref());
+            }
         }
-        Statement::ArrayStore { arr, index, value, elem } => {
+        Statement::ArrayStore { arr, index, value, kind, checked } => {
             let a = e.operand(w, arr);
             let i = e.operand(w, index);
             let v = e.operand(w, value);
-            // aastore erledigt das RC (retain neu, release alt) intern.
-            let func = match elem {
-                Ty::Ref => "jrt_aastore",
-                Ty::I64 => "jrt_lastore",
-                Ty::F64 => "jrt_dastore",
-                Ty::F32 => "jrt_fastore",
-                _ => "jrt_iastore",
-            };
-            writeln!(w, "  call void @{func}(ptr {a}, i32 {i}, {} {v})", llty(*elem)).unwrap();
+            let vty = kind.value_ty();
+            if *checked {
+                writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
+            } else {
+                emit_array_elem_store(w, e, &a, &i, &v, *kind);
+            }
         }
     }
+}
+
+/// Runtime-Load-Helfer je Elementart.
+fn arr_load_fn(k: ArrKind) -> &'static str {
+    match k {
+        ArrKind::Bool | ArrKind::Byte => "jrt_baload",
+        ArrKind::Char => "jrt_caload",
+        ArrKind::Short => "jrt_saload",
+        ArrKind::Int => "jrt_iaload",
+        ArrKind::Long => "jrt_laload",
+        ArrKind::Float => "jrt_faload",
+        ArrKind::Double => "jrt_daload",
+        ArrKind::Ref => "jrt_aaload",
+    }
+}
+fn arr_store_fn(k: ArrKind) -> &'static str {
+    match k {
+        ArrKind::Bool | ArrKind::Byte => "jrt_bastore",
+        ArrKind::Char => "jrt_castore",
+        ArrKind::Short => "jrt_sastore",
+        ArrKind::Int => "jrt_iastore",
+        ArrKind::Long => "jrt_lastore",
+        ArrKind::Float => "jrt_fastore",
+        ArrKind::Double => "jrt_dastore",
+        ArrKind::Ref => "jrt_aastore",
+    }
+}
+/// LLVM-Speichertyp eines Array-Elements.
+fn arr_store_ty(k: ArrKind) -> &'static str {
+    match k {
+        ArrKind::Bool | ArrKind::Byte => "i8",
+        ArrKind::Char | ArrKind::Short => "i16",
+        ArrKind::Int => "i32",
+        ArrKind::Long => "i64",
+        ArrKind::Float => "float",
+        ArrKind::Double => "double",
+        ArrKind::Ref => "ptr",
+    }
+}
+fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind) -> String {
+    let i64v = e.fresh();
+    writeln!(w, "  {i64v} = sext i32 {i} to i64").unwrap();
+    let off = e.fresh();
+    writeln!(w, "  {off} = mul i64 {i64v}, {}", k.size()).unwrap();
+    let base = e.fresh();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    let ep = e.fresh();
+    writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+    let raw = e.fresh();
+    writeln!(w, "  {raw} = load {}, ptr {ep}", arr_store_ty(k)).unwrap();
+    // Schmale Typen auf i32 erweitern (byte/short signed, bool/char unsigned).
+    match k {
+        ArrKind::Byte | ArrKind::Short => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = sext {} {raw} to i32", arr_store_ty(k)).unwrap();
+            x
+        }
+        ArrKind::Bool | ArrKind::Char => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = zext {} {raw} to i32", arr_store_ty(k)).unwrap();
+            x
+        }
+        _ => raw,
+    }
+}
+fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind) {
+    let i64v = e.fresh();
+    writeln!(w, "  {i64v} = sext i32 {i} to i64").unwrap();
+    let off = e.fresh();
+    writeln!(w, "  {off} = mul i64 {i64v}, {}", k.size()).unwrap();
+    let base = e.fresh();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    let ep = e.fresh();
+    writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+    // Wert auf die Speicherbreite kürzen (byte/char/short).
+    let sv = match k {
+        ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = trunc i32 {v} to {}", arr_store_ty(k)).unwrap();
+            x
+        }
+        _ => v.to_string(),
+    };
+    writeln!(w, "  store {} {sv}, ptr {ep}", arr_store_ty(k)).unwrap();
 }
 
 /// Speichert die Vtable im Objektheader (hinter refcount + rcflags).
