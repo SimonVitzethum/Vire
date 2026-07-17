@@ -1,4 +1,4 @@
-/* fastllvm Mini-Runtime (hosted-Variante).
+/* fastllvm Mini-Runtime (Plattformschicht: hosted-libc oder freestanding/seL4).
  *
  * Bewusst klein (DESIGN.md §6): println-Intrinsics, Java-Semantik-Helfer
  * für idiv/irem und die Referenzzählung (Stufe 4, DESIGN.md §6/§7). Die
@@ -18,9 +18,171 @@
  */
 #include <stddef.h>
 #include <stdint.h>
+
+/* ====================================================================
+ * Plattformschicht — die EINZIGE Stelle mit OS-/libc-Abhängigkeiten.
+ * Hosted (Standard): libc. Freestanding (-DFASTLLVM_FREESTANDING, z.B.
+ * seL4): statischer Heap + schwache Ausgabe-/Halt-Hooks, keine libc.
+ * Der gesamte übrige Runtime-Kern ruft nur plat_, fmt_ und jrt_memcpy.
+ * ==================================================================== */
+
+static void *plat_alloc(size_t n);        /* genullter Speicher */
+static void *plat_realloc(void *p, size_t n);
+static void plat_free(void *p);
+static void plat_write(const char *s, size_t n); /* Bytes → stdout/Debug */
+static void plat_abort(void);             /* kehrt nicht zurück */
+
+/* Portable Helfer (ohne libc). */
+static void jrt_memcpy(void *d, const void *s, size_t n) {
+    uint8_t *dd = (uint8_t *)d;
+    const uint8_t *ss = (const uint8_t *)s;
+    for (size_t i = 0; i < n; i++) dd[i] = ss[i];
+}
+static size_t jrt_strlen(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+static void plat_puts(const char *s) { plat_write(s, jrt_strlen(s)); }
+/* Uncaught-Meldung: `Exception in thread "main" <msg>\n` ohne printf. */
+static void plat_uncaught(const char *msg) {
+    plat_puts("Exception in thread \"main\" ");
+    plat_puts(msg);
+    plat_write("\n", 1);
+}
+
+/* Vorzeichenbehaftete Dezimalformatierung nach buf (>=24 Bytes). */
+static int fmt_i64(char *buf, int64_t v) {
+    char tmp[24];
+    int n = 0;
+    int neg = v < 0;
+    uint64_t u = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
+    do {
+        tmp[n++] = (char)('0' + (u % 10u));
+        u /= 10u;
+    } while (u);
+    int len = 0;
+    if (neg) buf[len++] = '-';
+    while (n) buf[len++] = tmp[--n];
+    buf[len] = '\0';
+    return len;
+}
+
+#ifdef FASTLLVM_FREESTANDING
+/* -------- Freestanding (seL4): keine libc -------------------------- */
+/* Von der Zielumgebung bereitzustellen; schwache Defaults, damit es linkt. */
+__attribute__((weak)) void jrt_debug_putchar(char c) { (void)c; }
+__attribute__((weak)) void jrt_platform_halt(void) {
+    for (;;) {}
+}
+static void plat_write(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) jrt_debug_putchar(s[i]);
+}
+static void plat_abort(void) {
+    jrt_platform_halt();
+    for (;;) {}
+}
+
+/* Minimaler Freelist-Allokator über einen statischen Heap. Blockheader trägt
+ * die Nutzgröße; plat_free() hängt Blöcke in eine First-Fit-Liste. Ausreichend für
+ * den seL4-Bring-up; produktiv ersetzt die Zielumgebung plat_* durch ihren
+ * eigenen Allokator. */
+#ifndef FASTLLVM_HEAP_SIZE
+#define FASTLLVM_HEAP_SIZE (16u * 1024u * 1024u)
+#endif
+typedef struct FreeBlock {
+    size_t size;
+    struct FreeBlock *next;
+} FreeBlock;
+static uint8_t plat_heap[FASTLLVM_HEAP_SIZE] __attribute__((aligned(16)));
+static size_t plat_bump = 0;
+static FreeBlock *plat_freelist = NULL;
+#define PLAT_HDR ((sizeof(size_t) + 15u) & ~((size_t)15u))
+static void *plat_alloc(size_t n) {
+    size_t need = (n + 15u) & ~((size_t)15u);
+    /* First-Fit in der Freiliste. */
+    FreeBlock **pp = &plat_freelist;
+    while (*pp) {
+        if ((*pp)->size >= need) {
+            FreeBlock *b = *pp;
+            *pp = b->next;
+            uint8_t *payload = (uint8_t *)b + PLAT_HDR;
+            for (size_t i = 0; i < b->size; i++) payload[i] = 0;
+            return payload;
+        }
+        pp = &(*pp)->next;
+    }
+    /* Sonst vom Bump-Zeiger. */
+    if (plat_bump + PLAT_HDR + need > FASTLLVM_HEAP_SIZE) return NULL;
+    FreeBlock *b = (FreeBlock *)(plat_heap + plat_bump);
+    b->size = need;
+    plat_bump += PLAT_HDR + need;
+    return (uint8_t *)b + PLAT_HDR; /* Heap ist statisch genullt */
+}
+static void plat_free(void *p) {
+    if (!p) return;
+    FreeBlock *b = (FreeBlock *)((uint8_t *)p - PLAT_HDR);
+    b->next = plat_freelist;
+    plat_freelist = b;
+}
+static void *plat_realloc(void *p, size_t n) {
+    if (!p) return plat_alloc(n);
+    FreeBlock *b = (FreeBlock *)((uint8_t *)p - PLAT_HDR);
+    if (b->size >= n) return p;
+    void *q = plat_alloc(n);
+    if (q) jrt_memcpy(q, p, b->size);
+    plat_free(p);
+    return q;
+}
+
+/* Minimaler %g-Ersatz: Vorzeichen, Ganzteil, 6 Nachkommastellen. */
+static int fmt_g(char *buf, double v) {
+    int len = 0;
+    if (v < 0) {
+        buf[len++] = '-';
+        v = -v;
+    }
+    int64_t ip = (int64_t)v;
+    len += fmt_i64(buf + len, ip);
+    double frac = v - (double)ip;
+    buf[len++] = '.';
+    for (int i = 0; i < 6; i++) {
+        frac *= 10.0;
+        int d = (int)frac;
+        if (d < 0) d = 0;
+        if (d > 9) d = 9;
+        buf[len++] = (char)('0' + d);
+        frac -= (double)d;
+    }
+    buf[len] = '\0';
+    return len;
+}
+static int fmt_spec_i64(char *buf, const char *spec, int64_t v) {
+    (void)spec;
+    return fmt_i64(buf, v);
+}
+static int fmt_spec_f(char *buf, const char *spec, double v) {
+    (void)spec;
+    return fmt_g(buf, v);
+}
+
+#else
+/* -------- Hosted: libc -------------------------------------------- */
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+static void *plat_alloc(size_t n) { return calloc(1, n); }
+static void *plat_realloc(void *p, size_t n) { return realloc(p, n); }
+static void plat_free(void *p) { free(p); }
+static void plat_write(const char *s, size_t n) { fwrite(s, 1, n, stdout); }
+static void plat_abort(void) { exit(1); }
+static int fmt_g(char *buf, double v) { return snprintf(buf, 32, "%g", v); }
+static int fmt_spec_i64(char *buf, const char *spec, int64_t v) {
+    return snprintf(buf, 64, spec, v);
+}
+static int fmt_spec_f(char *buf, const char *spec, double v) {
+    return snprintf(buf, 64, spec, v);
+}
+#endif
 
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
@@ -50,33 +212,36 @@ typedef struct {
 } JStr;
 
 void jrt_print_str(const JStr *s) {
-    fwrite(s->bytes, 1, (size_t)s->len, stdout);
+    plat_write((const char *)s->bytes, (size_t)s->len);
 }
 
 void jrt_println_str(const JStr *s) {
     jrt_print_str(s);
-    fputc('\n', stdout);
+    plat_write("\n", 1);
 }
 
 void jrt_print_int(int32_t v) {
-    printf("%d", v);
+    char b[24];
+    plat_write(b, (size_t)fmt_i64(b, v));
 }
 
 void jrt_println_int(int32_t v) {
-    printf("%d\n", v);
+    jrt_print_int(v);
+    plat_write("\n", 1);
 }
 
 void jrt_println_ln(void) {
-    fputc('\n', stdout);
+    plat_write("\n", 1);
 }
 
 void jrt_print_char(int32_t c) {
-    fputc(c, stdout);
+    char cc = (char)c;
+    plat_write(&cc, 1);
 }
 
 void jrt_println_char(int32_t c) {
-    fputc(c, stdout);
-    fputc('\n', stdout);
+    jrt_print_char(c);
+    plat_write("\n", 1);
 }
 
 /* String-Methoden (Byte-/ASCII-Semantik, s. Frontend-Kommentar).
@@ -184,7 +349,7 @@ int32_t jrt_integer_equals(void *a, void *b) {
 }
 void *jrt_integer_tostring(void *o) {
     char buf[16];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%d", ((JInteger *)o)->value));
+    return str_from_buf(buf, fmt_i64(buf, ((JInteger *)o)->value));
 }
 
 void *jrt_long_valueof(int64_t v) {
@@ -204,7 +369,7 @@ int32_t jrt_long_equals(void *a, void *b) {
 }
 void *jrt_long_tostring(void *o) {
     char buf[24];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%lld", (long long)((JLong *)o)->value));
+    return str_from_buf(buf, fmt_i64(buf, ((JLong *)o)->value));
 }
 
 /* Boolean nutzt dasselbe Layout wie Integer (0/1). */
@@ -241,7 +406,7 @@ void *jrt_double_valueof(double v) {
 double jrt_double_doublevalue(void *o) { return ((JDouble *)o)->value; }
 int32_t jrt_double_hashcode(void *o) {
     int64_t bits;
-    memcpy(&bits, &((JDouble *)o)->value, sizeof bits);
+    jrt_memcpy(&bits, &((JDouble *)o)->value, sizeof bits);
     return (int32_t)(bits ^ (bits >> 32)); /* Java Double.hashCode */
 }
 int32_t jrt_double_equals(void *a, void *b) {
@@ -250,7 +415,7 @@ int32_t jrt_double_equals(void *a, void *b) {
 }
 void *jrt_double_tostring(void *o) {
     char buf[32];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", ((JDouble *)o)->value));
+    return str_from_buf(buf, fmt_g(buf, ((JDouble *)o)->value));
 }
 
 /* Character nutzt dasselbe Layout wie Integer (char = i32). */
@@ -288,7 +453,7 @@ float jrt_float_floatvalue(void *o) { return ((JFloat *)o)->value; }
 int32_t jrt_float_hashcode(void *o) {
     int32_t bits;
     float v = ((JFloat *)o)->value;
-    memcpy(&bits, &v, sizeof bits);
+    jrt_memcpy(&bits, &v, sizeof bits);
     return bits; /* Java Float.hashCode = floatToIntBits */
 }
 int32_t jrt_float_equals(void *a, void *b) {
@@ -297,7 +462,7 @@ int32_t jrt_float_equals(void *a, void *b) {
 }
 void *jrt_float_tostring(void *o) {
     char buf[32];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", (double)((JFloat *)o)->value));
+    return str_from_buf(buf, fmt_g(buf, (double)((JFloat *)o)->value));
 }
 
 /* --- String-Konkatenation (invokedynamic makeConcatWithConstants) ----
@@ -318,24 +483,24 @@ JStr *jrt_str_concat(const JStr *a, const JStr *b) {
     const uint8_t *bb = b ? b->bytes : NUL;
     int64_t lb = b ? b->len : 4;
     JStr *r = str_alloc(la + lb);
-    memcpy(r->bytes, ba, (size_t)la);
-    memcpy(r->bytes + la, bb, (size_t)lb);
+    jrt_memcpy(r->bytes, ba, (size_t)la);
+    jrt_memcpy(r->bytes + la, bb, (size_t)lb);
     return r;
 }
 
 static JStr *str_from_buf(const char *buf, int n) {
     JStr *r = str_alloc(n);
-    memcpy(r->bytes, buf, (size_t)n);
+    jrt_memcpy(r->bytes, buf, (size_t)n);
     return r;
 }
 
 JStr *jrt_int_to_str(int32_t v) {
     char buf[16];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%d", v));
+    return str_from_buf(buf, fmt_i64(buf, v));
 }
 JStr *jrt_long_to_str(int64_t v) {
     char buf[24];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%lld", (long long)v));
+    return str_from_buf(buf, fmt_i64(buf, v));
 }
 JStr *jrt_char_to_str(int32_t c) {
     char b = (char)c;
@@ -348,11 +513,11 @@ JStr *jrt_bool_to_str(int32_t b) {
  * mit %g an (dokumentierte Abweichung, DESIGN.md §6). */
 JStr *jrt_double_to_str(double d) {
     char buf[32];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", d));
+    return str_from_buf(buf, fmt_g(buf, d));
 }
 JStr *jrt_float_to_str(float f) {
     char buf[32];
-    return str_from_buf(buf, snprintf(buf, sizeof buf, "%g", (double)f));
+    return str_from_buf(buf, fmt_g(buf, (double)f));
 }
 
 /* --- StringBuilder (runtime-gestützt) -------------------------------
@@ -370,22 +535,22 @@ typedef struct {
     int64_t len, cap;
 } JSB;
 
-static void jrt_sb_drop(void *p) { free(((JSB *)p)->buf); }
+static void jrt_sb_drop(void *p) { plat_free(((JSB *)p)->buf); }
 
 void *jrt_sb_new(void) {
     JSB *sb = (JSB *)jrt_alloc((int64_t)sizeof(JSB));
     sb->vtable = (void *)jrt_sb_vtable;
     sb->cap = 16;
-    sb->buf = (uint8_t *)malloc(16);
+    sb->buf = (uint8_t *)plat_alloc(16);
     sb->len = 0;
     return sb;
 }
 static void sb_append(JSB *sb, const void *b, int64_t n) {
     if (sb->len + n > sb->cap) {
         while (sb->len + n > sb->cap) sb->cap *= 2;
-        sb->buf = (uint8_t *)realloc(sb->buf, (size_t)sb->cap);
+        sb->buf = (uint8_t *)plat_realloc(sb->buf, (size_t)sb->cap);
     }
-    memcpy(sb->buf + sb->len, b, (size_t)n);
+    jrt_memcpy(sb->buf + sb->len, b, (size_t)n);
     sb->len += n;
 }
 /* append gibt this zurück (Verkettung); der Aufrufer erwartet eine
@@ -398,19 +563,19 @@ void *jrt_sb_append_str(void *p, const JStr *s) {
 }
 void *jrt_sb_append_int(void *p, int32_t v) {
     char b[16];
-    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%d", v));
+    sb_append((JSB *)p, b, fmt_i64(b, v));
     jrt_retain(p);
     return p;
 }
 void *jrt_sb_append_long(void *p, int64_t v) {
     char b[24];
-    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%lld", (long long)v));
+    sb_append((JSB *)p, b, fmt_i64(b, v));
     jrt_retain(p);
     return p;
 }
 void *jrt_sb_append_double(void *p, double v) {
     char b[32];
-    sb_append((JSB *)p, b, snprintf(b, sizeof b, "%g", v));
+    sb_append((JSB *)p, b, fmt_g(b, v));
     jrt_retain(p);
     return p;
 }
@@ -477,15 +642,15 @@ JStr *jrt_str_format(const JStr *fmt, void *argsp) {
         case 'd':
         case 'i': {
             spec[sl - 1] = 'd';
-            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JInteger *)arg)->value : 0));
+            sb_append(sb, buf, fmt_spec_i64(buf, spec, arg ? ((JInteger *)arg)->value : 0));
             break;
         }
         case 'x':
         case 'X':
-            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JInteger *)arg)->value : 0));
+            sb_append(sb, buf, fmt_spec_i64(buf, spec, arg ? ((JInteger *)arg)->value : 0));
             break;
         case 'f': {
-            sb_append(sb, buf, snprintf(buf, sizeof buf, spec, arg ? ((JDouble *)arg)->value : 0.0));
+            sb_append(sb, buf, fmt_spec_f(buf, spec, arg ? ((JDouble *)arg)->value : 0.0));
             break;
         }
         case 'c': {
@@ -560,14 +725,14 @@ static size_t roots_len = 0, roots_cap = 0;
 static void jrt_collect_cycles(void);
 
 static void free_obj(JObjHeader *h) {
-    free(h);
+    plat_free(h);
     live_objects--;
 }
 
 static void roots_push(JObjHeader *h) {
     if (roots_len == roots_cap) {
         roots_cap = roots_cap ? roots_cap * 2 : 64;
-        roots = (JObjHeader **)realloc(roots, roots_cap * sizeof(*roots));
+        roots = (JObjHeader **)plat_realloc(roots, roots_cap * sizeof(*roots));
     }
     roots[roots_len++] = h;
 }
@@ -585,20 +750,31 @@ static void possible_root(JObjHeader *h) {
 
 static void jrt_shutdown(void) {
     jrt_collect_cycles();
+#ifndef FASTLLVM_FREESTANDING
+    /* Leak-Detektor nur hosted (getenv/Prozess-Exit). */
     if (getenv("FASTLLVM_HEAPSTATS")) {
-        fprintf(stderr, "[heap] %lld alloziert, %lld noch live (Zyklen-Leak)\n",
-                (long long)total_allocated, (long long)live_objects);
+        char b[24];
+        plat_puts("[heap] ");
+        plat_write(b, (size_t)fmt_i64(b, total_allocated));
+        plat_puts(" alloziert, ");
+        plat_write(b, (size_t)fmt_i64(b, live_objects));
+        plat_puts(" noch live (Zyklen-Leak)\n");
     }
+#endif
 }
 
 void *jrt_alloc(int64_t size) {
-    void *p = calloc(1, (size_t)size);
+    void *p = plat_alloc((size_t)size);
     if (!p) {
-        fputs("Exception in thread \"main\" java.lang.OutOfMemoryError\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
+        plat_abort();
     }
     if (total_allocated++ == 0) {
+#ifndef FASTLLVM_FREESTANDING
+#ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
+#endif
+#endif
     }
     live_objects++;
     ((JObjHeader *)p)->refcount = 1; /* der Erzeuger hält die erste Referenz */
@@ -724,8 +900,8 @@ static void jrt_collect_cycles(void) {
 
 void jrt_null_check(const void *p) {
     if (!p) {
-        fputs("Exception in thread \"main\" java.lang.NullPointerException\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.NullPointerException\n");
+        plat_abort();
     }
 }
 
@@ -825,8 +1001,8 @@ int32_t jrt_pending_instanceof(void *target_td) {
  * sonst muss der Typ passen (ClassCastException = Abbruch). */
 void jrt_checkcast(void *obj, void *target_td) {
     if (obj && !jrt_instanceof(obj, target_td)) {
-        fputs("Exception in thread \"main\" java.lang.ClassCastException\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.ClassCastException\n");
+        plat_abort();
     }
 }
 
@@ -837,19 +1013,19 @@ void jrt_check_uncaught(void) {
     if (!pending_exception) return;
     if (pending_message) {
         /* Laufzeit-Exception (Sentinel) mit fertigem Meldungstext. */
-        fprintf(stderr, "Exception in thread \"main\" %s\n", pending_message);
+        plat_uncaught(pending_message);
     } else {
         /* Benutzer-Exception: Klassenname aus dem Type-Descriptor. */
         JObjHeader *h = (JObjHeader *)pending_exception;
         void **vt = (void **)h->vtable;
         TypeDesc *td = vt ? (TypeDesc *)vt[2] : NULL;
         if (td && td->cname) {
-            fprintf(stderr, "Exception in thread \"main\" %s\n", td->cname);
+            plat_uncaught(td->cname);
         } else {
-            fputs("Exception in thread \"main\" (unbehandelte Exception)\n", stderr);
+            plat_puts("Exception in thread \"main\" (unbehandelte Exception)\n");
         }
     }
-    exit(1);
+    plat_abort();
 }
 
 /* --- Arrays ---------------------------------------------------------- */
@@ -864,16 +1040,20 @@ typedef struct {
 
 void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     if (count < 0) {
-        fputs("Exception in thread \"main\" java.lang.NegativeArraySizeException\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.NegativeArraySizeException\n");
+        plat_abort();
     }
-    void *p = calloc(1, sizeof(JArray) + (size_t)count * (size_t)elem_size);
+    void *p = plat_alloc(sizeof(JArray) + (size_t)count * (size_t)elem_size);
     if (!p) {
-        fputs("Exception in thread \"main\" java.lang.OutOfMemoryError\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
+        plat_abort();
     }
     if (total_allocated++ == 0) {
+#ifndef FASTLLVM_FREESTANDING
+#ifndef FASTLLVM_FREESTANDING
         atexit(jrt_shutdown);
+#endif
+#endif
     }
     live_objects++;
     JArray *a = (JArray *)p;
@@ -886,11 +1066,14 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
 void jrt_bounds_check(const void *arr, int32_t index) {
     int64_t len = ((const JArray *)arr)->length;
     if (index < 0 || index >= len) {
-        fprintf(stderr,
-                "Exception in thread \"main\" "
-                "java.lang.ArrayIndexOutOfBoundsException: Index %d out of bounds for length %lld\n",
-                index, (long long)len);
-        exit(1);
+        char nb[24];
+        plat_puts("Exception in thread \"main\" "
+                  "java.lang.ArrayIndexOutOfBoundsException: Index ");
+        plat_write(nb, (size_t)fmt_i64(nb, index));
+        plat_puts(" out of bounds for length ");
+        plat_write(nb, (size_t)fmt_i64(nb, len));
+        plat_write("\n", 1);
+        plat_abort();
     }
 }
 
@@ -983,8 +1166,8 @@ void *jrt_enum_valueof(void *values, void *name) {
         }
     }
     if (!found) {
-        fputs("Exception in thread \"main\" java.lang.IllegalArgumentException\n", stderr);
-        exit(1);
+        plat_puts("Exception in thread \"main\" java.lang.IllegalArgumentException\n");
+        plat_abort();
     }
     jrt_retain(found);
     return found;
@@ -999,7 +1182,7 @@ void *jrt_array_clone(void *arr, int64_t elem_size, int32_t is_ref) {
     }
     JArray *a = (JArray *)arr;
     void *p = jrt_alloc_array(a->length, elem_size, a->vtable);
-    memcpy((JArray *)p + 1, a + 1, (size_t)a->length * (size_t)elem_size);
+    jrt_memcpy((JArray *)p + 1, a + 1, (size_t)a->length * (size_t)elem_size);
     if (is_ref) {
         void **elems = (void **)((JArray *)p + 1);
         for (int64_t i = 0; i < a->length; i++) {
@@ -1117,11 +1300,11 @@ int64_t jrt_f2l(float f) {
     if (f <= -9223372036854775808.0f) return INT64_MIN;
     return (int64_t)f;
 }
-void jrt_print_float(float f) { printf("%g", (double)f); }
-void jrt_println_float(float f) { printf("%g\n", (double)f); }
+void jrt_print_float(float f) { char b[40]; plat_write(b, (size_t)fmt_g(b, (double)f)); }
+void jrt_println_float(float f) { jrt_print_float(f); plat_write("\n", 1); }
 
-void jrt_print_long(int64_t v) { printf("%lld", (long long)v); }
-void jrt_println_long(int64_t v) { printf("%lld\n", (long long)v); }
+void jrt_print_long(int64_t v) { char b[24]; plat_write(b, (size_t)fmt_i64(b, v)); }
+void jrt_println_long(int64_t v) { jrt_print_long(v); plat_write("\n", 1); }
 /* %g-Näherung; nicht Javas kürzestes rundreisesicheres Format (DESIGN.md §6). */
-void jrt_print_double(double d) { printf("%g", d); }
-void jrt_println_double(double d) { printf("%g\n", d); }
+void jrt_print_double(double d) { char b[40]; plat_write(b, (size_t)fmt_g(b, d)); }
+void jrt_println_double(double d) { jrt_print_double(d); plat_write("\n", 1); }

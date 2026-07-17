@@ -158,6 +158,33 @@ jartest() {
 }
 jartest jar          0 Shapes
 
+# --- Freestanding/seL4: libc-freies Objekt, mit bare-metal-Shim gelinkt ---
+fstest() {
+    name="$1"; want="$2"; main="$3"; shift 3
+    rm -f "$work"/*.class "$work/app.o" "$work/app_fs"
+    if ! javac -sourcepath "$ex" -d "$work" "$ex/$main.java" >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (javac)"; fail=$((fail+1)); return
+    fi
+    cls="$work/$main.class"; for c in "$@"; do cls="$cls $work/$c.class"; done
+    if ! $fastjavac --freestanding -o "$work/app.o" $cls >/dev/null 2>"$work/err"; then
+        echo "FAIL $name (fastjavac): $(head -1 "$work/err")"; fail=$((fail+1)); return
+    fi
+    # kein libc-Undef im Objekt?
+    if nm -u "$work/app.o" 2>/dev/null | grep -qiE "printf|malloc|calloc| free|fwrite|__stack"; then
+        echo "FAIL $name (libc-Undef im freestanding-Objekt)"; fail=$((fail+1)); return
+    fi
+    if ! clang -nostdlib -static -fno-stack-protector -ffreestanding \
+            "$root/sel4/bringup.c" "$work/app.o" -o "$work/app_fs" 2>"$work/err"; then
+        echo "FAIL $name (link): $(head -1 "$work/err")"; fail=$((fail+1)); return
+    fi
+    out="$("$work/app_fs" 2>&1)"; code=$?
+    if [ "$code" != "$want" ]; then
+        echo "FAIL $name (exit $code, erwartet $want)"; fail=$((fail+1)); return
+    fi
+    echo "ok   $name"; pass=$((pass+1))
+}
+fstest freestanding  0 Cycle Box
+
 echo "---"
 echo "$pass bestanden, $fail fehlgeschlagen"
 [ $fail -eq 0 ]

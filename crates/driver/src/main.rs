@@ -16,6 +16,7 @@ fn main() {
     let mut emit_llvm = false;
     let mut stats = false;
     let mut no_solver = false;
+    let mut freestanding = false;
     let mut main_override: Option<String> = None;
     let mut raw_inputs: Vec<PathBuf> = Vec::new();
 
@@ -34,8 +35,9 @@ fn main() {
             "--emit-llvm" => emit_llvm = true,
             "--stats" => stats = true,
             "--no-solver" => no_solver = true,
+            "--freestanding" => freestanding = true,
             "-h" | "--help" => {
-                println!("Aufruf: fastjavac [-o BIN] [--main KLASSE] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] (KLASSE.class | LIB.jar) ...");
+                println!("Aufruf: fastjavac [-o BIN] [--main KLASSE] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] (KLASSE.class | LIB.jar) ...");
                 return;
             }
             _ => raw_inputs.push(PathBuf::from(a)),
@@ -144,13 +146,22 @@ fn main() {
         return die(&format!("Schreiben nach {}: {e}", build_dir.display()));
     }
 
-    let status = Command::new("clang")
-        .arg("-O2")
-        .arg(&ll_path)
-        .arg(&rt_path)
-        .arg("-o")
-        .arg(&out)
-        .status();
+    // Freestanding (seL4): keine libc, kein Startup. Ergebnis ist ein
+    // relozierbares Objekt (`clang -r`), das die Zielumgebung mit ihrem
+    // _start und den schwachen Hooks (jrt_debug_putchar/jrt_platform_halt)
+    // zusammenlinkt.
+    let mut cmd = Command::new("clang");
+    cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
+    if freestanding {
+        cmd.args([
+            "-r",
+            "-nostdlib",
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-DFASTLLVM_FREESTANDING",
+        ]);
+    }
+    let status = cmd.arg("-o").arg(&out).status();
     match status {
         Ok(s) if s.success() => {
             let _ = std::fs::remove_dir_all(&build_dir);
