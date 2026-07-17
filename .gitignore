@@ -10,3 +10,4 @@ examples/*
 
 # kompilierte Stub-Klassenbibliothek
 /stdlib/out/
+benchmarks/m0/q[0-9]*
