@@ -11,8 +11,10 @@
 
 mod escape;
 mod inline;
+mod pending;
 pub use escape::stack_allocate;
 pub use inline::inline_program;
+pub use pending::elide_pending_checks;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -110,6 +110,11 @@ fn main() {
     let mut acyclic = false;
     if !no_solver {
         let mut s = fastllvm_solver::run(&mut program);
+        // Tote pending-Prüfungen VOR dem Inlining entfernen: dort steht die
+        // Prüfung noch im selben Block wie der (werfende) Aufruf; danach wandern
+        // eingeflochtene Rümpfe über Blockgrenzen und die Block-lokale Analyse
+        // wäre unsound.
+        let _elided = fastllvm_solver::elide_pending_checks(&mut program);
         s.inlined_calls = fastllvm_solver::inline_program(&mut program);
         s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
         acyclic = s.acyclic;
