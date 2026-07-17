@@ -1,0 +1,33 @@
+// Strukturierter Logger, "in gut": Felder statt String-Kleben, Level zur
+// Compilezeit gefiltert (deaktiviert = 0 Instruktionen), Kontext-Spans, Sinks.
+
+use std.log
+
+fn handle_request(rid: Int, method: Str, path: Str) -> Int {
+    // Ein Span hängt seine Felder an ALLE Logs im Block — strukturiert, ohne
+    // sie jedes Mal zu wiederholen:
+    with log.span("http", req: rid, method: method, path: path) {
+        log.info("start")                         // trägt req/method/path automatisch
+
+        status = route(path)
+
+        // log.debug wird in einem Release-Build mit level=warn KOMPLETT entfernt —
+        // inklusive der (womöglich teuren) Argument-Auswertung. Kosten: exakt 0.
+        log.debug("geroutet", status: status, cache: cache_state())
+
+        if status >= 500 {
+            log.error("serverfehler", status: status)   // datei:zeile automatisch
+        }
+        status
+    }
+}
+
+fn main() {
+    // Sink + Mindestlevel beim Start wählen (JSON für Maschinen, human für Konsole):
+    log.init(sink: log.json_stdout, level: .info)
+
+    handle_request(1, "GET", "/health")
+    handle_request(2, "POST", "/orders")
+}
+// Beispielausgabe (JSON-Sink):
+// {"lvl":"info","msg":"start","req":1,"method":"GET","path":"/health","at":"logger.vr:11"}

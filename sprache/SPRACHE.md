@@ -1,8 +1,12 @@
-# Lume — Sprachdesign & Syntax (Skizze)
+# Vire — Sprachdesign & Syntax (Tour)
 
-*Arbeitsname, provisorisch. Ziel: Ergonomie von Python, Leistung & Reichweite von
-C/C++/Rust, Speichersicherheit ohne Annotationen, AOT über FastLLVMs Backend.
-Begründung & Machbarkeit in [BEWERTUNG.md](BEWERTUNG.md).*
+*Ziel: Ergonomie von Python, Leistung & Reichweite von C/C++/Rust,
+Speichersicherheit ohne Annotationen, AOT über FastLLVMs Backend. Dies ist die
+**Schnell-Tour**; die vollständige Referenz steht in [REFERENZ.md](REFERENZ.md),
+die Machbarkeit in [BEWERTUNG.md](BEWERTUNG.md), die Bewertung der acht
+Zusatz-Features (Multithreading, Templates, comptime-Reflection, Makros, Meson,
+Logger, Go-Error-Handling, Debug-Crash-Pfade) in
+[FEATURES-BEWERTUNG.md](FEATURES-BEWERTUNG.md).*
 
 ## Leitprinzipien
 
@@ -22,7 +26,7 @@ Begründung & Machbarkeit in [BEWERTUNG.md](BEWERTUNG.md).*
    Traits + Generics + Summentypen + Pattern-Matching = Rust-Bereich. Inferenz +
    automatischer Speicher = Python/Go-Bereich.
 
-Dateiendung `.lm`. Einstiegspunkt: die freie Funktion `main`. Anweisungen enden
+Dateiendung `.vr`. Einstiegspunkt: die freie Funktion `main`. Anweisungen enden
 am Zeilenende (Semikolon optional); Blöcke stehen in `{ }`. Der **letzte Ausdruck
 eines Blocks ist sein Wert** (wie Rust) — `return` nur zum frühen Aussteigen.
 
@@ -30,7 +34,7 @@ eines Blocks ist sein Wert** (wie Rust) — `return` nur zum frühen Aussteigen.
 
 ## 1. Werte, Bindungen, Funktionen
 
-```lume
+```vire
 x = 5                 // unveränderliche Bindung (wie `let`), Typ inferiert: Int
 mut total = 0         // veränderlich, explizit
 total = total + x     // ok, weil `mut`
@@ -44,7 +48,7 @@ fn greet(name) {                  // Block; letzter Ausdruck ist der Wert
 
 fn main() {
     print(add(2, 3))              // 5
-    greet("Lume")
+    greet("Vire")
 }
 ```
 
@@ -65,7 +69,7 @@ Systemcode und FFI.
 
 ## 3. Zusammengesetzte Typen — `type`
 
-```lume
+```vire
 type Point {                      // Produkt (struct), Werttyp, kein Header
     x: Float
     y: Float
@@ -81,7 +85,7 @@ print(q.dist())                   // 5.0
 
 Summentypen (algebraisch, ersetzen Enums **und** `null`):
 
-```lume
+```vire
 type Shape {
     Circle(radius: Float)
     Rect(w: Float, h: Float)
@@ -99,14 +103,14 @@ fn area(s: Shape) -> Float {
 
 `Option` und `Result` sind gewöhnliche Summentypen der Stdlib, kein Spezialfall:
 
-```lume
+```vire
 type Option[T] { Some(T)  None }
 type Result[T, E] { Ok(T)  Err(E) }
 ```
 
 ## 4. Kein `null` — `Option` + `?`
 
-```lume
+```vire
 fn find(xs: List[Int], target: Int) -> Option[Int] {
     for i, x in enumerate(xs) {
         if x == target { return Some(i) }
@@ -128,7 +132,7 @@ fn first_plus_one(xs: List[Int]) -> Option[Int] {
 
 ## 5. Fehler — `Result` + `?`
 
-```lume
+```vire
 fn read_config(path: Str) -> Result[Config, Error] {
     text  = read_file(path)?         // propagiert Err
     lines = text.split("\n")
@@ -147,7 +151,7 @@ Keine Exceptions, kein `try/catch` — Fehler sind Werte, `?` macht sie leicht.
 
 ## 6. Generik & Traits (Typklassen)
 
-```lume
+```vire
 trait Ord {
     fn cmp(self, other: Self) -> Int
     fn less(self, other: Self) = self.cmp(other) < 0   // Default-Methode
@@ -170,7 +174,7 @@ Typkombination) — zero-cost wie C++-Templates/Rust, ohne deren Syntaxlast.
 
 ## 7. Sammlungen & Iteration
 
-```lume
+```vire
 xs = [1, 2, 3, 4]                 // List[Int]
 m  = {"a": 1, "b": 2}             // Map[Str, Int]
 s  = {1, 2, 3}                    // Set[Int]
@@ -193,7 +197,7 @@ Lambdas: `x -> ausdruck` (ein Argument), `(a, b) -> ausdruck` (mehrere).
 
 ## 8. Kontrollfluss
 
-```lume
+```vire
 if x > 0 { print("pos") } elif x == 0 { print("null") } else { print("neg") }
 
 // `if` ist ein Ausdruck:
@@ -212,7 +216,7 @@ for x in xs {
 
 Standard: **nichts tun.** Der Solver entscheidet.
 
-```lume
+```vire
 p = Point(1.0, 2.0)     // entkommt nicht → Stack, kein RC
 node = Node(value: 5)   // in eine Liste gehängt → Heap + RC, automatisch
 q = p                   // move/copy/share — inferiert, immer sicher, zero-cost wo möglich
@@ -224,7 +228,7 @@ q = p                   // move/copy/share — inferiert, immer sicher, zero-cos
 
 Für heiße Pfade *optional* explizite Ausleihe (kein Muss, keine Lifetimes):
 
-```lume
+```vire
 fn sum(xs: &List[Int]) -> Int {   // `&` = geborgt, keine RC-Berührung
     mut acc = 0
     for x in xs { acc = acc + x }
@@ -237,7 +241,7 @@ der Solver leitet Borrows ohnehin her (wie schon heute `this`/Parameter).
 
 ## 10. C-Interop (der universelle Klebstoff)
 
-```lume
+```vire
 extern "C" {
     fn sqrt(x: F64) -> F64
     fn write(fd: I32, buf: Ptr[Byte], n: UInt) -> Int
@@ -259,7 +263,7 @@ Reine C++-Templates / idiomatisches Rust: über generierte Bindings bzw. gar nic
 
 ## 11. Nebenläufigkeit (CSP, wie Go — leicht)
 
-```lume
+```vire
 ch = Channel[Int]()
 
 spawn {                              // leichter Thread
@@ -277,7 +281,7 @@ oder `Atomic[T]`/`Mutex[T]`).
 
 ## 12. Module & Sichtbarkeit
 
-```lume
+```vire
 use std.io                           // Standardbibliothek
 use math.{sin, cos}                  // selektiv
 
@@ -290,7 +294,7 @@ Inferenz-Anker); innen bleibt alles inferiert.
 
 ## 13. Vollständiges Mini-Programm
 
-```lume
+```vire
 // Wortfrequenz — zeigt Inferenz, Map, Iteration, Option, Fehler in ~10 Zeilen
 use std.io
 
@@ -329,7 +333,7 @@ Binary.
 
 ## Abbildung auf FastLLVM (warum es „einfach" absenkt)
 
-| Lume-Konstrukt | FastLLVM-IR / Solver |
+| Vire-Konstrukt | FastLLVM-IR / Solver |
 |---|---|
 | `type` (Produkt) | Struct-Layout, Werttyp; Escape-Analyse → Stack/Heap |
 | `type` (Summe) | getaggte Union; `match` → `switch` + Feldzugriff |

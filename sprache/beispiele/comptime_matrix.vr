@@ -1,0 +1,36 @@
+// Wert-Generics + comptime: Matrixgrößen sind Typ-Parameter → die Größe steht
+// zur Compilezeit fest, die Daten liegen als Fixarray auf dem Stack (kein Heap,
+// kein RC), Schleifen sind entrollbar. C++-Template-Metaprogramming-Bereich,
+// aber als normaler Code.
+
+type Matrix[T, comptime R: Int, comptime C: Int] {
+    data: [T; R * C]                              // Größe comptime → Stack-Layout
+
+    fn get(self, r: Int, c: Int) -> T = self.data[r * C + c]
+
+    fn set(mut self, r: Int, c: Int, v: T) {
+        self.data[r * C + c] = v
+    }
+
+    // Dimensions-korrekte Multiplikation: der Compiler prüft C == andere.R zur
+    // Compilezeit (Typfehler statt Laufzeitfehler bei falschen Größen).
+    fn mul[comptime K: Int](self, o: Matrix[T, C, K]) -> Matrix[T, R, K] {
+        mut out = Matrix[T, R, K]()
+        comptime for i in 0..R {                  // entrollt bei kleinen Größen
+            comptime for j in 0..K {
+                mut acc = zero[T]()
+                for k in 0..C { acc = acc + self.get(i, k) * o.get(k, j) }
+                out.set(i, j, acc)
+            }
+        }
+        out
+    }
+}
+
+fn main() {
+    a = Matrix[Float, 2, 3]()                     // 2×3
+    b = Matrix[Float, 3, 2]()                     // 3×2
+    c = a.mul(b)                                  // → Matrix[Float, 2, 2], geprüft
+    // a.mul(a)  // FEHLER zur Compilezeit: 3 != 2 (Dimensionen passen nicht)
+    print(c.get(0, 0))
+}

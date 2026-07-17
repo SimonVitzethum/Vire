@@ -1,8 +1,17 @@
-# FastLLVM — Design-Dokument
+# FastLLVM — Design-Dokument (Backend der Sprache **Vire**)
 
-Java-zu-Native-Compiler (AOT, ohne JVM/JIT) mit Whole-Program-Solver als erster Pipeline-Phase und LLVM als Backend.
+> **Ausrichtung:** Dieses Projekt ist der Compiler der Sprache **Vire** (siehe
+> [README.md](README.md) und [sprache/](sprache/)). Der hier dokumentierte
+> **Java-Bytecode-Pfad** ist das **Beweismittel und die Bootstrap-Basis**: ein
+> Front-End-Prototyp, mit dem Backend, Speichermodell und Sicherheits-Check-Elision
+> entwickelt und gegen Rust/C++ gebenchmarkt wurden. Vire setzt als eigenes
+> Front-End (SSA-Absenkung) auf **genau diesen** Solver + Backend auf; der
+> Backend-Stack unten bleibt unverändert. Warum das eigene Front-End besser ist als
+> der Java-Weg: [sprache/BEWERTUNG.md](sprache/BEWERTUNG.md) §3.
 
-Stand: 2026-07-13. Konsolidiert aus der Machbarkeitsanalyse (rustc-Backend-Frage) und der Solver-Architektur-Bewertung.
+Whole-Program-Solver als erste Pipeline-Phase, LLVM als Backend, AOT ohne JIT.
+
+Stand: 2026-07-13 (Backend-Architektur). Konsolidiert aus der Machbarkeitsanalyse (rustc-Backend-Frage) und der Solver-Architektur-Bewertung.
 
 ---
 

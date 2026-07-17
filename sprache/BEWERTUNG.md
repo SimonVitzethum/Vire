@@ -1,7 +1,10 @@
 # Lohnt sich eine eigene Sprache für FastLLVM? — Bewertung
 
-*Arbeitsname der Sprache: **Lume** (von „lumen"/Licht, echot LLVM; provisorisch).
-Details der Syntax in [SPRACHE.md](SPRACHE.md), Beispiele in [beispiele/](beispiele/).*
+*Name der Sprache: **Vire** — von lateinisch *vīrēs* („Kräfte, Stärke"): leicht,
+aber mächtig. Dateiendung `.vr`. (Web-geprüft frei als Sprachname, Stand Juli 2026.)
+Details der Syntax in [SPRACHE.md](SPRACHE.md) und [REFERENZ.md](REFERENZ.md),
+Beispiele in [beispiele/](beispiele/), Feature-Bewertung in
+[FEATURES-BEWERTUNG.md](FEATURES-BEWERTUNG.md).*
 
 ## 1. Der Anspruch (und wo er sich selbst widerspricht)
 
@@ -70,8 +73,8 @@ Leichtigkeit **ohne** Pythons Dynamikkosten.
 # Python — dynamisch, langsam, Runtime nötig
 def add(a, b): return a + b
 ```
-```lume
-// Lume — sieht identisch aus, ist aber statisch monomorphisiert, AOT, zero-cost
+```vire
+// Vire — sieht identisch aus, ist aber statisch monomorphisiert, AOT, zero-cost
 fn add(a, b) = a + b        // a, b: inferiert; für jede benutzte Typkombination
                             // eine spezialisierte Maschinencode-Variante
 ```
@@ -158,7 +161,7 @@ Ein eigenes Front-End, das **direkt SSA** erzeugt, würde:
    AOT-nativ **und** ohne nennenswerte Runtime ist. Go hat GC + Pausen. Swift hat
    RC, ist aber Apple-zentriert und nicht ohne Runtime. Nim/Crystal kommen am
    nächsten, haben aber GC bzw. RC ohne Whole-Program-Elimination. Zig ist schnell,
-   aber manuell/unsicher. **Lume = Nims/Crystals Ergonomie + FastLLVMs beweisbare
+   aber manuell/unsicher. **Vire = Nims/Crystals Ergonomie + FastLLVMs beweisbare
    RC-Elimination.**
 2. **Der Beweis steht.** Die Benchmarks zeigen: die Technik hält Rust-Niveau (und
    schlägt es teils). Das Risiko „geht das überhaupt performant?" ist bereits

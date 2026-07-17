@@ -1,0 +1,52 @@
+// Fehlerbehandlung im Go-Geist: Fehler sind WERTE, explizit im Rückgabetyp,
+// keine Exceptions. Aber ohne Gos Boilerplate (`?`) und mit typisierten Fehlern,
+// Kontext-Wrapping und Debug-Crash-Pfaden.
+
+use std.io
+
+// Typisierte Fehler als Summentyp — mehr als Gos nacktes `error`-Interface:
+type ConfigError {
+    NotFound(path: Str)
+    BadSyntax(path: Str, line: Int)
+    Empty(path: Str)
+}
+
+type Config { host: Str, port: Int }
+
+fn parse(path: Str, text: Str) -> (Config, Error) {
+    if text.is_empty() { return (Config("", 0), ConfigError.Empty(path)) }
+    mut host = ""
+    mut port = 0
+    for i, line in enumerate(text.lines()) {
+        parts = line.split("=")
+        if parts.len() != 2 {
+            return (Config("", 0), ConfigError.BadSyntax(path, i + 1))
+        }
+        match parts[0].trim() {
+            "host" -> host = parts[1].trim()
+            "port" -> port = parse_int(parts[1].trim())?   // ? propagiert Fehler
+            _      -> {}                                     // unbekannt: ignorieren
+        }
+    }
+    (Config(host, port), nil)                               // nil = kein Fehler
+}
+
+fn load(path: Str) -> (Config, Error) {
+    text = read_file(path).wrap("Config {path}")?           // Kontext + Propagation
+    parse(path, text)
+}
+
+fn main() -> Error {
+    // Explizite Prüfung (voll Go-Stil), wenn man differenziert behandeln will:
+    cfg, err = load("app.cfg")
+    if err != nil {
+        match err {
+            ConfigError.NotFound(p)    -> log.warn("fehlt, nehme Default", path: p)
+            ConfigError.BadSyntax(p, l) -> return err        // mit Debug-Pfad
+            _                          -> return err
+        }
+        cfg = Config("localhost", 8080)
+    }
+    log.info("gestartet", host: cfg.host, port: cfg.port)
+    nil
+}
