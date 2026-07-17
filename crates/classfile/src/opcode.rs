@@ -128,6 +128,8 @@ pub enum Instr {
     NewArrayRef(u16),
     ArrayLength,
     AThrow,
+    /// monitorenter/monitorexit — poppt objectref, sonst No-Op (Einthread).
+    MonitorOp,
     IaLoad,
     IaStore,
     AaLoad,
@@ -353,6 +355,9 @@ pub fn decode_code(
             0xBF => (Instr::AThrow, 1),
             0xC0 => (Instr::CheckCast(u16_at(pc + 1)?), 3),
             0xC1 => (Instr::InstanceOf(u16_at(pc + 1)?), 3),
+            // monitorenter/monitorexit: im Einthread-Modell No-Ops (nur
+            // objectref poppen). Echte Nebenläufigkeit → atomare RC nötig.
+            0xC2 | 0xC3 => (Instr::MonitorOp, 1),
             0xC6 => (Instr::IfRefNull(Cond::Eq, branch(pc + 1)?), 3),
             0xC7 => (Instr::IfRefNull(Cond::Ne, branch(pc + 1)?), 3),
             _ => return Err(ParseError::UnsupportedOpcode(op, pc)),

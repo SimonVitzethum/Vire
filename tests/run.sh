@@ -134,6 +134,7 @@ run messages      0 Messages Messages Boom
 run enumswitch    0 EnumSwitch EnumSwitch Dir
 run escfields     0 EscapeFields EscapeFields Node2
 run intrinsics    0 Intrinsics Intrinsics
+run sync          0 Sync Sync
 
 # --- JAR-Ingestion: Klassen + Manifest-Main-Class aus einem JAR ---
 jartest() {

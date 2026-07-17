@@ -1319,6 +1319,11 @@ fn lower_block(
             Instr::Pop => {
                 pop!();
             }
+            // monitorenter/monitorexit: Einthread-Modell → objectref poppen,
+            // keine Sperre. Für echte Threads bräuchte es atomare RC.
+            Instr::MonitorOp => {
+                pop!();
+            }
             Instr::Pop2 => {
                 // Kategorie-2 (long/double) belegt einen Stack-Eintrag; zwei
                 // Kategorie-1-Werte zwei.
