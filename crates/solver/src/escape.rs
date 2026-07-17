@@ -17,29 +17,142 @@
 //! sonst über Iterationen wiederverwendet, während Aliase aus früheren
 //! Iterationen noch leben könnten.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
 pub fn stack_allocate(program: &mut Program) -> usize {
+    // Interprozedurale Escape-Summaries: welche Ref-Parameter jeder Funktion
+    // ihren Aufrufer entkommen lässt. Damit muss ein an einen Call übergebenes
+    // Objekt nicht mehr blind als entkommend gelten — nur wenn der Callee es
+    // wirklich festhält. Präzisionsschub (Phase 5) → mehr Stack-Allokation.
+    let summaries = compute_param_summaries(&program.functions);
+    // Klassen mit (geerbten) Ref-Feldern — für die Leck-Sicherheit der
+    // interprozeduralen Relaxation (Callee könnte Heap-Refs hineinschreiben).
+    let ref_field_classes = classes_with_ref_fields(&program.classes);
     let mut total = 0;
     for f in &mut program.functions {
-        total += run_function(f);
+        total += run_function(f, &summaries, &ref_field_classes);
     }
     total
 }
 
-fn run_function(f: &mut Function) -> usize {
+/// Klassen, deren Instanzen (inkl. geerbter Felder) mindestens ein Ref-Feld
+/// haben.
+fn classes_with_ref_fields(classes: &[ClassInfo]) -> BTreeSet<String> {
+    let class_of = |n: &str| classes.iter().find(|c| c.name == n);
+    let mut out = BTreeSet::new();
+    for c in classes {
+        let mut cur = Some(c.name.clone());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+            let Some(ci) = class_of(&cn) else { break };
+            if ci.fields.iter().any(|f| f.ty == Ty::Ref) {
+                out.insert(c.name.clone());
+                break;
+            }
+            cur = ci.super_name.clone();
+        }
+    }
+    out
+}
+
+/// Entkommt Argument `j` an den Callee `func`? `jrt_null_check` nie; bekannte
+/// Funktionen laut Summary; externe/Runtime-Funktionen konservativ ja.
+fn arg_escapes(func: &str, j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool {
+    if func == "jrt_null_check" {
+        return false;
+    }
+    match summ.get(func) {
+        Some(s) => s.get(j).copied().unwrap_or(true),
+        None => true,
+    }
+}
+
+/// Fixpunkt über den Aufrufgraphen: für jede Funktion die Ref-Parameter, die
+/// entkommen (Return / Feld-/Statik-/Array-Store / Weitergabe an einen Call,
+/// der sie entkommen lässt / virtueller Call mit unbekanntem Ziel).
+fn compute_param_summaries(functions: &[Function]) -> BTreeMap<String, Vec<bool>> {
+    let mut summ: BTreeMap<String, Vec<bool>> = functions
+        .iter()
+        .map(|f| (f.name.clone(), vec![false; f.params.len()]))
+        .collect();
+    loop {
+        let mut changed = false;
+        for f in functions {
+            for i in 0..f.params.len() {
+                if f.params[i] != Ty::Ref || summ[&f.name][i] {
+                    continue;
+                }
+                if param_escapes(f, Local(i as u32), &summ) {
+                    summ.get_mut(&f.name).unwrap()[i] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    summ
+}
+
+fn param_escapes(f: &Function, root: Local, summ: &BTreeMap<String, Vec<bool>>) -> bool {
+    let aliases = alias_set(f, root);
+    let is_alias = |op: &Operand| matches!(op, Operand::Copy(l) if aliases.contains(l));
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            match st {
+                Statement::Call { func, args, .. } | Statement::CallGuarded { func, args, .. } => {
+                    for (j, a) in args.iter().enumerate() {
+                        if is_alias(a) && arg_escapes(func, j, summ) {
+                            return true;
+                        }
+                    }
+                }
+                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
+                    if args.iter().any(is_alias) {
+                        return true;
+                    }
+                }
+                Statement::PutField { value, .. }
+                | Statement::PutStatic { value, .. }
+                | Statement::ArrayStore { value, .. } => {
+                    if is_alias(value) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Return(Some(op)) = &bb.terminator {
+            if is_alias(op) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn run_function(
+    f: &mut Function,
+    summ: &BTreeMap<String, Vec<bool>>,
+    ref_field_classes: &BTreeSet<String>,
+) -> usize {
     let cyclic = cyclic_blocks(f);
 
-    // Objekte = Allokations-Sites. Position (bi, si) + Ziel-Local.
-    let news: Vec<(usize, usize, Local)> = f
+    // Objekte = Allokations-Sites. Position (bi, si) + Ziel-Local + Klasse.
+    let news: Vec<(usize, usize, Local, String)> = f
         .blocks
         .iter()
         .enumerate()
         .flat_map(|(bi, bb)| {
             bb.statements.iter().enumerate().filter_map(move |(si, st)| match st {
-                Statement::New { dest, .. } => Some((bi, si, *dest)),
+                Statement::New { dest, class } => Some((bi, si, *dest, class.clone())),
                 _ => None,
             })
         })
@@ -50,7 +163,7 @@ fn run_function(f: &mut Function) -> usize {
 
     // Alias-Menge pro Objekt (flussunsensitiver Kopie-Fixpunkt; wegen
     // Local-Slot-Wiederverwendung konservativ überschätzt → nur mehr Escapes).
-    let aliases: Vec<BTreeSet<Local>> = news.iter().map(|(_, _, d)| alias_set(f, *d)).collect();
+    let aliases: Vec<BTreeSet<Local>> = news.iter().map(|(_, _, d, _)| alias_set(f, *d)).collect();
     // Objekte, die ein Operand referenzieren kann.
     let objs_of = |op: &Operand| -> Vec<usize> {
         match op {
@@ -76,18 +189,26 @@ fn run_function(f: &mut Function) -> usize {
     for bb in &f.blocks {
         for st in &bb.statements {
             match st {
-                // Aufrufargumente entkommen (Callee könnte sie festhalten);
-                // der reine Null-Check tut das nicht.
-                Statement::Call { func, args, .. } => {
-                    if func != "jrt_null_check" {
-                        for a in args {
-                            mark(&mut direct, a);
+                // Aufrufargumente entkommen nur, wenn der Callee sie laut
+                // Summary festhält (interprozedural); direkte + devirtualisierte
+                // Calls haben ein bekanntes Ziel.
+                Statement::Call { func, args, .. } | Statement::CallGuarded { func, args, .. } => {
+                    for (j, a) in args.iter().enumerate() {
+                        let esc = arg_escapes(func, j, summ);
+                        for oi in objs_of(a) {
+                            // Leck-Sicherheit: der Callee könnte eine Heap-Ref in
+                            // ein Ref-Feld von O schreiben (für uns unsichtbar) —
+                            // ein O mit Ref-Feldern, das an einen echten Call geht,
+                            // muss darum Heap bleiben.
+                            if esc || (func != "jrt_null_check" && ref_field_classes.contains(&news[oi].3)) {
+                                direct[oi] = true;
+                            }
                         }
                     }
                 }
-                Statement::CallGuarded { args, .. }
-                | Statement::CallVirtual { args, .. }
-                | Statement::CallPoly { args, .. } => {
+                // Virtuelle/polymorphe Sites: Ziel(e) nicht eindeutig →
+                // konservativ entkommend.
+                Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
                     for a in args {
                         mark(&mut direct, a);
                     }
@@ -150,7 +271,7 @@ fn run_function(f: &mut Function) -> usize {
 
     // Nicht entkommende, nicht in Schleifen liegende Objekte stack-allozieren.
     let mut count = 0;
-    for (idx, (bi, si, _)) in news.iter().enumerate() {
+    for (idx, (bi, si, _, _)) in news.iter().enumerate() {
         if escape[idx] || cyclic[*bi] {
             continue;
         }

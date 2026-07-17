@@ -135,6 +135,7 @@ run twr           0 Twr Twr Res MyException
 run messages      0 Messages Messages Boom
 run enumswitch    0 EnumSwitch EnumSwitch Dir
 run escfields     0 EscapeFields EscapeFields Node2
+run ipesc         0 IpEsc IpEsc Vec2
 run intrinsics    0 Intrinsics Intrinsics
 run sync          0 Sync Sync
 run threads_seq   0 Threads Threads
