@@ -135,6 +135,7 @@ run enumswitch    0 EnumSwitch EnumSwitch Dir
 run escfields     0 EscapeFields EscapeFields Node2
 run intrinsics    0 Intrinsics Intrinsics
 run sync          0 Sync Sync
+run strs          0 Strs Strs
 
 # --- JAR-Ingestion: Klassen + Manifest-Main-Class aus einem JAR ---
 jartest() {

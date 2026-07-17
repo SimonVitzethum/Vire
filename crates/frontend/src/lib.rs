@@ -1726,15 +1726,24 @@ fn lower_block(
                 // echtes Argument, kein Dummy). UTF-8/Byte-Semantik: charAt
                 // liefert das Byte — für ASCII korrekt (Java: UTF-16-Einheit).
                 if class == "java/lang/String" {
-                    let func = match (name, desc) {
-                        ("length", "()I") => "jrt_str_length",
-                        ("charAt", "(I)C") => "jrt_str_char_at",
-                        ("equals", "(Ljava/lang/Object;)Z") => "jrt_str_equals",
-                        ("isEmpty", "()Z") => "jrt_str_is_empty",
-                        ("hashCode", "()I") => "jrt_str_hashcode",
+                    let (func, rty) = match (name, desc) {
+                        ("length", "()I") => ("jrt_str_length", Ty::I32),
+                        ("charAt", "(I)C") => ("jrt_str_char_at", Ty::I32),
+                        ("equals", "(Ljava/lang/Object;)Z") => ("jrt_str_equals", Ty::I32),
+                        ("isEmpty", "()Z") => ("jrt_str_is_empty", Ty::I32),
+                        ("hashCode", "()I") => ("jrt_str_hashcode", Ty::I32),
+                        ("indexOf", "(Ljava/lang/String;)I") => ("jrt_str_indexof", Ty::I32),
+                        ("startsWith", "(Ljava/lang/String;)Z") => ("jrt_str_startswith", Ty::I32),
+                        ("endsWith", "(Ljava/lang/String;)Z") => ("jrt_str_endswith", Ty::I32),
+                        ("compareTo", "(Ljava/lang/String;)I") => ("jrt_str_compareto", Ty::I32),
+                        ("substring", "(I)Ljava/lang/String;") => ("jrt_str_substring1", Ty::Ref),
+                        ("substring", "(II)Ljava/lang/String;") => ("jrt_str_substring2", Ty::Ref),
+                        ("concat", "(Ljava/lang/String;)Ljava/lang/String;") => ("jrt_str_concat", Ty::Ref),
+                        ("trim", "()Ljava/lang/String;") => ("jrt_str_trim", Ty::Ref),
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "String.{name}{desc} (Teilmenge: length, charAt, equals, isEmpty, hashCode)"
+                                "String.{name}{desc} (Teilmenge: length, charAt, equals, isEmpty, \
+                                 hashCode, indexOf, startsWith, endsWith, compareTo, substring, concat, trim)"
                             )))
                         }
                     };
@@ -1746,11 +1755,11 @@ fn lower_block(
                     let recv = pop!();
                     args.push(Operand::Copy(recv));
                     args.reverse();
-                    let l = ml.stack_slot(stack.len(), Ty::I32);
-                    stack.push(Ty::I32);
+                    let l = ml.stack_slot(stack.len(), rty);
+                    stack.push(rty);
                     stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
-                    // length/charAt/isEmpty werfen NPE/StringIndexOutOfBounds
-                    // bei null/OOB → abfangbar (equals ist null-tolerant).
+                    // Receiver-null/OOB werfen NPE/StringIndexOutOfBounds →
+                    // abfangbar (equals/compareTo sind null-tolerant genug).
                     if func != "jrt_str_equals" {
                         throw_after = Some(*pc);
                     }

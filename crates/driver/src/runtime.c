@@ -314,6 +314,60 @@ void *jrt_obj_tostring(void *o) {
     return str_from_buf("object", 6);
 }
 
+/* Weitere String-Methoden (Byte-/ASCII-Semantik). Suchende/vergleichende
+ * geben int/bool; substring/trim/concat neue (RC-verwaltete) Strings. */
+int32_t jrt_str_indexof(const JStr *s, const JStr *sub) {
+    if (!s) { jrt_throw_npe(); return -1; }
+    if (!sub || sub->len == 0) return 0;
+    if (sub->len > s->len) return -1;
+    for (int64_t i = 0; i + sub->len <= s->len; i++) {
+        int64_t j = 0;
+        while (j < sub->len && s->bytes[i + j] == sub->bytes[j]) j++;
+        if (j == sub->len) return (int32_t)i;
+    }
+    return -1;
+}
+int32_t jrt_str_startswith(const JStr *s, const JStr *p) {
+    if (!s) { jrt_throw_npe(); return 0; }
+    if (!p || p->len > s->len) return 0;
+    for (int64_t i = 0; i < p->len; i++)
+        if (s->bytes[i] != p->bytes[i]) return 0;
+    return 1;
+}
+int32_t jrt_str_endswith(const JStr *s, const JStr *p) {
+    if (!s) { jrt_throw_npe(); return 0; }
+    if (!p || p->len > s->len) return 0;
+    int64_t off = s->len - p->len;
+    for (int64_t i = 0; i < p->len; i++)
+        if (s->bytes[off + i] != p->bytes[i]) return 0;
+    return 1;
+}
+int32_t jrt_str_compareto(const JStr *a, const JStr *b) {
+    if (!a || !b) { jrt_throw_npe(); return 0; }
+    int64_t n = a->len < b->len ? a->len : b->len;
+    for (int64_t i = 0; i < n; i++) {
+        int d = (int)a->bytes[i] - (int)b->bytes[i];
+        if (d) return d;
+    }
+    return (int32_t)(a->len - b->len);
+}
+void *jrt_str_substring2(const JStr *s, int32_t from, int32_t to) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    if (from < 0 || (int64_t)to > s->len || from > to) { jrt_throw_sioobe(); return NULL; }
+    return str_from_buf((const char *)s->bytes + from, to - from);
+}
+void *jrt_str_substring1(const JStr *s, int32_t from) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    return jrt_str_substring2(s, from, (int32_t)s->len);
+}
+void *jrt_str_trim(const JStr *s) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    int64_t a = 0, b = s->len;
+    while (a < b && (unsigned char)s->bytes[a] <= ' ') a++;
+    while (b > a && (unsigned char)s->bytes[b - 1] <= ' ') b--;
+    return str_from_buf((const char *)s->bytes + a, (int)(b - a));
+}
+
 /* --- Wrapper-Klassen (Autoboxing) -----------------------------------
  * Integer/Long/Boolean sind reguläre Objekte (RC-verwaltet) mit einem
  * eingepackten Primitivwert und generierter Vtable (Object-Methoden).
