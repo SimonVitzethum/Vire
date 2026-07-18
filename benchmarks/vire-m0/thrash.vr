@@ -1,0 +1,57 @@
+type Node {
+    next: Node
+    prev: Node
+    rank: Int
+}
+// Gibt einen kleinen a<->b-Zyklus zurück → entkommt junk → Heap. Der Aufrufer
+// lässt ihn je Schritt sterben → gepufferter Zyklen-Kandidat. Über N*40 Schritte
+// füllt das den Kandidaten-Puffer WEIT über 2×live, WÄHREND der N-Ring lebt →
+// erzwungene Mid-Run-Rescans der großen lebenden Menge = die schärfste M0-Form.
+fn junk() -> Node {
+    mut a = Node(null, null, 0)
+    mut b = Node(a, a, 0)
+    a.next = b
+    a.prev = b
+    a
+}
+fn build_ring(n: Int) -> Node {
+    mut head = Node(null, null, 1)
+    mut prev = head
+    mut i = 1
+    while i < n {
+        mut node = Node(null, prev, 1)
+        prev.next = node
+        prev = node
+        i = i + 1
+    }
+    prev.next = head
+    head.prev = prev
+    head
+}
+fn pagerank(head: Node, n: Int, iters: Int) -> Int {
+    mut it = 0
+    while it < iters {
+        mut cur = head
+        mut k = 0
+        while k < n {
+            cur.rank = (cur.prev.rank + cur.next.rank) / 2 + 1
+            mut g = junk()
+            cur = cur.next
+            k = k + 1
+        }
+        it = it + 1
+    }
+    mut cur = head
+    mut s = 0
+    mut k = 0
+    while k < n {
+        s = s + cur.rank
+        cur = cur.next
+        k = k + 1
+    }
+    s
+}
+fn main() {
+    mut head = build_ring(GRAPHN)
+    print(pagerank(head, GRAPHN, 40))
+}
