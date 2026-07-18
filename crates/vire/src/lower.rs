@@ -351,6 +351,15 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
+    // Nicht-generische Funktions-ASTs für Higher-Order-Inlining.
+    let mut fn_defs: HashMap<String, FnDef> = HashMap::new();
+    for it in &m.items {
+        if let Item::Fn(f) = it {
+            if f.sig.generics.is_empty() && f.body.is_some() {
+                fn_defs.insert(f.sig.name.clone(), f.clone());
+            }
+        }
+    }
     // Pre-Pass: annotationsgetriebene generische Instanzen (`-> Option[Float]`,
     // `b: Box[Int]`) modulweit instanziieren, damit Aufrufstellen/Matches die
     // konkrete Instanz (Layout + Varianten) sehen — auch in Funktionen, die den
@@ -401,7 +410,10 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             if !f.sig.generics.is_empty() {
                 continue; // generisch → nur bei Bedarf instanziiert
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, None) {
+            if is_higher_order(f) {
+                continue; // Higher-Order-Template → nur inline (Defunktionalisierung)
+            }
+            match lower_fn(f, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, None) {
                 Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
@@ -414,7 +426,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, Some(class), Some(&sym)) {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, Some(class), Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -437,7 +449,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, Some(&sym)) {
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -640,6 +652,12 @@ struct FnLower<'a> {
     variants: &'a HashMap<String, VariantInfo>,
     /// Generische Funktionen (Name → Info) für Aufruf-Monomorphisierung.
     generics: &'a HashMap<String, GInfo>,
+    /// Funktions-ASTs (Name → Def) für Higher-Order-Inlining: wird ein Lambda
+    /// übergeben, expandiert die aufgerufene Funktion an der Stelle inline
+    /// (Defunktionalisierung — direkter, spezialisierter Code statt Funktionszeiger).
+    fn_defs: &'a HashMap<String, FnDef>,
+    /// Stack der gerade inline-expandierten Funktionen (Rekursions-Guard).
+    inlining: Vec<String>,
     /// Generische Produkttypen (Name → (Typparameter, Felder)) für `Box(x)`.
     generic_ptypes: &'a HashMap<String, (Vec<String>, Vec<Field>)>,
     /// Generische Summentypen (Name → (Typparameter, Varianten)) für `Some(x)`.
@@ -1546,6 +1564,17 @@ impl<'a> FnLower<'a> {
             }
             return (Operand::Copy(obj), Ty::Ref);
         }
+        // Higher-Order: wird ein Lambda übergeben, expandiere die aufgerufene
+        // Funktion an dieser Stelle inline (Parameter gebunden, Lambda als
+        // local_lambda). VOR der eager-Argument-Senkung — ein Lambda ist kein
+        // Wert und darf nicht direkt gesenkt werden.
+        if args.iter().any(|a| matches!(a, Expr::Lambda { .. })) {
+            if let Some(fdef) = self.fn_defs.get(&name).cloned() {
+                if fdef.body.is_some() {
+                    return self.inline_higher_order(&name, &fdef, args);
+                }
+            }
+        }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
         // Dimensionierte typisierte Arrays: `array(n)` (Int), `farray(n)` (Float) —
         // echte bounds-gecheckte/-elidierbare Arrays (im Gegensatz zur i64-Liste).
@@ -1655,6 +1684,52 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: name, args: arg_ops });
             (Operand::Copy(d), ret)
         }
+    }
+
+    /// Higher-Order-Funktion inline expandieren: `apply(x -> x+1, 5)` →
+    /// Rumpf von `apply` an der Aufrufstelle, `f` als local_lambda gebunden,
+    /// Wert-Parameter als Locals. Voll spezialisiert (direkter Code, LLVM kann
+    /// weiter inlinen); Captures des Lambdas bleiben über den Scope-Stack sichtbar.
+    fn inline_higher_order(&mut self, name: &str, fdef: &FnDef, args: &[Expr]) -> (Operand, Ty) {
+        let body = fdef.body.as_ref().unwrap();
+        if self.inlining.iter().any(|n| n == name) {
+            self.errs
+                .push(format!("Higher-Order: rekursives Inlining von `{name}` nicht unterstützt (Lambda ist kein speicherbarer Funktionszeiger)"));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
+        if body_has_return(body) {
+            self.errs.push(format!(
+                "Higher-Order: `{name}` benutzt `return` — inline-Expansion braucht einen ausdrucksförmigen Rumpf (Tail-Wert statt `return`)"
+            ));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
+        self.inlining.push(name.to_string());
+        self.scopes.push(HashMap::new());
+        for (p, arg) in fdef.sig.params.iter().zip(args) {
+            match arg {
+                Expr::Lambda { params, body, .. } => {
+                    let l = self.new_local(Ty::Ref);
+                    self.local_lambda.insert(l.0, (params.clone(), (**body).clone()));
+                    self.bind(&p.name, l, Ty::Ref);
+                }
+                _ => {
+                    let (op, ty) = self.lower_expr(arg);
+                    let d = self.new_local(ty);
+                    if let Some(c) = self.class_of_operand(&op) {
+                        self.local_class.insert(d.0, c);
+                    }
+                    if let Some(k) = self.arr_of_operand(&op) {
+                        self.local_arr.insert(d.0, k);
+                    }
+                    self.emit(Statement::Assign(d, Rvalue::Use(op)));
+                    self.bind(&p.name, d, ty);
+                }
+            }
+        }
+        let r = self.lower_block_val(body);
+        self.scopes.pop();
+        self.inlining.pop();
+        r
     }
 
     /// List-Comprehension `[elem for var in src (if cond)]` → Zwei-Pass:
@@ -2036,6 +2111,7 @@ fn lower_fn(
     types: &HashMap<String, Layout>,
     variants: &HashMap<String, VariantInfo>,
     generics: &HashMap<String, GInfo>,
+    fn_defs: &HashMap<String, FnDef>,
     generic_ptypes: &HashMap<String, (Vec<String>, Vec<Field>)>,
     generic_stypes: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
     variant_owner_g: &HashMap<String, String>,
@@ -2060,6 +2136,8 @@ fn lower_fn(
         types,
         variants,
         generics,
+        fn_defs,
+        inlining: Vec::new(),
         generic_ptypes,
         generic_stypes,
         variant_owner_g,
@@ -2141,6 +2219,58 @@ fn lower_fn(
         mono,
         local_inst,
     ))
+}
+
+/// Higher-Order-Template? Wahr, wenn ein Parameter im Rumpf als Aufruf-Ziel
+/// benutzt wird (`f(x)` mit `f` = Parameter). Solche Funktionen werden NUR
+/// inline expandiert (Defunktionalisierung) — nie eigenständig gesenkt, weil der
+/// Funktionsparameter keinen Laufzeitwert hat.
+fn is_higher_order(f: &FnDef) -> bool {
+    let params: std::collections::HashSet<&str> = f.sig.params.iter().map(|p| p.name.as_str()).collect();
+    match &f.body {
+        Some(b) => block_calls_param(b, &params),
+        None => false,
+    }
+}
+fn block_calls_param(b: &Block2, params: &std::collections::HashSet<&str>) -> bool {
+    b.stmts.iter().any(|s| stmt_calls_param(s, params)) || b.tail.as_deref().map(|e| expr_calls_param(e, params)).unwrap_or(false)
+}
+fn stmt_calls_param(s: &Stmt, params: &std::collections::HashSet<&str>) -> bool {
+    match s {
+        Stmt::Let { value, .. } => value.as_ref().map(|e| expr_calls_param(e, params)).unwrap_or(false),
+        Stmt::Assign { target, value, .. } => expr_calls_param(target, params) || expr_calls_param(value, params),
+        Stmt::Expr(e) => expr_calls_param(e, params),
+        Stmt::Return(v, _) => v.as_ref().map(|e| expr_calls_param(e, params)).unwrap_or(false),
+        Stmt::While { cond, body, .. } => expr_calls_param(cond, params) || block_calls_param(body, params),
+        Stmt::For { iter, body, .. } => expr_calls_param(iter, params) || block_calls_param(body, params),
+        Stmt::Break(_) | Stmt::Continue(_) => false,
+    }
+}
+fn expr_calls_param(e: &Expr, params: &std::collections::HashSet<&str>) -> bool {
+    let sub = |e: &Expr| expr_calls_param(e, params);
+    let blk = |b: &Block2| block_calls_param(b, params);
+    match e {
+        Expr::Call { callee, args, .. } => {
+            (matches!(callee.as_ref(), Expr::Ident(n, _) if params.contains(n.as_str()))) || sub(callee) || args.iter().any(sub)
+        }
+        Expr::Unary { rhs, .. } => sub(rhs),
+        Expr::Binary { lhs, rhs, .. } => sub(lhs) || sub(rhs),
+        Expr::Field { base, .. } => sub(base),
+        Expr::Index { base, index, .. } => sub(base) || sub(index),
+        Expr::If { cond, then, elifs, els, .. } => {
+            sub(cond) || blk(then) || elifs.iter().any(|(c, b)| sub(c) || blk(b)) || els.as_ref().map(blk).unwrap_or(false)
+        }
+        Expr::Match { scrutinee, arms, .. } => sub(scrutinee) || arms.iter().any(|(_, g, b)| g.as_ref().map(sub).unwrap_or(false) || sub(b)),
+        Expr::Block(b) => blk(b),
+        Expr::Lambda { body, .. } => sub(body),
+        Expr::List(xs, _) => xs.iter().any(sub),
+        Expr::Comprehension { elem, iter, cond, .. } => sub(elem) || sub(iter) || cond.as_deref().map(sub).unwrap_or(false),
+        Expr::MapLit(kvs, _) => kvs.iter().any(|(k, v)| sub(k) || sub(v)),
+        Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => sub(inner),
+        Expr::Range { start, end, .. } => sub(start) || sub(end),
+        Expr::Capsule { body, .. } => blk(body),
+        _ => false,
+    }
 }
 
 /// Enthält ein Block (rekursiv über verschachtelte Blöcke/Schleifen/if) ein

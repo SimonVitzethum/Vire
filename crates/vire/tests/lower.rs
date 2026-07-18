@@ -244,6 +244,22 @@ fn generics_monomorphisieren_pro_typ() {
 }
 
 #[test]
+fn higher_order_inline_defunktionalisiert() {
+    // apply(f, x) mit Lambda-Argument → an der Aufrufstelle inline expandiert
+    // (kein Funktionszeiger); Capture über den Scope; das Template selbst wird
+    // NICHT als eigenständige Funktion emittiert.
+    let src = "fn apply(f, x) -> Int {\n f(x)\n}\nfn main() {\n mut c = 10\n print(apply(y -> y + c, 5))\n}\n";
+    let p = lower(src);
+    assert!(!p.functions.iter().any(|f| f.name == "apply"), "Higher-Order-Template darf nicht eigenständig emittiert werden");
+    // Der Lambda-Rumpf (y + c) ist in main inline → ein Add mit der Capture c.
+    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let has_add = main.blocks.iter().flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Add, ..)))
+    });
+    assert!(has_add, "Lambda-Rumpf y+c muss inline (Add) in main stehen");
+}
+
+#[test]
 fn generische_produkttypen() {
     // type Box[T] pro Typargument monomorphisiert: Box$Int, Box$Float —
     // je mit dem korrekten Feldtyp (I64 vs F64).
