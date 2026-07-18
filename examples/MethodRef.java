@@ -6,15 +6,15 @@ class MathU { static int max(int a, int b) { return a > b ? a : b; } }
 
 public class MethodRef {
     public static void main(String[] args) {
-        // statische Methoden-Referenz
+        // static method reference
         IntBiOp max = MathU::max;
         System.out.println(max.apply(3, 7));      // 7
 
-        // unbound Instanz-Methoden-Referenz (Receiver = Argument)
+        // unbound instance method reference (receiver = argument)
         StrLen len = String::length;
-        System.out.println(len.len("hallo"));     // 5
+        System.out.println(len.len("hello"));     // 5
 
-        // Konstruktor-Referenz
+        // constructor reference
         Maker m = Box::new;
         Box b = m.make(42);
         System.out.println(b.get());              // 42

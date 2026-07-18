@@ -1,22 +1,22 @@
 public class Rc {
     public static void main(String[] args) {
-        // Heap-Objekt, entkommt (Return) → refcount-verwaltet
+        // Heap object, escapes (return) → refcount-managed
         Box b = make(21);
         System.out.println(b.v);        // 21
 
-        // Aliasing: c teilt sich das Objekt mit b
+        // aliasing: c shares the object with b
         Box c = b;
         c.v = 99;
-        System.out.println(b.v);        // 99 (gleiches Objekt)
+        System.out.println(b.v);        // 99 (same object)
 
-        // Feld hält Referenz auf verschachteltes Objekt
+        // field holds a reference to a nested object
         Box outer = new Box(1);
         outer.next = new Box(2);
         outer.next.next = new Box(3);
         System.out.println(outer.next.next.v);  // 3
-        // outer, outer.next, outer.next.next: 4 Heap-Boxen total mit make/b
+        // outer, outer.next, outer.next.next: 4 heap boxes total with make/b
 
-        // viele kurzlebige Objekte in einer Schleife (Heap, da Schleife)
+        // many short-lived objects in a loop (heap, because loop)
         int sum = 0;
         for (int i = 0; i < 1000; i++) {
             Box t = new Box(i);

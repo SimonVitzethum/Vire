@@ -1,14 +1,14 @@
-//! AOT-Hotpath: die statische Schleifen-Schätzung setzt `!prof`-Branch-Weights.
-//! Eine Funktion mit einer Schleife (Header-Branch: Körper vs. Ausgang) muss im
-//! emittierten LLVM ein `!prof`-Tag am Schleifen-Branch + die branch_weights-
-//! Metadatenknoten tragen. Eine Funktion ohne Schleife tut das nicht.
+//! AOT hotpath: the static loop estimate sets `!prof` branch weights.
+//! A function with a loop (header branch: body vs. exit) must carry a
+//! `!prof` tag at the loop branch + the branch_weights metadata node in the
+//! emitted LLVM. A function without a loop does not.
 
 use fastllvm_ir::{BasicBlock, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty, BinOp};
 
 fn looping_fn() -> Function {
     // bb0: i=0; goto bb1
     // bb1 (header): c = i < 10; branch c -> bb2(body) : bb3(exit)
-    // bb2 (body): i = i+1; goto bb1  (Rückwärtskante bb2->bb1)
+    // bb2 (body): i = i+1; goto bb1  (back edge bb2->bb1)
     // bb3 (exit): return
     let i = Local(0);
     let c = Local(1);
@@ -43,6 +43,6 @@ fn schleifen_branch_bekommt_prof_weights() {
     let ll = fastllvm_backend::emit(&prog);
     assert!(ll.contains("!prof"), "Schleifen-Branch muss ein !prof-Tag tragen:\n{ll}");
     assert!(ll.contains("branch_weights"), "branch_weights-Metadatenknoten fehlt");
-    // Der Header-Branch (bb1) gewichtet den Körper (then=bb2) heiß.
+    // The header branch (bb1) weights the body (then=bb2) as hot.
     assert!(ll.contains("label %bb2, label %bb3, !prof"), "Header-Branch muss gewichtet sein:\n{ll}");
 }

@@ -1,7 +1,7 @@
 public class Shapes {
     public static void main(String[] args) {
-        // Beide Subklassen instanziiert → Site bleibt polymorph (Vtable),
-        // RTA kann nicht devirtualisieren.
+        // Both subclasses instantiated → site stays polymorphic (vtable),
+        // RTA cannot devirtualize.
         Shape a = new Circle(5);
         Shape b = new Rect(3, 4);
         System.out.print("circle.area() = ");
@@ -12,10 +12,10 @@ public class Shapes {
         System.out.println(describe(a));
         System.out.print("describe(b)   = ");
         System.out.println(describe(b));
-        // Geerbte Methode (Shape.scaledArea, kein Override) → monomorph.
+        // Inherited method (Shape.scaledArea, no override) → monomorphic.
         System.out.print("a.scaledArea(2) = ");
         System.out.println(a.scaledArea(2));
-        // Null-Vergleiche:
+        // Null comparisons:
         Shape n = null;
         System.out.println(n == null ? 1 : 0);
     }
@@ -42,7 +42,7 @@ class Circle extends Shape {
     }
 
     int area() {
-        return 3 * r * r; // int-Pi :)
+        return 3 * r * r; // int pi :)
     }
 
     int kind() {

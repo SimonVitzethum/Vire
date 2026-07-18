@@ -1,6 +1,6 @@
-// Echte Hash-Map mit open addressing (linear probing) — nutzt hashCode()
-// zur Bucket-Bestimmung und equals() bei Kollisionen (beides virtueller
-// Dispatch über Object).
+// Real hash map with open addressing (linear probing) — uses hashCode()
+// to determine the bucket and equals() on collisions (both virtual
+// dispatch via Object).
 class MiniHashMap<K, V> {
     private Object[] keys;
     private Object[] vals;

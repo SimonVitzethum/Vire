@@ -1,6 +1,6 @@
-// Generische Liste — javac erased die Typparameter zu Object; der
-// Compiler sieht Object[]/Object-Signaturen, der Aufrufer bekommt
-// automatisch checkcast eingefügt.
+// Generic list — javac erases the type parameters to Object; the
+// compiler sees Object[]/Object signatures, and the caller gets
+// checkcast inserted automatically.
 class MiniList<E> {
     private Object[] elems;
     private int count;

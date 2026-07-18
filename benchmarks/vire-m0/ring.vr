@@ -2,9 +2,9 @@ type Node {
     next: Node
     v: Int
 }
-// Baut eine Kette und schließt sie zum RING (prev.next = head) → echter Zyklus
-// mit externem Refcount 0 am Funktionsende → RC allein LECKT ihn → nur der
-// Zyklen-Kollektor kann ihn zurückholen. Genau der M0-Risikopfad, auf Vire-IR.
+// Builds a chain and closes it into a RING (prev.next = head) → real cycle
+// with external refcount 0 at the function end → RC alone LEAKS it → only the
+// cycle collector can retrieve it. Exactly the M0 risk path, on Vire IR.
 fn make_ring(n: Int) -> Int {
     mut head = Node(null, 0)
     mut prev = head

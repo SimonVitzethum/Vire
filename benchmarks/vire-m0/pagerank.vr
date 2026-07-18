@@ -3,11 +3,11 @@ type Node {
     prev: Node
     rank: Int
 }
-// Doppelt verkette Ring: JEDE Node ist von zwei anderen referenziert (Refcount 2,
-// >1 → Zyklen-Kandidat) UND der ganze Ring ist EIN Zyklus. Wird über build_ring
-// zurückgegeben → entkommt → Heap. In pagerank über iters Iterationen LEBEND
-// gehalten und mutiert → große, persistente, geteilte, mutierende lebende Menge:
-// die echte M0.1-Bedingung, erstmals auf Vire-IR.
+// Doubly linked ring: EVERY Node is referenced by two others (refcount 2,
+// >1 → cycle candidate) AND the whole ring is ONE cycle. Returned via build_ring
+// → escapes → heap. In pagerank kept ALIVE over iters iterations and mutated →
+// large, persistent, shared, mutating live set:
+// the real M0.1 condition, for the first time on Vire IR.
 fn build_ring(n: Int) -> Node {
     mut head = Node(null, null, 1)
     mut prev = head

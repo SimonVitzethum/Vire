@@ -1,35 +1,35 @@
-# Freestanding-/seL4-Ziel
+# Freestanding/seL4 target
 
-`fastjavac --freestanding -o app.o …` erzeugt ein **relozierbares Objekt ohne
-libc**: die Runtime nutzt einen statischen Heap-Allokator und schreibt Ausgabe
-über zwei schwache Hooks, die die Zielumgebung bereitstellt:
+`fastjavac --freestanding -o app.o …` produces a **relocatable object without
+libc**: the runtime uses a static heap allocator and writes output
+via two weak hooks that the target environment provides:
 
 ```c
-void jrt_debug_putchar(char c);   /* ein Byte ausgeben (z.B. seL4_DebugPutChar) */
-void jrt_platform_halt(void);      /* Prozess/Thread beenden — kehrt nie zurück */
+void jrt_debug_putchar(char c);   /* emit one byte (e.g. seL4_DebugPutChar) */
+void jrt_platform_halt(void);      /* terminate process/thread — never returns */
 ```
 
-Ohne eigene Definition greifen schwache Defaults (putchar = no-op, halt =
-Endlosschleife). Der Einstiegspunkt der übersetzten Klasse ist `int main(void)`.
+Without a custom definition, weak defaults take effect (putchar = no-op, halt =
+infinite loop). The entry point of the compiled class is `int main(void)`.
 
-Heapgröße per `-DFASTLLVM_HEAP_SIZE=<bytes>` überschreibbar (Default 16 MiB);
-der Heap ist ein statisches `.bss`-Array, es gibt keine `brk`/`mmap`-Aufrufe.
+Heap size overridable via `-DFASTLLVM_HEAP_SIZE=<bytes>` (default 16 MiB);
+the heap is a static `.bss` array, there are no `brk`/`mmap` calls.
 
-## Bring-up ohne seL4 (Beweis der libc-Freiheit)
+## Bring-up without seL4 (proof of libc-freedom)
 
-`bringup.c` liefert die Hooks + einen `_start` über rohe Linux-Syscalls und
-linkt statisch ohne C-Bibliothek:
+`bringup.c` provides the hooks + a `_start` via raw Linux syscalls and
+links statically without a C library:
 
 ```sh
 fastjavac --freestanding -o app.o App.class
 clang -nostdlib -static -fno-stack-protector -ffreestanding bringup.c app.o -o app
-./app          # läuft ohne jede libc-Abhängigkeit (ldd: nicht dynamisch)
+./app          # runs without any libc dependency (ldd: not dynamic)
 ```
 
-## Einbettung in seL4
+## Embedding into seL4
 
-`jrt_debug_putchar` auf `seL4_DebugPutChar` (Debug-Kernel) bzw. den seriellen
-Treiber abbilden, `jrt_platform_halt` auf `seL4_TCB_Suspend`/Endlos-`seL4_Yield`.
-Das `app.o` wird wie ein gewöhnliches Objekt in das Root-Task-Image gelinkt.
-Der Allokator lebt komplett im statischen Heap — kein Untypeds-Retyping nötig,
-solange `FASTLLVM_HEAP_SIZE` reicht.
+Map `jrt_debug_putchar` to `seL4_DebugPutChar` (debug kernel) or the serial
+driver, and `jrt_platform_halt` to `seL4_TCB_Suspend`/endless `seL4_Yield`.
+The `app.o` is linked into the root task image like an ordinary object.
+The allocator lives entirely in the static heap — no untypeds retyping needed,
+as long as `FASTLLVM_HEAP_SIZE` is sufficient.

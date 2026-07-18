@@ -2100,8 +2100,8 @@ fn lower_block(
                             Some(c) => c,
                             None => {
                                 return Err(FrontendError::Unsupported(format!(
-                                    "Class.{name} auf nicht statisch bekanntem Class-Objekt \
-                                     (Closed World: Reflection muss statisch auflösbar sein)"
+                                    "Class.{name} on a not-statically-known Class object \
+                                     (closed world: reflection must be statically resolvable)"
                                 )));
                             }
                         },

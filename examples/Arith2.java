@@ -1,25 +1,25 @@
 public class Arith2 {
     public static void main(String[] args) {
-        // abfangbare ArithmeticException
+        // catchable ArithmeticException
         System.out.println(safeDiv(10, 2));   // 5
-        System.out.println(safeDiv(10, 0));   // -1 (gefangen)
+        System.out.println(safeDiv(10, 0));   // -1 (caught)
 
         try {
             int x = 100 / 0;
-            System.out.println("nicht erreicht " + x);
+            System.out.println("not reached " + x);
         } catch (ArithmeticException e) {
-            System.out.println("division durch null gefangen");
+            System.out.println("division by zero caught");
         }
 
-        // long division auch
+        // long division too
         try {
             long y = 5L % 0L;
             System.out.println(y);
         } catch (RuntimeException e) {
-            System.out.println("long rem gefangen");
+            System.out.println("long rem caught");
         }
 
-        System.out.println("weiter nach catch");
+        System.out.println("continuing after catch");
     }
 
     static int safeDiv(int a, int b) {

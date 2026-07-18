@@ -1,24 +1,24 @@
 class ErrorA extends RuntimeException {}
 class ErrorB extends RuntimeException {}
-class ErrorC extends ErrorA {}   // Subklasse von A
+class ErrorC extends ErrorA {}   // subclass of A
 
 public class Catch {
     public static void main(String[] args) {
-        // typspezifische Diskriminierung
-        test(1);   // wirft A → fängt A
-        test(2);   // wirft B → fängt B
-        test(3);   // wirft C (extends A) → fängt A (Subklasse!)
-        test(4);   // wirft nichts
+        // type-specific discrimination
+        test(1);   // throws A → catches A
+        test(2);   // throws B → catches B
+        test(3);   // throws C (extends A) → catches A (subclass!)
+        test(4);   // throws nothing
     }
 
     static void test(int which) {
         try {
             throwIt(which);
-            System.out.println(which + ": kein Wurf");
+            System.out.println(which + ": no throw");
         } catch (ErrorB e) {
-            System.out.println(which + ": fing B");
+            System.out.println(which + ": caught B");
         } catch (ErrorA e) {
-            System.out.println(which + ": fing A");
+            System.out.println(which + ": caught A");
         }
     }
 

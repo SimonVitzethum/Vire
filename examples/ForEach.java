@@ -8,13 +8,13 @@ public class ForEach {
         l.add("Bert");
         l.add("Cora");
 
-        // for-each über Iterator
+        // for-each over iterator
         for (String s : l) {
-            System.out.println("hallo " + s);
+            System.out.println("hello " + s);
         }
 
-        // klassisch mit Index
+        // classic with index
         System.out.println("size = " + l.size());
-        System.out.println("erstes = " + l.get(0));
+        System.out.println("first = " + l.get(0));
     }
 }

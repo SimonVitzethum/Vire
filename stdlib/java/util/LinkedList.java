@@ -1,8 +1,8 @@
 package java.util;
 
-// Einfach verkettete Liste; implementiert List (add/get/size/iterator).
+// Singly linked list; implements List (add/get/size/iterator).
 public class LinkedList<E> implements List<E> {
-    LinkedListNode<E> head;   // package-private für Iterator
+    LinkedListNode<E> head;   // package-private for Iterator
     private LinkedListNode<E> tail;
     private int count;
 

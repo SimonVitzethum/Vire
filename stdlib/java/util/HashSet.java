@@ -1,8 +1,8 @@
 package java.util;
 
-// Hash-Set mit open addressing über hashCode()/equals().
+// Hash set with open addressing via hashCode()/equals().
 public class HashSet<E> implements Set<E> {
-    Object[] slots;   // package-private für den Iterator
+    Object[] slots;   // package-private for the Iterator
     int count;
     private int cap;
 

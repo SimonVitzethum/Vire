@@ -1,8 +1,8 @@
 package java.util;
 
-// Teil-Stub von java.util.Arrays für die Closed-World-Kompilierung. Nutzt die
-// neuen Intrinsics System.arraycopy/Math.min sowie StringBuilder. Bewusst
-// klein: die gängigen int[]-/Object[]-Operationen.
+// Partial stub of java.util.Arrays for closed-world compilation. Uses the
+// new intrinsics System.arraycopy/Math.min as well as StringBuilder. Deliberately
+// small: the common int[]/Object[] operations.
 public class Arrays {
     public static void fill(int[] a, int v) {
         for (int i = 0; i < a.length; i++) a[i] = v;
@@ -20,7 +20,7 @@ public class Arrays {
         return r;
     }
 
-    // Insertion Sort (klein, stabil) — ausreichend für den Stub.
+    // Insertion sort (small, stable) — sufficient for the stub.
     public static void sort(int[] a) {
         for (int i = 1; i < a.length; i++) {
             int k = a[i], j = i - 1;

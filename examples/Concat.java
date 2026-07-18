@@ -1,17 +1,17 @@
 public class Concat {
     public static void main(String[] args) {
         int x = 42;
-        String name = "Welt";
+        String name = "World";
         char c = '!';
         boolean b = true;
 
-        System.out.println("Hallo, " + name + c);
-        System.out.println("x = " + x + ", doppelt = " + (x * 2));
+        System.out.println("Hello, " + name + c);
+        System.out.println("x = " + x + ", doubled = " + (x * 2));
         System.out.println("bool: " + b);
-        System.out.println(x + name);          // "42Welt" (int links)
-        System.out.println("leer:[" + "" + "]");
+        System.out.println(x + name);          // "42World" (int on left)
+        System.out.println("empty:[" + "" + "]");
 
-        // Konkatenation in Schleife (viele temporäre Strings)
+        // concatenation in a loop (many temporary strings)
         String acc = "";
         for (int i = 0; i < 5; i++) {
             acc = acc + i;

@@ -1,7 +1,7 @@
 package java.util;
 
-// Minimales List-Interface (ohne die volle Collection/Iterable-Hierarchie
-// des JDK; für fastjavac zählt nur die aufgerufene Methodensignatur).
+// Minimal List interface (without the full Collection/Iterable hierarchy
+// of the JDK; for fastjavac only the invoked method signature matters).
 public interface List<E> {
     boolean add(E e);
     E get(int i);

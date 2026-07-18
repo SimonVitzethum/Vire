@@ -1,6 +1,6 @@
-# Beispiel: nutzerdefinierte Schlüsselwort-Schreibweisen.
-# Format: kanonisch = eigene_schreibweise   (# = Kommentar)
-# Neben eine .vr-Datei legen; `vire build/run` lädt sie automatisch.
+# Example: user-defined keyword spellings.
+# Format: canonical = custom_spelling   (# = comment)
+# Place next to a .vr file; `vire build/run` loads it automatically.
 fn       = funktion
 return   = gib
 while    = solange

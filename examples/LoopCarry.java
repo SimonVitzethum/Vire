@@ -4,7 +4,7 @@ public class LoopCarry {
         Node prev = null; long s = 0;
         for (int i = 0; i < 6; i++) {
             Node n = new Node(i);
-            if (prev != null) s += prev.v;   // liest Vor-Iterations-Objekt
+            if (prev != null) s += prev.v;   // reads previous-iteration object
             prev = n;
         }
         System.out.println(s);   // 0+1+2+3+4 = 10

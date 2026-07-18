@@ -24,10 +24,10 @@ impl fmt::Display for ParseError {
         match self {
             ParseError::Eof => write!(f, "unerwartetes Dateiende"),
             ParseError::BadMagic(m) => write!(f, "kein Classfile (magic {m:#x})"),
-            ParseError::UnsupportedConstTag(t) => write!(f, "Constant-Pool-Tag {t} nicht unterstützt"),
-            ParseError::UnsupportedOpcode(op, pc) => write!(f, "Opcode {op:#04x} bei pc={pc} nicht unterstützt"),
-            ParseError::BadUtf8 => write!(f, "ungültiges Modified-UTF-8"),
-            ParseError::BadIndex(i) => write!(f, "ungültiger Constant-Pool-Index {i}"),
+            ParseError::UnsupportedConstTag(t) => write!(f, "constant-pool tag {t} not supported"),
+            ParseError::UnsupportedOpcode(op, pc) => write!(f, "opcode {op:#04x} at pc={pc} not supported"),
+            ParseError::BadUtf8 => write!(f, "invalid Modified-UTF-8"),
+            ParseError::BadIndex(i) => write!(f, "invalid constant-pool index {i}"),
         }
     }
 }

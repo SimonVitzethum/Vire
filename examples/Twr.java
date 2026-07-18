@@ -1,6 +1,6 @@
-// try-with-resources: javac entzuckert es zu try/catch(Throwable) + close()
-// + addSuppressed + athrow. Wir prüfen, dass Ressourcen in umgekehrter
-// Reihenfolge geschlossen werden — sowohl normal als auch bei Exception.
+// try-with-resources: javac desugars it to try/catch(Throwable) + close()
+// + addSuppressed + athrow. We check that resources are closed in reverse
+// order — both normally and on exception.
 class Res implements AutoCloseable {
     String n;
     Res(String n) { this.n = n; System.out.println("open " + n); }

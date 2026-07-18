@@ -1,16 +1,16 @@
 public class Switch {
     static String day(int d) {
         switch (d) {
-            case 1: return "Mo";
-            case 2: return "Di";
-            case 3: return "Mi";
+            case 1: return "Mon";
+            case 2: return "Tue";
+            case 3: return "Wed";
             case 6:
-            case 7: return "Wochenende";
+            case 7: return "weekend";
             default: return "?";
         }
     }
     static int classify(int x) {
-        // lookupswitch (weit auseinander liegende Werte)
+        // lookupswitch (widely spaced values)
         switch (x) {
             case 0: return 100;
             case 1000: return 200;
@@ -29,9 +29,9 @@ public class Switch {
         for (int i = 0; i < cmds.length; i++) {
             String r;
             switch (cmds[i]) {
-                case "start": r = "gestartet"; break;
-                case "stop": r = "gestoppt"; break;
-                default: r = "unbekannt";
+                case "start": r = "started"; break;
+                case "stop": r = "stopped"; break;
+                default: r = "unknown";
             }
             System.out.println(cmds[i] + " -> " + r);
         }

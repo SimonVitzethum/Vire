@@ -2,23 +2,23 @@ interface IntOp { int apply(int x); }
 interface IntBiOp { int apply(int a, int b); }
 public class Lambdas {
     public static void main(String[] args) {
-        // nicht-einfangendes Lambda
+        // non-capturing lambda
         IntOp dbl = x -> x * 2;
         System.out.println(dbl.apply(21));       // 42
 
-        // einfangendes Lambda (captured c)
+        // capturing lambda (captured c)
         int c = 100;
         IntOp addC = x -> x + c;
         System.out.println(addC.apply(5));        // 105
 
-        // zwei Parameter
+        // two parameters
         IntBiOp add = (a, b) -> a + b;
         System.out.println(add.apply(3, 4));      // 7
 
-        // Lambda als Argument
+        // lambda as argument
         System.out.println(applyTwice(dbl, 5));   // 20
 
-        // mehrere Captures
+        // multiple captures
         int base = 1000;
         int step = 10;
         IntOp f = x -> base + step * x;

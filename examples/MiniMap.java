@@ -1,4 +1,4 @@
-// Kleine Hash-Map über equals/hashCode der Schlüssel (virtueller Dispatch).
+// Small hash map keyed on equals/hashCode of the keys (virtual dispatch).
 class MiniMap<K, V> {
     private Object[] keys;
     private Object[] vals;

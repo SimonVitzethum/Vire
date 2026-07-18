@@ -1,10 +1,10 @@
 public class Stack {
     public static void main(String[] args) {
-        System.out.println(localSum());     // Point entkommt nicht → Stack
-        System.out.println(escaper().x);    // Point entkommt (Return) → Heap
+        System.out.println(localSum());     // Point does not escape → stack
+        System.out.println(escaper().x);    // Point escapes (return) → heap
         int s = 0;
         for (int i = 0; i < 3; i++) {
-            s += inLoop(i);                 // New in Schleife → Heap (konservativ)
+            s += inLoop(i);                 // New in loop → heap (conservative)
         }
         System.out.println(s);
     }

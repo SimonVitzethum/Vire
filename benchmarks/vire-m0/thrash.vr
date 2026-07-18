@@ -3,10 +3,10 @@ type Node {
     prev: Node
     rank: Int
 }
-// Gibt einen kleinen a<->b-Zyklus zurück → entkommt junk → Heap. Der Aufrufer
-// lässt ihn je Schritt sterben → gepufferter Zyklen-Kandidat. Über N*40 Schritte
-// füllt das den Kandidaten-Puffer WEIT über 2×live, WÄHREND der N-Ring lebt →
-// erzwungene Mid-Run-Rescans der großen lebenden Menge = die schärfste M0-Form.
+// Returns a small a<->b cycle → escapes junk → heap. The caller lets it die
+// each step → buffered cycle candidate. Over N*40 steps this fills the
+// candidate buffer WAY over 2×live, WHILE the N-ring is alive →
+// forced mid-run rescans of the large live set = the sharpest M0 form.
 fn junk() -> Node {
     mut a = Node(null, null, 0)
     mut b = Node(a, a, 0)

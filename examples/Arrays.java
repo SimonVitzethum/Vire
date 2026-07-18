@@ -1,6 +1,6 @@
 public class Arrays {
     public static void main(String[] args) {
-        // int[]: Erzeugen, Füllen, Summieren
+        // int[]: create, fill, sum
         int[] a = new int[10];
         for (int i = 0; i < a.length; i++) {
             a[i] = i * i;
@@ -12,7 +12,7 @@ public class Arrays {
         System.out.print("sum of squares 0..9 = ");
         System.out.println(sum);          // 285
 
-        // ref[]: Array von Objekten (RC-verwaltet)
+        // ref[]: array of objects (RC-managed)
         Box[] boxes = new Box[3];
         boxes[0] = new Box(10);
         boxes[1] = new Box(20);
@@ -24,7 +24,7 @@ public class Arrays {
         System.out.print("sum of boxes = ");
         System.out.println(t);            // 60
 
-        // Überschreiben (altes Objekt muss released werden)
+        // overwrite (old object must be released)
         boxes[0] = new Box(99);
         System.out.println(boxes[0].v);   // 99
 

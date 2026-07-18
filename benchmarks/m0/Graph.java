@@ -2,7 +2,7 @@ public class Graph {
     static class Node {
         double rank, next;
         int outdeg;
-        Node[] out;          // Nachbar-Referenzen: geteilt (Aliasing), zyklenfähig
+        Node[] out;          // neighbor references: shared (aliasing), can form cycles
     }
     public static void main(String[] args) {
         int N = 200_000, E = 6;

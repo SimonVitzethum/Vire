@@ -1,6 +1,6 @@
-/* Minimaler bare-metal-Ersatz für seL4: liefert die schwachen Runtime-Hooks
- * und _start über rohe Linux-Syscalls — keine libc. Beweist, dass die
- * freestanding-Runtime ohne C-Bibliothek läuft. */
+/* Minimal bare-metal replacement for seL4: provides the weak runtime hooks
+ * and _start via raw Linux syscalls — no libc. Proves that the
+ * freestanding runtime runs without a C library. */
 #include <stddef.h>
 static long sys_write(long fd, const void *b, long n){long r;__asm__ volatile("syscall":"=a"(r):"a"(1L),"D"(fd),"S"(b),"d"(n):"rcx","r11","memory");return r;}
 static void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"rcx","r11","memory");__builtin_unreachable();}

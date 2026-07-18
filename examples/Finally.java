@@ -1,7 +1,7 @@
 public class Finally {
     public static void main(String[] args) {
-        System.out.println(withFinally(false));  // finally, dann 1
-        System.out.println(withFinally(true));   // finally, dann 2 (gefangen)
+        System.out.println(withFinally(false));  // finally, then 1
+        System.out.println(withFinally(true));   // finally, then 2 (caught)
         cleanup();
     }
 
@@ -12,15 +12,15 @@ public class Finally {
         } catch (RuntimeException e) {
             return 2;
         } finally {
-            System.out.println("finally lief");
+            System.out.println("finally ran");
         }
     }
 
     static void cleanup() {
         try {
-            System.out.println("versuch");
+            System.out.println("try");
         } finally {
-            System.out.println("aufraeumen");
+            System.out.println("cleanup");
         }
     }
 }

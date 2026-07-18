@@ -1,15 +1,15 @@
-/* Eingebaute Python-Brücke: einmal hier, damit Vire-Nutzer Python-Bibliotheken
- * OHNE eigenen C-Code aufrufen können. Wird automatisch mitkompiliert+gelinkt,
- * sobald ein Programm `vire_py_*` deklariert. Nimmt einen Vire-Ausdruck als Text
- * (mit gebundener Variable `x`), wertet ihn im Python-Interpreter aus und gibt
- * das Ergebnis als Skalar zurück — reicht, um jede Python-Lib zu erreichen
+/* Built-in Python bridge: here once, so that Vire users can call Python
+ * libraries WITHOUT their own C code. Automatically compiled and linked in
+ * as soon as a program declares `vire_py_*`. Takes a Vire expression as text
+ * (with a bound variable `x`), evaluates it in the Python interpreter and
+ * returns the result as a scalar — enough to reach any Python lib
  * (`__import__('numpy').linalg.norm(...)` etc.). */
 #include <Python.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Vire-String-Layout (muss zum Runtime-JStr passen: Header + len + bytes). */
+/* Vire string layout (must match the runtime JStr: header + len + bytes). */
 typedef struct {
     int64_t refcount;
     int64_t rcflags;
@@ -33,7 +33,7 @@ static char *vstr_dup(const VStr *s) {
     return c;
 }
 
-/* Wertet den Python-Ausdruck `code` aus (mit `x` als float gebunden) → double. */
+/* Evaluates the Python expression `code` (with `x` bound as float) → double. */
 double vire_py_eval_f(const VStr *code, double x) {
     vire_py_ensure();
     char *c = vstr_dup(code);
@@ -55,10 +55,10 @@ double vire_py_eval_f(const VStr *code, double x) {
     return d;
 }
 
-/* --- Objekt-API: Python-Objekte halten, aufrufen, Attribute lesen ----------
- * Alle Objekte sind `void*` (in Vire der opake `Ptr`-Typ). Strings kommen als
- * C-`char*` (via Vire-Builtin `cstr`). Damit erreicht man jede Python-Lib aus
- * reinem Vire: import → getattr → call → as-Skalar. */
+/* --- Object API: hold Python objects, call them, read attributes ----------
+ * All objects are `void*` (in Vire the opaque `Ptr` type). Strings arrive as
+ * C `char*` (via the Vire builtin `cstr`). This reaches any Python lib from
+ * pure Vire: import → getattr → call → as-scalar. */
 void *py_import(const char *name) {
     vire_py_ensure();
     return (void *)PyImport_ImportModule(name);
@@ -83,7 +83,7 @@ void *py_int(int64_t x) { vire_py_ensure(); return (void *)PyLong_FromLongLong((
 void *py_str(const char *s) { vire_py_ensure(); return (void *)PyUnicode_FromString(s); }
 double py_asfloat(void *o) { return o ? PyFloat_AsDouble((PyObject *)o) : 0.0; }
 int64_t py_asint(void *o) { return o ? (int64_t)PyLong_AsLongLong((PyObject *)o) : 0; }
-/* Attribut/Index als bequeme Kurzform. */
+/* Attribute/index as a convenient shorthand. */
 void *py_getitem_i(void *o, int64_t i) {
     PyObject *k = PyLong_FromLongLong((long long)i);
     PyObject *r = PyObject_GetItem((PyObject *)o, k);
@@ -91,7 +91,7 @@ void *py_getitem_i(void *o, int64_t i) {
     return (void *)r;
 }
 
-/* Wie oben, aber `x` als int gebunden → int64. */
+/* As above, but `x` bound as int → int64. */
 int64_t vire_py_eval_i(const VStr *code, int64_t x) {
     vire_py_ensure();
     char *c = vstr_dup(code);

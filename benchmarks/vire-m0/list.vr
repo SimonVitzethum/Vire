@@ -2,10 +2,10 @@ type Node {
     next: Node
     v: Int
 }
-// Baut eine Liste dynamischer Länge n (jeder Knoten zeigt auf den vorigen →
-// loop-carried Alias über die Rückkante → NICHT stack-allokierbar → Heap).
-// Summiert dabei; gibt Skalar zurück, die Liste stirbt am Funktionsende → RC
-// muss sie freigeben (azyklisch → Kaskaden-Release, kein Kollektor).
+// Builds a list of dynamic length n (each node points to the previous one →
+// loop-carried alias via the back edge → NOT stack-allocatable → heap).
+// Sums along the way; returns a scalar, the list dies at the function end → RC
+// must free it (acyclic → cascade release, no collector).
 fn build_and_sum(n: Int) -> Int {
     mut head = null
     mut i = 0

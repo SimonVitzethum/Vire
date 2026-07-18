@@ -19,7 +19,7 @@ public class Strings {
         System.out.println("".isEmpty() ? 1 : 0);  // 1
         System.out.println(s.isEmpty() ? 1 : 0);   // 0
 
-        // Zeichen zählen die 'l' sind
+        // count the characters that are 'l'
         int count = 0;
         for (int i = 0; i < s.length(); i++) {
             if (s.charAt(i) == 'l') count++;

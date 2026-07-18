@@ -1,6 +1,6 @@
 class Vec2 { int x, y; Vec2(int x,int y){this.x=x;this.y=y;} }
 public class IpEsc {
-    // groß genug, dass der Inliner es NICHT inlinet (>16 Statements)
+    // large enough that the inliner does NOT inline it (>16 statements)
     static int score(Vec2 a, Vec2 b) {
         int s = 0;
         s += a.x*b.x; s += a.y*b.y; s += a.x+b.x; s += a.y+b.y;

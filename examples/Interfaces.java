@@ -8,13 +8,13 @@ interface Named {
 }
 
 class Dog implements Animal, Named {
-    public String sound() { return "wuff"; }
+    public String sound() { return "woof"; }
     public int legs() { return 4; }
-    public String name() { return "Hund"; }
+    public String name() { return "Dog"; }
 }
 
 class Bird implements Animal {
-    public String sound() { return "piep"; }
+    public String sound() { return "tweet"; }
     public int legs() { return 2; }
 }
 
@@ -23,19 +23,19 @@ public class Interfaces {
         Animal a = new Dog();
         Animal b = new Bird();
 
-        // polymorpher Interface-Dispatch (zwei Impls → nicht devirtualisiert)
-        System.out.println(a.sound() + " " + a.legs());  // wuff 4
-        System.out.println(b.sound() + " " + b.legs());  // piep 2
+        // polymorphic interface dispatch (two impls → not devirtualized)
+        System.out.println(a.sound() + " " + a.legs());  // woof 4
+        System.out.println(b.sound() + " " + b.legs());  // tweet 2
 
         describe(a);
         describe(b);
 
-        // Interface über eine andere Interface-Referenz
+        // interface via a different interface reference
         Named n = new Dog();
-        System.out.println(n.name());   // Hund
+        System.out.println(n.name());   // Dog
     }
 
     static void describe(Animal x) {
-        System.out.println("macht " + x.sound() + " mit " + x.legs() + " Beinen");
+        System.out.println("goes " + x.sound() + " with " + x.legs() + " legs");
     }
 }

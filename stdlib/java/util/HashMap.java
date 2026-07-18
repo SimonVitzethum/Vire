@@ -1,7 +1,7 @@
 package java.util;
 
-// Hash-Map mit open addressing; nutzt hashCode()/equals() der Schlüssel
-// (virtueller Dispatch über Object).
+// Hash map with open addressing; uses hashCode()/equals() of the keys
+// (virtual dispatch via Object).
 public class HashMap<K, V> implements Map<K, V> {
     private Object[] keys;
     private Object[] vals;
