@@ -91,3 +91,24 @@ einen Shim, der die Bytes übergibt — noch offen (Erweiterung: `cstr(s)`-Built
 - `-l NAME` — Bibliothek linken (z.B. `-l stdc++`, `-l python3.14`).
 - `--obj FILE` — Objekt/Quelle mitlinken (`.o`, `.c`, `.cpp`, `.a`).
 - `libm` wird immer gelinkt.
+
+## Python-Libs aus REINEM Vire — ohne eigenen C-Code (eingebaute Brücke)
+Für Python gibt es eine **in den Compiler eingebaute Brücke**: deklariere die
+`vire_py_*`-Funktionen und rufe Python direkt aus Vire — `pybridge.c` wird
+automatisch mitkompiliert und libpython gelinkt. **Kein Nutzer-C, kein Shim, kein Flag.**
+```vire
+extern "C" {
+    fn vire_py_eval_f(code: Str, x: F64) -> F64
+    fn vire_py_eval_i(code: Str, x: Int) -> Int
+}
+print(vire_py_eval_f("__import__('math').sqrt(x)", 625.0))       // 25.0
+print(vire_py_eval_i("__import__('math').factorial(x)", 6))      // 720
+```
+`x` ist im Ausdruck als Argument gebunden; `__import__('lib')` erreicht JEDE
+installierte Python-Bibliothek (numpy, …). Ergebnis kommt als Skalar zurück.
+
+**Zusammenfassung „ohne eigenen Fremdcode nutzbar?"**
+- **C-Libs:** ja, direkt — nur Signaturen in `extern "C"` deklarieren + `link`.
+- **C++-Libs:** nur wenn die Lib ein C-API exportiert; gemangeltes C++ braucht
+  prinzipbedingt (keine stabile ABI) eine `extern "C"`-Fassade (`native`-Block).
+- **Python-Libs:** ja, über die eingebaute Brücke (`vire_py_*`) aus reinem Vire.

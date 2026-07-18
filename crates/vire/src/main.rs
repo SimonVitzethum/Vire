@@ -11,6 +11,8 @@ use std::process::{exit, Command};
 // Dieselbe Runtime wie der Java-Treiber (crates/driver/src/runtime.c) — ein
 // gemeinsamer `main`→`java_main`-Einstieg, dieselben jrt_-Helfer.
 const RUNTIME_C: &str = include_str!("../../driver/src/runtime.c");
+// Eingebaute Python-Brücke: erlaubt Python-Libs aus reinem Vire (kein Nutzer-C).
+const PYBRIDGE_C: &str = include_str!("pybridge.c");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -195,9 +197,17 @@ fn build_or_run(args: &[String]) {
     // FFI aus der Quelle: `extern "…" link "lib"` + `native "…" … """code"""`.
     // Link-Libs → clang `-l`; native-Blöcke → automatisch mitkompiliert.
     let mut native_blocks: Vec<(String, String)> = Vec::new();
+    // Nutzt das Programm die eingebaute Python-Brücke (`vire_py_*`)? Dann wird
+    // pybridge.c automatisch mitkompiliert + libpython gelinkt — KEIN Nutzer-C.
+    let mut want_py_bridge = false;
     for it in &module.items {
         match it {
-            vire::ast::Item::Extern { links, .. } => link_libs.extend(links.iter().cloned()),
+            vire::ast::Item::Extern { items, links, .. } => {
+                link_libs.extend(links.iter().cloned());
+                if items.iter().any(|s| s.name.starts_with("vire_py_")) {
+                    want_py_bridge = true;
+                }
+            }
             vire::ast::Item::Native { abi, code, links, .. } => {
                 link_libs.extend(links.iter().cloned());
                 native_blocks.push((abi.clone(), code.clone()));
@@ -268,6 +278,11 @@ fn build_or_run(args: &[String]) {
     if let Err(e) = std::fs::write(&ll_path, &ll).and_then(|_| std::fs::write(&rt_path, RUNTIME_C)) {
         eprintln!("Schreiben nach {}: {e}", build_dir.display());
         exit(1);
+    }
+    // Eingebaute Python-Brücke als (Python-)native-Block einreihen → sie durchläuft
+    // denselben Auto-Include/-Link-Pfad wie ein Nutzer-`native "python"`-Block.
+    if want_py_bridge {
+        native_blocks.push(("python".into(), PYBRIDGE_C.to_string()));
     }
     // Eingebettete native-Blöcke in Dateien schreiben (Endung nach ABI) und
     // Kompilier-/Link-Flags für C++/Python automatisch ergänzen.
