@@ -24,6 +24,10 @@ fn main() {
         build_or_run(&args);
         return;
     }
+    if args[0] == "bindgen" {
+        bindgen(&args[1..]);
+        return;
+    }
     if args.len() < 2 {
         eprintln!("Aufruf: vire (parse|lex) DATEI.vr");
         exit(2);
@@ -194,6 +198,31 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // `extern "C" header "h.h"` → Signaturen zur Compilezeit aus dem C-Header
+    // generieren (auto-bindgen) und den extern-Block damit füllen.
+    let src_dir = std::path::Path::new(&path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    for it in module.items.iter_mut() {
+        if let vire::ast::Item::Extern { items, header: Some(h), .. } = it {
+            let hpath = src_dir.join(&*h);
+            let htext = match std::fs::read_to_string(&hpath) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("header {}: {e}", hpath.display());
+                    exit(1);
+                }
+            };
+            let (extern_text, _skipped) = header_to_extern(&htext, None);
+            let (gen, gdiags) = vire::parse(&extern_text);
+            if !gdiags.is_empty() {
+                eprintln!("bindgen({}): generierte Bindings fehlerhaft", hpath.display());
+                exit(1);
+            }
+            if let Some(vire::ast::Item::Extern { items: gitems, .. }) = gen.items.into_iter().next() {
+                *items = gitems; // extern-Block mit generierten Signaturen füllen
+            }
+        }
+    }
+
     // FFI aus der Quelle: `extern "…" link "lib"` + `native "…" … """code"""`.
     // Link-Libs → clang `-l`; native-Blöcke → automatisch mitkompiliert.
     let mut native_blocks: Vec<(String, String)> = Vec::new();
@@ -385,4 +414,188 @@ fn build_or_run(args: &[String]) {
             }
         }
     }
+}
+
+/// `vire bindgen HEADER.h [-l lib] [-o OUT.vr]` — erzeugt aus C-Funktions-
+/// deklarationen einen `extern "C"`-Block, damit man Signaturen nicht von Hand
+/// tippt. Dependency-freier Heuristik-Parser: deckt skalare + Zeiger-APIs ab
+/// (der 80%-Fall). Struct-by-value/Funktionszeiger/Varargs werden mit Hinweis
+/// übersprungen (nicht sauber auf die C-ABI abbildbar).
+fn bindgen(args: &[String]) {
+    let mut header: Option<String> = None;
+    let mut lib: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-l" => lib = it.next().cloned(),
+            "-o" => out = it.next().cloned(),
+            other => header = Some(other.to_string()),
+        }
+    }
+    let header = header.unwrap_or_else(|| {
+        eprintln!("Aufruf: vire bindgen HEADER.h [-l lib] [-o OUT.vr]");
+        exit(2);
+    });
+    let text = std::fs::read_to_string(&header).unwrap_or_else(|e| {
+        eprintln!("{header}: {e}");
+        exit(1);
+    });
+    let (s, skipped) = header_to_extern(&text, lib.as_deref());
+    let nfns = s.matches("\n    fn ").count();
+    match out {
+        Some(o) => {
+            std::fs::write(&o, &s).unwrap_or_else(|e| {
+                eprintln!("{o}: {e}");
+                exit(1);
+            });
+            eprintln!("vire bindgen: {nfns} Funktion(en) → {o} ({skipped} übersprungen)");
+        }
+        None => print!("{s}"),
+    }
+}
+
+/// C-Header-Text → `extern "C"`-Block (Text) + Anzahl übersprungener Deklarationen.
+/// Kern, den sowohl `vire bindgen` als auch die `header "…"`-Direktive nutzen.
+fn header_to_extern(text: &str, lib: Option<&str>) -> (String, usize) {
+    let cleaned = strip_c(text);
+    let mut lines = Vec::new();
+    let mut skipped = 0usize;
+    for chunk in cleaned.split(';') {
+        match parse_proto(chunk) {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => {}
+            Err(_) => skipped += 1,
+        }
+    }
+    let mut s = String::new();
+    match lib {
+        Some(l) => s.push_str(&format!("extern \"C\" link \"{l}\" {{\n")),
+        None => s.push_str("extern \"C\" {\n"),
+    }
+    for l in &lines {
+        s.push_str("    ");
+        s.push_str(l);
+        s.push('\n');
+    }
+    s.push_str("}\n");
+    (s, skipped)
+}
+
+/// Kommentare + Präprozessor-Zeilen entfernen (grob, für den Prototyp-Scan).
+fn strip_c(text: &str) -> String {
+    let mut out = String::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    // Präprozessor-Zeilen (#...) weg.
+    out.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n")
+}
+
+/// Einen C-Funktionsprototyp aus einem `;`-getrennten Chunk parsen → Vire-`fn`-Zeile.
+/// `Ok(None)` = kein Funktionsprototyp; `Err` = übersprungen (nicht abbildbar).
+fn parse_proto(chunk: &str) -> Result<Option<String>, ()> {
+    let c = chunk.trim();
+    if c.is_empty() || c.contains('{') || c.contains('}') {
+        return Ok(None);
+    }
+    // erstes '(' und passendes ')'
+    let open = match c.find('(') {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let close = match c.rfind(')') {
+        Some(x) if x > open => x,
+        _ => return Ok(None),
+    };
+    let head = c[..open].trim();
+    let params_s = c[open + 1..close].trim();
+    // Funktionszeiger / verschachtelte Klammern im Kopf → skip.
+    if head.contains('(') || head.contains(')') || head.is_empty() {
+        return Ok(None);
+    }
+    // Varargs → nicht abbildbar.
+    if params_s.contains("...") {
+        return Err(());
+    }
+    // Name = letzter Bezeichner im Kopf; Rest = Rückgabetyp.
+    let name_start = head.rfind(|ch: char| !(ch.is_alphanumeric() || ch == '_')).map(|p| p + 1).unwrap_or(0);
+    let name = &head[name_start..];
+    let ret_c = head[..name_start].trim();
+    if name.is_empty() || !name.chars().next().unwrap().is_alphabetic() && name.chars().next() != Some('_') {
+        return Ok(None);
+    }
+    // nur echte Deklarationen (kein typedef/struct/enum/union als „Rückgabe")
+    if ret_c.is_empty() || ret_c.starts_with("typedef") {
+        return Ok(None);
+    }
+    let ret_v = map_c_ty(ret_c, true)?;
+    // Parameter
+    let mut vparams = Vec::new();
+    if !params_s.is_empty() && params_s != "void" {
+        for (k, p) in params_s.split(',').enumerate() {
+            let p = p.trim();
+            let ty = map_c_param(p)?;
+            vparams.push(format!("a{k}: {ty}"));
+        }
+    }
+    let ret_part = if ret_v == "Unit" { String::new() } else { format!(" -> {ret_v}") };
+    Ok(Some(format!("fn {name}({}){ret_part}", vparams.join(", "))))
+}
+
+/// C-Parameter (Typ + evtl. Name) → Vire-Typ.
+fn map_c_param(p: &str) -> Result<&'static str, ()> {
+    // Name am Ende wegnehmen (falls vorhanden): letzter Bezeichner ohne '*'.
+    let t = if p.contains('*') {
+        "Ptr" // jeder Zeiger
+    } else {
+        // letzten Bezeichner (Param-Name) abtrennen
+        let stripped = match p.rfind(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            Some(pos) => p[..pos + 1].trim(),
+            None => p, // nur ein Wort → Typ ohne Name
+        };
+        let base = if stripped.is_empty() { p } else { stripped };
+        return map_c_ty(base, false);
+    };
+    Ok(t)
+}
+
+/// C-Typname → Vire-Typ. `is_ret`: void → Unit erlaubt.
+fn map_c_ty(s: &str, is_ret: bool) -> Result<&'static str, ()> {
+    let s = s.replace("const", " ").replace("volatile", " ").replace("unsigned", " ").replace("signed", " ");
+    let n: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if n.contains('*') {
+        return Ok("Ptr");
+    }
+    Ok(match n.as_str() {
+        "void" => {
+            if is_ret {
+                "Unit"
+            } else {
+                return Err(());
+            }
+        }
+        "double" => "F64",
+        "float" => "F32",
+        "int" | "int32_t" | "short" | "char" | "int16_t" | "int8_t" | "uint32_t" | "uint16_t" | "uint8_t" | "wchar_t" => "I32",
+        "long" | "long long" | "long int" | "int64_t" | "uint64_t" | "size_t" | "ssize_t" | "intptr_t" | "uintptr_t" | "off_t" | "time_t" => "Int",
+        "bool" | "_Bool" => "Bool",
+        // Unbekannter Nicht-Zeiger-Typ (z.B. struct by value) → nicht abbildbar.
+        _ => return Err(()),
+    })
 }

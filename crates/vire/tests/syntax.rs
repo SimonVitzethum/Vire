@@ -74,3 +74,11 @@ fn native_and_link_parse() {
     let has_extern_link = m.items.iter().any(|it| matches!(it, vire::ast::Item::Extern { links, .. } if !links.is_empty()));
     assert!(has_native && has_extern_link);
 }
+
+#[test]
+fn extern_header_directive_parses() {
+    let (m, diags) = parse_with_syntax("extern \"C\" header \"geo.h\" link \"geo\"\nprint(1)\n", Syntax::default());
+    assert!(diags.is_empty(), "{diags:?}");
+    let has = m.items.iter().any(|it| matches!(it, vire::ast::Item::Extern { header: Some(h), .. } if h == "geo.h"));
+    assert!(has, "extern header-Direktive muss parsen");
+}

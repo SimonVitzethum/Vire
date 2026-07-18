@@ -16,8 +16,10 @@ pub enum Item {
     Impl(ImplDef),
     Const { name: String, value: Expr, span: Span },
     Use { path: Vec<String>, span: Span },
-    /// `extern "C" [link "lib"]* { fn … }` — Fremdfunktionen + in-Quelle-Link-Libs.
-    Extern { abi: String, items: Vec<FnSig>, links: Vec<String>, span: Span },
+    /// `extern "C" [header "h.h"] [link "lib"]* { fn … }` — Fremdfunktionen.
+    /// Mit `header`: die Signaturen werden zur Compilezeit aus dem C-Header
+    /// generiert (auto-bindgen), kein `{}`-Block nötig.
+    Extern { abi: String, items: Vec<FnSig>, links: Vec<String>, header: Option<String>, span: Span },
     /// `native "c++" [link "lib"]* """ …raw code… """` — eingebetteter Fremdcode,
     /// der automatisch mitkompiliert und gelinkt wird (kein Extra-File/Flag).
     Native { abi: String, code: String, links: Vec<String>, span: Span },

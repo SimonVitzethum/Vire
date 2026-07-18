@@ -112,3 +112,29 @@ installierte Python-Bibliothek (numpy, …). Ergebnis kommt als Skalar zurück.
 - **C++-Libs:** nur wenn die Lib ein C-API exportiert; gemangeltes C++ braucht
   prinzipbedingt (keine stabile ABI) eine `extern "C"`-Fassade (`native`-Block).
 - **Python-Libs:** ja, über die eingebaute Brücke (`vire_py_*`) aus reinem Vire.
+
+## C-Header automatisch binden — keine Signaturen von Hand
+Zwei Stufen, damit man C-Funktionen NICHT einzeln deklarieren muss:
+
+**`vire bindgen`** erzeugt aus einem C-Header einen `extern "C"`-Block:
+```sh
+vire bindgen geo.h -l geo -o geo_bind.vr    # → fn geo_hypot(a0: F64, a1: F64) -> F64 …
+```
+Deckt skalare + Zeiger-APIs ab; struct-by-value/Funktionszeiger/varargs werden
+übersprungen (nicht sauber auf die C-ABI abbildbar).
+
+**`extern "C" header "…"`** macht das zur Compilezeit automatisch — man nennt nur
+den Header, alle Funktionen sind da:
+```vire
+extern "C" header "geo.h"
+print(geo_hypot(3.0, 4.0))     // 5.0 — keine Signatur getippt
+```
+`vire run --obj geo.c c_header_auto.vr` (oder eine vorkompilierte Lib linken).
+
+## Ergonomie-Stufen (Zusammenfassung)
+| Ziel | Aufwand |
+|---|---|
+| C-Funktion aufrufen | `extern "C" { fn f(...) }` + `link` — oder `header "h.h"` (auto) |
+| Eingebetteter C/C++/Python-Shim | `native "abi" """…"""` (auto-kompiliert/gelinkt) |
+| Python-Lib nutzen | `py_import("mod")` aus reinem Vire — kein extern, kein cstr, kein C |
+| String an C übergeben | Vire-Str direkt (bei `header`/Deklaration `Ptr`), oder `cstr(s)` |

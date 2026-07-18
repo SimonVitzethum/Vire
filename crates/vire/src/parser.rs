@@ -382,16 +382,30 @@ impl Parser {
             Tok::Str(s) => s,
             _ => "C".into(),
         };
+        // Optional: `header "datei.h"` → Signaturen später aus dem C-Header
+        // generieren (auto-bindgen), kein `{}`-Block.
+        let mut header = None;
+        if matches!(self.peek(), Tok::Ident(n) if n == "header") {
+            self.bump();
+            if let Tok::Str(h) = self.peek().clone() {
+                self.bump();
+                header = Some(h);
+            } else {
+                self.err("nach `header` wird ein Dateiname erwartet (String)");
+            }
+        }
         let links = self.parse_links();
         let mut items = Vec::new();
-        self.expect(&Tok::LBrace, "'{'");
-        self.stmt_end();
-        while self.at_kw(Kw::Fn) {
-            items.push(self.parse_fn_sig());
+        if header.is_none() {
+            self.expect(&Tok::LBrace, "'{'");
             self.stmt_end();
+            while self.at_kw(Kw::Fn) {
+                items.push(self.parse_fn_sig());
+                self.stmt_end();
+            }
+            self.expect(&Tok::RBrace, "'}'");
         }
-        self.expect(&Tok::RBrace, "'}'");
-        Item::Extern { abi, items, links, span: sp }
+        Item::Extern { abi, items, links, header, span: sp }
     }
 
     fn parse_type(&mut self) -> Type {
