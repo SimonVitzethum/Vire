@@ -812,6 +812,202 @@ impl<'a> FnLower<'a> {
         let _ = self.lower_block_val(b); // Void-Kontext: Tail-Wert verworfen
     }
 
+    /// Name, dessen Aufruf ein Heap-Objekt erzeugt (Konstruktor eines Nutzer-/
+    /// generischen Typs, Variante, oder Collection-Builtin).
+    fn is_alloc_name(&self, n: &str) -> bool {
+        self.types.contains_key(n)
+            || self.variants.contains_key(n)
+            || self.generic_ptypes.contains_key(n)
+            || self.variant_owner_g.contains_key(n)
+            || matches!(n, "list" | "map" | "array" | "farray")
+    }
+
+    /// AUTOMATISCHE SCHLEIFEN-ARENA (escape→arena). Eine `while`-Iteration, deren
+    /// Allokationen die Iteration nachweislich NICHT verlassen, wird in eine
+    /// per-Iteration-Bump-Arena gelegt (wie eine automatische capsule): kein
+    /// malloc/free je Knoten, en-bloc-Freigabe am Iterationsende. Trifft den
+    /// EINZIGEN gemessenen Gap (Allokator; btree 2,57×-Decke). Konservativ —
+    /// jede Unsicherheit ⇒ nicht promoten (kein Arena ⇒ keine Unsoundness).
+    ///
+    /// Sicher, wenn der Rumpf (transitiv über Nutzer-Callees):
+    ///  - alloziert (sonst kein Nutzen),
+    ///  - KEIN Feld/Index schreibt (Mutation eines existierenden Objekts könnte
+    ///    eine Arena-Referenz nach außen speichern; Konstruktoren zählen NICHT als
+    ///    Feld-Schreibung — sie sind Calls auf frische Objekte),
+    ///  - KEINE Mutator-Methode (push/put/set/pop/add/insert) ruft,
+    ///  - KEIN `return`/`break`/`continue` (auf Rumpf-Ebene) enthält,
+    ///  - nur Nutzerfunktionen + Konstruktoren ruft (kein extern/builtin/Lambda —
+    ///    könnte eine Referenz einfangen),
+    ///  - keiner äußeren (iterationsübergreifenden) Variable eine Ref zuweist.
+    fn while_arena_safe(&self, body: &Block2) -> bool {
+        let mut outer: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for s in &self.scopes {
+            for k in s.keys() {
+                outer.insert(k.clone());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        if self.region_bad_block(body, true, &outer, &mut seen) {
+            return false;
+        }
+        seen.clear();
+        self.region_allocates_block(body, &mut seen)
+    }
+
+    fn region_bad_block(&self, b: &Block2, top: bool, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+        b.stmts.iter().any(|s| self.region_bad_stmt(s, top, outer, seen))
+            || b.tail.as_deref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
+    }
+
+    fn region_bad_stmt(&self, s: &Stmt, top: bool, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+        match s {
+            Stmt::Return(..) => true,
+            Stmt::Break(_) | Stmt::Continue(_) => top, // verlässt UNSERE Arena-Iteration
+            // `name = expr` ist im Vire-AST ein Let (Neubindung). Re-bindet es eine
+            // ÄUSSERE Variable (vor der Schleife deklariert) mit einer Ref, entkommt
+            // die Ref über die Iteration hinaus → verboten. Neue Rumpf-lokale Namen
+            // (nicht in `outer`) sind harmlos (sterben mit der Iteration).
+            Stmt::Let { name, value, .. } => {
+                let escapes = top && outer.contains(name) && value.as_ref().map(|v| self.expr_may_be_ref(v)).unwrap_or(false);
+                escapes || value.as_ref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
+            }
+            Stmt::Assign { target, value, .. } => {
+                let target_bad = match target {
+                    // Feld-/Index-Mutation = Schreiben in existierendes Objekt → verboten.
+                    Expr::Field { .. } | Expr::Index { .. } => true,
+                    // Ref an eine äußere Variable (compound `x op= e`) → entkommt.
+                    Expr::Ident(n, _) => top && outer.contains(n) && self.expr_may_be_ref(value),
+                    _ => false,
+                };
+                target_bad || self.region_bad_expr(value, outer, seen)
+            }
+            Stmt::Expr(e) => self.region_bad_expr(e, outer, seen),
+            Stmt::While { cond, body, .. } => self.region_bad_expr(cond, outer, seen) || self.region_bad_block(body, false, outer, seen),
+            Stmt::For { iter, body, .. } => self.region_bad_expr(iter, outer, seen) || self.region_bad_block(body, false, outer, seen),
+        }
+    }
+
+    fn region_bad_expr(&self, e: &Expr, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+        match e {
+            Expr::Call { callee, args, .. } => {
+                let callee_bad = match callee.as_ref() {
+                    Expr::Ident(n, _) => {
+                        if let Some(fd) = self.fn_defs.get(n) {
+                            if seen.insert(n.clone()) {
+                                match &fd.body {
+                                    Some(b) => self.region_bad_block(b, false, outer, seen),
+                                    None => true, // nur Signatur → opak
+                                }
+                            } else {
+                                false // schon in Prüfung (Rekursion) → für den Zyklus ok
+                            }
+                        } else if self.is_alloc_name(n) {
+                            false // Konstruktor eines frischen Objekts — erlaubt
+                        } else {
+                            true // builtin/extern/unbekannt → konservativ opak
+                        }
+                    }
+                    // Mutator-Methode auf einem (evtl. äußeren) Objekt → könnte speichern.
+                    _ => true,
+                };
+                callee_bad || args.iter().any(|a| self.region_bad_expr(a, outer, seen))
+            }
+            Expr::Unary { rhs, .. } => self.region_bad_expr(rhs, outer, seen),
+            Expr::Binary { lhs, rhs, .. } => self.region_bad_expr(lhs, outer, seen) || self.region_bad_expr(rhs, outer, seen),
+            Expr::Field { base, .. } => self.region_bad_expr(base, outer, seen),
+            Expr::Index { base, index, .. } => self.region_bad_expr(base, outer, seen) || self.region_bad_expr(index, outer, seen),
+            Expr::If { cond, then, elifs, els, .. } => {
+                self.region_bad_expr(cond, outer, seen)
+                    || self.region_bad_block(then, false, outer, seen)
+                    || elifs.iter().any(|(c, b)| self.region_bad_expr(c, outer, seen) || self.region_bad_block(b, false, outer, seen))
+                    || els.as_ref().map(|b| self.region_bad_block(b, false, outer, seen)).unwrap_or(false)
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                self.region_bad_expr(scrutinee, outer, seen)
+                    || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_bad_expr(g, outer, seen)).unwrap_or(false) || self.region_bad_expr(b, outer, seen))
+            }
+            Expr::Block(b) => self.region_bad_block(b, false, outer, seen),
+            Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, outer, seen)),
+            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, outer, seen),
+            Expr::Range { start, end, .. } => self.region_bad_expr(start, outer, seen) || self.region_bad_expr(end, outer, seen),
+            // Lambda/Comprehension/MapLit/Capsule: konservativ opak (könnten fangen/außen speichern).
+            Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) | Expr::Capsule { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn region_allocates_block(&self, b: &Block2, seen: &mut std::collections::HashSet<String>) -> bool {
+        b.stmts.iter().any(|s| self.region_allocates_stmt(s, seen)) || b.tail.as_deref().map(|e| self.region_allocates_expr(e, seen)).unwrap_or(false)
+    }
+    fn region_allocates_stmt(&self, s: &Stmt, seen: &mut std::collections::HashSet<String>) -> bool {
+        match s {
+            Stmt::Let { value, .. } => value.as_ref().map(|e| self.region_allocates_expr(e, seen)).unwrap_or(false),
+            Stmt::Assign { target, value, .. } => self.region_allocates_expr(target, seen) || self.region_allocates_expr(value, seen),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.region_allocates_expr(e, seen),
+            Stmt::While { cond, body, .. } => self.region_allocates_expr(cond, seen) || self.region_allocates_block(body, seen),
+            Stmt::For { iter, body, .. } => self.region_allocates_expr(iter, seen) || self.region_allocates_block(body, seen),
+            _ => false,
+        }
+    }
+    fn region_allocates_expr(&self, e: &Expr, seen: &mut std::collections::HashSet<String>) -> bool {
+        match e {
+            Expr::Call { callee, args, .. } => {
+                let ca = match callee.as_ref() {
+                    Expr::Ident(n, _) => {
+                        if self.is_alloc_name(n) {
+                            true
+                        } else if let Some(fd) = self.fn_defs.get(n) {
+                            if seen.insert(n.clone()) {
+                                fd.body.as_ref().map(|b| self.region_allocates_block(b, seen)).unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                ca || args.iter().any(|a| self.region_allocates_expr(a, seen))
+            }
+            Expr::List(..) | Expr::MapLit(..) | Expr::Comprehension { .. } => true,
+            Expr::Unary { rhs, .. } => self.region_allocates_expr(rhs, seen),
+            Expr::Binary { lhs, rhs, .. } => self.region_allocates_expr(lhs, seen) || self.region_allocates_expr(rhs, seen),
+            Expr::Field { base, .. } => self.region_allocates_expr(base, seen),
+            Expr::Index { base, index, .. } => self.region_allocates_expr(base, seen) || self.region_allocates_expr(index, seen),
+            Expr::If { cond, then, elifs, els, .. } => {
+                self.region_allocates_expr(cond, seen)
+                    || self.region_allocates_block(then, seen)
+                    || elifs.iter().any(|(c, b)| self.region_allocates_expr(c, seen) || self.region_allocates_block(b, seen))
+                    || els.as_ref().map(|b| self.region_allocates_block(b, seen)).unwrap_or(false)
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                self.region_allocates_expr(scrutinee, seen) || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_allocates_expr(g, seen)).unwrap_or(false) || self.region_allocates_expr(b, seen))
+            }
+            Expr::Block(b) => self.region_allocates_block(b, seen),
+            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_allocates_expr(inner, seen),
+            _ => false,
+        }
+    }
+
+    /// Konservativ: kann der Ausdruck eine Referenz liefern? (Für die
+    /// „Ref an äußere Variable"-Escape-Prüfung.) Nur offensichtlich Skalares → false.
+    fn expr_may_be_ref(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Unary { .. } => false,
+            Expr::Binary { op, lhs, rhs, .. } => {
+                // String-`+` liefert Ref; sonstige Arithmetik/Vergleich/Logik = Skalar.
+                matches!(op, BinOp::Add) && (self.expr_may_be_ref(lhs) || self.expr_may_be_ref(rhs))
+            }
+            Expr::Ident(n, _) => self.lookup(n).map(|(_, t)| t == Ty::Ref).unwrap_or(true),
+            Expr::Call { callee, .. } => match callee.as_ref() {
+                Expr::Ident(n, _) => self.is_alloc_name(n) || self.sigs.get(n).map(|s| s.ret == Ty::Ref).unwrap_or(true),
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
     /// Wie `lower_block`, liefert aber den Tail-Wert (für if-/Block-Ausdrücke).
     /// Ohne Tail → (_, Void).
     fn lower_block_val(&mut self, b: &Block2) -> (Operand, Ty) {
@@ -989,9 +1185,27 @@ impl<'a> FnLower<'a> {
                 let exit = self.new_block();
                 self.term(header.0 as usize, Terminator::Branch { cond: c, then_blk: bodyb, else_blk: exit });
                 self.cur = bodyb.0 as usize;
+                // AUTO-ARENA (escape→arena): nachweislich nicht-entkommende Allok.
+                // in eine per-Iteration-Bump-Arena legen (kein malloc/free je Knoten).
+                let arena = self.while_arena_safe(body);
+                let body_locals_start = self.locals.len();
+                if arena {
+                    self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
+                }
                 self.loops.push((header, exit));
                 self.lower_block(body);
                 self.loops.pop();
+                if arena {
+                    // Im Rumpf erzeugte Ref-Locals zeigen in die Arena. Nach dem Pop
+                    // ist der Speicher weg → VOR dem Pop nullen, sonst liest die
+                    // Funktions-Ende-Freigabe (jrt_release) freien Speicher (UAF).
+                    for idx in body_locals_start..self.locals.len() {
+                        if self.locals[idx] == Ty::Ref {
+                            self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
+                        }
+                    }
+                    self.emit(Statement::Call { dest: None, func: "jrt_arena_pop".into(), args: vec![] });
+                }
                 let end = self.cur;
                 self.term(end, Terminator::Goto(header));
                 self.cur = exit.0 as usize;

@@ -245,6 +245,30 @@ fn generics_monomorphisieren_pro_typ() {
 }
 
 #[test]
+fn auto_arena_promoviert_nicht_entkommende_schleife() {
+    // Schleife, die eine temporäre Struktur alloziert, einen Skalar reduziert und
+    // sie verwirft → per-Iteration-Arena (jrt_arena_push/pop im Rumpf).
+    let src = "type Tree { l: Tree  r: Tree }\nfn make(d: Int) -> Tree {\n if d == 0 { Tree(null, null) } else { Tree(make(d - 1), make(d - 1)) }\n}\nfn check(t: Tree, d: Int) -> Int {\n if d == 0 { 1 } else { 1 + check(t.l, d - 1) + check(t.r, d - 1) }\n}\nfn main() {\n mut s = 0\n mut n = 0\n while n < 10 {\n s = s + check(make(5), 5)\n n = n + 1\n }\n print(s)\n}\n";
+    let p = lower(src);
+    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let calls: Vec<&str> = main.blocks.iter().flat_map(|b| &b.statements).filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
+    assert!(calls.contains(&"jrt_arena_push"), "nicht-entkommende Alloc-Schleife muss Auto-Arena bekommen: {calls:?}");
+    assert!(calls.contains(&"jrt_arena_pop"), "Auto-Arena braucht pop");
+}
+
+#[test]
+fn auto_arena_meidet_entkommende_schleife() {
+    // Schleife, die eine Liste BAUT (frische Node fließt in die äußere `head`,
+    // wird nach der Schleife genutzt) → darf NICHT arena-promotet werden
+    // (sonst dangling). `head = Node(head, i)` ist ein Let einer äußeren Ref.
+    let src = "type Node { next: Node  v: Int }\nfn main() {\n mut head = null\n mut i = 0\n while i < 100 {\n head = Node(head, i)\n i = i + 1\n }\n mut s = 0\n mut cur = head\n while cur != null {\n s = s + cur.v\n cur = cur.next\n }\n print(s)\n}\n";
+    let p = lower(src);
+    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let has_arena = main.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_arena_push"));
+    assert!(!has_arena, "entkommende (Listen-baue) Schleife darf KEINE Auto-Arena bekommen");
+}
+
+#[test]
 fn makro_expandiert_und_ist_hygienisch() {
     // add_one(x) führt ein lokales `tmp` ein. Aufruf mit einem Argument, das
     // ebenfalls `tmp` heißt: das makro-lokale `tmp` wird gensym-umbenannt, fängt
