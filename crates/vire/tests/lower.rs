@@ -244,6 +244,38 @@ fn generics_monomorphisieren_pro_typ() {
 }
 
 #[test]
+fn generische_produkttypen() {
+    // type Box[T] pro Typargument monomorphisiert: Box$Int, Box$Float —
+    // je mit dem korrekten Feldtyp (I64 vs F64).
+    let src = "type Box[T] {\n value: T\n}\nfn main() {\n mut a = Box(42)\n mut b = Box(3.5)\n print(a.value)\n print(b.value)\n}\n";
+    let p = lower(src);
+    let bi = p.classes.iter().find(|c| c.name == "Box$Int").expect("Box$Int fehlt");
+    assert_eq!(bi.fields[0].ty, fastllvm_ir::Ty::I64);
+    let bf = p.classes.iter().find(|c| c.name == "Box$Float").expect("Box$Float fehlt");
+    assert_eq!(bf.fields[0].ty, fastllvm_ir::Ty::F64, "Float-Payload muss F64 sein (kein i64-Erasen)");
+}
+
+#[test]
+fn generische_summentypen_typkorrekt() {
+    // Option[Float]: Some(3.5) trägt F64 (kein i64-Erasen → kein Truncation-Bug).
+    let src = "fn g() -> Option[Float] {\n Some(3.5)\n}\nfn main() {\n match g() {\n Some(x) -> print(x)\n None -> print(0.0)\n }\n}\n";
+    let p = lower(src);
+    let of = p.classes.iter().find(|c| c.name == "Option$Float").expect("Option$Float fehlt");
+    let some_v = of.fields.iter().find(|f| f.name == "Some_value").expect("Some_value fehlt");
+    assert_eq!(some_v.ty, fastllvm_ir::Ty::F64, "Some_value in Option$Float muss F64 sein");
+}
+
+#[test]
+fn generische_summen_erschoepfung_pflicht() {
+    // Nicht-erschöpfendes match auf typisierte Option = HARTER FEHLER (kein Loch
+    // durch die Instanz-Klasse Option$Float).
+    let (mut m, _) = parse("fn g() -> Option[Float] {\n Some(1.5)\n}\nfn main() {\n match g() {\n Some(x) -> print(x)\n }\n}\n");
+    let _ = infer_module(&mut m);
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("erschöpf")), "typisierte Option nicht-erschöpfend muss Fehler sein: {errs:?}");
+}
+
+#[test]
 fn option_result_und_try() {
     // Eingebaute Summentypen + `?`-Propagation.
     let src = "fn d(a: Int, b: Int) -> Result {\n if b == 0 { Err(1) } else { Ok(a / b) }\n}\nfn c(a: Int, b: Int) -> Result {\n mut q = d(a, b)?\n Ok(q + 1)\n}\nfn main() {\n print(1)\n}\n";

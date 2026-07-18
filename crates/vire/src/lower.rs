@@ -174,8 +174,49 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     // Klassenmodell. Kompaktere Union folgt später.)
     let mut types: HashMap<String, Layout> = HashMap::new();
     let mut variants: HashMap<String, VariantInfo> = HashMap::new();
+    // Generische Produkttypen (`type Box[T] { value: T }`): NICHT direkt als
+    // Klasse registrieren (Felder referenzieren T). Stattdessen pro benutzter
+    // Typargument-Kombination monomorphisiert (`Box$Float`) — wie generische
+    // Funktionen. Name → (Typparameter, Felder).
+    let mut generic_ptypes: HashMap<String, (Vec<String>, Vec<Field>)> = HashMap::new();
+    // Generische Summentypen (`type Maybe[T] { Some2(T) | Nothing }` + eingebautes
+    // Option[T]): pro Typargument monomorphisiert (`Option$Float`), damit Float-
+    // Payloads typkorrekt (kein i64-Erasen). Name → (Typparameter, [(Variante,
+    // [(Feldname, Typname)])]). Einzel-parametrig; Result bleibt i64-gelöscht.
+    let mut generic_stypes: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)> = HashMap::new();
+    let mut variant_owner_g: HashMap<String, String> = HashMap::new();
     for it in &m.items {
         if let Item::Type(t) = it {
+            if !t.generics.is_empty() && t.variants.is_empty() {
+                generic_ptypes.insert(
+                    t.name.clone(),
+                    (t.generics.iter().map(|g| g.name.clone()).collect(), t.fields.clone()),
+                );
+                continue;
+            }
+            if !t.generics.is_empty() {
+                // Generischer Summentyp.
+                let tparams: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
+                let variants_g: Vec<(String, Vec<(String, String)>)> = t
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        let vf = v
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| {
+                                let fname = if f.name.is_empty() { format!("{}_{i}", v.name) } else { format!("{}_{}", v.name, f.name) };
+                                (fname, f.ty.name.clone())
+                            })
+                            .collect();
+                        variant_owner_g.insert(v.name.clone(), t.name.clone());
+                        (v.name.clone(), vf)
+                    })
+                    .collect();
+                generic_stypes.insert(t.name.clone(), (tparams, variants_g));
+                continue;
+            }
             if t.variants.is_empty() {
                 let layout: Layout = t
                     .fields
@@ -215,8 +256,23 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         variants.insert("Ok".into(), ("Result".into(), 0, vec![("Ok_value".into(), Ty::I64, None)]));
         variants.insert("Err".into(), ("Result".into(), 1, vec![("Err_error".into(), Ty::I64, None)]));
     }
+    // Eingebautes generisches Option[T]: `Some(x)` wird typ-korrekt monomorphisiert
+    // (`Option$Float` trägt F64), `None` bleibt über die gelöschte Option (nur __tag).
+    if !generic_stypes.contains_key("Option") {
+        generic_stypes.insert(
+            "Option".into(),
+            (vec!["T".into()], vec![("Some".into(), vec![("Some_value".into(), "T".into())]), ("None".into(), vec![])]),
+        );
+        variant_owner_g.entry("Some".into()).or_insert("Option".into());
+        variant_owner_g.entry("None".into()).or_insert("Option".into());
+    }
     // ClassInfo je Typ (Nutzer + eingebaut) registrieren.
-    let mut all_type_names: Vec<String> = m.items.iter().filter_map(|it| if let Item::Type(t) = it { Some(t.name.clone()) } else { None }).collect();
+    let mut all_type_names: Vec<String> = m
+        .items
+        .iter()
+        .filter_map(|it| if let Item::Type(t) = it { Some(t.name.clone()) } else { None })
+        .filter(|n| types.contains_key(n))
+        .collect();
     for bi in ["Option", "Result"] {
         if types.contains_key(bi) && !all_type_names.iter().any(|n| n == bi) {
             all_type_names.push(bi.into());
@@ -244,7 +300,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     for it in &m.items {
         if let Item::Fn(f) = it {
             let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
-            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of(f.sig.ret.as_ref()) });
+            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
         }
         // extern "C" { fn name(...) -> T }: C-ABI-Funktion, direkt unter ihrem
         // Namen (keine Mangling). Aufrufe lösen darüber auf; das Backend
@@ -273,7 +329,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             .map(|p| if p.name == "self" { Ty::Ref } else { ty_of(p.ty.as_ref()) })
             .collect();
         let sym = format!("{class}.{}", meth.sig.name);
-        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of(meth.sig.ret.as_ref()) });
+        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
     }
     // Generische Funktionen sammeln (NICHT direkt absenken — pro Aufruf-Typargument
     // eine Monomorph.-Instanz). Trait-Schranken werden geparst, aber noch nicht
@@ -295,16 +351,61 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
+    // Pre-Pass: annotationsgetriebene generische Instanzen (`-> Option[Float]`,
+    // `b: Box[Int]`) modulweit instanziieren, damit Aufrufstellen/Matches die
+    // konkrete Instanz (Layout + Varianten) sehen — auch in Funktionen, die den
+    // Typ nur benutzen, aber nicht annotieren.
+    let mut shared_inst: HashMap<String, Layout> = HashMap::new();
+    let mut shared_svars: HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>> = HashMap::new();
+    {
+        let mut seed = |t: &Type| {
+            if t.args.is_empty() {
+                return;
+            }
+            let targs: Vec<String> = t.args.iter().map(|a| a.name.clone()).collect();
+            if let Some((tps, vars)) = generic_stypes.get(&t.name) {
+                inst_stype(&t.name, tps, vars, &targs, &mut shared_inst, &mut shared_svars);
+            } else if let Some((tps, fields)) = generic_ptypes.get(&t.name) {
+                inst_ptype(&t.name, tps, fields, &targs, &mut shared_inst);
+            }
+        };
+        for it in &m.items {
+            if let Item::Fn(f) = it {
+                for p in &f.sig.params {
+                    if let Some(t) = &p.ty {
+                        seed(t);
+                    }
+                }
+                if let Some(t) = &f.sig.ret {
+                    seed(t);
+                }
+            }
+        }
+        for (_, meth) in &methods {
+            for p in &meth.sig.params {
+                if let Some(t) = &p.ty {
+                    seed(t);
+                }
+            }
+            if let Some(t) = &meth.sig.ret {
+                seed(t);
+            }
+        }
+    }
     let mut mono_queue: Vec<(String, Vec<String>)> = Vec::new();
+    // Instanziierte generische Typen (gemangelte Klasse → Layout), aus allen
+    // Funktionen gesammelt und danach als Klassen fürs Backend registriert.
+    let mut all_insts: HashMap<String, Layout> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
             if !f.sig.generics.is_empty() {
                 continue; // generisch → nur bei Bedarf instanziiert
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &mut prog.strings, None, None) {
-                Ok((func, mono)) => {
+            match lower_fn(f, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, None) {
+                Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
+                    all_insts.extend(insts);
                 }
                 Err(mut e) => errs.append(&mut e),
             }
@@ -313,10 +414,11 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &mut prog.strings, Some(class), Some(&sym)) {
-            Ok((func, mono)) => {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, Some(class), Some(&sym)) {
+            Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
+                all_insts.extend(insts);
             }
             Err(mut e) => errs.append(&mut e),
         }
@@ -334,14 +436,36 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         let inst = subst_fndef(gdef, &bind);
         // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
-        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of(inst.sig.ret.as_ref()) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &mut prog.strings, None, Some(&sym)) {
-            Ok((func, mono)) => {
+        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, Some(&sym)) {
+            Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
+                all_insts.extend(insts);
             }
             Err(mut e) => errs.append(&mut e),
         }
+    }
+    // Instanziierte generische Typen als Klassen registrieren (Backend-Layout).
+    // Annotationsgetriebene (shared) + payload-getriebene (all_insts) vereinen.
+    for (k, v) in &shared_inst {
+        all_insts.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    for (mangled, layout) in &all_insts {
+        let fields = layout
+            .iter()
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .collect();
+        prog.classes.push(fastllvm_ir::ClassInfo {
+            name: mangled.clone(),
+            super_name: Some("java/lang/Object".to_string()),
+            is_interface: false,
+            interfaces: vec![],
+            fields,
+            static_fields: vec![],
+            methods: vec![],
+            has_clinit: false,
+        });
     }
     if errs.is_empty() {
         Ok(prog)
@@ -373,6 +497,75 @@ fn class_of(t: Option<&Type>) -> Option<String> {
         "Float" | "F64" | "F32" | "Bool" | "Str" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr" => None,
         _ => Some(name.to_string()),
     }
+}
+
+/// Klasse eines Annotats mit Rücksicht auf generische Typen: `Option[Float]` →
+/// `Option$Float` (die monomorphisierte Instanz), sonst wie `class_of`. Für
+/// Rückgabe-Klassen in Signaturen, damit Aufrufstellen die konkrete Instanz sehen.
+fn class_of_ann(
+    t: Option<&Type>,
+    gp: &HashMap<String, (Vec<String>, Vec<Field>)>,
+    gs: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
+) -> Option<String> {
+    let t = t?;
+    if !t.args.is_empty() && (gp.contains_key(&t.name) || gs.contains_key(&t.name)) {
+        let args = t.args.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join("$");
+        return Some(format!("{}${args}", t.name));
+    }
+    class_of(Some(t))
+}
+
+/// Instanziiert einen generischen Produkttyp `base[targs]` → gemangelte Klasse
+/// `base$targs`; legt das substituierte Layout in `layouts` ab.
+fn inst_ptype(base: &str, tparams: &[String], fields: &[Field], targs: &[String], layouts: &mut HashMap<String, Layout>) -> String {
+    let mangled = format!("{base}${}", targs.join("$"));
+    if !layouts.contains_key(&mangled) {
+        let tmap: HashMap<String, String> = tparams.iter().cloned().zip(targs.iter().cloned()).collect();
+        let layout: Layout = fields
+            .iter()
+            .map(|f| {
+                let cn = tmap.get(&f.ty.name).cloned().unwrap_or_else(|| f.ty.name.clone());
+                let t = Type { name: cn, args: vec![], borrowed: false, span: f.ty.span };
+                (f.name.clone(), ty_of(Some(&t)), class_of(Some(&t)))
+            })
+            .collect();
+        layouts.insert(mangled.clone(), layout);
+    }
+    mangled
+}
+
+/// Instanziiert einen generischen Summentyp `sum[targs]` → gemangelte Klasse.
+/// Füllt `layouts` (Klassen-Layout) + `svars` (Variante → (tag, Feldlayout)).
+fn inst_stype(
+    sum: &str,
+    tparams: &[String],
+    variants: &[(String, Vec<(String, String)>)],
+    targs: &[String],
+    layouts: &mut HashMap<String, Layout>,
+    svars: &mut HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
+) -> String {
+    let mangled = format!("{sum}${}", targs.join("$"));
+    if layouts.contains_key(&mangled) {
+        return mangled;
+    }
+    let tmap: HashMap<String, String> = tparams.iter().cloned().zip(targs.iter().cloned()).collect();
+    let mut layout: Layout = vec![("__tag".into(), Ty::I64, None)];
+    let mut vmap: HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)> = HashMap::new();
+    for (tag, (vname, vfields)) in variants.iter().enumerate() {
+        let vf: Vec<(String, Ty, Option<String>)> = vfields
+            .iter()
+            .map(|(fname, tyname)| {
+                let cn = tmap.get(tyname).cloned().unwrap_or_else(|| tyname.clone());
+                let t = Type { name: cn, args: vec![], borrowed: false, span: crate::diag::Span(0, 0) };
+                (fname.clone(), ty_of(Some(&t)), class_of(Some(&t)))
+            })
+            .collect();
+        layout.extend(vf.iter().cloned());
+        vmap.insert(vname.clone(), (tag as i64, vf));
+    }
+    layouts.insert(mangled.clone(), layout);
+    svars.insert(mangled.clone(), vmap);
+    mangled
 }
 
 fn ret_ty(sig: &FnSig) -> Ty {
@@ -447,6 +640,21 @@ struct FnLower<'a> {
     variants: &'a HashMap<String, VariantInfo>,
     /// Generische Funktionen (Name → Info) für Aufruf-Monomorphisierung.
     generics: &'a HashMap<String, GInfo>,
+    /// Generische Produkttypen (Name → (Typparameter, Felder)) für `Box(x)`.
+    generic_ptypes: &'a HashMap<String, (Vec<String>, Vec<Field>)>,
+    /// Generische Summentypen (Name → (Typparameter, Varianten)) für `Some(x)`.
+    generic_stypes: &'a HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
+    /// Variante → generischer Summentyp (`Some` → `Option`) für Konstruktion/Match.
+    variant_owner_g: &'a HashMap<String, String>,
+    /// Modulweite generische Instanzen (annotationsgetrieben): Layout + Varianten.
+    shared_inst: &'a HashMap<String, Layout>,
+    shared_svars: &'a HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
+    /// Instanziierte generische Typen dieser Funktion (gemangelter Name → Layout).
+    /// Konstruktion + annotierte Parameter füllen dies; das Modul registriert
+    /// daraus die Klassen fürs Backend.
+    local_inst: HashMap<String, Layout>,
+    /// Payload-getriebene Summen-Instanzen dieser Funktion (Variante-Registry).
+    local_svars: HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
     /// Angeforderte Monomorph.-Instanzen: (generischer Name, konkrete Typargumente).
     mono: Vec<(String, Vec<String>)>,
     /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
@@ -495,6 +703,41 @@ impl<'a> FnLower<'a> {
     }
     fn bind(&mut self, name: &str, l: Local, t: Ty) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), (l, t));
+    }
+    /// Layout einer Klasse — Nutzertyp ODER instanziierter generischer Typ.
+    fn layout_of(&self, class: &str) -> Option<Layout> {
+        self.types
+            .get(class)
+            .or_else(|| self.local_inst.get(class))
+            .or_else(|| self.shared_inst.get(class))
+            .cloned()
+    }
+    /// Varianten-Info (tag, Feldlayout) einer Variante IN einer konkreten
+    /// (evtl. generischen) Instanz-Klasse. None → nicht in dieser Instanz.
+    fn variant_in(&self, class: &str, variant: &str) -> Option<(String, i64, Vec<(String, Ty, Option<String>)>)> {
+        let m = self.local_svars.get(class).or_else(|| self.shared_svars.get(class))?;
+        let (tag, vf) = m.get(variant)?;
+        Some((class.to_string(), *tag, vf.clone()))
+    }
+    /// Konkreter Typname eines gesenkten Werts (für Typargument-Inferenz von
+    /// generischen Konstruktoren): Klasse eines Ref sonst Skalar-Name.
+    fn ty_name(&self, op: &Operand, ty: Ty) -> String {
+        if let Some(c) = self.class_of_operand(op) {
+            return c;
+        }
+        match ty {
+            Ty::F64 => "Float",
+            Ty::F32 => "F32",
+            Ty::I32 => "I32",
+            Ty::Ref => "Ref",
+            _ => "Int",
+        }
+        .to_string()
+    }
+    /// Instanziiert einen generischen Produkttyp `base[targs]` → gemangelte Klasse
+    /// `base$targs`. Legt das (substituierte) Layout einmalig in `local_inst` ab.
+    fn instantiate_ptype(&mut self, base: &str, tparams: &[String], fields: &[Field], targs: &[String]) -> String {
+        inst_ptype(base, tparams, fields, targs, &mut self.local_inst)
     }
     /// Klasse eines Operanden, falls er ein Ref-Local mit bekannter Klasse ist.
     fn class_of_operand(&self, op: &Operand) -> Option<String> {
@@ -637,8 +880,8 @@ impl<'a> FnLower<'a> {
                             return;
                         }
                     };
-                    let fty = match self.types.get(&class).and_then(|l| l.iter().find(|(n, ..)| n == name)) {
-                        Some((_, ty, _)) => *ty,
+                    let fty = match self.layout_of(&class).and_then(|l| l.into_iter().find(|(n, ..)| n == name)) {
+                        Some((_, ty, _)) => ty,
                         None => {
                             self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
                             return;
@@ -948,8 +1191,8 @@ impl<'a> FnLower<'a> {
                         return (Operand::ConstI64(0), Ty::I64);
                     }
                 };
-                let (fty, rtarget) = match self.types.get(&class).and_then(|l| l.iter().find(|(n, ..)| n == name)) {
-                    Some((_, ty, rt)) => (*ty, rt.clone()),
+                let (fty, rtarget) = match self.layout_of(&class).and_then(|l| l.into_iter().find(|(n, ..)| n == name)) {
+                    Some((_, ty, rt)) => (ty, rt.clone()),
                     None => {
                         self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
                         return (Operand::ConstI64(0), Ty::I64);
@@ -1240,9 +1483,45 @@ impl<'a> FnLower<'a> {
                 return r;
             }
         }
+        // Datentragende Variante eines generischen Summentyps (`Some(3.5)`) →
+        // typ-korrekt monomorphisiert. Datenlose Varianten (`None`) laufen über
+        // den gelöschten Pfad (nur __tag; Payload-Typ irrelevant).
+        if self.variant_owner_g.contains_key(&name) && !args.is_empty() {
+            return self.build_generic_variant(&name, args);
+        }
         // Varianten-Konstruktor eines Summentyps: `Circle(2.0)` → getaggte Instanz.
         if self.variants.contains_key(&name) {
             return self.build_variant(&name, args);
+        }
+        // Konstruktor eines generischen Produkttyps: `Box(x)` → Typargumente aus
+        // den Argumenttypen inferieren, `Box$Float` instanziieren, New + PutField.
+        if let Some((tparams, fields)) = self.generic_ptypes.get(&name).cloned() {
+            let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+            // Typparameter aus dem ersten Feld ableiten, das genau `T` ist.
+            let mut tmap: HashMap<String, String> = HashMap::new();
+            for (i, f) in fields.iter().enumerate() {
+                if tparams.iter().any(|tp| tp == &f.ty.name) {
+                    if let Some((op, ty)) = lowered.get(i) {
+                        tmap.entry(f.ty.name.clone()).or_insert_with(|| self.ty_name(op, *ty));
+                    }
+                }
+            }
+            let targs: Vec<String> = tparams.iter().map(|tp| tmap.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
+            let mangled = self.instantiate_ptype(&name, &tparams, &fields, &targs);
+            let layout = self.local_inst[&mangled].clone();
+            let obj = self.new_local(Ty::Ref);
+            self.local_class.insert(obj.0, mangled.clone());
+            self.emit(Statement::New { dest: obj, class: mangled.clone() });
+            if lowered.len() != layout.len() {
+                self.errs.push(format!("{name}: {} Felder erwartet, {} übergeben", layout.len(), lowered.len()));
+            }
+            for ((fname, fty, _), (mut v, _)) in layout.iter().zip(lowered) {
+                if *fty == Ty::I64 {
+                    v = to_i64(v);
+                }
+                self.emit(Statement::PutField { obj: Operand::Copy(obj), class: mangled.clone(), field: fname.clone(), value: v });
+            }
+            return (Operand::Copy(obj), Ty::Ref);
         }
         // Konstruktor eines Nutzertyps: `Point(x, y)` → New + PutField je Feld
         // (Feldreihenfolge = Deklarationsreihenfolge).
@@ -1488,6 +1767,39 @@ impl<'a> FnLower<'a> {
         (Operand::Copy(obj), Ty::Ref)
     }
 
+    /// Datentragende Variante eines generischen Summentyps (`Some(3.5)`) typ-korrekt
+    /// bauen: Typargumente aus den Payload-Typen inferieren, `Option$Float`
+    /// instanziieren (F64-Payload), getaggte Instanz mit Instanz-Klasse.
+    fn build_generic_variant(&mut self, vname: &str, args: &[Expr]) -> (Operand, Ty) {
+        let sum = self.variant_owner_g[vname].clone();
+        let (tparams, variants) = self.generic_stypes[&sum].clone();
+        let vdef = variants.iter().find(|(n, _)| n == vname).cloned().unwrap_or((vname.into(), vec![]));
+        let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Typparameter aus den Payload-Feldern ableiten, die genau `T` sind.
+        let mut tmap: HashMap<String, String> = HashMap::new();
+        for (i, (_, tyname)) in vdef.1.iter().enumerate() {
+            if tparams.iter().any(|tp| tp == tyname) {
+                if let Some((op, ty)) = lowered.get(i) {
+                    tmap.entry(tyname.clone()).or_insert_with(|| self.ty_name(op, *ty));
+                }
+            }
+        }
+        let targs: Vec<String> = tparams.iter().map(|tp| tmap.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
+        let mangled = inst_stype(&sum, &tparams, &variants, &targs, &mut self.local_inst, &mut self.local_svars);
+        let (_, tag, vfields) = self.variant_in(&mangled, vname).unwrap();
+        let obj = self.new_local(Ty::Ref);
+        self.local_class.insert(obj.0, mangled.clone());
+        self.emit(Statement::New { dest: obj, class: mangled.clone() });
+        self.emit(Statement::PutField { obj: Operand::Copy(obj), class: mangled.clone(), field: "__tag".into(), value: Operand::ConstI64(tag) });
+        for ((fname, fty, _), (mut v, _)) in vfields.iter().zip(lowered) {
+            if *fty == Ty::I64 {
+                v = to_i64(v);
+            }
+            self.emit(Statement::PutField { obj: Operand::Copy(obj), class: mangled.clone(), field: fname.clone(), value: v });
+        }
+        (Operand::Copy(obj), Ty::Ref)
+    }
+
     /// `match s { Variant(binds) -> body … _ -> body }` → Dispatch über `__tag`,
     /// Feld-Extraktion je Arm, Phi-Ersatz über ein Ergebnis-Local (wie lower_if).
     fn lower_match(&mut self, scrut: &Expr, arms: &[(Pattern, Option<Expr>, Expr)]) -> (Operand, Ty) {
@@ -1570,8 +1882,11 @@ impl<'a> FnLower<'a> {
             Pattern::Int(v, _) => self.emit_eq_test(obj, to_i64(Operand::ConstI64(*v as i64)), fail),
             Pattern::Bool(b, _) => self.emit_eq_test(obj, Operand::ConstI32(if *b { 1 } else { 0 }), fail),
             Pattern::Ctor { name, args, .. } => {
-                let (sum, vtag, vfields) = match self.variants.get(name) {
-                    Some(v) => v.clone(),
+                // Bei generischer Instanz-Klasse (`Option$Float`): das Instanz-Layout
+                // nutzen (typ-korrekte Feld-Extraktion), sonst die gelöschte Variante.
+                let inst = class.as_deref().and_then(|c| self.variant_in(c, name));
+                let (sum, vtag, vfields) = match inst.or_else(|| self.variants.get(name).cloned()) {
+                    Some(v) => v,
                     None => {
                         self.errs.push(format!("unbekannte Variante `{name}` im match"));
                         return;
@@ -1627,16 +1942,24 @@ impl<'a> FnLower<'a> {
             return;
         }
         if let Some(sum) = class {
-            // alle Varianten dieses Summentyps
-            let all: Vec<(String, i64)> = self
-                .variants
-                .iter()
-                .filter(|(_, (s, _, _))| s == sum)
-                .map(|(n, (_, t, _))| (n.clone(), *t))
-                .collect();
+            // Generische Instanz-Klasse (`Option$Float`) → Varianten aus der
+            // Instanz-Registry; sonst die gelöschten Varianten des Summentyps.
+            let inst_vars = self.local_svars.get(sum).or_else(|| self.shared_svars.get(sum));
+            let all: Vec<(String, i64)> = if let Some(m) = inst_vars {
+                m.iter().map(|(n, (t, _))| (n.clone(), *t)).collect()
+            } else {
+                self.variants.iter().filter(|(_, (s, _, _))| s == sum).map(|(n, (_, t, _))| (n.clone(), *t)).collect()
+            };
             if all.is_empty() {
                 return; // kein Summentyp (z.B. Produkttyp) → keine Prüfung
             }
+            let tag_of = |name: &str| -> Option<i64> {
+                if let Some(m) = inst_vars {
+                    m.get(name).map(|(t, _)| *t)
+                } else {
+                    self.variants.get(name).map(|(_, t, _)| *t)
+                }
+            };
             let mut covered = std::collections::HashSet::new();
             for (p, g, _) in arms {
                 if g.is_some() {
@@ -1645,8 +1968,8 @@ impl<'a> FnLower<'a> {
                 if let Pattern::Ctor { name, args, .. } = p {
                     // deckt den Tag nur, wenn alle Argumente unwiderlegbar sind
                     if args.iter().all(is_irrefutable) {
-                        if let Some((_, t, _)) = self.variants.get(name) {
-                            covered.insert(*t);
+                        if let Some(t) = tag_of(name) {
+                            covered.insert(t);
                         }
                     }
                 }
@@ -1713,10 +2036,15 @@ fn lower_fn(
     types: &HashMap<String, Layout>,
     variants: &HashMap<String, VariantInfo>,
     generics: &HashMap<String, GInfo>,
+    generic_ptypes: &HashMap<String, (Vec<String>, Vec<Field>)>,
+    generic_stypes: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
+    variant_owner_g: &HashMap<String, String>,
+    shared_inst: &HashMap<String, Layout>,
+    shared_svars: &HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
     strings: &mut Vec<String>,
     recv_class: Option<&str>,
     sym: Option<&str>,
-) -> Result<(Function, Vec<(String, Vec<String>)>), Vec<String>> {
+) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>), Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = match sym {
         Some(s) => s.to_string(),
@@ -1732,6 +2060,13 @@ fn lower_fn(
         types,
         variants,
         generics,
+        generic_ptypes,
+        generic_stypes,
+        variant_owner_g,
+        shared_inst,
+        shared_svars,
+        local_inst: HashMap::new(),
+        local_svars: HashMap::new(),
         mono: Vec::new(),
         local_class: HashMap::new(),
         local_arr: HashMap::new(),
@@ -1748,6 +2083,13 @@ fn lower_fn(
         // `self`-Empfänger: Ref auf die Methoden-Klasse.
         let (t, cls) = if p.name == "self" {
             (Ty::Ref, recv_class.map(|c| c.to_string()))
+        } else if let Some(pt) = p.ty.as_ref().filter(|pt| !pt.args.is_empty() && fl.generic_ptypes.contains_key(&pt.name)) {
+            // Annotierter generischer Typ `b: Box[Int]` → Instanz `Box$Int`, damit
+            // Feldzugriffe im Rumpf das konkrete Layout finden.
+            let (tparams, fields) = fl.generic_ptypes[&pt.name].clone();
+            let targs: Vec<String> = pt.args.iter().map(|a| a.name.clone()).collect();
+            let mangled = fl.instantiate_ptype(&pt.name, &tparams, &fields, &targs);
+            (Ty::Ref, Some(mangled))
         } else {
             (ty_of(p.ty.as_ref()), class_of(p.ty.as_ref()))
         };
@@ -1786,6 +2128,7 @@ fn lower_fn(
         return Err(fl.errs);
     }
     let mono = fl.mono;
+    let local_inst = fl.local_inst;
     Ok((
         Function {
             name,
@@ -1796,6 +2139,7 @@ fn lower_fn(
             receiver_nonnull: false,
         },
         mono,
+        local_inst,
     ))
 }
 
