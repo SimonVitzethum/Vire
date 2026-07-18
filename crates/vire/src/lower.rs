@@ -1036,94 +1036,172 @@ impl<'a> FnLower<'a> {
     /// `match s { Variant(binds) -> body … _ -> body }` → Dispatch über `__tag`,
     /// Feld-Extraktion je Arm, Phi-Ersatz über ein Ergebnis-Local (wie lower_if).
     fn lower_match(&mut self, scrut: &Expr, arms: &[(Pattern, Option<Expr>, Expr)]) -> (Operand, Ty) {
-        let (obj, _) = self.lower_expr(scrut);
-        let class = match self.class_of_operand(&obj) {
-            Some(c) => c,
-            None => {
-                self.errs.push("match: Typ des Ausdrucks unbekannt (Summentyp annotieren)".into());
-                return (Operand::ConstI64(0), Ty::I64);
-            }
-        };
-        let tag = self.new_local(Ty::I64);
-        self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: class.clone(), field: "__tag".into() });
-        let merge = self.new_block();
-        let mut ends: Vec<(usize, Operand, Ty)> = Vec::new();
+        let (obj, oty) = self.lower_expr(scrut);
+        let class = self.class_of_operand(&obj);
+        // Oder-Muster auf Arm-Ebene auffalten: `A | B -> body` → zwei Arme.
+        let mut flat: Vec<(Pattern, Option<Expr>, Expr)> = Vec::new();
         for (pat, guard, body) in arms {
-            if guard.is_some() {
-                self.errs.push("match-Guard (`if`) noch nicht abgesenkt".into());
-            }
             match pat {
-                Pattern::Ctor { name, args, .. } => {
-                    let (_, vtag, vfields) = match self.variants.get(name) {
-                        Some(v) => v.clone(),
-                        None => {
-                            self.errs.push(format!("unbekannte Variante `{name}` im match"));
-                            continue;
-                        }
-                    };
-                    let cond = self.new_local(Ty::I32);
-                    self.emit(Statement::Assign(cond, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(vtag))));
-                    let armb = self.new_block();
-                    let nextb = self.new_block();
-                    let cur = self.cur;
-                    self.term(cur, Terminator::Branch { cond: Operand::Copy(cond), then_blk: armb, else_blk: nextb });
-                    self.cur = armb.0 as usize;
-                    self.scopes.push(HashMap::new());
-                    for (j, argpat) in args.iter().enumerate() {
-                        if let Pattern::Bind(bn, _) = argpat {
-                            if let Some((fname, fty, rt)) = vfields.get(j) {
-                                let d = self.new_local(*fty);
-                                if let Some(rc) = rt {
-                                    self.local_class.insert(d.0, rc.clone());
-                                }
-                                self.emit(Statement::GetField { dest: d, obj: obj.clone(), class: class.clone(), field: fname.clone() });
-                                self.bind(bn, d, *fty);
-                            }
-                        }
+                Pattern::Or(ps, _) => {
+                    for p in ps {
+                        flat.push((p.clone(), guard.clone(), body.clone()));
                     }
-                    let (v, t) = self.lower_expr(body);
-                    self.scopes.pop();
-                    ends.push((self.cur, v, t));
-                    self.cur = nextb.0 as usize;
                 }
-                Pattern::Wildcard(_) | Pattern::Bind(..) => {
-                    self.scopes.push(HashMap::new());
-                    if let Pattern::Bind(bn, _) = pat {
-                        if let Operand::Copy(l) = obj {
-                            self.bind(bn, l, Ty::Ref);
-                            self.local_class.insert(l.0, class.clone());
-                        }
-                    }
-                    let (v, t) = self.lower_expr(body);
-                    self.scopes.pop();
-                    ends.push((self.cur, v, t));
-                    let dead = self.new_block();
-                    self.cur = dead.0 as usize;
-                }
-                _ => self.errs.push("match-Muster M2: nur Varianten, `_` und Bindungen".into()),
+                _ => flat.push((pat.clone(), guard.clone(), body.clone())),
             }
         }
+        // Erschöpfungsprüfung (Compilezeit): nicht-erschöpfend = HARTER FEHLER.
+        self.check_exhaustive(&class, &flat);
+        let merge = self.new_block();
+        let mut ends: Vec<(usize, Operand, Ty)> = Vec::new();
+        for (pat, guard, body) in &flat {
+            let fail = self.new_block();
+            self.scopes.push(HashMap::new());
+            self.emit_pattern_test(obj.clone(), oty, class.clone(), pat, fail);
+            // Guard nach erfolgreichem Muster.
+            if let Some(g) = guard {
+                let (gc, _) = self.lower_expr(g);
+                let cont = self.new_block();
+                let cur = self.cur;
+                self.term(cur, Terminator::Branch { cond: gc, then_blk: cont, else_blk: fail });
+                self.cur = cont.0 as usize;
+            }
+            let (v, t) = self.lower_expr(body);
+            self.scopes.pop();
+            ends.push((self.cur, v, t));
+            self.cur = fail.0 as usize; // nächster Arm beginnt im fail-Block
+        }
         let rty = ends.iter().map(|(_, _, t)| *t).find(|t| *t != Ty::Void).unwrap_or(Ty::Void);
-        if rty != Ty::Void {
-            let res = self.new_local(rty);
-            for (end, v, _) in &ends {
-                self.blocks[*end].statements.push(Statement::Assign(res, Rvalue::Use(v.clone())));
-                self.blocks[*end].terminator = Terminator::Goto(merge);
+        let res = if rty != Ty::Void { Some(self.new_local(rty)) } else { None };
+        for (end, v, _) in &ends {
+            if let Some(r) = res {
+                self.blocks[*end].statements.push(Statement::Assign(r, Rvalue::Use(v.clone())));
             }
-            // Fallthrough (nicht-erschöpfend): Default-Wert.
-            let cur = self.cur;
-            self.blocks[cur].statements.push(Statement::Assign(res, Rvalue::Use(zero_of(rty))));
-            self.term(cur, Terminator::Goto(merge));
-            self.cur = merge.0 as usize;
-            (Operand::Copy(res), rty)
+            self.blocks[*end].terminator = Terminator::Goto(merge);
+        }
+        // Fallthrough (unerreichbar, weil erschöpfend geprüft) typkorrekt schließen.
+        let cur = self.cur;
+        if let Some(r) = res {
+            self.blocks[cur].statements.push(Statement::Assign(r, Rvalue::Use(zero_of(rty))));
+        }
+        self.term(cur, Terminator::Goto(merge));
+        self.cur = merge.0 as usize;
+        match res {
+            Some(r) => (Operand::Copy(r), rty),
+            None => (Operand::ConstI64(0), Ty::Void),
+        }
+    }
+
+    /// Emittiert die Tests für EIN Muster gegen `obj`. Bei Nicht-Übereinstimmung
+    /// → `fail`; bei Übereinstimmung läuft `self.cur` weiter (mit Bindungen im
+    /// Scope). Rekursiv für verschachtelte Muster.
+    fn emit_pattern_test(&mut self, obj: Operand, ty: Ty, class: Option<String>, pat: &Pattern, fail: Block) {
+        match pat {
+            Pattern::Wildcard(_) => {}
+            Pattern::Bind(name, _) => {
+                let l = match &obj {
+                    Operand::Copy(l) => *l,
+                    _ => {
+                        let d = self.new_local(ty);
+                        self.emit(Statement::Assign(d, Rvalue::Use(obj.clone())));
+                        d
+                    }
+                };
+                if let Some(c) = &class {
+                    self.local_class.insert(l.0, c.clone());
+                }
+                self.bind(name, l, ty);
+            }
+            Pattern::Int(v, _) => self.emit_eq_test(obj, to_i64(Operand::ConstI64(*v as i64)), fail),
+            Pattern::Bool(b, _) => self.emit_eq_test(obj, Operand::ConstI32(if *b { 1 } else { 0 }), fail),
+            Pattern::Ctor { name, args, .. } => {
+                let (sum, vtag, vfields) = match self.variants.get(name) {
+                    Some(v) => v.clone(),
+                    None => {
+                        self.errs.push(format!("unbekannte Variante `{name}` im match"));
+                        return;
+                    }
+                };
+                let tag = self.new_local(Ty::I64);
+                self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: sum.clone(), field: "__tag".into() });
+                self.emit_eq_test(Operand::Copy(tag), Operand::ConstI64(vtag), fail);
+                for (j, argpat) in args.iter().enumerate() {
+                    if let Some((fname, fty, rt)) = vfields.get(j).cloned() {
+                        let d = self.new_local(fty);
+                        if let Some(rc) = &rt {
+                            self.local_class.insert(d.0, rc.clone());
+                        }
+                        self.emit(Statement::GetField { dest: d, obj: obj.clone(), class: sum.clone(), field: fname });
+                        self.emit_pattern_test(Operand::Copy(d), fty, rt, argpat, fail);
+                    }
+                }
+            }
+            Pattern::Or(ps, _) => {
+                // Verschachteltes Oder: der Reihe nach probieren; passt eins → weiter.
+                let matched = self.new_block();
+                for p in ps {
+                    let next = self.new_block();
+                    self.emit_pattern_test(obj.clone(), ty, class.clone(), p, next);
+                    let cur = self.cur;
+                    self.term(cur, Terminator::Goto(matched));
+                    self.cur = next.0 as usize;
+                }
+                let cur = self.cur;
+                self.term(cur, Terminator::Goto(fail));
+                self.cur = matched.0 as usize;
+            }
+            _ => self.errs.push("match-Muster: Tupel/String-Muster noch nicht abgesenkt".into()),
+        }
+    }
+
+    /// `obj == val ? weiter : fail`.
+    fn emit_eq_test(&mut self, obj: Operand, val: Operand, fail: Block) {
+        let c = self.new_local(Ty::I32);
+        self.emit(Statement::Assign(c, Rvalue::Binary(IB::CmpEq, obj, val)));
+        let cont = self.new_block();
+        let cur = self.cur;
+        self.term(cur, Terminator::Branch { cond: Operand::Copy(c), then_blk: cont, else_blk: fail });
+        self.cur = cont.0 as usize;
+    }
+
+    /// Compilezeit-Erschöpfungsprüfung. Summentyp: alle Varianten oder `_`/Bind.
+    /// Skalar/Literal: `_`/Bind-Zweig nötig. Sonst harter Fehler.
+    fn check_exhaustive(&mut self, class: &Option<String>, arms: &[(Pattern, Option<Expr>, Expr)]) {
+        let has_catchall = arms.iter().any(|(p, g, _)| g.is_none() && matches!(p, Pattern::Wildcard(_) | Pattern::Bind(..)));
+        if has_catchall {
+            return;
+        }
+        if let Some(sum) = class {
+            // alle Varianten dieses Summentyps
+            let all: Vec<(String, i64)> = self
+                .variants
+                .iter()
+                .filter(|(_, (s, _, _))| s == sum)
+                .map(|(n, (_, t, _))| (n.clone(), *t))
+                .collect();
+            if all.is_empty() {
+                return; // kein Summentyp (z.B. Produkttyp) → keine Prüfung
+            }
+            let mut covered = std::collections::HashSet::new();
+            for (p, g, _) in arms {
+                if g.is_some() {
+                    continue; // Guard kann fehlschlagen → deckt nicht sicher
+                }
+                if let Pattern::Ctor { name, args, .. } = p {
+                    // deckt den Tag nur, wenn alle Argumente unwiderlegbar sind
+                    if args.iter().all(is_irrefutable) {
+                        if let Some((_, t, _)) = self.variants.get(name) {
+                            covered.insert(*t);
+                        }
+                    }
+                }
+            }
+            let missing: Vec<&str> = all.iter().filter(|(_, t)| !covered.contains(t)).map(|(n, _)| n.as_str()).collect();
+            if !missing.is_empty() {
+                self.errs.push(format!("nicht-erschöpfendes `match`: fehlt {} (oder `_`-Zweig)", missing.join(", ")));
+            }
         } else {
-            for (end, _, _) in &ends {
-                self.blocks[*end].terminator = Terminator::Goto(merge);
-            }
-            let cur = self.cur;
-            self.term(cur, Terminator::Goto(merge));
-            self.cur = merge.0 as usize;
-            (Operand::ConstI64(0), Ty::Void)
+            self.errs.push("`match` über Skalar/Literal braucht einen `_`-Zweig (nicht-erschöpfend)".into());
         }
     }
 
@@ -1268,6 +1346,11 @@ fn stmt_has_return(s: &Stmt) -> bool {
         Stmt::While { body, .. } | Stmt::For { body, .. } => body_has_return(body),
         _ => false,
     }
+}
+
+/// Muster, das immer passt (deckt seinen Slot vollständig ab).
+fn is_irrefutable(p: &Pattern) -> bool {
+    matches!(p, Pattern::Wildcard(_) | Pattern::Bind(..))
 }
 
 /// IR-Wertetyp → Array-Elementart.

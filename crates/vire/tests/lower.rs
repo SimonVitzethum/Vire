@@ -207,3 +207,20 @@ fn listen_und_comprehensions() {
     assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::ArrayLoad { .. })), "Comprehension iteriert (ArrayLoad)");
     assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::ArrayLen { .. })), ".len()/Iteration braucht ArrayLen");
 }
+
+#[test]
+fn match_erschoepfung_ist_pflicht() {
+    // Nicht-erschöpfendes match = HARTER FEHLER (kein stiller Default mehr).
+    let (mut m, _) = parse("type T {\n A(x: Int)\n B\n}\nfn f(t: T) -> Int {\n match t {\n A(x) -> x\n }\n}\n");
+    let _ = infer_module(&mut m);
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("erschöpf")), "nicht-erschöpfendes match muss Fehler sein: {errs:?}");
+}
+
+#[test]
+fn match_verschachtelt_bindet_korrekt() {
+    // Verschachteltes Muster B(A(y)) bindet y (kein stilles Ignorieren mehr).
+    let src = "type T {\n A(x: Int)\n B(i: T)\n C\n}\nfn f(t: T) -> Int {\n match t {\n B(A(y)) -> y\n A(x) -> x\n B(z) -> 0\n C -> 0\n }\n}\nfn main() {\n print(f(C))\n}\n";
+    let p = lower(src); // kompiliert = erschöpfend + verschachtelt akzeptiert
+    assert!(p.functions.iter().any(|f| f.name == "f"));
+}
