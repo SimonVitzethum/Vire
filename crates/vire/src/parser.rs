@@ -768,12 +768,35 @@ impl Parser {
                 // Listen-Literal
                 self.bump();
                 self.skip_nl();
-                // Leere Liste?
+                // Leere Liste `[]` bzw. leere Map `[:]`.
                 if self.at(&Tok::RBracket) {
                     self.bump();
                     return Expr::List(Vec::new(), sp);
                 }
+                if self.at(&Tok::Colon) {
+                    self.bump();
+                    self.expect(&Tok::RBracket, "']'");
+                    return Expr::MapLit(Vec::new(), sp);
+                }
                 let first = self.parse_expr(0);
+                // Map-Literal `[k: v, …]`
+                if self.eat(&Tok::Colon) {
+                    let v0 = self.parse_expr(0);
+                    let mut pairs = vec![(first, v0)];
+                    while self.eat(&Tok::Comma) {
+                        self.skip_nl();
+                        if self.at(&Tok::RBracket) {
+                            break;
+                        }
+                        let k = self.parse_expr(0);
+                        self.expect(&Tok::Colon, "':'");
+                        let v = self.parse_expr(0);
+                        pairs.push((k, v));
+                    }
+                    self.skip_nl();
+                    self.expect(&Tok::RBracket, "']'");
+                    return Expr::MapLit(pairs, sp);
+                }
                 // Comprehension `[elem for var in iter (if cond)?]`
                 if self.at_kw(Kw::For) {
                     self.bump(); // for

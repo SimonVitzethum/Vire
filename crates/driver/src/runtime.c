@@ -218,6 +218,98 @@ void jrt_print_str(const JStr *s) {
 }
 
 #ifndef FASTLLVM_FREESTANDING
+/* --- Wachsende Liste (Vire `list()`), i64-Slots ------------------------------
+ * Dynamisches Array aus 64-Bit-Slots (Int direkt / Zeiger / F64-Bits). Nicht
+ * RC-getrackt (leckt am Ende) — bewusst einfach; typisierte/generische
+ * Collections folgen mit generischen Typen. */
+typedef struct {
+    int64_t refcount, rcflags; /* jrt-Header: immortal (-1) → RC/Collector No-Op */
+    void *vtable;
+    int64_t len, cap;
+    int64_t *data;
+} VList;
+VList *vire_list_new(void) {
+    VList *l = (VList *)malloc(sizeof(VList));
+    l->refcount = -1;
+    l->rcflags = 0;
+    l->vtable = 0;
+    l->len = 0;
+    l->cap = 8;
+    l->data = (int64_t *)malloc((size_t)l->cap * sizeof(int64_t));
+    return l;
+}
+void vire_list_push(VList *l, int64_t v) {
+    if (l->len == l->cap) {
+        l->cap *= 2;
+        l->data = (int64_t *)realloc(l->data, (size_t)l->cap * sizeof(int64_t));
+    }
+    l->data[l->len++] = v;
+}
+int64_t vire_list_get(VList *l, int64_t i) { return (i >= 0 && i < l->len) ? l->data[i] : 0; }
+void vire_list_set(VList *l, int64_t i, int64_t v) { if (i >= 0 && i < l->len) l->data[i] = v; }
+int64_t vire_list_len(VList *l) { return l->len; }
+int64_t vire_list_pop(VList *l) { return l->len > 0 ? l->data[--l->len] : 0; }
+
+/* --- Map (Int→Int, offene Adressierung) und Set (Int) ---------------------- */
+typedef struct {
+    int64_t refcount, rcflags; /* jrt-Header: immortal */
+    void *vtable;
+    int64_t cap, len;
+    int64_t *keys, *vals;
+    uint8_t *used;
+} VMap;
+static VMap *vmap_new_cap(int64_t cap) {
+    VMap *m = (VMap *)malloc(sizeof(VMap));
+    m->refcount = -1;
+    m->rcflags = 0;
+    m->vtable = 0;
+    m->cap = cap;
+    m->len = 0;
+    m->keys = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    m->vals = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    m->used = (uint8_t *)calloc((size_t)cap, 1);
+    return m;
+}
+VMap *vire_map_new(void) { return vmap_new_cap(16); }
+static void vmap_grow(VMap *m);
+void vire_map_put(VMap *m, int64_t k, int64_t v) {
+    if ((m->len + 1) * 4 >= m->cap * 3) vmap_grow(m);
+    size_t i = (size_t)(k * 2654435761u) & (size_t)(m->cap - 1);
+    while (m->used[i]) {
+        if (m->keys[i] == k) { m->vals[i] = v; return; }
+        i = (i + 1) & (size_t)(m->cap - 1);
+    }
+    m->used[i] = 1;
+    m->keys[i] = k;
+    m->vals[i] = v;
+    m->len++;
+}
+static void vmap_grow(VMap *m) {
+    VMap *n = vmap_new_cap(m->cap * 2);
+    for (int64_t i = 0; i < m->cap; i++)
+        if (m->used[i]) vire_map_put(n, m->keys[i], m->vals[i]);
+    free(m->keys); free(m->vals); free(m->used);
+    *m = *n;
+    free(n);
+}
+int64_t vire_map_get(VMap *m, int64_t k) {
+    size_t i = (size_t)(k * 2654435761u) & (size_t)(m->cap - 1);
+    while (m->used[i]) {
+        if (m->keys[i] == k) return m->vals[i];
+        i = (i + 1) & (size_t)(m->cap - 1);
+    }
+    return 0;
+}
+int64_t vire_map_has(VMap *m, int64_t k) {
+    size_t i = (size_t)(k * 2654435761u) & (size_t)(m->cap - 1);
+    while (m->used[i]) {
+        if (m->keys[i] == k) return 1;
+        i = (i + 1) & (size_t)(m->cap - 1);
+    }
+    return 0;
+}
+int64_t vire_map_len(VMap *m) { return m->len; }
+
 /* FFI: Vire-String → NUL-terminierter C-`char*` (für extern-C-Funktionen, die
  * `const char*` erwarten). Kopiert; der Puffer wird nicht wieder freigegeben
  * (kurzlebige Argument-Strings) — für dauerhafte Nutzung selbst kopieren. */

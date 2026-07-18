@@ -255,3 +255,12 @@ fn option_result_und_try() {
     });
     assert!(reads_ok, "`?` muss Ok_value extrahieren");
 }
+
+#[test]
+fn wachsende_liste_und_map() {
+    let p = lower("fn main() {\n mut xs = list()\n xs.push(1)\n print(xs.len())\n mut m = [1: 2]\n print(m.get(1))\n}\n");
+    let calls: Vec<&str> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
+    assert!(calls.contains(&"vire_list_new") && calls.contains(&"vire_list_push"));
+    assert!(calls.contains(&"vire_map_new") && calls.contains(&"vire_map_put"));
+}

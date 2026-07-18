@@ -153,6 +153,8 @@ pub enum Expr {
     List(Vec<Expr>, Span),
     /// `[elem for var in iter (if cond)?]` — List-Comprehension.
     Comprehension { elem: Box<Expr>, var: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
+    /// `[k: v, …]` / `[:]` — Map-Literal.
+    MapLit(Vec<(Expr, Expr)>, Span),
     /// `expr?` — Fehler-Propagation.
     Try { inner: Box<Expr>, span: Span },
     /// `expr as Type`

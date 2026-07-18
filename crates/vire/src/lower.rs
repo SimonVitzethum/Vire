@@ -721,6 +721,39 @@ impl<'a> FnLower<'a> {
                 // i=0; while i<len { x = arr[i]; body; i++ }.
                 if !matches!(iter, Expr::Range { .. }) {
                     let (arr, _) = self.lower_expr(iter);
+                    // for über eine wachsende Liste ($List) → vire_list_len/get.
+                    if self.class_of_operand(&arr).as_deref() == Some("$List") {
+                        let len = self.new_local(Ty::I64);
+                        self.emit(Statement::Call { dest: Some(len), func: "vire_list_len".into(), args: vec![arr.clone()] });
+                        let ivar = self.new_local(Ty::I64);
+                        self.emit(Statement::Assign(ivar, Rvalue::Use(Operand::ConstI64(0))));
+                        let header = self.new_block();
+                        let cur = self.cur;
+                        self.term(cur, Terminator::Goto(header));
+                        self.cur = header.0 as usize;
+                        let c = self.new_local(Ty::I32);
+                        self.emit(Statement::Assign(c, Rvalue::Binary(IB::CmpLt, Operand::Copy(ivar), Operand::Copy(len))));
+                        let bodyb = self.new_block();
+                        let latch = self.new_block();
+                        let exit = self.new_block();
+                        self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(c), then_blk: bodyb, else_blk: exit });
+                        self.cur = bodyb.0 as usize;
+                        let elem = self.new_local(Ty::I64);
+                        self.emit(Statement::Call { dest: Some(elem), func: "vire_list_get".into(), args: vec![arr.clone(), Operand::Copy(ivar)] });
+                        self.scopes.push(HashMap::new());
+                        self.bind(&name, elem, Ty::I64);
+                        self.loops.push((latch, exit));
+                        self.lower_block(body);
+                        self.loops.pop();
+                        self.scopes.pop();
+                        let end = self.cur;
+                        self.term(end, Terminator::Goto(latch));
+                        self.cur = latch.0 as usize;
+                        self.emit(Statement::Assign(ivar, Rvalue::Binary(IB::Add, Operand::Copy(ivar), Operand::ConstI64(1))));
+                        self.term(latch.0 as usize, Terminator::Goto(header));
+                        self.cur = exit.0 as usize;
+                        return;
+                    }
                     let kind = match self.arr_of_operand(&arr) {
                         Some(k) => k,
                         None => {
@@ -934,9 +967,29 @@ impl<'a> FnLower<'a> {
                 (Operand::Copy(arr), Ty::Ref)
             }
             Expr::Comprehension { elem, var, iter, cond, .. } => self.lower_comprehension(elem, var, iter, cond.as_deref()),
-            // Indexierung `xs[i]` → ArrayLoad (bounds-gecheckt).
+            // Map-Literal `[k: v, …]` → map() + put je Paar.
+            Expr::MapLit(pairs, _) => {
+                let m = self.new_local(Ty::Ref);
+                self.local_class.insert(m.0, "$Map".into());
+                self.emit(Statement::Call { dest: Some(m), func: "vire_map_new".into(), args: vec![] });
+                for (k, v) in pairs {
+                    let (ko, kt) = self.lower_expr(k);
+                    let (vo, vt) = self.lower_expr(v);
+                    let ko = if kt == Ty::Ref { ko } else { to_i64(ko) };
+                    let vo = if vt == Ty::Ref { vo } else { to_i64(vo) };
+                    self.emit(Statement::Call { dest: None, func: "vire_map_put".into(), args: vec![Operand::Copy(m), ko, vo] });
+                }
+                (Operand::Copy(m), Ty::Ref)
+            }
+            // Indexierung `xs[i]` → ArrayLoad (bounds-gecheckt) bzw. vire_list_get.
             Expr::Index { base, index, .. } => {
                 let (arr, _) = self.lower_expr(base);
+                if self.class_of_operand(&arr).as_deref() == Some("$List") {
+                    let (idx, _) = self.lower_expr(index);
+                    let d = self.new_local(Ty::I64);
+                    self.emit(Statement::Call { dest: Some(d), func: "vire_list_get".into(), args: vec![arr, to_i64(idx)] });
+                    return (Operand::Copy(d), Ty::I64);
+                }
                 let kind = match self.arr_of_operand(&arr) {
                     Some(k) => k,
                     None => {
@@ -1030,6 +1083,54 @@ impl<'a> FnLower<'a> {
                 let l = self.array_len_i64(obj);
                 return (l, Ty::I64);
             }
+            // Methoden auf wachsenden Listen ($List) und Maps ($Map).
+            if let Some(sent) = self.class_of_operand(&obj) {
+                if sent == "$List" {
+                    let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
+                    let (func, ret): (&str, Ty) = match name.as_str() {
+                        "push" => ("vire_list_push", Ty::Void),
+                        "pop" => ("vire_list_pop", Ty::I64),
+                        "len" => ("vire_list_len", Ty::I64),
+                        "get" => ("vire_list_get", Ty::I64),
+                        "set" => ("vire_list_set", Ty::Void),
+                        _ => {
+                            self.errs.push(format!("List hat keine Methode `{name}`"));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                    };
+                    let mut all = vec![obj];
+                    all.extend(a);
+                    if ret == Ty::Void {
+                        self.emit(Statement::Call { dest: None, func: func.into(), args: all });
+                        return (Operand::ConstI64(0), Ty::Void);
+                    }
+                    let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
+                if sent == "$Map" {
+                    let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
+                    let (func, ret): (&str, Ty) = match name.as_str() {
+                        "put" => ("vire_map_put", Ty::Void),
+                        "get" => ("vire_map_get", Ty::I64),
+                        "has" => ("vire_map_has", Ty::I32),
+                        "len" => ("vire_map_len", Ty::I64),
+                        _ => {
+                            self.errs.push(format!("Map hat keine Methode `{name}`"));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                    };
+                    let mut all = vec![obj];
+                    all.extend(a);
+                    if ret == Ty::Void {
+                        self.emit(Statement::Call { dest: None, func: func.into(), args: all });
+                        return (Operand::ConstI64(0), Ty::Void);
+                    }
+                    let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
+            }
             let class = match self.class_of_operand(&obj) {
                 Some(c) => c,
                 None => {
@@ -1092,6 +1193,14 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(obj), Ty::Ref);
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Collection-Builtins: `list()` (wachsende Liste), `map()` (Int→Int).
+        if name == "list" || name == "map" {
+            let (func, sentinel) = if name == "list" { ("vire_list_new", "$List") } else { ("vire_map_new", "$Map") };
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, sentinel.into());
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
         // Builtin `str(x)` → Text-Repräsentation (Ref).
         if name == "str" {
             let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
