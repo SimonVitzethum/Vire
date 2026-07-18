@@ -1,0 +1,7 @@
+extern "C" {
+    fn py_math_sqrt_times(x: F64, k: F64) -> F64
+}
+fn main() {
+    // Python rechnet math.sqrt(256) = 16, mal 3 = 48
+    print(py_math_sqrt_times(256.0, 3.0))
+}

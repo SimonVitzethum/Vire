@@ -1,0 +1,6 @@
+extern "C" {
+    fn cpp_median_of_squares(n: Int) -> Int
+}
+fn main() {
+    print(cpp_median_of_squares(101))
+}

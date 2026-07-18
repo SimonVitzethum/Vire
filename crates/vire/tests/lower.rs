@@ -154,6 +154,17 @@ fn return_statement_liefert_typisierten_wert() {
 }
 
 #[test]
+fn extern_c_aufruf_loest_direkt_auf() {
+    // extern "C"-Signatur registriert → Aufruf lowert als direkter Call (kein
+    // Mangling); das Backend deklariert, clang linkt.
+    let p = lower("extern \"C\" {\n fn sqrt(x: F64) -> F64\n}\nfn main() {\n print(sqrt(16.0))\n}\n");
+    let calls_sqrt = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "sqrt")
+    });
+    assert!(calls_sqrt, "extern-Aufruf muss als Call(sqrt) lowern");
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());

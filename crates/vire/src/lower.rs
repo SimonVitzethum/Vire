@@ -70,6 +70,16 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
             sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of(f.sig.ret.as_ref()) });
         }
+        // extern "C" { fn name(...) -> T }: C-ABI-Funktion, direkt unter ihrem
+        // Namen (keine Mangling). Aufrufe lösen darüber auf; das Backend
+        // deklariert die gerufene-aber-undefinierte Funktion, clang linkt sie
+        // (libc/libm/-lstdc++ / verlinkte Objekte).
+        if let Item::Extern { items, .. } = it {
+            for sig in items {
+                let ps = sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
+                sigs.insert(sig.name.clone(), Sig { params: ps, ret: ret_ty(sig), ret_class: class_of(sig.ret.as_ref()) });
+            }
+        }
     }
     for it in &m.items {
         if let Item::Fn(f) = it {

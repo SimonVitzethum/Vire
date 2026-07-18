@@ -1,0 +1,10 @@
+extern "C" {
+    fn sqrt(x: F64) -> F64
+    fn pow(base: F64, exp: F64) -> F64
+    fn llabs(n: Int) -> Int
+}
+fn main() {
+    print(sqrt(16.0))
+    print(pow(2.0, 10.0))
+    print(llabs(0 - 42))
+}

@@ -108,6 +108,10 @@ fn build_or_run(args: &[String]) {
     let mut opt0 = false;
     let mut force_no_cycles = false;
     let mut force_no_rc = false;
+    // FFI: zusätzliche Bibliotheken (`-l NAME`) und Objekte/Quellen (`--obj FILE`,
+    // .c/.cpp/.o/.a) zum Linken — für C/C++/Python-Interop.
+    let mut link_libs: Vec<String> = Vec::new();
+    let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -133,6 +137,21 @@ fn build_or_run(args: &[String]) {
                 force_no_rc = true;
                 force_no_cycles = true;
             }
+            "-l" => match it.next() {
+                Some(l) => link_libs.push(l.clone()),
+                None => {
+                    eprintln!("-l braucht einen Bibliotheksnamen");
+                    exit(2);
+                }
+            },
+            "--obj" => match it.next() {
+                Some(o) => link_objs.push(o.clone()),
+                None => {
+                    eprintln!("--obj braucht eine Datei");
+                    exit(2);
+                }
+            },
+            a if a.starts_with("-l") && a.len() > 2 => link_libs.push(a[2..].to_string()),
             other => path = Some(other.to_string()),
         }
     }
@@ -236,6 +255,15 @@ fn build_or_run(args: &[String]) {
     }
     if force_no_rc {
         cmd.arg("-DFASTLLVM_NO_RC");
+    }
+    // FFI-Linken: Nutzer-Objekte/-Quellen zuerst, dann Bibliotheken. libm immer
+    // (Mathe-Intrinsics via extern "C"). clang übersetzt mitgegebene .c/.cpp direkt.
+    for o in &link_objs {
+        cmd.arg(o);
+    }
+    cmd.arg("-lm");
+    for l in &link_libs {
+        cmd.arg(format!("-l{l}"));
     }
     let status = cmd.arg("-o").arg(&out).status();
     match status {

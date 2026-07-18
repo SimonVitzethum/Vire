@@ -103,6 +103,15 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
             };
             sigs.insert(f.sig.name.clone(), Sig { params, ret });
         }
+        // extern "C"-Signaturen sind voll annotiert (C-ABI) → konkrete Typen,
+        // damit Aufrufe (`sqrt(x)`) ihre Argumente korrekt constrainen.
+        if let Item::Extern { items, .. } = it {
+            for s in items {
+                let params = s.params.iter().map(|p| ann_ty(p.ty.as_ref()).unwrap_or(T::I64)).collect();
+                let ret = ann_ty(s.ret.as_ref()).unwrap_or(T::Void);
+                sigs.insert(s.name.clone(), Sig { params, ret });
+            }
+        }
     }
     // 2. Rümpfe durchlaufen, Constraints sammeln.
     for it in &m.items {
