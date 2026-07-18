@@ -1351,6 +1351,26 @@ static void wl_push(JObjHeader ***buf, size_t *len, size_t *cap, JObjHeader *h) 
     if (*len == *cap) { *cap = *cap ? *cap * 2 : 256; *buf = (JObjHeader **)plat_realloc(*buf, *cap * sizeof(**buf)); }
     (*buf)[(*len)++] = h;
 }
+/* Nach einer Collection wachsen die Work-Buffer auf O(Graphgröße) (bei einem
+ * Zyklus über N Knoten: ~N Zeiger je Buffer). Große Buffer NACH dem Lauf an den
+ * Allokator zurückgeben, sonst hält der Collector diesen Speicher dauerhaft —
+ * relevant für langlaufende Programme, die wiederholt Zyklen sammeln. Kleine
+ * Buffer bleiben (amortisiert die Re-Allokation häufiger, kleiner Collections). */
+static void trim_buf(JObjHeader ***buf, size_t *len, size_t *cap) {
+    if (*cap * sizeof(JObjHeader *) > 64u * 1024u) {
+        plat_free(*buf);
+        *buf = NULL;
+        *len = 0;
+        *cap = 0;
+    }
+}
+static void collector_trim(void) {
+    trim_buf(&cwork, &cwl, &cwc);
+    trim_buf(&bwork, &bwl, &bwc);
+    trim_buf(&fwork, &fwl, &fwc);
+    trim_buf(&roots, &roots_len, &roots_cap);
+    trim_buf(&dropbuf, &droplen, &dropcap);
+}
 
 /* --- MarkGray: je Kante Kind dekrementieren, Knoten grau; iterativ. --- */
 static void visit_mark_gray(void *p) {
@@ -1456,6 +1476,7 @@ static void jrt_collect_cycles(void) {
      * auf ein bereits freigegebenes Zyklen-Mitglied trifft. */
     for (size_t i = 0; i < fwl; i++) free_obj(fwork[i]);
     fwl = 0;
+    collector_trim();
 }
 #endif /* FASTLLVM_COLLECTOR */
 
