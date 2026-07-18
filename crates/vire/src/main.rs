@@ -82,6 +82,7 @@ fn build_or_run(args: &[String]) {
     // eliminiert `-O2 -flto` tote Allokations-/Release-Paare (die Objekte werden
     // wegoptimiert, die Laufzeitzähler bleiben 0). Der Solver läuft immer.
     let mut opt0 = false;
+    let mut force_no_cycles = false;
     let mut path: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -96,6 +97,10 @@ fn build_or_run(args: &[String]) {
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
             "-O0" => opt0 = true,
+            // MESSUNG: Zyklen-Kollektor erzwungen AUS (auch bei zyklischen Typen).
+            // Unsound (leckt Zyklen), aber isoliert die Kollektor-Kosten gegen den
+            // reinen RC-Pfad — die mittlere Spalte des M0.1-Dreiwegs.
+            "--no-cycles" => force_no_cycles = true,
             other => path = Some(other.to_string()),
         }
     }
@@ -193,7 +198,7 @@ fn build_or_run(args: &[String]) {
         cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
         cmd.args(["-ffunction-sections", "-fdata-sections", "-flto", "-Wl,--gc-sections", "-march=native"]);
     }
-    if acyclic {
+    if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");
     }
     let status = cmd.arg("-o").arg(&out).status();

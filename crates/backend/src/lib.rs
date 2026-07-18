@@ -1994,6 +1994,10 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         BinOp::Add => writeln!(w, "  {t} = add {ty} {a}, {b}").unwrap(),
         BinOp::Sub => writeln!(w, "  {t} = sub {ty} {a}, {b}").unwrap(),
         BinOp::Mul => writeln!(w, "  {t} = mul {ty} {a}, {b}").unwrap(),
+        // div/rem über die Runtime (Division-durch-Null → ArithmeticException).
+        // Breite nach Operandentyp: i64 → jrt_ldiv/lrem, sonst i32.
+        BinOp::Div if aty == Ty::I64 => writeln!(w, "  {t} = call i64 @jrt_ldiv(i64 {a}, i64 {b})").unwrap(),
+        BinOp::Rem if aty == Ty::I64 => writeln!(w, "  {t} = call i64 @jrt_lrem(i64 {a}, i64 {b})").unwrap(),
         BinOp::Div => writeln!(w, "  {t} = call i32 @jrt_idiv(i32 {a}, i32 {b})").unwrap(),
         BinOp::Rem => writeln!(w, "  {t} = call i32 @jrt_irem(i32 {a}, i32 {b})").unwrap(),
         BinOp::And => writeln!(w, "  {t} = and {ty} {a}, {b}").unwrap(),
