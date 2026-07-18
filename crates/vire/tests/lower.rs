@@ -6,6 +6,24 @@ use fastllvm_ir::Ty;
 use vire::{expand_macros, infer_module, inline_recursion, lower_module, parse};
 
 #[test]
+fn trait_objekte_dynamischer_dispatch() {
+    // `fn f(s: Shape)` + `s.area()` → dynamischer Dispatch (CallVirtual über die
+    // Vtable), weil der konkrete Typ erst zur Laufzeit feststeht. Der Trait wird
+    // als Interface registriert, Impls füllen die Vtable-Slots.
+    let src = "trait Shape {\n fn area(self) -> Int\n}\ntype Circle { r: Int }\nimpl Shape for Circle {\n fn area(self) -> Int { self.r * self.r }\n}\nfn describe(s: Shape) -> Int {\n s.area()\n}\nfn main() { print(describe(Circle(5))) }\n";
+    let p = lower(src);
+    // describe ruft area() virtuell (CallVirtual), nicht statisch.
+    let describe = p.functions.iter().find(|f| f.name == "describe").expect("describe");
+    let has_virtual = describe.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::CallVirtual { class, name, .. } if class == "Shape" && name == "area"));
+    assert!(has_virtual, "trait-typisierter Empfänger muss CallVirtual auf Shape.area emittieren");
+    // Der Trait ist als Interface registriert; Circle implementiert ihn.
+    let shape = p.classes.iter().find(|c| c.name == "Shape").expect("Shape-Interface");
+    assert!(shape.is_interface, "Trait muss als Interface registriert sein");
+    let circle = p.classes.iter().find(|c| c.name == "Circle").expect("Circle");
+    assert!(circle.interfaces.iter().any(|i| i == "Shape"), "Circle muss Shape implementieren");
+}
+
+#[test]
 fn rueckgabetyp_kurzform_gt() {
     // `> T` als Kurzform für `-> T` beim Rückgabetyp; `->` gilt weiter.
     let p = lower("fn add(a: Int, b: Int) > Int { a + b }\nfn classic(n: Int) -> Int { n * n }\nfn main() { print(add(3, 4))  print(classic(5)) }\n");

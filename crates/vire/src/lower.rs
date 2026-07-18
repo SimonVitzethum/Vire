@@ -266,6 +266,35 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         variant_owner_g.entry("Some".into()).or_insert("Option".into());
         variant_owner_g.entry("None".into()).or_insert("Option".into());
     }
+    // TRAIT-OBJEKTE (dynamischer Dispatch): Traits werden als Interfaces
+    // registriert, `impl Trait for Typ` fügt die Methoden in die Typ-Vtable an
+    // konsistenten globalen Slots (die bestehende Interface-/CallVirtual-Maschinerie
+    // des Backends). Trait → [(Methode, Deskriptor, Param-Typen inkl. self, Rückgabe)].
+    let mut trait_methods: HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>> = HashMap::new();
+    for it in &m.items {
+        if let Item::Trait(tr) = it {
+            let ms = tr
+                .methods
+                .iter()
+                .map(|meth| {
+                    let params: Vec<Ty> = meth.sig.params.iter().map(|p| if p.name == "self" { Ty::Ref } else { ty_of(p.ty.as_ref()) }).collect();
+                    (meth.sig.name.clone(), method_desc(&params), params, guess_ret_ty(meth))
+                })
+                .collect();
+            trait_methods.insert(tr.name.clone(), ms);
+        }
+    }
+    // Typ → implementierte Traits (aus `impl Trait for Typ`).
+    let mut type_traits: HashMap<String, Vec<String>> = HashMap::new();
+    for it in &m.items {
+        if let Item::Impl(im) = it {
+            if let Some(tn) = &im.trait_name {
+                if trait_methods.contains_key(tn) {
+                    type_traits.entry(im.for_type.name.clone()).or_default().push(tn.clone());
+                }
+            }
+        }
+    }
     // ClassInfo je Typ (Nutzer + eingebaut) registrieren.
     let mut all_type_names: Vec<String> = m
         .items
@@ -283,14 +312,48 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             .iter()
             .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
             .collect();
+        // Implementierte Traits → Interfaces + die Impl-Methoden in die Vtable
+        // (mangled = `Typ.methode`, wie collect_methods sie absenkt).
+        let ifaces = type_traits.get(tname).cloned().unwrap_or_default();
+        let mut methods = Vec::new();
+        for tn in &ifaces {
+            if let Some(tms) = trait_methods.get(tn) {
+                for (mn, d, _, _) in tms {
+                    methods.push(fastllvm_ir::MethodInfo {
+                        name: mn.clone(),
+                        desc: d.clone(),
+                        is_static: false,
+                        has_body: true,
+                        mangled: format!("{tname}.{mn}"),
+                    });
+                }
+            }
+        }
         prog.classes.push(fastllvm_ir::ClassInfo {
             name: tname.clone(),
             super_name: Some("java/lang/Object".to_string()),
             is_interface: false,
-            interfaces: vec![],
+            interfaces: ifaces,
             fields,
             static_fields: vec![],
-            methods: vec![],
+            methods,
+            has_clinit: false,
+        });
+    }
+    // Traits als Interface-ClassInfos (abstrakte Methoden → globale Vtable-Slots).
+    for (tname, ms) in &trait_methods {
+        let methods = ms
+            .iter()
+            .map(|(mn, d, _, _)| fastllvm_ir::MethodInfo { name: mn.clone(), desc: d.clone(), is_static: false, has_body: false, mangled: String::new() })
+            .collect();
+        prog.classes.push(fastllvm_ir::ClassInfo {
+            name: tname.clone(),
+            super_name: Some("java/lang/Object".to_string()),
+            is_interface: true,
+            interfaces: vec![],
+            fields: vec![],
+            static_fields: vec![],
+            methods,
             has_clinit: false,
         });
     }
@@ -414,7 +477,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // Higher-Order-Template → nur inline (Defunktionalisierung)
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None) {
+            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None) {
                 Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
@@ -427,7 +490,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym)) {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -450,7 +513,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym)) {
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -581,6 +644,25 @@ fn inst_stype(
     mangled
 }
 
+/// Synthetischer Methoden-Deskriptor (für konsistente Vtable-Slot-Zuordnung
+/// zwischen Trait-Aufruf und Impl). `self` (erster Param) wird ausgelassen.
+fn method_desc(params: &[Ty]) -> String {
+    let mut s = String::from("(");
+    for t in params.iter().skip(1) {
+        s.push(ty_code(*t));
+    }
+    s.push(')');
+    s
+}
+fn ty_code(t: Ty) -> char {
+    match t {
+        Ty::F64 | Ty::F32 => 'D',
+        Ty::Ref => 'L',
+        Ty::I32 => 'I',
+        _ => 'J',
+    }
+}
+
 fn ret_ty(sig: &FnSig) -> Ty {
     match &sig.ret {
         None => Ty::Void,
@@ -653,6 +735,9 @@ struct FnLower<'a> {
     variants: &'a HashMap<String, VariantInfo>,
     /// Generische Funktionen (Name → Info) für Aufruf-Monomorphisierung.
     generics: &'a HashMap<String, GInfo>,
+    /// Traits (Name → Methoden) für dynamischen Dispatch (Trait-Objekte): ein
+    /// Methodenaufruf auf einem trait-typisierten Empfänger wird zu `CallVirtual`.
+    trait_methods: &'a HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>>,
     /// Funktions-ASTs (Name → Def) für Higher-Order-Inlining: wird ein Lambda
     /// übergeben, expandiert die aufgerufene Funktion an der Stelle inline
     /// (Defunktionalisierung — direkter, spezialisierter Code statt Funktionszeiger).
@@ -1676,6 +1761,23 @@ impl<'a> FnLower<'a> {
                     return (Operand::ConstI64(0), Ty::I64);
                 }
             };
+            // TRAIT-OBJEKT: ist der Empfänger trait-typisiert (`s: Show`), dynamisch
+            // über die Vtable dispatchen (CallVirtual) — der konkrete Typ ist erst
+            // zur Laufzeit bekannt. Sonst statischer `Typ.methode`-Aufruf.
+            if let Some(tms) = self.trait_methods.get(&class) {
+                if let Some((mn, desc, params, ret)) = tms.iter().find(|(n, ..)| n == name).cloned() {
+                    let mut arg_ops = vec![obj];
+                    for a in args {
+                        arg_ops.push(self.lower_expr(a).0);
+                    }
+                    let dest = if ret == Ty::Void { None } else { Some(self.new_local(ret)) };
+                    self.emit(Statement::CallVirtual { dest, class: class.clone(), name: mn, desc, params, ret, args: arg_ops });
+                    return match dest {
+                        Some(d) => (Operand::Copy(d), ret),
+                        None => (Operand::ConstI64(0), Ty::Void),
+                    };
+                }
+            }
             let sym = format!("{class}.{name}");
             let mut arg_ops = vec![obj];
             for a in args {
@@ -2331,6 +2433,7 @@ fn lower_fn(
     types: &HashMap<String, Layout>,
     variants: &HashMap<String, VariantInfo>,
     generics: &HashMap<String, GInfo>,
+    trait_methods: &HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>>,
     fn_defs: &HashMap<String, FnDef>,
     generic_ptypes: &HashMap<String, (Vec<String>, Vec<Field>)>,
     generic_stypes: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
@@ -2357,6 +2460,7 @@ fn lower_fn(
         types,
         variants,
         generics,
+        trait_methods,
         fn_defs,
         inlining: Vec::new(),
         generic_ptypes,
