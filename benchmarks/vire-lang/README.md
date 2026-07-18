@@ -12,6 +12,7 @@ geprüft. `./run.sh` reproduziert.
 | struct | Stack-Struct | 0,307 s | 0,291 s | 0,307 s | 1,05× | **1,00×** |
 | **mandelbrot** | CLBG, Float-Compute | 0,137 s | 0,140 s | 0,118 s | **0,99×** | 1,17× |
 | **binary-trees** | CLBG, Allok/GC | 0,477 s | 0,180 s | 0,139 s | **2,65×** | 3,43× |
+| **nsieve** (i64-matched) | CLBG, Array | 0,340 s | 0,334 s | 0,363 s | **1,02×** | **0,94×** |
 
 ## Lesart
 **Compute-gebunden = Parität.** Scalar-Arithmetik, Rekursion, Stack-Structs und der

@@ -658,6 +658,23 @@ impl<'a> FnLower<'a> {
                     }
                     self.emit(Statement::PutField { obj, class, field: name.clone(), value: v });
                 }
+                // Index-Zuweisung `xs[i] = v` (Array oder wachsende Liste).
+                Expr::Index { base, index, .. } => {
+                    let (arr, _) = self.lower_expr(base);
+                    let (idx, _) = self.lower_expr(index);
+                    let (mut v, vt) = self.lower_expr(value);
+                    if self.class_of_operand(&arr).as_deref() == Some("$List") {
+                        self.emit(Statement::Call { dest: None, func: "vire_list_set".into(), args: vec![arr, to_i64(idx), to_i64(v)] });
+                    } else if let Some(kind) = self.arr_of_operand(&arr) {
+                        if kind == ArrKind::Long && vt != Ty::I64 {
+                            v = to_i64(v);
+                        }
+                        let idx32 = self.to_i32(idx);
+                        self.emit(Statement::ArrayStore { arr, index: idx32, value: v, kind, checked: true });
+                    } else {
+                        self.errs.push("Index-Zuweisung: kein Array/Liste".into());
+                    }
+                }
                 _ => {
                     self.errs.push("Zuweisungsziel M2: nur Variablen und Felder".into());
                 }
@@ -1251,6 +1268,17 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(obj), Ty::Ref);
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Dimensionierte typisierte Arrays: `array(n)` (Int), `farray(n)` (Float) —
+        // echte bounds-gecheckte/-elidierbare Arrays (im Gegensatz zur i64-Liste).
+        if name == "array" || name == "farray" {
+            let kind = if name == "farray" { ArrKind::Double } else { ArrKind::Long };
+            let n = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstI64(0));
+            let len32 = self.to_i32(n);
+            let arr = self.new_local(Ty::Ref);
+            self.local_arr.insert(arr.0, kind);
+            self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
+            return (Operand::Copy(arr), Ty::Ref);
+        }
         // Collection-Builtins: `list()` (wachsende Liste), `map()` (Int→Int).
         if name == "list" || name == "map" {
             let (func, sentinel) = if name == "list" { ("vire_list_new", "$List") } else { ("vire_map_new", "$Map") };
