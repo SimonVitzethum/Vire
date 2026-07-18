@@ -83,6 +83,7 @@ fn build_or_run(args: &[String]) {
     // wegoptimiert, die Laufzeitzähler bleiben 0). Der Solver läuft immer.
     let mut opt0 = false;
     let mut force_no_cycles = false;
+    let mut force_no_rc = false;
     let mut path: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -101,6 +102,13 @@ fn build_or_run(args: &[String]) {
             // Unsound (leckt Zyklen), aber isoliert die Kollektor-Kosten gegen den
             // reinen RC-Pfad — die mittlere Spalte des M0.1-Dreiwegs.
             "--no-cycles" => force_no_cycles = true,
+            // MESSUNG (Orakel): RC komplett aus (retain/release No-Op) — die Decke
+            // einer idealen Region-Inferenz auf der stabilen Menge. Impliziert
+            // --no-cycles. Unsound (leckt), nur für Ceiling-Timing.
+            "--no-rc" => {
+                force_no_rc = true;
+                force_no_cycles = true;
+            }
             other => path = Some(other.to_string()),
         }
     }
@@ -200,6 +208,9 @@ fn build_or_run(args: &[String]) {
     }
     if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");
+    }
+    if force_no_rc {
+        cmd.arg("-DFASTLLVM_NO_RC");
     }
     let status = cmd.arg("-o").arg(&out).status();
     match status {

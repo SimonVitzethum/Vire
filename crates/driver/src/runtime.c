@@ -892,7 +892,14 @@ void *jrt_alloc(int64_t size) {
     return p;
 }
 
-#ifdef FASTLLVM_THREADS
+#if defined(FASTLLVM_NO_RC)
+/* MESSMODUS (Orakel): Referenzzählung komplett aus — retain/release sind No-Ops.
+ * Modelliert die Decke einer idealen Region-/Borrow-Inferenz, die auf der
+ * beweisbar-stabilen Menge ALLE RC-Ops elidiert. UNSOUND (leckt — nichts wird
+ * freigegeben), nur für Ceiling-Timing. Impliziert NO_CYCLES (kein Kollektor). */
+void jrt_retain(void *p) { (void)p; }
+void jrt_release(void *p) { (void)p; }
+#elif defined(FASTLLVM_THREADS)
 /* Threaded: atomare Refcounts. Inkrementelle Zyklen-Erkennung ist unter
  * Threads nicht thread-safe → deaktiviert; azyklischer Müll wird prompt
  * freigegeben, Zyklen bleiben bis Programmende liegen (dokumentierte Grenze,
