@@ -708,8 +708,13 @@ fn lower_fn(
         let term = if let Some(t) = &body.tail {
             let (op, _) = fl.lower_expr(t);
             if ret == Ty::Void { Terminator::Return(None) } else { Terminator::Return(Some(op)) }
-        } else {
+        } else if ret == Ty::Void {
             Terminator::Return(None)
+        } else {
+            // Kein Tail, aber typisierter Rückgabewert: der Wert kommt aus einem
+            // `return`-Statement; dieser Fallthrough-Block ist unerreichbar. Er
+            // muss aber typkorrekt terminieren (sonst `ret void` in i64-Funktion).
+            Terminator::Return(Some(zero_of(ret)))
         };
         fl.scopes.pop();
         let cur = fl.cur;
@@ -729,6 +734,17 @@ fn lower_fn(
         blocks: fl.blocks,
         receiver_nonnull: false,
     })
+}
+
+/// Typkorrekter Null-/Default-Operand (für unerreichbare typisierte Returns).
+fn zero_of(t: Ty) -> Operand {
+    match t {
+        Ty::F64 => Operand::ConstF64(0.0),
+        Ty::F32 => Operand::ConstF32(0.0),
+        Ty::I32 => Operand::ConstI32(0),
+        Ty::Ref => Operand::ConstNull,
+        _ => Operand::ConstI64(0),
+    }
 }
 
 fn map_op(o: BinOp) -> IB {

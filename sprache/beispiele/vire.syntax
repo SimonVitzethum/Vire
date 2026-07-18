@@ -1,0 +1,10 @@
+# Beispiel: nutzerdefinierte Schlüsselwort-Schreibweisen.
+# Format: kanonisch = eigene_schreibweise   (# = Kommentar)
+# Neben eine .vr-Datei legen; `vire build/run` lädt sie automatisch.
+fn       = funktion
+return   = gib
+while    = solange
+for      = fuer
+mut      = veraenderlich
+if       = wenn
+else     = sonst

@@ -887,7 +887,12 @@ impl Parser {
 
 /// Bequemer Einstieg: Quelltext → (Modul, Diagnosen).
 pub fn parse(src: &str) -> (Module, Vec<Diag>) {
-    let (toks, mut diags) = crate::lexer::lex(src);
+    parse_with_syntax(src, crate::syntax::Syntax::default())
+}
+
+/// Wie `parse`, aber mit nutzerdefinierter Schlüsselwort-Schreibweise.
+pub fn parse_with_syntax(src: &str, syntax: crate::syntax::Syntax) -> (Module, Vec<Diag>) {
+    let (toks, mut diags) = crate::lexer::Lexer::with_syntax(src, syntax).lex();
     let mut p = Parser::new(toks);
     let m = p.parse_module();
     diags.append(&mut p.diags);

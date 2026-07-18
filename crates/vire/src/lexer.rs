@@ -36,21 +36,27 @@ pub enum Kw {
     And, Or, Not, As, True, False, SelfLower, SelfType,
 }
 
+/// Kanonische Standard-Schreibweise jedes Schlüsselworts. Einzige Wahrheit —
+/// `from_ident` UND die konfigurierbare `Syntax`-Tabelle leiten sich hieraus ab.
+pub const KW_TABLE: &[(&str, Kw)] = {
+    use Kw::*;
+    &[
+        ("fn", Fn), ("type", Type), ("trait", Trait), ("impl", Impl),
+        ("mut", Mut), ("const", Const), ("use", Use), ("pub", Pub),
+        ("extern", Extern), ("unsafe", Unsafe), ("macro", Macro),
+        ("comptime", Comptime), ("match", Match), ("if", If), ("elif", Elif),
+        ("else", Else), ("while", While), ("for", For), ("in", In),
+        ("break", Break), ("continue", Continue), ("return", Return),
+        ("spawn", Spawn), ("capsule", Capsule),
+        ("and", And), ("or", Or), ("not", Not), ("as", As),
+        ("true", True), ("false", False), ("self", SelfLower), ("Self", SelfType),
+    ]
+};
+
 impl Kw {
-    fn from_ident(s: &str) -> Option<Kw> {
-        use Kw::*;
-        Some(match s {
-            "fn" => Fn, "type" => Type, "trait" => Trait, "impl" => Impl,
-            "mut" => Mut, "const" => Const, "use" => Use, "pub" => Pub,
-            "extern" => Extern, "unsafe" => Unsafe, "macro" => Macro,
-            "comptime" => Comptime, "match" => Match, "if" => If, "elif" => Elif,
-            "else" => Else, "while" => While, "for" => For, "in" => In,
-            "break" => Break, "continue" => Continue, "return" => Return,
-            "spawn" => Spawn, "capsule" => Capsule,
-            "and" => And, "or" => Or, "not" => Not, "as" => As,
-            "true" => True, "false" => False, "self" => SelfLower, "Self" => SelfType,
-            _ => return None,
-        })
+    /// Kanonischer Name (für Config-Dateien und Reverse-Mapping).
+    pub fn canonical(self) -> &'static str {
+        KW_TABLE.iter().find(|(_, k)| *k == self).map(|(sp, _)| *sp).unwrap_or("?")
     }
 }
 
@@ -75,11 +81,16 @@ pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
     pub diags: Vec<Diag>,
+    syntax: crate::syntax::Syntax,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Lexer { src: src.as_bytes(), pos: 0, diags: Vec::new() }
+        Lexer { src: src.as_bytes(), pos: 0, diags: Vec::new(), syntax: Default::default() }
+    }
+    /// Lexer mit nutzerdefinierter Schlüsselwort-Schreibweise.
+    pub fn with_syntax(src: &'a str, syntax: crate::syntax::Syntax) -> Self {
+        Lexer { src: src.as_bytes(), pos: 0, diags: Vec::new(), syntax }
     }
 
     fn peek(&self) -> u8 {
@@ -173,7 +184,7 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string();
-        match Kw::from_ident(&s) {
+        match self.syntax.keyword(&s) {
             Some(kw) => Tok::Kw(kw),
             None => Tok::Ident(s),
         }

@@ -3,11 +3,14 @@
 //! Schleifen/Kontrollfluss.
 
 use fastllvm_ir::Ty;
-use vire::{lower_module, parse};
+use vire::{infer_module, lower_module, parse};
 
 fn lower(src: &str) -> fastllvm_ir::Program {
-    let (m, diags) = parse(src);
+    // Reale Pipeline: parsen → Typinferenz → absenken.
+    let (mut m, diags) = parse(src);
     assert!(diags.is_empty(), "Parse-Diagnosen: {diags:?}");
+    let conflicts = infer_module(&mut m);
+    assert!(conflicts.is_empty(), "Typkonflikte: {conflicts:?}");
     lower_module(&m).unwrap_or_else(|e| panic!("Absenkung: {e:?}"))
 }
 
@@ -123,6 +126,18 @@ fn null_senkt_zu_constnull() {
         matches!(s, fastllvm_ir::Statement::PutField { value: fastllvm_ir::Operand::ConstNull, .. })
     });
     assert!(has_null, "null muss als ConstNull ins next-Feld");
+}
+
+#[test]
+fn return_statement_liefert_typisierten_wert() {
+    // Funktion, deren Wert aus einem `return`-Statement kommt (kein Tail): der
+    // unerreichbare Fallthrough muss typkorrekt terminieren, nicht `ret void`.
+    let p = lower("fn f(n) {\n mut s = 0\n s = s + n\n return s\n}\n");
+    let f = p.functions.iter().find(|f| f.name == "f").unwrap();
+    assert_eq!(f.ret, Ty::I64);
+    // Kein Return(None) in einer I64-Funktion.
+    let has_void_return = f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(None)));
+    assert!(!has_void_return, "I64-Funktion darf kein Return(None) haben");
 }
 
 #[test]

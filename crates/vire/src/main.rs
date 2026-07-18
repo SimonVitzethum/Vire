@@ -71,6 +71,30 @@ fn main() {
     }
 }
 
+/// Lädt eine `vire.syntax`-Datei neben der Quelle (falls vorhanden) → nutzer-
+/// definierte Schlüsselwort-Schreibweisen. Fehlt sie, gilt die Standard-Syntax.
+fn load_syntax(src_path: &str) -> vire::Syntax {
+    let cfg = std::path::Path::new(src_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("vire.syntax");
+    let Ok(text) = std::fs::read_to_string(&cfg) else {
+        return vire::Syntax::default();
+    };
+    match vire::Syntax::parse(&text) {
+        Ok(s) => {
+            eprintln!("vire: Syntax-Konfig {} geladen", cfg.display());
+            s
+        }
+        Err(errs) => {
+            for e in &errs {
+                eprintln!("{}: {e}", cfg.display());
+            }
+            exit(1);
+        }
+    }
+}
+
 /// `vire build`/`run`: .vr → AST → IR (Absenkung) → Solver → LLVM → clang → Binary.
 /// `run` führt das Binary danach aus und reicht dessen Exit-Code durch.
 fn build_or_run(args: &[String]) {
@@ -124,8 +148,9 @@ fn build_or_run(args: &[String]) {
         }
     };
 
-    // Front-End: lexen/parsen.
-    let (mut module, diags) = vire::parse(&src);
+    // Front-End: lexen/parsen (mit optionaler nutzerdefinierter Syntax).
+    let syntax = load_syntax(&path);
+    let (mut module, diags) = vire::parse_with_syntax(&src, syntax);
     if !diags.is_empty() {
         for d in &diags {
             eprintln!("{}", d.render(&src));
