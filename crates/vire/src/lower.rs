@@ -15,6 +15,28 @@ type Layout = Vec<(String, Ty, Option<String>)>;
 /// Variante eines Summentyps: (Summentyp-Name, Tag, Felder als (geflachter Name, Typ, Ref-Klasse)).
 type VariantInfo = (String, i64, Vec<(String, Ty, Option<String>)>);
 
+/// Eingebaute FFI-/Python-Brücken-Signaturen (Ptr = i64). Immer verfügbar, damit
+/// Python aus reinem Vire ohne `extern`-Block nutzbar ist.
+fn builtin_ffi_sigs() -> Vec<(&'static str, Vec<Ty>, Ty)> {
+    use Ty::*;
+    vec![
+        ("py_import", vec![I64], I64),
+        ("py_getattr", vec![I64, I64], I64),
+        ("py_call_f", vec![I64, F64], I64),
+        ("py_call_ff", vec![I64, F64, F64], I64),
+        ("py_call_i", vec![I64, I64], I64),
+        ("py_call_s", vec![I64, I64], I64),
+        ("py_float", vec![F64], I64),
+        ("py_int", vec![I64], I64),
+        ("py_str", vec![I64], I64),
+        ("py_asfloat", vec![I64], F64),
+        ("py_asint", vec![I64], I64),
+        ("py_getitem_i", vec![I64, I64], I64),
+        ("vire_py_eval_f", vec![Ref, F64], F64),
+        ("vire_py_eval_i", vec![Ref, I64], I64),
+    ]
+}
+
 /// Alle Methoden (Type-inline + `impl`-Blöcke) als (Klassenname, Methode).
 fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
     let mut out = Vec::new();
@@ -112,6 +134,12 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
+    // Eingebaute Python-Brücke: Signaturen immer registrieren, damit `py_import`
+    // & Co. OHNE `extern`-Block aus reinem Vire aufrufbar sind (die Absenkung
+    // emittiert Calls, das Backend deklariert, der Treiber linkt die Brücke).
+    for (name, params, ret) in builtin_ffi_sigs() {
+        sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None });
+    }
     // Methoden (Type-inline + impl-Blöcke) → Symbol `Class.method`, self = Ref.
     let methods = collect_methods(m);
     for (class, meth) in &methods {
@@ -155,6 +183,8 @@ fn ty_of(t: Option<&Type>) -> Ty {
         Some("Str") => Ty::Ref,
         Some("I32") | Some("U32") => Ty::I32,
         Some("Int") | Some("I64") | Some("U64") => Ty::I64,
+        // `Ptr` = opaker Roh-Zeiger (FFI): i64-breit, KEIN RC (kein Vire-Objekt).
+        Some("Ptr") => Ty::I64,
         Some("Unit") | None => Ty::I64, // Default-Ganzzahl, wenn nichts steht
         // Alles andere ist ein (Nutzer-)Referenztyp: Objekt auf dem Heap.
         Some(_) => Ty::Ref,
@@ -165,7 +195,7 @@ fn ty_of(t: Option<&Type>) -> Ty {
 fn class_of(t: Option<&Type>) -> Option<String> {
     let name = t?.name.as_str();
     match name {
-        "Float" | "F64" | "F32" | "Bool" | "Str" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" => None,
+        "Float" | "F64" | "F32" | "Bool" | "Str" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr" => None,
         _ => Some(name.to_string()),
     }
 }
@@ -838,6 +868,13 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(obj), Ty::Ref);
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // FFI-Builtin `cstr(s)` → NUL-terminierter char* (als Ptr/i64).
+        if name == "cstr" {
+            let arg = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstNull);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "vire_cstr".into(), args: vec![arg] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // Intrinsic `print` — mehrargumentig: jedes Argument in eigener Zeile.
         if name == "print" {
             if lowered.is_empty() {
@@ -857,7 +894,22 @@ impl<'a> FnLower<'a> {
         }
         // Aufruf einer eigenen Funktion
         let (ret, ret_class) = self.sigs.get(&name).map(|s| (s.ret, s.ret_class.clone())).unwrap_or((Ty::I64, None));
-        let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
+        // Bequemlichkeit: an `py_*`-Brückenfunktionen werden String-Argumente
+        // automatisch zu C-Strings (`cstr`), damit man `py_import("math")` statt
+        // `py_import(cstr("math"))` schreiben kann.
+        let auto_cstr = name.starts_with("py_");
+        let arg_ops: Vec<Operand> = lowered
+            .into_iter()
+            .map(|(o, t)| {
+                if auto_cstr && t == Ty::Ref {
+                    let d = self.new_local(Ty::I64);
+                    self.emit(Statement::Call { dest: Some(d), func: "vire_cstr".into(), args: vec![o] });
+                    Operand::Copy(d)
+                } else {
+                    o
+                }
+            })
+            .collect();
         if ret == Ty::Void {
             self.emit(Statement::Call { dest: None, func: name, args: arg_ops });
             (Operand::ConstI64(0), Ty::Void)

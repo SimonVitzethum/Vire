@@ -204,7 +204,7 @@ fn build_or_run(args: &[String]) {
         match it {
             vire::ast::Item::Extern { items, links, .. } => {
                 link_libs.extend(links.iter().cloned());
-                if items.iter().any(|s| s.name.starts_with("vire_py_")) {
+                if items.iter().any(|s| s.name.starts_with("vire_py_") || s.name.starts_with("py_")) {
                     want_py_bridge = true;
                 }
             }
@@ -238,6 +238,13 @@ fn build_or_run(args: &[String]) {
     if !program.functions.iter().any(|f| f.name == "java_main") {
         eprintln!("kein Einstiegspunkt: erwarte `fn main()`");
         exit(1);
+    }
+    // Python-Brücke auch triggern, wenn `py_*` OHNE extern-Block genutzt wird
+    // (die Signaturen sind eingebaut) — am gelowerten Programm erkennbar.
+    if !want_py_bridge {
+        want_py_bridge = program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|st| {
+            matches!(st, fastllvm_ir::Statement::Call { func, .. } if func.starts_with("py_") || func.starts_with("vire_py_"))
+        });
     }
 
     // Solver + Optimierungspässe — identisch zum Java-Treiber.

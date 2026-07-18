@@ -217,6 +217,19 @@ void jrt_print_str(const JStr *s) {
     plat_write((const char *)s->bytes, (size_t)s->len);
 }
 
+#ifndef FASTLLVM_FREESTANDING
+/* FFI: Vire-String → NUL-terminierter C-`char*` (für extern-C-Funktionen, die
+ * `const char*` erwarten). Kopiert; der Puffer wird nicht wieder freigegeben
+ * (kurzlebige Argument-Strings) — für dauerhafte Nutzung selbst kopieren. */
+char *vire_cstr(const JStr *s) {
+    char *c = (char *)malloc((size_t)s->len + 1);
+    if (!c) return (char *)"";
+    memcpy(c, s->bytes, (size_t)s->len);
+    c[s->len] = 0;
+    return c;
+}
+#endif
+
 void jrt_println_str(const JStr *s) {
     jrt_print_str(s);
     plat_write("\n", 1);
