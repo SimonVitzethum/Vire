@@ -1,0 +1,1 @@
+fn main(){ let mut seed=12345i64; let mut inside=0i64; let mut i=0i64; while i<20000000 { seed=(seed.wrapping_mul(1103515245)+12345)%2147483648; let x=seed%10000; seed=(seed.wrapping_mul(1103515245)+12345)%2147483648; let y=seed%10000; if x*x+y*y<100000000 { inside+=1; } i+=1; } println!("{}",inside); }

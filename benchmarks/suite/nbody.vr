@@ -1,0 +1,36 @@
+fn main() {
+    mut n = 2000
+    mut px = farray(n)
+    mut py = farray(n)
+    mut vx = farray(n)
+    mut vy = farray(n)
+    mut i = 0
+    while i < n { px[i] = ((i % 100) as Float)  py[i] = ((i % 50) as Float)  vx[i] = 0.0  vy[i] = 0.0  i = i + 1 }
+    mut step = 0
+    while step < 20 {
+        mut a = 0
+        while a < n {
+            mut fx = 0.0
+            mut fy = 0.0
+            mut b = 0
+            while b < n {
+                mut dx = px[b] - px[a]
+                mut dy = py[b] - py[a]
+                mut d = dx * dx + dy * dy + 1.0
+                fx = fx + dx / d
+                fy = fy + dy / d
+                b = b + 1
+            }
+            vx[a] = vx[a] + fx * 0.01
+            vy[a] = vy[a] + fy * 0.01
+            a = a + 1
+        }
+        mut m = 0
+        while m < n { px[m] = px[m] + vx[m]  py[m] = py[m] + vy[m]  m = m + 1 }
+        step = step + 1
+    }
+    mut t = 0.0
+    mut k = 0
+    while k < n { t = t + px[k]  k = k + 1 }
+    print(t)
+}

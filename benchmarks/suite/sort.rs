@@ -1,0 +1,2 @@
+fn qsort(a:&mut [i64], lo:i64, hi:i64){ if lo<hi { let p=a[hi as usize]; let mut i=lo-1; let mut j=lo; while j<hi { if a[j as usize]<p { i+=1; a.swap(i as usize,j as usize); } j+=1; } a.swap((i+1) as usize,hi as usize); qsort(a,lo,i); qsort(a,i+2,hi); } }
+fn main(){ let n=2000000i64; let mut a=vec![0i64;n as usize]; let mut seed=987654321i64; for i in 0..n as usize { seed=(seed.wrapping_mul(1103515245)+12345)%2147483648; a[i]=seed%1000000; } qsort(&mut a,0,n-1); println!("{}",a[0]+a[n as usize/2]+a[n as usize-1]); }

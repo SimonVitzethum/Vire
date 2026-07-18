@@ -1,0 +1,12 @@
+fn main() {
+    mut s = 0
+    mut i = 0
+    while i < 30000000 {
+        mut x = i
+        mut c = 0
+        while x > 0 { c = c + (x and 1)  x = x / 2 }
+        s = s + c
+        i = i + 1
+    }
+    print(s)
+}

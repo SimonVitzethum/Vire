@@ -1,0 +1,16 @@
+trait Op { fn apply(self, x: Int) -> Int }
+type AddOp { k: Int }
+impl Op for AddOp { fn apply(self, x: Int) -> Int { x + self.k } }
+type MulOp { k: Int }
+impl Op for MulOp { fn apply(self, x: Int) -> Int { x * self.k } }
+fn run(o: Op, iters: Int) -> Int {
+    mut acc = 0
+    mut i = 0
+    while i < iters { acc = o.apply(acc) % 1000000  i = i + 1 }
+    acc
+}
+fn main() {
+    mut a = AddOp(3)
+    mut m = MulOp(7)
+    print(run(a, 50000000) + run(m, 50000000))
+}

@@ -1,0 +1,43 @@
+fn main() {
+    mut n = 2000000
+    mut a = array(n)
+    mut seed = 987654321
+    mut i = 0
+    while i < n { seed = (seed * 1103515245 + 12345) % 2147483648  a[i] = seed % 1000000  i = i + 1 }
+    mut lostack = array(512)
+    mut histack = array(512)
+    mut sp = 0
+    lostack[0] = 0
+    histack[0] = n - 1
+    sp = 1
+    while sp > 0 {
+        sp = sp - 1
+        mut lo = lostack[sp]
+        mut hi = histack[sp]
+        if lo < hi {
+            mut p = a[hi]
+            mut pi = lo - 1
+            mut j = lo
+            while j < hi {
+                if a[j] < p {
+                    pi = pi + 1
+                    mut t = a[pi]
+                    a[pi] = a[j]
+                    a[j] = t
+                }
+                j = j + 1
+            }
+            mut t2 = a[pi + 1]
+            a[pi + 1] = a[hi]
+            a[hi] = t2
+            mut mid = pi + 1
+            lostack[sp] = lo
+            histack[sp] = mid - 1
+            sp = sp + 1
+            lostack[sp] = mid + 1
+            histack[sp] = hi
+            sp = sp + 1
+        }
+    }
+    print(a[0] + a[n / 2] + a[n - 1])
+}
