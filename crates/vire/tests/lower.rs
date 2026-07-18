@@ -284,3 +284,16 @@ fn comptime_faltet_konstanten() {
         .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(..))));
     assert!(!has_arith, "comptime muss zur Compilezeit falten (keine Binary-Ops)");
 }
+
+#[test]
+fn traits_statische_dispatch() {
+    // `impl Show for Point` → Methode Point.show; `display[T: Show]` monomorphisiert
+    // und ruft die konkrete Impl (statische Dispatch, kein vtable).
+    let src = "trait Show { fn show(self) -> Int }\ntype P { x: Int }\nimpl Show for P {\n fn show(self) -> Int { self.x }\n}\nfn display[T: Show](it: T) -> Int { it.show() }\nfn main() {\n print(display(P(9)))\n}\n";
+    let p = lower(src);
+    assert!(p.functions.iter().any(|f| f.name == "P.show"), "impl-Methode P.show fehlt");
+    // display$P-Instanz ruft P.show.
+    let calls_show = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "P.show"));
+    assert!(calls_show, "monomorphisierte display muss P.show rufen");
+}
