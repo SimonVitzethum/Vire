@@ -235,7 +235,7 @@ impl Expander {
 
 // --- Binder-Sammlung (makro-lokale Namen) -----------------------------------
 
-fn collect_binders_expr(e: &Expr, out: &mut HashSet<String>) {
+pub(crate) fn collect_binders_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Unary { rhs, .. } => collect_binders_expr(rhs, out),
         Expr::Binary { lhs, rhs, .. } => {
@@ -302,7 +302,7 @@ fn collect_binders_expr(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-fn collect_binders_block(b: &Block, out: &mut HashSet<String>) {
+pub(crate) fn collect_binders_block(b: &Block, out: &mut HashSet<String>) {
     for s in &b.stmts {
         match s {
             Stmt::Let { name, value, .. } => {
@@ -350,7 +350,7 @@ fn collect_binders_pat(p: &Pattern, out: &mut HashSet<String>) {
 
 // --- Substitution: Parameter → Argument, lokale Binder → frische Namen -------
 
-fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
+pub(crate) fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
     // Ident: Parameter-Ersetzung (ganzer Knoten) hat Vorrang, sonst Umbenennung.
     if let Expr::Ident(n, _) = e {
         if let Some(arg) = pmap.get(n) {
@@ -432,7 +432,7 @@ fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &HashMap<Strin
     }
 }
 
-fn subst_block(b: &mut Block, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
+pub(crate) fn subst_block(b: &mut Block, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
     for s in &mut b.stmts {
         match s {
             Stmt::Let { name, value, .. } => {

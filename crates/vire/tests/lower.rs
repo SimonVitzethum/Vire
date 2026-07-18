@@ -3,7 +3,24 @@
 //! Schleifen/Kontrollfluss.
 
 use fastllvm_ir::Ty;
-use vire::{expand_macros, infer_module, lower_module, parse};
+use vire::{expand_macros, infer_module, inline_recursion, lower_module, parse};
+
+#[test]
+fn shallow_recursive_inlining_reduziert_selbstaufrufe() {
+    // fib: 2 Selbstaufrufe. Nach dem shallow-inline-Pass (Tiefe 2) hat der Rumpf
+    // deutlich MEHR Aufruf-Statements (aufgefaltete Kopien) und die verbleibenden
+    // Selbstaufrufe liegen tiefer — die Call-Zahl je Frame sinkt drastisch.
+    let (mut m, _) = parse("fn fib(n: Int) -> Int {\n if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\nfn main() { print(fib(10)) }\n");
+    expand_macros(&mut m).unwrap();
+    inline_recursion(&mut m);
+    let _ = infer_module(&mut m);
+    let p = lower_module(&m).unwrap();
+    let fib = p.functions.iter().find(|f| f.name == "fib").expect("fib");
+    let calls = fib.blocks.iter().flat_map(|b| &b.statements).filter(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "fib")).count();
+    // Naiv wären es 2 Calls; nach Tiefe-2-Entfaltung stehen viele aufgefaltete
+    // fib-Calls im Rumpf (jeder Frame deckt 3 Ebenen ab).
+    assert!(calls > 2, "shallow-inline muss die Selbstaufrufe auffalten (>2), fand {calls}");
+}
 
 fn lower(src: &str) -> fastllvm_ir::Program {
     // Reale Pipeline: parsen → Makro-Expansion → Typinferenz → absenken.

@@ -272,6 +272,9 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // Shallow Self-Recursive Inlining (kleine, reine, tail-förmige Rekursion →
+    // 1–2 Ebenen selbst-inline; LLVM-CSE holt den Branching-Gewinn). Vor infer.
+    vire::inline_recursion(&mut module);
     // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen. Erkannte
     // Typkonflikte sind echte Fehler → ablehnen (nicht still auf I64 defaulten).
     let type_conflicts = vire::infer_module(&mut module);
