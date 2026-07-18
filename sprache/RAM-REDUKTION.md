@@ -113,3 +113,26 @@ Graphen wäre ein Slab-Allokator die Ergänzung. Schätzung: ~19,9 → ~13 MB.
 Graphen → Header-Pack −18% (gebaut), Slab-Allokator als nächster Hebel (~−35%).
 Rust-Niveau bei Objekt-Graphen ist nur teilweise erreichbar (RC-Header ist der Preis
 der automatischen Speichersicherheit auf zyklischen Graphen).
+
+## GEBAUT: Slab-Allokator (nächster Hebel, umgesetzt)
+Kleine Objekte (≤256 B) kommen jetzt aus **segregierten Größenklassen-Pools**
+(8-B-Granularität, trifft 40-B-Nodes exakt) statt einzeln per `calloc` — spart den
+glibc-Chunk-Overhead (~8–16 B/Allokation) + dichte Packung. Slabs sind
+256-KB-ausgerichtet; `free` findet den Slab per `ptr & MASK` und prüft ein Hash-Set
+der Slab-Basen (sicher — kein Fehlalarm gegen calloc'te Große/Arrays), freie Zellen
+in intrusive Klassen-Freilisten. Große Objekte → weiter `plat_alloc`.
+
+**Wichtig — 8-B-Granularität:** die erste 16-B-Version rundete 40 B → 48 B und war
+schlechter als calloc; auf 8-B-Klassen umgestellt (40 B → exakt 40 B).
+
+**Gemessen (mit Header-Pack):**
+| Workload | ohne Slab (calloc) | mit Slab | |
+|---|---|---|---|
+| esc (100k acyklische Nodes) | 7,20 MB | **5,85 MB** | **−19%** |
+| pagerank (262k zyklische Nodes) | 20,4 MB | **18,1 MB** | −11% (Collector dominiert) |
+
+Sound: Java 65/65 (Heap-Bilanz), Vire-Suite grün, Korrektheit über Objekte/Arrays/
+Collections/Arena/generics/C++-Bridge geprüft. **Gesamt-RAM-Reduktion diese Session:
+pagerank 24,4 → 18,1 MB = −26%** (Header-Pack + Slab). Der zyklische Rest-Gap zu
+Rust ist der Bacon-Rajan-Collector (Mark/Scan-Buffer über den großen Zyklus) +
+der inhärente 16-B-RC-Header; acyklische/array-Fälle sind bei/unter Rust-Niveau.

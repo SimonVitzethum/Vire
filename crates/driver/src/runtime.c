@@ -185,6 +185,102 @@ static int fmt_spec_f(char *buf, const char *spec, double v) {
 }
 #endif
 
+/* --- Slab-Allokator (nur hosted) -------------------------------------------
+ * Kleine Objekte (≤256 B) aus segregierten Größenklassen-Pools statt einzeln per
+ * calloc. Spart den glibc-Chunk-Overhead (~8–16 B Metadaten JE Allokation) und
+ * packt gleichgroße Objekte dicht (Cache + RAM). Slabs sind SLAB_SIZE-ausgerichtet;
+ * `free` findet den Slab per `ptr & MASK` und prüft ihn gegen ein Hash-Set der
+ * Slab-Basen (sicher — kein Fehlalarm gegen calloc'te Große/Arrays). Freigegebene
+ * Zellen wandern in die Klassen-Freiliste (intrusiv). Große Objekte → plat_alloc. */
+#ifndef FASTLLVM_FREESTANDING
+#define SLAB_SIZE (256u * 1024u)
+#define SLAB_MASK (~(uintptr_t)(SLAB_SIZE - 1))
+#define SLAB_HDR 16u
+#define SLAB_CLASSES 32 /* 8, 16, … 256 B (8-B-Granularität, trifft 40-B-Objekte exakt) */
+typedef struct Slab {
+    struct Slab *next;
+    int64_t cell; /* Zellgröße dieses Slabs */
+} Slab;
+static void *slab_freelist[SLAB_CLASSES + 1];
+static char *slab_cur[SLAB_CLASSES + 1];
+static size_t slab_off[SLAB_CLASSES + 1];
+static uintptr_t *slab_set; /* Hash-Set der Slab-Basen (offene Adressierung) */
+static size_t slab_set_cap, slab_set_len;
+
+static void slab_set_insert(uintptr_t base) {
+    if (2 * (slab_set_len + 1) >= slab_set_cap) {
+        size_t nc = slab_set_cap ? slab_set_cap * 2 : 256;
+        uintptr_t *ns = (uintptr_t *)calloc(nc, sizeof(uintptr_t));
+        for (size_t i = 0; i < slab_set_cap; i++) {
+            uintptr_t v = slab_set[i];
+            if (v) {
+                size_t j = (v / SLAB_SIZE) & (nc - 1);
+                while (ns[j]) j = (j + 1) & (nc - 1);
+                ns[j] = v;
+            }
+        }
+        free(slab_set);
+        slab_set = ns;
+        slab_set_cap = nc;
+    }
+    size_t j = (base / SLAB_SIZE) & (slab_set_cap - 1);
+    while (slab_set[j]) {
+        if (slab_set[j] == base) return;
+        j = (j + 1) & (slab_set_cap - 1);
+    }
+    slab_set[j] = base;
+    slab_set_len++;
+}
+static int slab_set_has(uintptr_t base) {
+    if (!slab_set_cap) return 0;
+    size_t j = (base / SLAB_SIZE) & (slab_set_cap - 1);
+    while (slab_set[j]) {
+        if (slab_set[j] == base) return 1;
+        j = (j + 1) & (slab_set_cap - 1);
+    }
+    return 0;
+}
+static void *slab_alloc(size_t n) {
+    if (n == 0) n = 16;
+    if (n > (size_t)SLAB_CLASSES * 8) return plat_alloc(n); /* groß → calloc */
+    int c = (int)((n + 7) / 8);
+    size_t cell = (size_t)c * 8;
+    void *p = slab_freelist[c];
+    if (p) {
+        slab_freelist[c] = *(void **)p;
+        memset(p, 0, cell);
+        return p;
+    }
+    if (!slab_cur[c] || slab_off[c] + cell > SLAB_SIZE) {
+        char *s = (char *)aligned_alloc(SLAB_SIZE, SLAB_SIZE);
+        if (!s) return plat_alloc(n);
+        ((Slab *)s)->next = (Slab *)slab_cur[c];
+        ((Slab *)s)->cell = (int64_t)cell;
+        slab_set_insert((uintptr_t)s);
+        slab_cur[c] = s;
+        slab_off[c] = SLAB_HDR;
+    }
+    p = slab_cur[c] + slab_off[c];
+    slab_off[c] += cell;
+    memset(p, 0, cell); /* aligned_alloc ist NICHT genullt; Objekte brauchen Java-Default-Nullfelder */
+    return p;
+}
+static void slab_free(void *p) {
+    if (!p) return;
+    uintptr_t base = (uintptr_t)p & SLAB_MASK;
+    if (slab_set_has(base)) {
+        int c = (int)(((Slab *)base)->cell / 8);
+        *(void **)p = slab_freelist[c];
+        slab_freelist[c] = p;
+    } else {
+        plat_free(p);
+    }
+}
+#else
+#define slab_alloc plat_alloc
+#define slab_free plat_free
+#endif
+
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
 void *jrt_alloc(int64_t size);
@@ -919,7 +1015,7 @@ static uint64_t rc_elide_counter = 0;
 #endif
 
 static void free_obj(JObjHeader *h) {
-    plat_free(h);
+    slab_free(h);
     CNT_DEC(live_objects);
 }
 
@@ -1064,7 +1160,7 @@ void *jrt_alloc(int64_t size) {
         return ap;
     }
 #endif
-    void *p = plat_alloc((size_t)size);
+    void *p = slab_alloc((size_t)size);
     if (!p) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
         plat_abort();
