@@ -163,6 +163,25 @@ impl Parser {
                 Some(Item::Use { path, span: sp })
             }
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
+            Tok::Kw(Kw::Macro) => {
+                // `macro name(p, …) = <expr>` — Ausdrucks-Makro.
+                let sp = self.span();
+                self.bump();
+                let name = self.ident();
+                self.expect(&Tok::LParen, "'('");
+                let mut params = Vec::new();
+                while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+                    params.push(self.ident());
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                    self.skip_nl();
+                }
+                self.expect(&Tok::RParen, "')'");
+                self.expect(&Tok::Eq, "'='");
+                let body = self.parse_expr(0);
+                Some(Item::Macro { name, params, body, span: sp })
+            }
             _ => {
                 self.err("erwartete ein Item (fn/type/trait/impl/const/use/extern)");
                 None

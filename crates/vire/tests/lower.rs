@@ -3,12 +3,13 @@
 //! Schleifen/Kontrollfluss.
 
 use fastllvm_ir::Ty;
-use vire::{infer_module, lower_module, parse};
+use vire::{expand_macros, infer_module, lower_module, parse};
 
 fn lower(src: &str) -> fastllvm_ir::Program {
-    // Reale Pipeline: parsen → Typinferenz → absenken.
+    // Reale Pipeline: parsen → Makro-Expansion → Typinferenz → absenken.
     let (mut m, diags) = parse(src);
     assert!(diags.is_empty(), "Parse-Diagnosen: {diags:?}");
+    expand_macros(&mut m).unwrap_or_else(|e| panic!("Makro-Expansion: {e:?}"));
     let conflicts = infer_module(&mut m);
     assert!(conflicts.is_empty(), "Typkonflikte: {conflicts:?}");
     lower_module(&m).unwrap_or_else(|e| panic!("Absenkung: {e:?}"))
@@ -241,6 +242,30 @@ fn generics_monomorphisieren_pro_typ() {
     let names: Vec<&str> = p.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(names.iter().any(|n| n.starts_with("id$Int")), "id$Int-Instanz fehlt: {names:?}");
     assert!(names.iter().any(|n| n.starts_with("id$Float")), "id$Float-Instanz fehlt: {names:?}");
+}
+
+#[test]
+fn makro_expandiert_und_ist_hygienisch() {
+    // add_one(x) führt ein lokales `tmp` ein. Aufruf mit einem Argument, das
+    // ebenfalls `tmp` heißt: das makro-lokale `tmp` wird gensym-umbenannt, fängt
+    // das Argument NICHT ein. Ergebnis 11 (10+1), nicht 2 (tmp+tmp).
+    let src = "macro add_one(x) = { mut tmp = 1\n x + tmp }\nfn main() {\n mut tmp = 10\n print(add_one(tmp))\n}\n";
+    let p = lower(src);
+    // Makro-Definition ist verschwunden; nur main bleibt.
+    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    // Das eingeführte `tmp` wurde umbenannt → im IR steht eine Addition mit dem
+    // Argument (Local des Aufrufer-tmp) + der lokalen 1, kein Doppel-Argument.
+    let adds = main.blocks.iter().flat_map(|b| &b.statements).filter(|s| {
+        matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Add, ..)))
+    }).count();
+    assert!(adds >= 1, "Makro-Rumpf x+tmp muss als Add erscheinen");
+}
+
+#[test]
+fn makro_aritaetskonflikt_ist_fehler() {
+    let (mut m, _) = parse("macro pair(a, b) = a + b\nfn main() {\n print(pair(1))\n}\n");
+    let errs = expand_macros(&mut m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("Makro")), "Aritätskonflikt muss Fehler sein: {errs:?}");
 }
 
 #[test]

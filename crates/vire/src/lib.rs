@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod expand;
 pub mod infer;
 pub mod lexer;
 pub mod lower;
@@ -10,6 +11,7 @@ pub mod parser;
 pub mod syntax;
 
 pub use diag::Diag;
+pub use expand::expand_macros;
 pub use infer::infer_module;
 pub use lower::lower_module;
 pub use parser::{parse, parse_with_syntax};

@@ -23,6 +23,11 @@ pub enum Item {
     /// `native "c++" [link "lib"]* """ …raw code… """` — eingebetteter Fremdcode,
     /// der automatisch mitkompiliert und gelinkt wird (kein Extra-File/Flag).
     Native { abi: String, code: String, links: Vec<String>, span: Span },
+    /// `macro name(p, …) = <expr>` — hygienisches Ausdrucks-Makro. Vor der
+    /// Typinferenz per AST→AST-Expansion eingesetzt: Parameter werden durch die
+    /// Argument-Teilbäume ersetzt, makro-lokale Bindungen gensym-umbenannt
+    /// (Hygiene). Siehe `expand.rs`.
+    Macro { name: String, params: Vec<String>, body: Expr, span: Span },
 }
 
 #[derive(Debug, Clone)]

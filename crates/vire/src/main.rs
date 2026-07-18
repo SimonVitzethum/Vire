@@ -245,6 +245,13 @@ fn build_or_run(args: &[String]) {
         }
     }
 
+    // Hygienische Makros: AST→AST-Expansion VOR der Typinferenz.
+    if let Err(errs) = vire::expand_macros(&mut module) {
+        for e in &errs {
+            eprintln!("Fehler: {e}");
+        }
+        exit(1);
+    }
     // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen. Erkannte
     // Typkonflikte sind echte Fehler → ablehnen (nicht still auf I64 defaulten).
     let type_conflicts = vire::infer_module(&mut module);
