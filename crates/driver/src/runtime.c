@@ -170,6 +170,7 @@ static int fmt_spec_f(char *buf, const char *spec, double v) {
 /* -------- Hosted: libc -------------------------------------------- */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 static void *plat_alloc(size_t n) { return calloc(1, n); }
 static void *plat_realloc(void *p, size_t n) { return realloc(p, n); }
 static void plat_free(void *p) { free(p); }
@@ -883,7 +884,78 @@ static void jrt_shutdown(void) {
 #endif
 }
 
+/* --- capsule-Arena: Bump-Allokator (reine Form, Skalar-rein/-raus) ------
+ * Zwischen jrt_arena_push/_pop gehen Allokationen im Kapsel-Rumpf in eine private
+ * Arena: immortal (refcount -1 → retain/release/Collector No-Op), am Ende en bloc
+ * freigegeben. Kein Zeiger darf raus (die Absenkung erzwingt Skalar-Ergebnis), also
+ * kann kein Arena-Objekt die Arena überleben. Nesting via prev. Nur hosted; unter
+ * Threads global (dokumentierte Grenze). */
+#ifndef FASTLLVM_FREESTANDING
+typedef struct ArenaChunk {
+    struct ArenaChunk *prev;
+    size_t used, cap;
+    /* Daten folgen im selben malloc-Block, 16-aligned. */
+} ArenaChunk;
+typedef struct Arena {
+    struct Arena *prev;
+    ArenaChunk *chunk;
+} Arena;
+static Arena *arena_top = NULL;
+
+void jrt_arena_push(void) {
+    Arena *a = (Arena *)malloc(sizeof(Arena));
+    a->prev = arena_top;
+    a->chunk = NULL;
+    arena_top = a;
+}
+void jrt_arena_pop(void) {
+    if (!arena_top) return;
+    Arena *a = arena_top;
+    ArenaChunk *c = a->chunk;
+    while (c) {
+        ArenaChunk *p = c->prev;
+        free(c);
+        c = p;
+    }
+    arena_top = a->prev;
+    free(a);
+}
+static void *arena_alloc(size_t size) {
+    size = (size + 15u) & ~(size_t)15u;
+    ArenaChunk *c = arena_top->chunk;
+    if (!c || c->used + size > c->cap) {
+        size_t cap = size > (1u << 16) ? size : (1u << 16);
+        /* KEIN eager memset des ganzen Chunks: das erzwingt einen zusätzlichen
+         * Schreib-Pass über 64 KB (Page-Faults), während calloc Nullseiten lazy
+         * gibt. Stattdessen wird jedes Objekt einzeln genullt (unten). */
+        ArenaChunk *nc = (ArenaChunk *)malloc(sizeof(ArenaChunk) + cap);
+        nc->prev = c;
+        nc->used = 0;
+        nc->cap = cap;
+        arena_top->chunk = nc;
+        c = nc;
+    }
+    void *p = (uint8_t *)c + sizeof(ArenaChunk) + c->used;
+    c->used += size;
+    memset(p, 0, size); /* nur das Objekt nullen (Java-Default-Felder), wie calloc */
+    return p;
+}
+#else
+void jrt_arena_push(void) {}
+void jrt_arena_pop(void) {}
+#endif
+
 void *jrt_alloc(int64_t size) {
+#ifndef FASTLLVM_FREESTANDING
+    /* Im Kapsel-Rumpf: Arena-Bump, immortal (RC/Collector rühren es nicht an),
+     * nicht in live_objects (wird von jrt_arena_pop en bloc frei). */
+    if (arena_top) {
+        void *ap = arena_alloc((size_t)size);
+        ((JObjHeader *)ap)->refcount = -1;
+        ((JObjHeader *)ap)->rcflags = 0;
+        return ap;
+    }
+#endif
     void *p = plat_alloc((size_t)size);
     if (!p) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");

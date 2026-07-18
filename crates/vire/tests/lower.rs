@@ -100,12 +100,25 @@ fn feldmutation_erzeugt_putfield() {
 }
 
 #[test]
-fn capsule_stub_senkt_rumpf_transparent_ab() {
-    // M2-Stub: capsule-Rumpf inline; Blockwert kommt raus. (Arena/Deep-Copy folgt.)
+fn capsule_umklammert_rumpf_mit_arena() {
+    // Reine Form: arena_push vor dem Rumpf, arena_pop danach; Skalar-Ergebnis raus.
     let p = lower("fn f(n) {\n capsule(n) {\n mut s = 0\n s = s + n\n s\n }\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
-    assert!(f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(Some(_)))));
+    let calls: Vec<&str> = f.blocks.iter().flat_map(|b| &b.statements).filter_map(|s| {
+        if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }
+    }).collect();
+    assert!(calls.contains(&"jrt_arena_push"), "arena_push fehlt");
+    assert!(calls.contains(&"jrt_arena_pop"), "arena_pop fehlt");
+}
+
+#[test]
+fn capsule_ref_ergebnis_ist_fehler() {
+    // Objekt-Ergebnis würde in die freigegebene Arena zeigen → harter Fehler.
+    let (mut m, _) = parse("type P {\n x: Int\n}\nfn f(n) {\n capsule(n) {\n P(n)\n }\n}\n");
+    let _ = infer_module(&mut m);
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("capsule") && e.contains("Objekt-Ergebnis")));
 }
 
 #[test]

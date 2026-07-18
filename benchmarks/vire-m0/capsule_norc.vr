@@ -1,0 +1,18 @@
+type Node {
+    next: Node
+    v: Int
+}
+fn work(n: Int) -> Int {
+    mut head = null
+    mut i = 0
+    mut s = 0
+    while i < n {
+        head = Node(head, i)
+        s = s + head.v
+        i = i + 1
+    }
+    s
+}
+fn main() {
+    print(work(GRAPHN))
+}

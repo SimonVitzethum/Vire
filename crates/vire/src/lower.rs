@@ -517,16 +517,13 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Block(b) => self.lower_block_val(b),
-            // capsule: bis die Arena-Runtime + Deep-Copy stehen, sind NUR
-            // Skalar-Eingaben und Skalar-Ergebnisse erlaubt — das ist die
-            // beweisbar isolierte Teilmenge (Werte können nicht aliasieren, kein
-            // Objekt kann in die Arena zeigen). Objekt-Eingaben/-Ergebnisse sind
-            // HARTE FEHLER, kein stiller Stub: sonst verspräche `capsule`
-            // Containment für genau den Fall (aliasierte Ref-Eingabe / Objekt
-            // raus), in dem es NICHTS liefert. Die Isolationsgarantie der reinen
-            // Form ist noch nicht implementiert; für Skalar-rein/-raus wird der
-            // Rumpf transparent abgesenkt (beobachtungsgleich, aber noch ohne
-            // Arena/Perf — siehe CAPSULE-BEWERTUNG.md, Meilenstein capsule-Arena).
+            // capsule (reine Form, Skalar-rein/-raus): der Rumpf läuft in einer
+            // eigenen Arena. `jrt_arena_push` vor dem Rumpf routet alle Heap-
+            // Allokationen dorthin (immortal → kein RC/Kollektor), `jrt_arena_pop`
+            // danach gibt die Arena en bloc frei. NUR Skalar-Eingaben/-Ergebnis
+            // erlaubt (harte Fehler sonst): Werte können nicht aliasieren, und kein
+            // Objektzeiger überlebt die Arena → Isolation + Fault-Containment ohne
+            // Deep-Copy. Objekt-rein/-raus (Deep-Copy) bleibt offen.
             Expr::Capsule { inputs, body, .. } => {
                 for (nm, _borrowed) in inputs {
                     if let Some((_, Ty::Ref)) = self.lookup(nm) {
@@ -538,7 +535,17 @@ impl<'a> FnLower<'a> {
                         ));
                     }
                 }
+                // `return` im Rumpf würde arena_pop überspringen (Arena-Leck) →
+                // verbieten. break/continue: die Loop-Ziele werden gespeichert und
+                // während des Rumpfs geleert (innere Schleifen setzen eigene).
+                if body_has_return(body) {
+                    self.errs.push("capsule: `return` im Rumpf nicht erlaubt (würde die Arena lecken) — nutze den Blockwert".into());
+                }
+                self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
+                let saved_loops = std::mem::take(&mut self.loops);
+                let body_locals_start = self.locals.len(); // ab hier: Rumpf-Locals
                 let (val, ty) = self.lower_block_val(body);
+                self.loops = saved_loops;
                 if ty == Ty::Ref {
                     self.errs.push(
                         "capsule: Objekt-Ergebnis noch nicht erlaubt — das braucht Deep-Copy-out \
@@ -546,7 +553,26 @@ impl<'a> FnLower<'a> {
                             .into(),
                     );
                 }
-                (val, ty)
+                // Skalar-Ergebnis zuerst festhalten (Register/Const, überlebt den Pop).
+                let res = self.new_local(if ty == Ty::Void { Ty::I64 } else { ty });
+                if ty != Ty::Void {
+                    self.emit(Statement::Assign(res, Rvalue::Use(val)));
+                }
+                // Alle im Rumpf erzeugten Ref-Locals zeigen in die Arena. Nach dem
+                // Pop ist der Speicher weg; das Backend gibt Ref-Locals aber beim
+                // Funktionsende frei (liest den Header → use-after-free). Deshalb VOR
+                // dem Pop auf null setzen → jrt_release(null) ist ein No-Op.
+                for idx in body_locals_start..self.locals.len() {
+                    if self.locals[idx] == Ty::Ref {
+                        self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
+                    }
+                }
+                self.emit(Statement::Call { dest: None, func: "jrt_arena_pop".into(), args: vec![] });
+                if ty == Ty::Void {
+                    (Operand::ConstI64(0), Ty::Void)
+                } else {
+                    (Operand::Copy(res), ty)
+                }
             }
             Expr::Range { .. } => {
                 self.errs.push("Range nur als for-Iterator (M2)".into());
@@ -734,6 +760,19 @@ fn lower_fn(
         blocks: fl.blocks,
         receiver_nonnull: false,
     })
+}
+
+/// Enthält ein Block (rekursiv über verschachtelte Blöcke/Schleifen/if) ein
+/// `return`-Statement? Für die capsule-Prüfung (return würde arena_pop überspringen).
+fn body_has_return(b: &Block2) -> bool {
+    b.stmts.iter().any(stmt_has_return)
+}
+fn stmt_has_return(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(..) => true,
+        Stmt::While { body, .. } | Stmt::For { body, .. } => body_has_return(body),
+        _ => false,
+    }
 }
 
 /// Typkorrekter Null-/Default-Operand (für unerreichbare typisierte Returns).
