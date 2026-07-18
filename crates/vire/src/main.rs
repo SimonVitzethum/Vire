@@ -71,6 +71,22 @@ fn main() {
     }
 }
 
+/// Python-Include-Pfad + Lib-Name via `python3`/sysconfig (für `native "python"`).
+fn python_config() -> Option<(String, String)> {
+    let out = Command::new("python3")
+        .args(["-c", "import sysconfig;print(sysconfig.get_config_var('INCLUDEPY'));print(sysconfig.get_config_var('LDVERSION'))"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let inc = lines.next()?.trim().to_string();
+    let ver = lines.next()?.trim().to_string();
+    Some((inc, format!("python{ver}")))
+}
+
 /// Lädt eine `vire.syntax`-Datei neben der Quelle (falls vorhanden) → nutzer-
 /// definierte Schlüsselwort-Schreibweisen. Fehlt sie, gilt die Standard-Syntax.
 fn load_syntax(src_path: &str) -> vire::Syntax {
@@ -176,6 +192,20 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // FFI aus der Quelle: `extern "…" link "lib"` + `native "…" … """code"""`.
+    // Link-Libs → clang `-l`; native-Blöcke → automatisch mitkompiliert.
+    let mut native_blocks: Vec<(String, String)> = Vec::new();
+    for it in &module.items {
+        match it {
+            vire::ast::Item::Extern { links, .. } => link_libs.extend(links.iter().cloned()),
+            vire::ast::Item::Native { abi, code, links, .. } => {
+                link_libs.extend(links.iter().cloned());
+                native_blocks.push((abi.clone(), code.clone()));
+            }
+            _ => {}
+        }
+    }
+
     // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen. Erkannte
     // Typkonflikte sind echte Fehler → ablehnen (nicht still auf I64 defaulten).
     let type_conflicts = vire::infer_module(&mut module);
@@ -239,6 +269,38 @@ fn build_or_run(args: &[String]) {
         eprintln!("Schreiben nach {}: {e}", build_dir.display());
         exit(1);
     }
+    // Eingebettete native-Blöcke in Dateien schreiben (Endung nach ABI) und
+    // Kompilier-/Link-Flags für C++/Python automatisch ergänzen.
+    let mut native_paths: Vec<PathBuf> = Vec::new();
+    let mut want_cpp = false;
+    let mut want_python = false;
+    for (i, (abi, code)) in native_blocks.iter().enumerate() {
+        let a = abi.to_ascii_lowercase();
+        let ext = if a == "c++" || a == "cpp" || a == "cxx" { want_cpp = true; "cpp" } else { "c" };
+        if a == "python" || a == "py" {
+            want_python = true;
+        }
+        let p = build_dir.join(format!("native_{i}.{ext}"));
+        if let Err(e) = std::fs::write(&p, code) {
+            eprintln!("native-Block schreiben: {e}");
+            exit(1);
+        }
+        native_paths.push(p);
+    }
+    // Python: Include-Pfad + libpython automatisch (aus python3/sysconfig).
+    let mut py_include: Option<String> = None;
+    if want_python {
+        match python_config() {
+            Some((inc, lib)) => {
+                py_include = Some(inc);
+                link_libs.push(lib);
+            }
+            None => {
+                eprintln!("native \"python\": python3/sysconfig nicht gefunden");
+                exit(1);
+            }
+        }
+    }
     let mut cmd = Command::new("clang");
     if opt0 {
         // Messmodus: keine Optimierung, kein LTO → Allokationen bleiben stehen.
@@ -255,6 +317,16 @@ fn build_or_run(args: &[String]) {
     }
     if force_no_rc {
         cmd.arg("-DFASTLLVM_NO_RC");
+    }
+    // Eingebettete native-Quellen + Include-/Stdlib-Flags.
+    if let Some(inc) = &py_include {
+        cmd.arg(format!("-I{inc}"));
+    }
+    for p in &native_paths {
+        cmd.arg(p);
+    }
+    if want_cpp {
+        link_libs.push("stdc++".into()); // C++-Blöcke brauchen die C++-Stdlib
     }
     // FFI-Linken: Nutzer-Objekte/-Quellen zuerst, dann Bibliotheken. libm immer
     // (Mathe-Intrinsics via extern "C"). clang übersetzt mitgegebene .c/.cpp direkt.

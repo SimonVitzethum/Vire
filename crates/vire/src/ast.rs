@@ -16,7 +16,11 @@ pub enum Item {
     Impl(ImplDef),
     Const { name: String, value: Expr, span: Span },
     Use { path: Vec<String>, span: Span },
-    Extern { abi: String, items: Vec<FnSig>, span: Span },
+    /// `extern "C" [link "lib"]* { fn … }` — Fremdfunktionen + in-Quelle-Link-Libs.
+    Extern { abi: String, items: Vec<FnSig>, links: Vec<String>, span: Span },
+    /// `native "c++" [link "lib"]* """ …raw code… """` — eingebetteter Fremdcode,
+    /// der automatisch mitkompiliert und gelinkt wird (kein Extra-File/Flag).
+    Native { abi: String, code: String, links: Vec<String>, span: Span },
 }
 
 #[derive(Debug, Clone)]

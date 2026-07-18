@@ -33,7 +33,7 @@ pub enum Tok {
 pub enum Kw {
     Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Unsafe, Macro, Comptime,
     Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn, Capsule,
-    And, Or, Not, As, True, False, SelfLower, SelfType,
+    And, Or, Not, As, True, False, SelfLower, SelfType, Native,
 }
 
 /// Kanonische Standard-Schreibweise jedes Schlüsselworts. Einzige Wahrheit —
@@ -47,7 +47,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
         ("comptime", Comptime), ("match", Match), ("if", If), ("elif", Elif),
         ("else", Else), ("while", While), ("for", For), ("in", In),
         ("break", Break), ("continue", Continue), ("return", Return),
-        ("spawn", Spawn), ("capsule", Capsule),
+        ("spawn", Spawn), ("capsule", Capsule), ("native", Native),
         ("and", And), ("or", Or), ("not", Not), ("as", As),
         ("true", True), ("false", False), ("self", SelfLower), ("Self", SelfType),
     ]
@@ -259,6 +259,23 @@ impl<'a> Lexer<'a> {
     }
 
     fn string(&mut self) -> Tok {
+        // Mehrzeiliger Roh-String `"""…"""`: keine Escapes, ideal für eingebetteten
+        // Fremdcode (native-Blöcke) und lange Texte.
+        if self.peek() == b'"' && self.peek2() == b'"' && self.src.get(self.pos + 2) == Some(&b'"') {
+            let open = self.pos;
+            self.pos += 3;
+            let start = self.pos;
+            while self.pos < self.src.len() {
+                if self.peek() == b'"' && self.peek2() == b'"' && self.src.get(self.pos + 2) == Some(&b'"') {
+                    let raw = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string();
+                    self.pos += 3;
+                    return Tok::Str(raw);
+                }
+                self.pos += 1;
+            }
+            self.diags.push(Diag::error("nicht geschlossener \"\"\"-String", Span(open, self.pos)));
+            return Tok::Str(std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string());
+        }
         let start = self.pos;
         self.pos += 1; // "
         let mut s = String::new();

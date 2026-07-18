@@ -1,0 +1,18 @@
+native "python" """
+#include <Python.h>
+extern double pyval(double x) {
+    Py_Initialize();
+    PyObject* m = PyImport_ImportModule("math");
+    PyObject* f = PyObject_GetAttrString(m, "sqrt");
+    PyObject* a = PyFloat_FromDouble(x);
+    PyObject* r = PyObject_CallOneArg(f, a);
+    double d = PyFloat_AsDouble(r);
+    Py_DECREF(a); Py_DECREF(r); Py_DECREF(f); Py_DECREF(m);
+    Py_Finalize();
+    return d;
+}
+"""
+extern "C" {
+    fn pyval(x: F64) -> F64
+}
+print(pyval(625.0))

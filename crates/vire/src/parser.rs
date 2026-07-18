@@ -125,7 +125,7 @@ impl Parser {
             self.peek(),
             Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
-                | Tok::Kw(Kw::Macro)
+                | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
         )
     }
 
@@ -133,6 +133,7 @@ impl Parser {
         let is_pub = self.eat_kw(Kw::Pub);
         match self.peek() {
             Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn(is_pub))),
+            Tok::Kw(Kw::Native) => Some(self.parse_native()),
             Tok::Kw(Kw::Type) => Some(Item::Type(self.parse_type_def())),
             Tok::Kw(Kw::Trait) => Some(Item::Trait(self.parse_trait())),
             Tok::Kw(Kw::Impl) => Some(Item::Impl(self.parse_impl())),
@@ -340,6 +341,40 @@ impl Parser {
         ImplDef { trait_name, for_type, methods, span: sp }
     }
 
+    /// `link "lib"` / `link "a" link "b"` — kontextuelle Link-Direktiven.
+    fn parse_links(&mut self) -> Vec<String> {
+        let mut links = Vec::new();
+        while matches!(self.peek(), Tok::Ident(n) if n == "link") {
+            self.bump();
+            if let Tok::Str(s) = self.peek().clone() {
+                self.bump();
+                links.push(s);
+            } else {
+                self.err("nach `link` wird ein Bibliotheksname erwartet (String)");
+            }
+        }
+        links
+    }
+
+    /// `native "c++" [link "lib"]* """ …code… """` — eingebetteter Fremdcode.
+    fn parse_native(&mut self) -> Item {
+        let sp = self.span();
+        self.expect(&Tok::Kw(Kw::Native), "'native'");
+        let abi = match self.bump() {
+            Tok::Str(s) => s,
+            _ => "c".into(),
+        };
+        let links = self.parse_links();
+        let code = match self.bump() {
+            Tok::Str(s) => s,
+            _ => {
+                self.err("native: erwarte den Code als \"\"\"…\"\"\"-String");
+                String::new()
+            }
+        };
+        Item::Native { abi, code, links, span: sp }
+    }
+
     fn parse_extern(&mut self) -> Item {
         let sp = self.span();
         self.expect(&Tok::Kw(Kw::Extern), "'extern'");
@@ -347,6 +382,7 @@ impl Parser {
             Tok::Str(s) => s,
             _ => "C".into(),
         };
+        let links = self.parse_links();
         let mut items = Vec::new();
         self.expect(&Tok::LBrace, "'{'");
         self.stmt_end();
@@ -355,7 +391,7 @@ impl Parser {
             self.stmt_end();
         }
         self.expect(&Tok::RBrace, "'}'");
-        Item::Extern { abi, items, span: sp }
+        Item::Extern { abi, items, links, span: sp }
     }
 
     fn parse_type(&mut self) -> Type {

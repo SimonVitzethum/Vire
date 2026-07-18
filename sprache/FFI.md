@@ -47,6 +47,41 @@ clang -c -O2 -I$(python3 -c 'import sysconfig;print(sysconfig.get_config_var("IN
 vire build --obj py_shim.o -l python3.14 -o bin py_call.vr
 ```
 
+## Selbstständig: `link` in der Quelle + eingebettete `native`-Blöcke
+Damit eine `.vr`-Datei **ohne CLI-Flags und ohne Extra-Dateien** läuft:
+
+**Link-Libs in der Quelle** — `link "lib"` direkt im `extern`-Block:
+```vire
+extern "C" link "m" {
+    fn cbrt(x: F64) -> F64
+}
+print(cbrt(27.0))            // 3.0 — `vire run` genügt, kein -l nötig
+```
+
+**Eingebetteter Fremdcode** — `native "abi" [link "lib"]* """ …code… """`. Der Block
+wird automatisch mitkompiliert und gelinkt (Endung nach ABI). Kein separates File:
+```vire
+native "c++" """
+#include <vector>
+#include <algorithm>
+extern "C" long median_sq(long n) { /* …STL… */ }
+"""
+extern "C" { fn median_sq(n: Int) -> Int }
+print(median_sq(101))        // 2500 — C++-Stdlib automatisch gelinkt
+```
+
+**Python komplett automatisch** — `native "python"` zieht Include-Pfad + `libpython`
+selbst (aus `python3`/sysconfig):
+```vire
+native "python" """
+#include <Python.h>
+extern double pyval(double x) { /* math.sqrt(x) via CPython-C-API */ }
+"""
+extern "C" { fn pyval(x: F64) -> F64 }
+print(pyval(625.0))          // 25.0 — kein -I, kein -lpython, kein Extra-File
+```
+`"""…"""` ist ein mehrzeiliger Roh-String (keine Escapes) — ideal für Fremdcode.
+
 ## Typ-Abbildung (skalar, sauber)
 `Int`→`int64_t`, `I32`→`int`, `F64`→`double`, `F32`→`float`, `Bool`→`int`.
 Zeiger-/String-Interop (Vire-`Str` ist ein Objekt mit Header, kein `char*`) braucht

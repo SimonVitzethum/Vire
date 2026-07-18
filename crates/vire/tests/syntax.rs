@@ -51,3 +51,26 @@ fn top_level_and_explicit_main_conflict() {
     let (_, diags) = parse_with_syntax("print(1)\nfn main() { print(2) }\n", Syntax::default());
     assert!(!diags.is_empty(), "beides zugleich muss ein Fehler sein");
 }
+
+#[test]
+fn triple_quoted_raw_string() {
+    // """…""" ist ein mehrzeiliger Roh-String: Backslash + inneres " wörtlich.
+    let src = "\"\"\"a\\n b\"\"\"".to_string(); // Quelle: """a\n b"""
+    let (toks, diags) = vire::lexer::lex(&src);
+    assert!(diags.is_empty(), "{diags:?}");
+    let got = toks.iter().find_map(|t| match &t.tok {
+        vire::lexer::Tok::Str(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(got.as_deref(), Some("a\\n b")); // Backslash-n NICHT interpretiert
+}
+
+#[test]
+fn native_and_link_parse() {
+    let src = "native \"c++\" link \"stdc++\" \"\"\"\nextern \"C\" int f(){return 1;}\n\"\"\"\nextern \"C\" link \"m\" {\n fn f() -> I32\n}\n";
+    let (m, diags) = parse_with_syntax(src, Syntax::default());
+    assert!(diags.is_empty(), "{diags:?}");
+    let has_native = m.items.iter().any(|it| matches!(it, vire::ast::Item::Native { .. }));
+    let has_extern_link = m.items.iter().any(|it| matches!(it, vire::ast::Item::Extern { links, .. } if !links.is_empty()));
+    assert!(has_native && has_extern_link);
+}
