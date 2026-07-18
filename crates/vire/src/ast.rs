@@ -28,6 +28,12 @@ pub enum Item {
     /// Argument-Teilbäume ersetzt, makro-lokale Bindungen gensym-umbenannt
     /// (Hygiene). Siehe `expand.rs`.
     Macro { name: String, params: Vec<String>, body: Expr, span: Span },
+    /// `cxx [link "lib"]* """preamble""" { fn sig = "c++ body" … }` — C++-Bridge-
+    /// Generator: für jede `fn` wird ein `extern "C"`-Trampolin generiert (mit
+    /// C++-Rumpf), der über den `native "c++"`-Pfad kompiliert/gelinkt wird; die
+    /// Signaturen werden als Vire-`extern` registriert. Erspart die
+    /// handgeschriebene Fassade. Siehe sprache/CPP-INTEROP.md.
+    Cxx { links: Vec<String>, preamble: String, fns: Vec<(FnSig, String)>, span: Span },
 }
 
 #[derive(Debug, Clone)]

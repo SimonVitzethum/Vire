@@ -1391,9 +1391,9 @@ void jrt_throw(void *e) {
  * Type-Descriptor. Von catch-all (catch Exception / RuntimeException)
  * gefangen; ihre Meldung überlebt bis zur Uncaught-Ausgabe. */
 void *jrt_sentinel_vtable[3] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, NULL};
-static JObjHeader arith_exc_obj = {-1, 0, jrt_sentinel_vtable};
-static JObjHeader npe_exc_obj = {-1, 0, jrt_sentinel_vtable};
-static JObjHeader bounds_exc_obj = {-1, 0, jrt_sentinel_vtable};
+static JObjHeader arith_exc_obj = {-1, jrt_sentinel_vtable};
+static JObjHeader npe_exc_obj = {-1, jrt_sentinel_vtable};
+static JObjHeader bounds_exc_obj = {-1, jrt_sentinel_vtable};
 
 /* Von den Runtime-Checks aufgerufen: schwebende Laufzeit-Exception setzen. */
 static void throw_runtime(void *sentinel, const char *msg) {

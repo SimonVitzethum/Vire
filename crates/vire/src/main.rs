@@ -223,9 +223,29 @@ fn build_or_run(args: &[String]) {
         }
     }
 
+    // C++-Bridge-Generator: `cxx { fn sig = "c++ body" }` → generiere ein
+    // `extern "C"`-Trampolin je fn (kompiliert über den native "c++"-Pfad) und
+    // ersetze das Item durch ein `extern`-Item, damit infer/lower die Signaturen
+    // sehen. Erspart die handgeschriebene Fassade.
+    let mut cxx_native: Vec<(String, String)> = Vec::new();
+    for it in &mut module.items {
+        if let vire::ast::Item::Cxx { links, preamble, fns, span } = it {
+            let mut src = String::from("// generiert von `cxx {}` (Bridge-Generator)\n");
+            src.push_str(preamble);
+            src.push('\n');
+            for (sig, body) in fns.iter() {
+                src.push_str(&gen_cxx_trampoline(sig, body));
+            }
+            cxx_native.push(("c++".into(), src));
+            link_libs.extend(links.iter().cloned());
+            let sigs: Vec<vire::ast::FnSig> = fns.iter().map(|(s, _)| s.clone()).collect();
+            *it = vire::ast::Item::Extern { abi: "C".into(), items: sigs, links: links.clone(), header: None, span: *span };
+        }
+    }
+
     // FFI aus der Quelle: `extern "…" link "lib"` + `native "…" … """code"""`.
     // Link-Libs → clang `-l`; native-Blöcke → automatisch mitkompiliert.
-    let mut native_blocks: Vec<(String, String)> = Vec::new();
+    let mut native_blocks: Vec<(String, String)> = cxx_native;
     // Nutzt das Programm die eingebaute Python-Brücke (`vire_py_*`)? Dann wird
     // pybridge.c automatisch mitkompiliert + libpython gelinkt — KEIN Nutzer-C.
     let mut want_py_bridge = false;
@@ -605,4 +625,46 @@ fn map_c_ty(s: &str, is_ret: bool) -> Result<&'static str, ()> {
         // Unbekannter Nicht-Zeiger-Typ (z.B. struct by value) → nicht abbildbar.
         _ => return Err(()),
     })
+}
+
+/// C++-Bridge: Vire-Typname → C-ABI-C++-Typ (für die Trampolin-Signatur).
+/// Skalar + `Ptr` (opaker Objekt-Handle) direkt; Str/ref → `void*` (Roh-Handle).
+fn map_cxx_ty(n: &str) -> &'static str {
+    match n {
+        "Int" | "I64" | "U64" => "long",
+        "I32" | "U32" => "int",
+        "Float" | "F64" => "double",
+        "F32" => "float",
+        "Bool" => "int",
+        _ => "void*", // Ptr / Str / ref → opaker Zeiger
+    }
+}
+
+/// Generiert das `extern "C"`-Trampolin für eine `cxx`-fn. Der Rumpf ist C++:
+/// enthält er `;`/`return`, wird er als Anweisungsblock übernommen; sonst als
+/// Ausdruck gewickelt (`return (expr);` bzw. `expr;` bei Unit).
+fn gen_cxx_trampoline(sig: &vire::ast::FnSig, body: &str) -> String {
+    let ret_name = sig.ret.as_ref().map(|t| t.name.as_str());
+    let cret = match ret_name {
+        None | Some("Unit") => "void",
+        Some(n) => map_cxx_ty(n),
+    };
+    let params: Vec<String> = sig
+        .params
+        .iter()
+        .map(|p| {
+            let cty = p.ty.as_ref().map(|t| map_cxx_ty(&t.name)).unwrap_or("long");
+            format!("{cty} {}", p.name)
+        })
+        .collect();
+    let b = body.trim();
+    let is_void = matches!(ret_name, None | Some("Unit"));
+    let wrapped = if b.contains("return") || b.contains(';') {
+        b.to_string()
+    } else if is_void {
+        format!("{b};")
+    } else {
+        format!("return ({b});")
+    };
+    format!("extern \"C\" {cret} {}({}) {{ {wrapped} }}\n", sig.name, params.join(", "))
 }

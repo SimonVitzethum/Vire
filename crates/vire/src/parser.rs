@@ -126,7 +126,7 @@ impl Parser {
             Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
-        )
+        ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
     }
 
     fn parse_item(&mut self) -> Option<Item> {
@@ -163,6 +163,7 @@ impl Parser {
                 Some(Item::Use { path, span: sp })
             }
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
+            Tok::Ident(n) if n == "cxx" => Some(self.parse_cxx()),
             Tok::Kw(Kw::Macro) => {
                 // `macro name(p, …) = <expr>` — Ausdrucks-Makro.
                 let sp = self.span();
@@ -392,6 +393,38 @@ impl Parser {
             }
         };
         Item::Native { abi, code, links, span: sp }
+    }
+
+    /// `cxx [link "lib"]* """preamble""" { fn sig = "c++ body" … }`
+    fn parse_cxx(&mut self) -> Item {
+        let sp = self.span();
+        self.bump(); // `cxx`
+        let links = self.parse_links();
+        // Optionale Präambel als Triple-String (Includes/Usings).
+        let preamble = if let Tok::Str(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            String::new()
+        };
+        self.expect(&Tok::LBrace, "'{'");
+        self.stmt_end();
+        let mut fns = Vec::new();
+        while self.at_kw(Kw::Fn) {
+            let sig = self.parse_fn_sig();
+            self.expect(&Tok::Eq, "'=' (C++-Rumpf des Trampolins)");
+            let body = match self.bump() {
+                Tok::Str(s) => s,
+                _ => {
+                    self.err("cxx: nach `=` wird der C++-Rumpf als String erwartet");
+                    String::new()
+                }
+            };
+            fns.push((sig, body));
+            self.stmt_end();
+        }
+        self.expect(&Tok::RBrace, "'}'");
+        Item::Cxx { links, preamble, fns, span: sp }
     }
 
     fn parse_extern(&mut self) -> Item {
