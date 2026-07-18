@@ -85,3 +85,31 @@ Der **Header-Pack (24→16 B)** ist der klare, universelle RAM-Hebel (−28 %
 Objektspeicher, trifft die malloc-Größenklasse, hilft seL4). Encoding ist
 ausgearbeitet und sound; Umsetzung als bewusster fokussierter Schritt mit der
 Heap-Bilanz-Suite als Oracle.
+
+## GEBAUT + GEMESSEN: Header-Pack (24→16 B) + der Weg zu Rust-Niveau
+Der Header-Pack ist umgesetzt (Encoding A, s. Commit). Gemessene Wirkung:
+
+| Workload | vorher | nachher | Rust |
+|---|---|---|---|
+| pagerank OBJEKTE (262144 Nodes) | 24,4 MB | **19,9 MB (−18%)** | — |
+| **pagerank ARRAYS** (`array(n)`, flache Daten) | — | **7,76 MB** | **8,0 MB** |
+
+**Kernbefund — RAM auf Rust-Niveau ist ERREICHT, sobald die Datenstruktur flach ist:**
+Vires array-basiertes pagerank (7,76 MB) **unterbietet Rust (8,0 MB)** — Arrays haben
+KEINEN per-Objekt-Header (nur einen Array-Header einmal), exakt wie Rusts flache
+`Vec`s. Der 3×-Gap war die **Datenstruktur-Wahl** (Pointer-verlinkte Node-Objekte vs
+flache Index-Arrays), NICHT der Compiler. Rusts pagerank nutzt selbst flache vecs;
+schreibt man Vire-pagerank ebenso (`array(n)` + Indizes), ist es Rust-Parität.
+
+**Objekt-basierter Rest-Gap (19,9 MB vs 8 MB):** inhärent, weil RC einen Header
+braucht. Node = 16 B Header + 24 B Daten = 40 B (vs Rust 24 B flach). Dazu der
+**glibc-malloc-Chunk-Overhead** (~8–16 B Metadaten je Allokation VOR dem Zeiger,
+trotz `usable_size`=40): 262144 × ~48 B real. Der nächste Hebel dafür ist ein
+**Slab-/Pool-Allokator** (feste Größenklassen, kein per-Chunk-glibc-Header, dichte
+Packung) — die Auto-Arena macht das schon für transiente Loops; für persistente
+Graphen wäre ein Slab-Allokator die Ergänzung. Schätzung: ~19,9 → ~13 MB.
+
+**Fazit:** (1) flache Daten → **Rust-Parität heute** (gebaut/gemessen). (2) Objekt-
+Graphen → Header-Pack −18% (gebaut), Slab-Allokator als nächster Hebel (~−35%).
+Rust-Niveau bei Objekt-Graphen ist nur teilweise erreichbar (RC-Header ist der Preis
+der automatischen Speichersicherheit auf zyklischen Graphen).
