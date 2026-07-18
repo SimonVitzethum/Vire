@@ -1920,6 +1920,16 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
+        // DEVIRT: wird ein KONKRET-typisiertes Objekt an einen Trait-Parameter
+        // übergeben (`run(a, …)` mit `a: AddOp`, Param `o: Op`), die Funktion inline
+        // expandieren → im Rumpf ist `o` konkret → `o.apply()` wird ein STATISCHER
+        // Aufruf (kein Vtable/Typ-Check). Das ist g++s Devirtualisierungs-Gewinn,
+        // im Closed-World-Solver sauber gemacht. Nur bei kleinem Rumpf (Bloat).
+        if let Some(fdef) = self.fn_defs.get(&name).cloned() {
+            if fdef.body.is_some() && self.devirt_inline_ok(&fdef, args) {
+                return self.inline_higher_order(&name, &fdef, args);
+            }
+        }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
         // Dimensionierte typisierte Arrays: `array(n)` (Int), `farray(n)` (Float) —
         // echte bounds-gecheckte/-elidierbare Arrays (im Gegensatz zur i64-Liste).
@@ -2035,6 +2045,28 @@ impl<'a> FnLower<'a> {
     /// Rumpf von `apply` an der Aufrufstelle, `f` als local_lambda gebunden,
     /// Wert-Parameter als Locals. Voll spezialisiert (direkter Code, LLVM kann
     /// weiter inlinen); Captures des Lambdas bleiben über den Scope-Stack sichtbar.
+    /// Lohnt sich eine Devirt-Inline-Expansion? Ja, wenn ein KONKRET-typisiertes
+    /// Objekt an einen Trait-Parameter geht (dann wird der Methodenaufruf im Rumpf
+    /// statisch) UND der Rumpf klein genug ist (Code-Bloat-Schranke).
+    fn devirt_inline_ok(&self, fdef: &FnDef, args: &[Expr]) -> bool {
+        let has_devirt = fdef.sig.params.iter().zip(args).any(|(p, a)| {
+            let is_trait_param = p.ty.as_ref().map(|t| self.trait_methods.contains_key(&t.name)).unwrap_or(false);
+            if !is_trait_param {
+                return false;
+            }
+            if let Expr::Ident(n, _) = a {
+                if let Some((l, _)) = self.lookup(n) {
+                    if let Some(c) = self.local_class.get(&l.0) {
+                        // konkrete Klasse (kein Trait) → Aufruf wird statisch.
+                        return !self.trait_methods.contains_key(c);
+                    }
+                }
+            }
+            false
+        });
+        has_devirt && fdef.body.as_ref().map(|b| b.stmts.len() <= 24).unwrap_or(false)
+    }
+
     fn inline_higher_order(&mut self, name: &str, fdef: &FnDef, args: &[Expr]) -> (Operand, Ty) {
         let body = fdef.body.as_ref().unwrap();
         if self.inlining.iter().any(|n| n == name) {
