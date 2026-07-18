@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use fastllvm_ir::{BasicBlock, BinOp as IB, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
+use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
 
 use crate::ast::*;
 
@@ -242,6 +242,8 @@ struct FnLower<'a> {
     variants: &'a HashMap<String, VariantInfo>,
     /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
     local_class: HashMap<u32, String>,
+    /// Elementart eines Array/List-Locals (für Index/len/for-über-Liste).
+    local_arr: HashMap<u32, ArrKind>,
     /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
     strings: &'a mut Vec<String>,
     errs: Vec<String>,
@@ -289,6 +291,33 @@ impl<'a> FnLower<'a> {
             _ => None,
         }
     }
+    /// Array-Elementart eines Operanden, falls er ein Array/List-Local ist.
+    fn arr_of_operand(&self, op: &Operand) -> Option<ArrKind> {
+        match op {
+            Operand::Copy(l) => self.local_arr.get(&l.0).copied(),
+            _ => None,
+        }
+    }
+    /// Operand auf i32 bringen (Array-Index/Länge sind Java-`int`).
+    fn to_i32(&mut self, op: Operand) -> Operand {
+        match op {
+            Operand::ConstI64(v) => Operand::ConstI32(v as i32),
+            Operand::ConstI32(_) => op,
+            other => {
+                let d = self.new_local(Ty::I32);
+                self.emit(Statement::Assign(d, Rvalue::Convert(other)));
+                Operand::Copy(d)
+            }
+        }
+    }
+    /// ArrayLen (i32) → i64-Operand für Vire (Ints sind i64).
+    fn array_len_i64(&mut self, arr: Operand) -> Operand {
+        let li32 = self.new_local(Ty::I32);
+        self.emit(Statement::ArrayLen { dest: li32, arr });
+        let l64 = self.new_local(Ty::I64);
+        self.emit(Statement::Assign(l64, Rvalue::Convert(Operand::Copy(li32))));
+        Operand::Copy(l64)
+    }
 
     fn lower_block(&mut self, b: &Block2) {
         let _ = self.lower_block_val(b); // Void-Kontext: Tail-Wert verworfen
@@ -335,9 +364,12 @@ impl<'a> FnLower<'a> {
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
                 let l = self.new_local(ty);
-                // Objekt-Klasse an den neuen Local weiterreichen (für p.x).
+                // Objekt-Klasse bzw. Array-Elementart an den neuen Local weiterreichen.
                 if let Some(c) = self.class_of_operand(&op) {
                     self.local_class.insert(l.0, c);
+                }
+                if let Some(k) = self.arr_of_operand(&op) {
+                    self.local_arr.insert(l.0, k);
                 }
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
@@ -452,25 +484,64 @@ impl<'a> FnLower<'a> {
                 self.cur = exit.0 as usize;
             }
             Stmt::For { pat, iter, body, .. } => {
-                // Nur `for i in a..b` (Range) in M2.
                 let name = match pat {
                     Pattern::Bind(n, _) => n.clone(),
                     Pattern::Wildcard(_) => "_".into(),
                     _ => {
-                        self.errs.push("for-Muster M2: nur `for i in a..b`".into());
+                        self.errs.push("for-Muster: nur `for x in …`".into());
                         return;
                     }
                 };
+                // `for x in liste` (nicht-Range) → über Array iterieren:
+                // i=0; while i<len { x = arr[i]; body; i++ }.
+                if !matches!(iter, Expr::Range { .. }) {
+                    let (arr, _) = self.lower_expr(iter);
+                    let kind = match self.arr_of_operand(&arr) {
+                        Some(k) => k,
+                        None => {
+                            self.errs.push("for-Iterator: Range `a..b` oder eine Liste".into());
+                            return;
+                        }
+                    };
+                    let vty = kind.value_ty();
+                    let len = self.array_len_i64(arr.clone());
+                    let ivar = self.new_local(Ty::I64);
+                    self.emit(Statement::Assign(ivar, Rvalue::Use(Operand::ConstI64(0))));
+                    let header = self.new_block();
+                    let cur = self.cur;
+                    self.term(cur, Terminator::Goto(header));
+                    self.cur = header.0 as usize;
+                    let cond = self.new_local(Ty::I32);
+                    self.emit(Statement::Assign(cond, Rvalue::Binary(IB::CmpLt, Operand::Copy(ivar), len)));
+                    let bodyb = self.new_block();
+                    let latch = self.new_block();
+                    let exit = self.new_block();
+                    self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(cond), then_blk: bodyb, else_blk: exit });
+                    self.cur = bodyb.0 as usize;
+                    let elem = self.new_local(vty);
+                    let idx32 = self.to_i32(Operand::Copy(ivar));
+                    self.emit(Statement::ArrayLoad { dest: elem, arr, index: idx32, kind, checked: true });
+                    self.scopes.push(HashMap::new());
+                    self.bind(&name, elem, vty);
+                    self.loops.push((latch, exit));
+                    self.lower_block(body);
+                    self.loops.pop();
+                    self.scopes.pop();
+                    let end = self.cur;
+                    self.term(end, Terminator::Goto(latch));
+                    self.cur = latch.0 as usize;
+                    self.emit(Statement::Assign(ivar, Rvalue::Binary(IB::Add, Operand::Copy(ivar), Operand::ConstI64(1))));
+                    self.term(latch.0 as usize, Terminator::Goto(header));
+                    self.cur = exit.0 as usize;
+                    return;
+                }
                 let (start, end_op, incl) = match iter {
                     Expr::Range { start, end, inclusive, .. } => {
                         let (s, _) = self.lower_expr(start);
                         let (e, _) = self.lower_expr(end);
                         (s, e, *inclusive)
                     }
-                    _ => {
-                        self.errs.push("for-Iterator M2: nur Range `a..b`".into());
-                        return;
-                    }
+                    _ => unreachable!(),
                 };
                 let ivar = self.new_local(Ty::I64);
                 self.emit(Statement::Assign(ivar, Rvalue::Use(to_i64(start))));
@@ -591,6 +662,41 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
+            // List-Literal `[a, b, c]` → NewArray + ArrayStore. Elementart aus dem
+            // ersten Element (homogen). Leere Liste → Long (Default).
+            Expr::List(elems, _) => {
+                let lowered: Vec<(Operand, Ty)> = elems.iter().map(|e| self.lower_expr(e)).collect();
+                let kind = lowered.first().map(|(_, t)| arrkind_of(*t)).unwrap_or(ArrKind::Long);
+                let arr = self.new_local(Ty::Ref);
+                self.local_arr.insert(arr.0, kind);
+                self.emit(Statement::NewArray { dest: arr, kind, len: Operand::ConstI32(elems.len() as i32) });
+                for (i, (mut v, t)) in lowered.into_iter().enumerate() {
+                    if kind == ArrKind::Long {
+                        v = to_i64(v);
+                    }
+                    let _ = t;
+                    self.emit(Statement::ArrayStore { arr: Operand::Copy(arr), index: Operand::ConstI32(i as i32), value: v, kind, checked: false });
+                }
+                (Operand::Copy(arr), Ty::Ref)
+            }
+            Expr::Comprehension { elem, var, iter, cond, .. } => self.lower_comprehension(elem, var, iter, cond.as_deref()),
+            // Indexierung `xs[i]` → ArrayLoad (bounds-gecheckt).
+            Expr::Index { base, index, .. } => {
+                let (arr, _) = self.lower_expr(base);
+                let kind = match self.arr_of_operand(&arr) {
+                    Some(k) => k,
+                    None => {
+                        self.errs.push("Index `[]`: kein bekanntes Array (annotieren)".into());
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
+                };
+                let (idx, _) = self.lower_expr(index);
+                let idx32 = self.to_i32(idx);
+                let vty = kind.value_ty();
+                let d = self.new_local(vty);
+                self.emit(Statement::ArrayLoad { dest: d, arr, index: idx32, kind, checked: true });
+                (Operand::Copy(d), vty)
+            }
             Expr::Block(b) => self.lower_block_val(b),
             // capsule (reine Form, Skalar-rein/-raus): der Rumpf läuft in einer
             // eigenen Arena. `jrt_arena_push` vor dem Rumpf routet alle Heap-
@@ -665,6 +771,11 @@ impl<'a> FnLower<'a> {
         // (monomorph, kein virtueller Dispatch — Vire-Typen sind (noch) flach).
         if let Expr::Field { base, name, .. } = callee {
             let (obj, _) = self.lower_expr(base);
+            // `xs.len()` auf einem Array → ArrayLen.
+            if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
+                let l = self.array_len_i64(obj);
+                return (l, Ty::I64);
+            }
             let class = match self.class_of_operand(&obj) {
                 Some(c) => c,
                 None => {
@@ -758,6 +869,96 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: name, args: arg_ops });
             (Operand::Copy(d), ret)
         }
+    }
+
+    /// List-Comprehension `[elem for var in src (if cond)]` → Zwei-Pass:
+    /// zählen (mit Filter) → Ergebnis-Array allozieren → füllen.
+    fn lower_comprehension(&mut self, elem: &Expr, var: &str, iter: &Expr, cond: Option<&Expr>) -> (Operand, Ty) {
+        let (src, _) = self.lower_expr(iter);
+        let src_kind = match self.arr_of_operand(&src) {
+            Some(k) => k,
+            None => {
+                self.errs.push("Comprehension: Quelle ist keine Liste".into());
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        let src_vty = src_kind.value_ty();
+        // Elementart des Ergebnisses: elem in einem toten Block proben.
+        let elem_kind = {
+            let saved = self.cur;
+            let dead = self.new_block();
+            self.cur = dead.0 as usize;
+            self.scopes.push(HashMap::new());
+            let pv = self.new_local(src_vty);
+            self.bind(var, pv, src_vty);
+            let (_, ety) = self.lower_expr(elem);
+            self.scopes.pop();
+            self.cur = saved;
+            arrkind_of(ety)
+        };
+        // Pass 1: zählen.
+        let count = self.new_local(Ty::I64);
+        self.emit(Statement::Assign(count, Rvalue::Use(Operand::ConstI64(0))));
+        self.comp_loop(src.clone(), src_kind, var, src_vty, cond, &mut |s, _elem_local| {
+            s.emit(Statement::Assign(count, Rvalue::Binary(IB::Add, Operand::Copy(count), Operand::ConstI64(1))));
+        });
+        // Ergebnis-Array allozieren.
+        let count32 = self.to_i32(Operand::Copy(count));
+        let res = self.new_local(Ty::Ref);
+        self.local_arr.insert(res.0, elem_kind);
+        self.emit(Statement::NewArray { dest: res, kind: elem_kind, len: count32 });
+        // Pass 2: füllen (elem auswerten, an Position j schreiben).
+        let j = self.new_local(Ty::I64);
+        self.emit(Statement::Assign(j, Rvalue::Use(Operand::ConstI64(0))));
+        let elem_c = elem.clone();
+        self.comp_loop(src, src_kind, var, src_vty, cond, &mut |s, _elem_local| {
+            let (mut v, _) = s.lower_expr(&elem_c);
+            if elem_kind == ArrKind::Long {
+                v = to_i64(v);
+            }
+            let j32 = s.to_i32(Operand::Copy(j));
+            s.emit(Statement::ArrayStore { arr: Operand::Copy(res), index: j32, value: v, kind: elem_kind, checked: true });
+            s.emit(Statement::Assign(j, Rvalue::Binary(IB::Add, Operand::Copy(j), Operand::ConstI64(1))));
+        });
+        (Operand::Copy(res), Ty::Ref)
+    }
+
+    /// Emittiert `for var in src { if cond { body } }` — Schleifengerüst für
+    /// Comprehensions. `body` wird im Rumpf (nach optionalem cond-Filter) gerufen.
+    fn comp_loop(&mut self, src: Operand, kind: ArrKind, var: &str, vty: Ty, cond: Option<&Expr>, body: &mut dyn FnMut(&mut Self, Local)) {
+        let len = self.array_len_i64(src.clone());
+        let ivar = self.new_local(Ty::I64);
+        self.emit(Statement::Assign(ivar, Rvalue::Use(Operand::ConstI64(0))));
+        let header = self.new_block();
+        let cur = self.cur;
+        self.term(cur, Terminator::Goto(header));
+        self.cur = header.0 as usize;
+        let c = self.new_local(Ty::I32);
+        self.emit(Statement::Assign(c, Rvalue::Binary(IB::CmpLt, Operand::Copy(ivar), len)));
+        let bodyb = self.new_block();
+        let latch = self.new_block();
+        let exit = self.new_block();
+        self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(c), then_blk: bodyb, else_blk: exit });
+        self.cur = bodyb.0 as usize;
+        let elem = self.new_local(vty);
+        let idx32 = self.to_i32(Operand::Copy(ivar));
+        self.emit(Statement::ArrayLoad { dest: elem, arr: src, index: idx32, kind, checked: true });
+        self.scopes.push(HashMap::new());
+        self.bind(var, elem, vty);
+        // optionaler Filter
+        if let Some(cnd) = cond {
+            let (cv, _) = self.lower_expr(cnd);
+            let keep = self.new_block();
+            self.term(self.cur, Terminator::Branch { cond: cv, then_blk: keep, else_blk: latch });
+            self.cur = keep.0 as usize;
+        }
+        body(self, elem);
+        self.scopes.pop();
+        self.term(self.cur, Terminator::Goto(latch));
+        self.cur = latch.0 as usize;
+        self.emit(Statement::Assign(ivar, Rvalue::Binary(IB::Add, Operand::Copy(ivar), Operand::ConstI64(1))));
+        self.term(latch.0 as usize, Terminator::Goto(header));
+        self.cur = exit.0 as usize;
     }
 
     /// Getaggte Variante bauen: `New Sum`, `__tag = t`, Felder aus den Argumenten.
@@ -944,6 +1145,7 @@ fn lower_fn(
         types,
         variants,
         local_class: HashMap::new(),
+        local_arr: HashMap::new(),
         strings,
         errs: Vec::new(),
         loops: Vec::new(),
@@ -1013,6 +1215,17 @@ fn stmt_has_return(s: &Stmt) -> bool {
         Stmt::Return(..) => true,
         Stmt::While { body, .. } | Stmt::For { body, .. } => body_has_return(body),
         _ => false,
+    }
+}
+
+/// IR-Wertetyp → Array-Elementart.
+fn arrkind_of(t: Ty) -> ArrKind {
+    match t {
+        Ty::F64 => ArrKind::Double,
+        Ty::F32 => ArrKind::Float,
+        Ty::I32 => ArrKind::Int,
+        Ty::Ref => ArrKind::Ref,
+        _ => ArrKind::Long,
     }
 }
 

@@ -145,6 +145,8 @@ pub enum Expr {
     Block(Block),
     Lambda { params: Vec<String>, body: Box<Expr>, span: Span },
     List(Vec<Expr>, Span),
+    /// `[elem for var in iter (if cond)?]` — List-Comprehension.
+    Comprehension { elem: Box<Expr>, var: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
     /// `expr?` — Fehler-Propagation.
     Try { inner: Box<Expr>, span: Span },
     /// `expr as Type`

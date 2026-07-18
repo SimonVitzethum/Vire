@@ -249,7 +249,10 @@ impl<'a> Ctx<'a> {
                 self.infer_block(body, false);
             }
             Stmt::For { pat, iter, body, .. } => {
-                // `for i in a..b`: i:I64, Range-Enden I64.
+                // `for i in a..b`: i:I64, Range-Enden I64. `for x in liste`: das
+                // Element-Typ ist der Inferenz (ohne Array-Typ) unbekannt → frische
+                // Variable, damit die Nutzung sie constraint (kein I64-Zwang).
+                let is_range = matches!(iter, Expr::Range { .. });
                 if let Expr::Range { start, end, .. } = iter {
                     let s = self.infer_expr(start);
                     let e = self.infer_expr(end);
@@ -260,7 +263,8 @@ impl<'a> Ctx<'a> {
                 }
                 self.scopes.push(HashMap::new());
                 if let Pattern::Bind(n, _) = pat {
-                    self.bind(n, T::I64);
+                    let t = if is_range { T::I64 } else { self.u.fresh() };
+                    self.bind(n, t);
                 }
                 self.infer_block(body, false);
                 self.scopes.pop();
@@ -324,6 +328,20 @@ impl<'a> Ctx<'a> {
                 t
             }
             Expr::Block(b) => self.infer_block(b, false),
+            // Comprehension: Variable frisch binden (Element-Typ der Inferenz ohne
+            // Array-Typ unbekannt), elem/cond inferieren. Ergebnis = frisch (Array).
+            Expr::Comprehension { var, iter, elem, cond, .. } => {
+                self.infer_expr(iter);
+                self.scopes.push(std::collections::HashMap::new());
+                let v = self.u.fresh();
+                self.bind(var, v);
+                if let Some(c) = cond {
+                    self.infer_expr(c);
+                }
+                self.infer_expr(elem);
+                self.scopes.pop();
+                self.u.fresh()
+            }
             _ => self.u.fresh(),
         }
     }

@@ -197,3 +197,13 @@ fn summentyp_und_match() {
     });
     assert!(reads_tag, "match muss __tag lesen");
 }
+
+#[test]
+fn listen_und_comprehensions() {
+    // List-Literal → NewArray+ArrayStore; Comprehension mit Filter → NewArray + Loop.
+    let p = lower("fn main() {\n mut xs = [1, 2, 3]\n mut ys = [x * x for x in xs if x > 1]\n print(ys.len())\n}\n");
+    let stmts: Vec<_> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).collect();
+    assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::NewArray { .. })), "List/Comprehension braucht NewArray");
+    assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::ArrayLoad { .. })), "Comprehension iteriert (ArrayLoad)");
+    assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::ArrayLen { .. })), ".len()/Iteration braucht ArrayLen");
+}

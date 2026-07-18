@@ -718,21 +718,33 @@ impl Parser {
                 // Listen-Literal
                 self.bump();
                 self.skip_nl();
-                let mut items = Vec::new();
-                while !self.at(&Tok::RBracket) && !matches!(self.peek(), Tok::Eof) {
-                    items.push(self.parse_expr(0));
-                    // Comprehension `[e for …]` – für M1 nicht unterstützt
-                    if self.at_kw(Kw::For) {
-                        self.err("List-Comprehension noch nicht unterstützt (M1)");
-                        while !self.at(&Tok::RBracket) && !matches!(self.peek(), Tok::Eof) {
-                            self.bump();
-                        }
-                        break;
-                    }
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
+                // Leere Liste?
+                if self.at(&Tok::RBracket) {
+                    self.bump();
+                    return Expr::List(Vec::new(), sp);
+                }
+                let first = self.parse_expr(0);
+                // Comprehension `[elem for var in iter (if cond)?]`
+                if self.at_kw(Kw::For) {
+                    self.bump(); // for
+                    let var = self.ident();
+                    self.expect(&Tok::Kw(Kw::In), "'in'");
+                    let iter = self.parse_expr(0);
+                    let cond = if self.eat_kw(Kw::If) { Some(Box::new(self.parse_expr(0))) } else { None };
                     self.skip_nl();
+                    self.expect(&Tok::RBracket, "']'");
+                    return Expr::Comprehension { elem: Box::new(first), var, iter: Box::new(iter), cond, span: sp };
+                }
+                let mut items = vec![first];
+                if self.eat(&Tok::Comma) {
+                    self.skip_nl();
+                    while !self.at(&Tok::RBracket) && !matches!(self.peek(), Tok::Eof) {
+                        items.push(self.parse_expr(0));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                        self.skip_nl();
+                    }
                 }
                 self.expect(&Tok::RBracket, "']'");
                 Expr::List(items, sp)
