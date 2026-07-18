@@ -783,6 +783,13 @@ static void run_drop(JObjHeader *h) {
  * die Bilanz bei Prozessende gedruckt. */
 static int64_t total_allocated = 0;
 static int64_t live_objects = 0;
+/* MESSUNG (Orakel-Kurve): elidiere RC auf einem Anteil der Allokationen, indem
+ * jedes k-te Objekt immortal (refcount -1) markiert wird → retain/release No-Op
+ * darauf. Modelliert „Region-Inferenz elidiert RC auf einer TEILMENGE der Sites"
+ * (nicht nur 100%). Anteil via env FASTLLVM_RC_ELIDE_PCT (0..100), einmal gelesen.
+ * -1 = uninitialisiert. Unsound (elidierte Objekte lecken), nur Ceiling-Timing. */
+static int rc_elide_pct = -1;
+static uint64_t rc_elide_counter = 0;
 /* Zähler unter Threads atomar (sonst Datenrennen der Heap-Bilanz). */
 #ifdef FASTLLVM_THREADS
 #define CNT_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
@@ -887,6 +894,20 @@ void *jrt_alloc(int64_t size) {
         atexit(jrt_shutdown);
 #endif
     }
+#ifndef FASTLLVM_FREESTANDING
+    /* Orakel-Kurve: einen Anteil der Objekte immortal machen (RC darauf elidiert). */
+    if (rc_elide_pct != 0) {
+        if (rc_elide_pct < 0) {
+            const char *e = getenv("FASTLLVM_RC_ELIDE_PCT");
+            rc_elide_pct = e ? atoi(e) : 0;
+        }
+        if (rc_elide_pct > 0 && (int)(rc_elide_counter++ % 100) < rc_elide_pct) {
+            ((JObjHeader *)p)->refcount = -1; /* immortal → retain/release No-Op */
+            ((JObjHeader *)p)->rcflags = 0;
+            return p; /* nicht in live_objects gezählt (leckt bewusst) */
+        }
+    }
+#endif
     CNT_INC(live_objects);
     ((JObjHeader *)p)->refcount = 1; /* der Erzeuger hält die erste Referenz */
     return p;
