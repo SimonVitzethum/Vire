@@ -29,11 +29,14 @@ enum T {
 /// Union-Find über Typvariablen; konkrete Typen sind Blätter.
 struct Unifier {
     parent: Vec<T>, // parent[v] für Var(v); nicht-Var = gebundener konkreter Typ
+    /// Kollisionen zweier konkreter Typen — das sind fehlgetypte Programme, die
+    /// gemeldet werden MÜSSEN (sonst still auf I64-Default miskompiliert).
+    conflicts: Vec<(T, T)>,
 }
 
 impl Unifier {
     fn new() -> Self {
-        Unifier { parent: Vec::new() }
+        Unifier { parent: Vec::new(), conflicts: Vec::new() }
     }
     fn fresh(&mut self) -> T {
         let id = self.parent.len() as u32;
@@ -62,7 +65,10 @@ impl Unifier {
             (T::Var(v), other) | (other, T::Var(v)) => {
                 self.parent[v as usize] = other;
             }
-            _ => { /* Konflikt zweier konkreter Typen: ignorieren */ }
+            // Konflikt zweier konkreter Typen: NICHT still schlucken — merken und
+            // melden. Der Default-Fallback (I64) darf ein fehlgetyptes Programm
+            // nicht klammheimlich durchwinken.
+            _ => self.conflicts.push((ra, rb)),
         }
     }
 }
@@ -73,7 +79,10 @@ struct Sig {
     ret: T,
 }
 
-pub fn infer_module(m: &mut Module) {
+/// Inferiert Parameter-/Rückgabetypen und schreibt sie in den AST. Liefert
+/// Konflikt-Diagnosen (fehlgetypte Programme) — die MÜSSEN gemeldet werden, denn
+/// der Default-Fallback (I64) würde sie sonst still miskompilieren.
+pub fn infer_module(m: &mut Module) -> Vec<String> {
     let mut u = Unifier::new();
     // 1. Globale Signaturvariablen anlegen (annotiert → konkret, sonst frisch).
     let mut sigs: HashMap<String, Sig> = HashMap::new();
@@ -135,6 +144,27 @@ pub fn infer_module(m: &mut Module) {
                 }
             }
         }
+    }
+    // 4. Typkonflikte melden (dedupliziert). Best-effort-Inferenz, aber ein
+    //    erkannter Konflikt ist ein echter Typfehler, kein Rauschen.
+    let mut msgs: Vec<String> = u
+        .conflicts
+        .iter()
+        .map(|(a, b)| format!("Typkonflikt: {} vs {} (Inferenz)", ty_name(*a), ty_name(*b)))
+        .collect();
+    msgs.sort();
+    msgs.dedup();
+    msgs
+}
+
+fn ty_name(t: T) -> &'static str {
+    match t {
+        T::I64 => "Int",
+        T::F64 => "Float",
+        T::I32 => "I32/Bool",
+        T::Ref => "Objekt/Ref",
+        T::Void => "Unit",
+        T::Var(_) => "?",
     }
 }
 

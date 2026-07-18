@@ -119,8 +119,15 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
-    // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen.
-    vire::infer_module(&mut module);
+    // Typinferenz (F5-Kern): un-annotierte Parametertypen ausfüllen. Erkannte
+    // Typkonflikte sind echte Fehler → ablehnen (nicht still auf I64 defaulten).
+    let type_conflicts = vire::infer_module(&mut module);
+    if !type_conflicts.is_empty() {
+        for c in &type_conflicts {
+            eprintln!("Fehler: {c}");
+        }
+        exit(1);
+    }
     // Absenkung nach crates/ir.
     let mut program = match vire::lower_module(&module) {
         Ok(p) => p,

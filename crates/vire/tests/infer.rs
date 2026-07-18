@@ -48,6 +48,16 @@ fn int_param_bleibt_int() {
 }
 
 #[test]
+fn typkonflikt_wird_gemeldet_nicht_geschluckt() {
+    // `x` als Int UND Float benutzt → Konflikt. Muss gemeldet werden, nicht still
+    // auf I64 defaulten (sonst Miskompilat statt Ablehnung).
+    let (mut m, diags) = parse("fn bad(x) {\n mut a = x + 1\n mut b = x + 2.0\n a\n}\n");
+    assert!(diags.is_empty());
+    let conflicts = infer_module(&mut m);
+    assert!(!conflicts.is_empty(), "Typkonflikt Int/Float muss gemeldet werden");
+}
+
+#[test]
 fn main_bleibt_ohne_rueckgabetyp() {
     let src = "fn main() {\n print(1)\n}\n";
     assert_eq!(ret_of(src, "main"), None);
