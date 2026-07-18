@@ -202,24 +202,41 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // ClassInfo je Nutzertyp (Produkt UND Summe) registrieren (super = Object).
-    for it in &m.items {
-        if let Item::Type(t) = it {
-            let fields = types[&t.name]
-                .iter()
-                .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
-                .collect();
-            prog.classes.push(fastllvm_ir::ClassInfo {
-                name: t.name.clone(),
-                super_name: Some("java/lang/Object".to_string()),
-                is_interface: false,
-                interfaces: vec![],
-                fields,
-                static_fields: vec![],
-                methods: vec![],
-                has_clinit: false,
-            });
+    // Eingebaute Summentypen Option/Result (falls nicht vom Nutzer definiert).
+    // Payload ist derzeit i64-breit (Int/Zeiger); typisierte/Float-Payloads
+    // brauchen generische Typen (nächster Schritt).
+    if !types.contains_key("Option") {
+        types.insert("Option".into(), vec![("__tag".into(), Ty::I64, None), ("Some_value".into(), Ty::I64, None)]);
+        variants.insert("Some".into(), ("Option".into(), 0, vec![("Some_value".into(), Ty::I64, None)]));
+        variants.insert("None".into(), ("Option".into(), 1, vec![]));
+    }
+    if !types.contains_key("Result") {
+        types.insert("Result".into(), vec![("__tag".into(), Ty::I64, None), ("Ok_value".into(), Ty::I64, None), ("Err_error".into(), Ty::I64, None)]);
+        variants.insert("Ok".into(), ("Result".into(), 0, vec![("Ok_value".into(), Ty::I64, None)]));
+        variants.insert("Err".into(), ("Result".into(), 1, vec![("Err_error".into(), Ty::I64, None)]));
+    }
+    // ClassInfo je Typ (Nutzer + eingebaut) registrieren.
+    let mut all_type_names: Vec<String> = m.items.iter().filter_map(|it| if let Item::Type(t) = it { Some(t.name.clone()) } else { None }).collect();
+    for bi in ["Option", "Result"] {
+        if types.contains_key(bi) && !all_type_names.iter().any(|n| n == bi) {
+            all_type_names.push(bi.into());
         }
+    }
+    for tname in &all_type_names {
+        let fields = types[tname]
+            .iter()
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .collect();
+        prog.classes.push(fastllvm_ir::ClassInfo {
+            name: tname.clone(),
+            super_name: Some("java/lang/Object".to_string()),
+            is_interface: false,
+            interfaces: vec![],
+            fields,
+            static_fields: vec![],
+            methods: vec![],
+            has_clinit: false,
+        });
     }
 
     // Signatur-Tabelle (Name → (ParamTypen, RückgabeTyp, Rückgabe-Klasse)) für Aufrufe.
@@ -879,6 +896,26 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
+            // `e?` — Fehler-Propagation für Result: Ok(v) → v; Err(_) → return e.
+            // (Desugart zu match; die umgebende Funktion muss Result zurückgeben.)
+            Expr::Try { inner, .. } => {
+                let (obj, _) = self.lower_expr(inner);
+                let tag = self.new_local(Ty::I64);
+                self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                let is_ok = self.new_local(Ty::I32);
+                self.emit(Statement::Assign(is_ok, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(0))));
+                let okb = self.new_block();
+                let errb = self.new_block();
+                let cur = self.cur;
+                self.term(cur, Terminator::Branch { cond: Operand::Copy(is_ok), then_blk: okb, else_blk: errb });
+                // Err-Zweig: das ganze Result weiterreichen.
+                self.term(errb.0 as usize, Terminator::Return(Some(obj.clone())));
+                // Ok-Zweig: den Wert extrahieren.
+                self.cur = okb.0 as usize;
+                let v = self.new_local(Ty::I64);
+                self.emit(Statement::GetField { dest: v, obj, class: "Result".into(), field: "Ok_value".into() });
+                (Operand::Copy(v), Ty::I64)
+            }
             // List-Literal `[a, b, c]` → NewArray + ArrayStore. Elementart aus dem
             // ersten Element (homogen). Leere Liste → Long (Default).
             Expr::List(elems, _) => {

@@ -242,3 +242,16 @@ fn generics_monomorphisieren_pro_typ() {
     assert!(names.iter().any(|n| n.starts_with("id$Int")), "id$Int-Instanz fehlt: {names:?}");
     assert!(names.iter().any(|n| n.starts_with("id$Float")), "id$Float-Instanz fehlt: {names:?}");
 }
+
+#[test]
+fn option_result_und_try() {
+    // Eingebaute Summentypen + `?`-Propagation.
+    let src = "fn d(a: Int, b: Int) -> Result {\n if b == 0 { Err(1) } else { Ok(a / b) }\n}\nfn c(a: Int, b: Int) -> Result {\n mut q = d(a, b)?\n Ok(q + 1)\n}\nfn main() {\n print(1)\n}\n";
+    let p = lower(src);
+    // Result-Klasse registriert; `?` liest __tag + Ok_value.
+    assert!(p.classes.iter().any(|c| c.name == "Result"));
+    let reads_ok = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "Ok_value")
+    });
+    assert!(reads_ok, "`?` muss Ok_value extrahieren");
+}
