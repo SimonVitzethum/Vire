@@ -252,7 +252,11 @@ impl Parser {
         let name = self.ident();
         let generics = self.parse_generics();
         let params = self.parse_params();
-        let ret = if self.eat(&Tok::Arrow) { Some(self.parse_type()) } else { None };
+        // Rückgabetyp: `-> T` ODER das kürzere `> T`. Nach `)` gibt es keinen
+        // Ausdruckskontext, in dem `>` ein Vergleich sein könnte → eindeutig.
+        // (Match-Arme/Lambdas KÖNNEN das nicht: dort kollidierte `>` mit dem
+        // Vergleichsoperator bzw. dem Guard — s. sprache/SYNTAX-VEREINFACHUNG.md.)
+        let ret = if self.eat(&Tok::Arrow) || self.eat(&Tok::Gt) { Some(self.parse_type()) } else { None };
         FnSig { name, generics, params, ret, span: sp }
     }
 

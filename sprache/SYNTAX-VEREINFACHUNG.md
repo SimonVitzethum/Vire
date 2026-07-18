@@ -41,3 +41,24 @@ den vorhandenen Kern zurückführen lassen (desugaring), nicht ihn einschränken
 Zucker ja, solange (a) er sich auf den Kern zurückführen lässt, (b) er die Grammatik
 nicht mehrdeutig macht, (c) er null Laufzeitkosten hat. „Leichter" heißt weniger
 Boilerplate und mehr Inferenz — nicht weniger Präzision.
+
+## `->` → `>` beim Rückgabetyp (umgesetzt) + Analyse der anderen `->`-Stellen
+Kürzerer Rückgabetyp: `fn add(a: Int, b: Int) > Int { a + b }`. Das alte `-> Int`
+gilt weiter (nichts bricht); `>` ist die zusätzliche Kurzform. Sicher, weil nach der
+Parameterliste `)` KEIN Ausdruckskontext folgt, in dem `>` ein Vergleich sein könnte.
+
+**Wo `->` NICHT zu `>` werden kann (Grammatik würde mehrdeutig — Leitlinie (b)):**
+- **Lambda** `x -> x*2`: `x > x*2` IST ein gültiger Vergleich → nicht unterscheidbar.
+  (Beweis: `mut f = 3 > 5` ergibt `false`, nicht ein Lambda.)
+- **Match-Arm** `pat if guard -> body`: der Guard ist ein Ausdruck und oft selbst
+  ein `>`-Vergleich (`if x > 0`); ein `>` als Arm-Trenner würde vom Guard-Parser
+  verschluckt (`x > 0 > body`). Für Arme OHNE Guard wäre `>` eindeutig, aber die
+  Mischung wäre inkonsistent → bei `->` belassen.
+- **Range** `a..b`: `.` ist bereits der Feldzugriff → `a.b` wäre mehrdeutig.
+
+**Toter Token:** `=>` (FatArrow) ist im Lexer definiert, wird aber nirgends im Parser
+benutzt (Aufräum-Kandidat, keine Semantik).
+
+**Fazit:** Der Rückgabetyp ist die EINZIGE `->`-Stelle, an der die Verkürzung zu `>`
+mehrdeutigkeitsfrei ist. Alle anderen Verkürzungen (`->`, `..`) kollidieren mit
+bestehenden Operatoren/Kontexten — daher bewusst nicht gemacht (Leitlinie (b)).

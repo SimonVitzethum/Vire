@@ -6,6 +6,16 @@ use fastllvm_ir::Ty;
 use vire::{expand_macros, infer_module, inline_recursion, lower_module, parse};
 
 #[test]
+fn rueckgabetyp_kurzform_gt() {
+    // `> T` als Kurzform für `-> T` beim Rückgabetyp; `->` gilt weiter.
+    let p = lower("fn add(a: Int, b: Int) > Int { a + b }\nfn classic(n: Int) -> Int { n * n }\nfn main() { print(add(3, 4))  print(classic(5)) }\n");
+    let add = p.functions.iter().find(|f| f.name == "add").expect("add");
+    assert_eq!(add.ret, Ty::I64, "`> Int` muss den Rückgabetyp korrekt setzen");
+    let classic = p.functions.iter().find(|f| f.name == "classic").expect("classic");
+    assert_eq!(classic.ret, Ty::I64, "`-> Int` muss weiter funktionieren");
+}
+
+#[test]
 fn shallow_recursive_inlining_reduziert_selbstaufrufe() {
     // fib: 2 Selbstaufrufe. Nach dem shallow-inline-Pass (Tiefe 2) hat der Rumpf
     // deutlich MEHR Aufruf-Statements (aufgefaltete Kopien) und die verbleibenden
