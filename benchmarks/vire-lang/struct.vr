@@ -1,0 +1,11 @@
+type V { x: Int y: Int z: Int }
+fn main() {
+    mut s = 0
+    mut i = 0
+    while i < 100000000 {
+        mut v = V(i, i * 2, i * 3)
+        s = (s + v.x + v.y + v.z) % 1000000007
+        i = i + 1
+    }
+    print(s)
+}

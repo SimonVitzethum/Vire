@@ -892,6 +892,15 @@ impl<'a> FnLower<'a> {
                     }
                 }
             }
+            Expr::Binary { .. } if const_eval(e).is_some() => {
+                // Allgemeine Konstantenfaltung: `2 + 3`, `WIDTH * HEIGHT` etc. →
+                // Konstante zur Compilezeit (nicht nur unter `comptime`).
+                match const_eval(e).unwrap() {
+                    CVal::Int(v) => (Operand::ConstI64(v), Ty::I64),
+                    CVal::Float(v) => (Operand::ConstF64(v), Ty::F64),
+                    CVal::Bool(b) => (Operand::ConstI32(if b { 1 } else { 0 }), Ty::I32),
+                }
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.lower_expr(lhs);
                 let (r, rt) = self.lower_expr(rhs);

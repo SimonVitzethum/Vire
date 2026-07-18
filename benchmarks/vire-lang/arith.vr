@@ -1,0 +1,9 @@
+fn main() {
+    mut s = 0
+    mut i = 0
+    while i < 300000000 {
+        s = (s + i * 3 + 7) % 1000000007
+        i = i + 1
+    }
+    print(s)
+}
