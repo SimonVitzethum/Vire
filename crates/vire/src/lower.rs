@@ -405,6 +405,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     // Instanziierte generische Typen (gemangelte Klasse → Layout), aus allen
     // Funktionen gesammelt und danach als Klassen fürs Backend registriert.
     let mut all_insts: HashMap<String, Layout> = HashMap::new();
+    let mut str_index: HashMap<String, u32> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
             if !f.sig.generics.is_empty() {
@@ -413,7 +414,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // Higher-Order-Template → nur inline (Defunktionalisierung)
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, None) {
+            match lower_fn(f, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None) {
                 Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
@@ -426,7 +427,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, Some(class), Some(&sym)) {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -449,7 +450,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, None, Some(&sym)) {
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -684,6 +685,9 @@ struct FnLower<'a> {
     local_lambda: HashMap<u32, (Vec<String>, Expr)>,
     /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
     strings: &'a mut Vec<String>,
+    /// O(1)-Index in den String-Pool (Literal → Index) — sonst wäre `intern`
+    /// lineare Suche = O(n²) Compilezeit bei vielen Literalen (Skalierung große Prog.).
+    str_idx: &'a mut HashMap<String, u32>,
     errs: Vec<String>,
     /// Ziel-Blöcke der umgebenden Schleifen: (continue → header, break → exit).
     loops: Vec<(Block, Block)>,
@@ -695,11 +699,13 @@ impl<'a> FnLower<'a> {
         Local((self.locals.len() - 1) as u32)
     }
     fn intern(&mut self, s: &str) -> u32 {
-        if let Some(i) = self.strings.iter().position(|x| x == s) {
-            return i as u32;
+        if let Some(&i) = self.str_idx.get(s) {
+            return i;
         }
+        let i = self.strings.len() as u32;
+        self.str_idx.insert(s.to_string(), i);
         self.strings.push(s.to_string());
-        (self.strings.len() - 1) as u32
+        i
     }
     fn new_block(&mut self) -> Block {
         self.blocks.push(BasicBlock { statements: vec![], terminator: Terminator::Return(None) });
@@ -2332,6 +2338,7 @@ fn lower_fn(
     shared_inst: &HashMap<String, Layout>,
     shared_svars: &HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
     strings: &mut Vec<String>,
+    str_idx: &mut HashMap<String, u32>,
     recv_class: Option<&str>,
     sym: Option<&str>,
 ) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>), Vec<String>> {
@@ -2364,6 +2371,7 @@ fn lower_fn(
         local_arr: HashMap::new(),
         local_lambda: HashMap::new(),
         strings,
+        str_idx,
         errs: Vec::new(),
         loops: Vec::new(),
     };
