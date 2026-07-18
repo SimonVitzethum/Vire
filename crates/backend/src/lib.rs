@@ -1267,7 +1267,10 @@ fn non_null_locals(f: &Function) -> BTreeSet<u32> {
     }
     for bb in &f.blocks {
         for st in &bb.statements {
-            if let Statement::New { dest, .. } | Statement::StackNew { dest, .. } = st {
+            if let Statement::New { dest, .. }
+            | Statement::StackNew { dest, .. }
+            | Statement::NewArray { dest, .. } = st
+            {
                 nn[dest.0 as usize] = true;
             }
         }
@@ -1295,13 +1298,14 @@ fn non_null_locals(f: &Function) -> BTreeSet<u32> {
     for bb in &f.blocks {
         for st in &bb.statements {
             let (def, ok) = match st {
-                Statement::New { dest, .. } | Statement::StackNew { dest, .. } => (Some(dest.0), true),
+                Statement::New { dest, .. }
+                | Statement::StackNew { dest, .. }
+                | Statement::NewArray { dest, .. } => (Some(dest.0), true),
                 Statement::Assign(d, Rvalue::Use(Operand::Copy(s))) => (Some(d.0), nn[s.0 as usize]),
                 Statement::Assign(d, _) => (Some(d.0), false),
                 Statement::GetField { dest, .. }
                 | Statement::GetStatic { dest, .. }
                 | Statement::ArrayLoad { dest, .. }
-                | Statement::NewArray { dest, .. }
                 | Statement::InstanceOf { dest, .. }
                 | Statement::InstanceOfPending { dest, .. }
                 | Statement::ArrayLen { dest, .. } => (Some(dest.0), false),
@@ -1885,8 +1889,9 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             // jrt_throw_npe/jrt_throw_bounds, der Zugriff bleibt ein sichtbarer
             // load — LLVM hoistet die Längenprüfung aus Schleifen und kann
             // vektorisieren, statt einen opaken jrt_?aload-Call je Element.
+            let ann = e.nonnull(arr);
             let v = if *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none() {
-                emit_array_elem_load_checked(w, e, &a, &i, *kind)
+                emit_array_elem_load_checked(w, e, &a, &i, *kind, ann)
             } else {
                 emit_array_elem_load(w, e, &a, &i, *kind)
             };
@@ -1904,7 +1909,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             if bck && kind.is_ref() {
                 writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
             } else if bck {
-                emit_array_elem_store_checked(w, e, &a, &i, &v, *kind);
+                emit_array_elem_store_checked(w, e, &a, &i, &v, *kind, e.nonnull(arr));
             } else {
                 emit_array_elem_store(w, e, &a, &i, &v, *kind);
             }
@@ -1996,17 +2001,21 @@ fn zero_lit(vty: Ty) -> &'static str {
 /// → Bounds (beide setzen pending und liefern einen Neutralwert; die vom Frontend
 /// eingefügte pending-Prüfung übernimmt danach den Kontrollfluss). Der eigentliche
 /// Zugriff bleibt ein LLVM-`load` (hoistbar/vektorisierbar).
-fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind) -> String {
+fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind, nn: bool) -> String {
     let vty = k.value_ty();
     let sty = arr_store_ty(k);
     let (npe, ck, bd, ld, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
-    let isnull = e.fresh();
-    writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
-    writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
-    writeln!(w, "{npe}:").unwrap();
-    writeln!(w, "  call void @jrt_throw_npe()").unwrap();
-    writeln!(w, "  br label %{cont}").unwrap();
-    writeln!(w, "{ck}:").unwrap();
+    // Null-Check nur, wenn das Array NICHT nachweislich nicht-null ist (lokal via
+    // `array(n)` erzeugt o.ä.). Spart pro Zugriff einen Branch in engen Schleifen.
+    if !nn {
+        let isnull = e.fresh();
+        writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+        writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+        writeln!(w, "{npe}:").unwrap();
+        writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+        writeln!(w, "  br label %{cont}").unwrap();
+        writeln!(w, "{ck}:").unwrap();
+    }
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
@@ -2045,9 +2054,10 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     writeln!(w, "{cont}:").unwrap();
     let v = e.fresh();
     let z = zero_lit(vty);
+    let npe_arm = if nn { String::new() } else { format!("[ {z}, %{npe} ], ") };
     writeln!(
         w,
-        "  {v} = phi {} [ {z}, %{npe} ], [ {z}, %{bd} ], [ {ext}, %{ld} ]",
+        "  {v} = phi {} {npe_arm}[ {z}, %{bd} ], [ {ext}, %{ld} ]",
         llty(vty)
     )
     .unwrap();
@@ -2056,16 +2066,18 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
 
 /// Geprüfter Store, inline (primitive Elemente). Null-/Bounds-Fehler setzen
 /// pending; im gültigen Fall ein sichtbarer `store`.
-fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind) {
+fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind, nn: bool) {
     let sty = arr_store_ty(k);
     let (npe, ck, bd, st, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
-    let isnull = e.fresh();
-    writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
-    writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
-    writeln!(w, "{npe}:").unwrap();
-    writeln!(w, "  call void @jrt_throw_npe()").unwrap();
-    writeln!(w, "  br label %{cont}").unwrap();
-    writeln!(w, "{ck}:").unwrap();
+    if !nn {
+        let isnull = e.fresh();
+        writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+        writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+        writeln!(w, "{npe}:").unwrap();
+        writeln!(w, "  call void @jrt_throw_npe()").unwrap();
+        writeln!(w, "  br label %{cont}").unwrap();
+        writeln!(w, "{ck}:").unwrap();
+    }
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
