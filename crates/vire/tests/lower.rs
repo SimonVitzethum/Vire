@@ -264,3 +264,14 @@ fn wachsende_liste_und_map() {
     assert!(calls.contains(&"vire_list_new") && calls.contains(&"vire_list_push"));
     assert!(calls.contains(&"vire_map_new") && calls.contains(&"vire_map_put"));
 }
+
+#[test]
+fn lambda_inline_mit_capture() {
+    // `mut f = x -> x*k` fängt k; f(5) wird inline expandiert.
+    let src = "fn main() {\n mut k = 10\n mut f = x -> x * k\n print(f(5))\n}\n";
+    let p = lower(src);
+    // Inline: die Multiplikation landet im main-Body (kein separater Call an f).
+    let has_mul = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Mul, ..))));
+    assert!(has_mul, "Lambda-Rumpf muss inline expandiert werden");
+}

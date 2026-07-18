@@ -453,6 +453,9 @@ struct FnLower<'a> {
     local_class: HashMap<u32, String>,
     /// Elementart eines Array/List-Locals (für Index/len/for-über-Liste).
     local_arr: HashMap<u32, ArrKind>,
+    /// Lambda-Locals: `mut f = x -> …` → (Parameter, Rumpf). Aufruf `f(a)` wird
+    /// an der Stelle inline expandiert (fangende Closures im gleichen Scope gratis).
+    local_lambda: HashMap<u32, (Vec<String>, Expr)>,
     /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
     strings: &'a mut Vec<String>,
     errs: Vec<String>,
@@ -566,6 +569,13 @@ impl<'a> FnLower<'a> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Let { mutable, name, value, .. } => {
+                // `mut f = x -> …`: Lambda merken (Aufruf wird inline expandiert).
+                if let Some(Expr::Lambda { params, body, .. }) = value {
+                    let l = self.new_local(Ty::I64);
+                    self.local_lambda.insert(l.0, (params.clone(), (**body).clone()));
+                    self.bind(name, l, Ty::I64);
+                    return;
+                }
                 // Binding-vs-Zuweisung (F3-Ersatz bis Resolve steht): `mut x = …`
                 // bindet immer neu; ein schlichtes `x = …` auf einen bereits
                 // sichtbaren Namen ist eine Zuweisung, kein Shadowing.
@@ -1165,6 +1175,24 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
+        // Aufruf eines Lambda-Locals `f(args)` → Rumpf inline (Parameter gebunden).
+        if let Some((l, _)) = self.lookup(&name) {
+            if let Some((params, body)) = self.local_lambda.get(&l.0).cloned() {
+                self.scopes.push(HashMap::new());
+                for (p, arg) in params.iter().zip(args) {
+                    let (op, ty) = self.lower_expr(arg);
+                    let d = self.new_local(ty);
+                    if let Some(c) = self.class_of_operand(&op) {
+                        self.local_class.insert(d.0, c);
+                    }
+                    self.emit(Statement::Assign(d, Rvalue::Use(op)));
+                    self.bind(p, d, ty);
+                }
+                let r = self.lower_expr(&body);
+                self.scopes.pop();
+                return r;
+            }
+        }
         // Varianten-Konstruktor eines Summentyps: `Circle(2.0)` → getaggte Instanz.
         if self.variants.contains_key(&name) {
             return self.build_variant(&name, args);
@@ -1649,6 +1677,7 @@ fn lower_fn(
         mono: Vec::new(),
         local_class: HashMap::new(),
         local_arr: HashMap::new(),
+        local_lambda: HashMap::new(),
         strings,
         errs: Vec::new(),
         loops: Vec::new(),
