@@ -180,3 +180,39 @@ ist — der Ertrag ist marginal. Der einzige gemessene Gap (RC/Objekte, ~2,7×) 
 schon 2,0×→1,55× gebracht), nicht Hotpath-Spezialisierung. Ehrliche Empfehlung:
 `!prof`-Weights als billiges Experiment, sonst die AOT-Hotpath-Maschinerie
 ZURÜCKSTELLEN und die Region-Inferenz fertigbauen — dort sitzt die gemessene Zahl.
+
+## Neuplanung am 5%-Maßstab (Nutzer: „selbst 5% sind spürbar")
+Mit gesenkter Schwelle neu vermessen — wo sind ≥5% real? Befund: **nicht in der
+Hotness/Wahrscheinlichkeit, sondern in der Codegen-Parität zu clang.**
+
+**Messung Vire vs clang++ vs g++ (beide C++ über den jeweiligen Compiler, best-of-7):**
+| Benchmark | Vire | clang++ | g++ | Deutung |
+|---|---|---|---|---|
+| fib | 0,080 | 0,077 | 0,042 | Vire = **clang-Parität**; g++ ist der Ausreißer (GCC-vs-LLVM) |
+| arith | 0,939 | 0,935 | 0,653 | Vire = **clang-Parität**; g++ Ausreißer |
+| mandelbrot (vorher) | 0,142 | 0,125 | 0,113 | **echter Vire-vs-LLVM-Gap (18%)** |
+
+→ Der scheinbare „C++ schneller"-Gap auf fib/arith ist **GCC vs LLVM** (Vire nutzt
+clang/LLVM wie Rust; g++ optimiert naive Rekursion/Schleifen besser). Das ist KEIN
+Vire-Defizit und nur durch Backend-Wechsel (oder GCC-spezifische Tricks) zu holen —
+**nicht verfolgt** (Vire liegt am LLVM-Optimum).
+
+**Der eine echte ≥5%-Hebel — FMA-Kontraktion — GEBAUT:** mandelbrot war 18% hinter
+clang, weil clang per Default `a*b+c` zu FMA fusioniert (`-ffp-contract=on`) und
+Vire fmul/fadd OHNE `contract`-Flag emittierte. Fix: `contract` auf Float-Ops
+(sicherste fast-math-Stufe, nur Fusion, keine Reassoziation). **mandelbrot
+0,142→0,124 = clang-Parität** (~13%). Verifiziert: clang `-ffp-contract=off` (0,152)
+ist langsamer als Vire — FMA war der ganze Gap.
+
+**Konsequenz für den AOT-Plan:** der ≥5%-Spielraum liegt in **Codegen-Parität zu
+clangs Defaults**, nicht in statischer Hotness. Checkliste der clang-Default-Hebel:
+- **FMA (`contract`)** — ✅ gebaut, ~13% auf float-Code.
+- **`-O2 -flto -march=native`** — schon aktiv (= clang).
+- **mem2reg/SROA der naiven alloca-Kette** — LLVM erledigt es (fib/arith = clang-
+  Parität beweist: die store/reload-Kette wird vollständig weg-optimiert).
+- **Verbleibend potenziell ≥5%:** Objekt-Header-Verkleinerung → bessere Cache-Dichte
+  bei Pointer-Chasing (RAM-Doku), UND FMA war der letzte float-Gap. Sonst ist Vire
+  am LLVM-Optimum; die Hotness-Pässe (2–4) bleiben ~0% (bereits gemessen) — der
+  5%-Maßstab ändert daran nichts, weil der Code schon LLVM-optimal ist.
+- **Ehrlich:** die einzige verbleibende ≥5%-Quelle wäre, GCC auf fib/arith zu
+  schlagen — das ist ein Backend-Thema (LLVM-Codegen-Qualität), kein AOT-Pass.
