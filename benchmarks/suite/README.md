@@ -54,3 +54,28 @@ Speicher (Arena/RC/Heap — s. RAM-REDUKTION.md, ESCAPE-ARENA.md) ab.
   Ref-Params tragen keine ArrKind. sort wurde deshalb iterativ-in-main geschrieben
   (Array bleibt lokal). Eine `Array[T]`-Param-Annotation wäre der Fix.
 - **`else` muss auf derselben Zeile wie `}`** stehen (Newline-terminierte Syntax).
+
+## Bounds-Checks: Analyse + ehrliche Decke (Nachtrag)
+Gemessene Decke mit `FASTLLVM_NO_BOUNDS=1` (Messmodus, alle Checks aus, unsound):
+
+| Benchmark | Vire (Checks) | Vire (ohne Checks) | Rust | clang++ |
+|---|---|---|---|---|
+| sort | 0,168 | **0,132** (−21%) | 0,122 | 0,110 |
+| binsearch | 0,559 | **0,480** (−14%) | 0,479 | 0,458 |
+
+**Zwei Erkenntnisse:**
+1. **Bounds-Checks kosten real** (−14 bis −21%). `elide_bounds` (GVN) entfernt viele,
+   aber NICHT die daten-abhängigen (`a[mid]` mit `mid=(lo+hi)/2`, quicksort-Partition):
+   der Beweis `mid < len` bräuchte den Loop-Invariant `hi ≤ len-1`, der keine
+   direkte Branch-Bedingung ist. Das ist der Elisions-Hebel Richtung **Rust-Parität**.
+2. **`unter clang` ist NICHT erreichbar** — und das ist keine Vire-Schwäche: selbst
+   mit ALLEN Checks aus bleibt Vire (0,132/0,480) über clang (0,110/0,458). **clang++
+   hat NULL Bounds-Checks + das LLVM-Codegen-Optimum → es IST die Decke für jede
+   LLVM-Sprache.** Rust (das ebenfalls Checks hat + LLVM nutzt) landet identisch bei
+   0,122/0,479 = ~1,05-1,10× clang. Vire kann clang bestenfalls ERREICHEN (Parität),
+   nicht unterbieten — es gibt keinen Vire-Vorteil, den clang++ nicht auch hat.
+
+**Fazit:** der erreichbare + wertvolle Zielwert ist **Rust-Parität** (via
+Bounds-Elision der daten-abhängigen Indizes), nicht „unter clang". Der `div/rem`-Fix
+(inline `sdiv`/`srem` bei konstantem Divisor) ist umgesetzt (hilft -O0/nicht-LTO;
+unter -O2 -flto inlinet LTO `jrt_ldiv` ohnehin). `FASTLLVM_NO_BOUNDS=1` = Messflag.

@@ -1885,7 +1885,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             // jrt_throw_npe/jrt_throw_bounds, der Zugriff bleibt ein sichtbarer
             // load — LLVM hoistet die Längenprüfung aus Schleifen und kann
             // vektorisieren, statt einen opaken jrt_?aload-Call je Element.
-            let v = if *checked {
+            let v = if *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none() {
                 emit_array_elem_load_checked(w, e, &a, &i, *kind)
             } else {
                 emit_array_elem_load(w, e, &a, &i, *kind)
@@ -1900,9 +1900,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             // Ref-Stores geprüft über die Runtime (jrt_aastore trägt die
             // Kovarianz-/ArrayStoreException-Prüfung, die der inline-Pfad nicht
             // hätte). Primitive Stores werden inline geprüft.
-            if *checked && kind.is_ref() {
+            let bck = *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none();
+            if bck && kind.is_ref() {
                 writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
-            } else if *checked {
+            } else if bck {
                 emit_array_elem_store_checked(w, e, &a, &i, &v, *kind);
             } else {
                 emit_array_elem_store(w, e, &a, &i, &v, *kind);
@@ -2212,12 +2213,26 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         BinOp::Add => writeln!(w, "  {t} = add {ty} {a}, {b}").unwrap(),
         BinOp::Sub => writeln!(w, "  {t} = sub {ty} {a}, {b}").unwrap(),
         BinOp::Mul => writeln!(w, "  {t} = mul {ty} {a}, {b}").unwrap(),
-        // div/rem über die Runtime (Division-durch-Null → ArithmeticException).
-        // Breite nach Operandentyp: i64 → jrt_ldiv/lrem, sonst i32.
-        BinOp::Div if aty == Ty::I64 => writeln!(w, "  {t} = call i64 @jrt_ldiv(i64 {a}, i64 {b})").unwrap(),
-        BinOp::Rem if aty == Ty::I64 => writeln!(w, "  {t} = call i64 @jrt_lrem(i64 {a}, i64 {b})").unwrap(),
-        BinOp::Div => writeln!(w, "  {t} = call i32 @jrt_idiv(i32 {a}, i32 {b})").unwrap(),
-        BinOp::Rem => writeln!(w, "  {t} = call i32 @jrt_irem(i32 {a}, i32 {b})").unwrap(),
+        // div/rem: bei NICHT-NULL konstantem Divisor kann keine Division-durch-Null
+        // auftreten → inline `sdiv`/`srem` (LLVM stärke-reduziert: `/2`→Shift,
+        // `%2^n`→and, `/const`→Multiplikations-Trick). Das ist der große Hebel für
+        // Index-/RNG-lastigen Code (binsearch `(lo+hi)/2`, LCG `%2^31`). Sonst
+        // (Laufzeit-Divisor) über die Runtime, die den Null-Check + ArithmeticException
+        // trägt. Java/Vire-Semantik (trunc-toward-zero, Rest mit Dividenden-Vorzeichen)
+        // = LLVMs sdiv/srem.
+        BinOp::Div | BinOp::Rem => {
+            let inst = if matches!(op, BinOp::Div) { "sdiv" } else { "srem" };
+            let const_nonzero = b.parse::<i64>().map(|d| d != 0).unwrap_or(false);
+            if const_nonzero {
+                writeln!(w, "  {t} = {inst} {ty} {a}, {b}").unwrap();
+            } else if aty == Ty::I64 {
+                let f = if matches!(op, BinOp::Div) { "jrt_ldiv" } else { "jrt_lrem" };
+                writeln!(w, "  {t} = call i64 @{f}(i64 {a}, i64 {b})").unwrap();
+            } else {
+                let f = if matches!(op, BinOp::Div) { "jrt_idiv" } else { "jrt_irem" };
+                writeln!(w, "  {t} = call i32 @{f}(i32 {a}, i32 {b})").unwrap();
+            }
+        }
         BinOp::And => writeln!(w, "  {t} = and {ty} {a}, {b}").unwrap(),
         BinOp::Or => writeln!(w, "  {t} = or {ty} {a}, {b}").unwrap(),
         BinOp::Xor => writeln!(w, "  {t} = xor {ty} {a}, {b}").unwrap(),
