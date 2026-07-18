@@ -233,3 +233,12 @@ fn string_concat_und_auto_konvert() {
     assert!(calls.contains(&"jrt_str_concat"), "String-+ muss jrt_str_concat rufen");
     assert!(calls.contains(&"jrt_long_to_str"), "Int im +-String muss konvertiert werden");
 }
+
+#[test]
+fn generics_monomorphisieren_pro_typ() {
+    // id[T] wird pro Aufruf-Typ instanziiert: id$Int, id$Float.
+    let p = lower("fn id[T](x: T) -> T { x }\nfn main() {\n print(id(1))\n print(id(2.5))\n}\n");
+    let names: Vec<&str> = p.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.starts_with("id$Int")), "id$Int-Instanz fehlt: {names:?}");
+    assert!(names.iter().any(|n| n.starts_with("id$Float")), "id$Float-Instanz fehlt: {names:?}");
+}

@@ -88,6 +88,12 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
+            // Generische Funktionen NICHT monomorph typprüfen — ihr Rumpf ist
+            // polymorph (T ist kein konkreter Typ). Jede Monomorph.-Instanz wird
+            // beim Absenken erzeugt; Aufrufe `id(42)` bleiben hier unconstrained.
+            if !f.sig.generics.is_empty() {
+                continue;
+            }
             let params = f
                 .sig
                 .params
@@ -116,6 +122,9 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
     // 2. Rümpfe durchlaufen, Constraints sammeln.
     for it in &m.items {
         if let Item::Fn(f) = it {
+            if !f.sig.generics.is_empty() {
+                continue; // generisch → nicht monomorph inferieren
+            }
             if let Some(body) = &f.body {
                 let sig = &sigs[&f.sig.name];
                 let mut cx = Ctx {
@@ -139,6 +148,7 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
         .collect();
     for it in m.items.iter_mut() {
         if let Item::Fn(f) = it {
+            if f.sig.generics.is_empty() {
             let (rs, ret) = &resolved[&f.sig.name];
             for (p, t) in f.sig.params.iter_mut().zip(rs) {
                 if p.ty.is_none() {
@@ -151,6 +161,7 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
                 if let Some(name) = concrete_name(*ret) {
                     f.sig.ret = Some(Type { name: name.into(), args: vec![], borrowed: false, span: Span(0, 0) });
                 }
+            }
             }
         }
     }

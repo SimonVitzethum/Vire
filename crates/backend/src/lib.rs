@@ -1977,16 +1977,26 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
     // Vergleiche liefern immer i32 (0/1); Operanden sind i32 oder ptr
     // (long/double-Vergleiche laufen über Runtime-lcmp/dcmp).
     if matches!(op, BinOp::CmpEq | BinOp::CmpNe | BinOp::CmpLt | BinOp::CmpGe | BinOp::CmpGt | BinOp::CmpLe) {
-        let cc = match op {
-            BinOp::CmpEq => "eq",
-            BinOp::CmpNe => "ne",
-            BinOp::CmpLt => "slt",
-            BinOp::CmpGe => "sge",
-            BinOp::CmpGt => "sgt",
-            _ => "sle",
+        let is_float = aty == Ty::F64 || aty == Ty::F32;
+        // Float → fcmp mit geordneten Prädikaten (o*); ganzzahlig/Zeiger → icmp.
+        let cc = match (op, is_float) {
+            (BinOp::CmpEq, false) => "eq",
+            (BinOp::CmpNe, false) => "ne",
+            (BinOp::CmpLt, false) => "slt",
+            (BinOp::CmpGe, false) => "sge",
+            (BinOp::CmpGt, false) => "sgt",
+            (BinOp::CmpLe, false) => "sle",
+            (BinOp::CmpEq, true) => "oeq",
+            (BinOp::CmpNe, true) => "one",
+            (BinOp::CmpLt, true) => "olt",
+            (BinOp::CmpGe, true) => "oge",
+            (BinOp::CmpGt, true) => "ogt",
+            (BinOp::CmpLe, true) => "ole",
+            _ => unreachable!("emit_binop: nur Vergleiche in diesem Zweig"),
         };
         let c = e.fresh();
-        writeln!(w, "  {c} = icmp {cc} {} {a}, {b}", llty(aty)).unwrap();
+        let cmp = if is_float { "fcmp" } else { "icmp" };
+        writeln!(w, "  {c} = {cmp} {cc} {} {a}, {b}", llty(aty)).unwrap();
         writeln!(w, "  {t} = zext i1 {c} to i32").unwrap();
         return t;
     }

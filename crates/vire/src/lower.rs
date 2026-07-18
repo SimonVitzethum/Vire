@@ -15,6 +15,112 @@ type Layout = Vec<(String, Ty, Option<String>)>;
 /// Variante eines Summentyps: (Summentyp-Name, Tag, Felder als (geflachter Name, Typ, Ref-Klasse)).
 type VariantInfo = (String, i64, Vec<(String, Ty, Option<String>)>);
 
+/// Info über eine generische Funktion für die Monomorphisierung an Aufrufstellen.
+#[derive(Clone)]
+struct GInfo {
+    /// Typ-Parameter-Namen, z.B. `["T"]` bei `fn f[T](…)`.
+    tparams: Vec<String>,
+    /// Parameter-Typannotate (mit T-Platzhaltern), zum Binden der Typargumente.
+    param_tys: Vec<Option<Type>>,
+    /// Rückgabe-Annotat (mit T).
+    ret: Option<Type>,
+}
+
+/// Symbolname einer Monomorph.-Instanz: `f$Int$Point`.
+fn mono_sym(name: &str, targs: &[String]) -> String {
+    format!("{name}${}", targs.join("$"))
+}
+
+/// Konkreter Typname eines Arguments (für Typ-Argument-Bindung).
+fn concrete_tyname(ty: Ty, class: Option<&String>) -> String {
+    match ty {
+        Ty::F64 => "Float".into(),
+        Ty::F32 => "F32".into(),
+        Ty::I32 => "I32".into(),
+        Ty::Ref => class.cloned().unwrap_or_else(|| "Str".into()),
+        _ => "Int".into(),
+    }
+}
+
+/// Ersetzt Typparameter-Namen in einem `Type` durch konkrete Typen.
+fn subst_type(t: &Type, bind: &HashMap<String, String>) -> Type {
+    let name = bind.get(&t.name).cloned().unwrap_or_else(|| t.name.clone());
+    Type { name, args: t.args.iter().map(|a| subst_type(a, bind)).collect(), borrowed: t.borrowed, span: t.span }
+}
+
+/// Klont eine generische FnDef und substituiert die Typparameter in Signatur +
+/// Body-Annotaten (Let/Cast). Der Rest des Bodies läuft über Inferenz.
+fn subst_fndef(f: &FnDef, bind: &HashMap<String, String>) -> FnDef {
+    let mut nf = f.clone();
+    nf.sig.generics = vec![]; // Instanz ist nicht mehr generisch
+    for p in &mut nf.sig.params {
+        if let Some(t) = &p.ty {
+            p.ty = Some(subst_type(t, bind));
+        }
+    }
+    if let Some(t) = &nf.sig.ret {
+        nf.sig.ret = Some(subst_type(t, bind));
+    }
+    if let Some(b) = &mut nf.body {
+        subst_block(b, bind);
+    }
+    nf
+}
+
+fn subst_block(b: &mut crate::ast::Block, bind: &HashMap<String, String>) {
+    for s in &mut b.stmts {
+        subst_stmt(s, bind);
+    }
+    // Tail-Ausdrücke enthalten selten Typannotate; Casts darin über subst_expr.
+    if let Some(t) = &mut b.tail {
+        subst_expr(t, bind);
+    }
+}
+
+fn subst_stmt(s: &mut Stmt, bind: &HashMap<String, String>) {
+    match s {
+        Stmt::Let { value: Some(v), .. } => subst_expr(v, bind),
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => subst_expr(e, bind),
+        Stmt::Assign { value, .. } => subst_expr(value, bind),
+        Stmt::While { body, .. } | Stmt::For { body, .. } => subst_block(body, bind),
+        _ => {}
+    }
+}
+
+fn subst_expr(e: &mut Expr, bind: &HashMap<String, String>) {
+    match e {
+        Expr::Cast { ty, inner, .. } => {
+            *ty = subst_type(ty, bind);
+            subst_expr(inner, bind);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            subst_expr(lhs, bind);
+            subst_expr(rhs, bind);
+        }
+        Expr::Unary { rhs, .. } => subst_expr(rhs, bind),
+        Expr::Call { callee, args, .. } => {
+            subst_expr(callee, bind);
+            for a in args {
+                subst_expr(a, bind);
+            }
+        }
+        Expr::If { cond, then, elifs, els, .. } => {
+            subst_expr(cond, bind);
+            subst_block(then, bind);
+            for (c, b) in elifs {
+                subst_expr(c, bind);
+                subst_block(b, bind);
+            }
+            if let Some(b) = els {
+                subst_block(b, bind);
+            }
+        }
+        Expr::Block(b) => subst_block(b, bind),
+        Expr::Field { base, .. } | Expr::Try { inner: base, .. } => subst_expr(base, bind),
+        _ => {}
+    }
+}
+
 /// Eingebaute FFI-/Python-Brücken-Signaturen (Ptr = i64). Immer verfügbar, damit
 /// Python aus reinem Vire ohne `extern`-Block nutzbar ist.
 fn builtin_ffi_sigs() -> Vec<(&'static str, Vec<Ty>, Ty)> {
@@ -152,19 +258,71 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         let sym = format!("{class}.{}", meth.sig.name);
         sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of(meth.sig.ret.as_ref()) });
     }
+    // Generische Funktionen sammeln (NICHT direkt absenken — pro Aufruf-Typargument
+    // eine Monomorph.-Instanz). Trait-Schranken werden geparst, aber noch nicht
+    // aufgelöst (Trait-Solving/Kohärenz ist die offene schwere Hälfte).
+    let mut generics: HashMap<String, GInfo> = HashMap::new();
+    let mut generic_defs: HashMap<String, FnDef> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            match lower_fn(f, &sigs, &types, &variants, &mut prog.strings, None, None) {
-                Ok(func) => prog.functions.push(func),
+            if !f.sig.generics.is_empty() {
+                generics.insert(
+                    f.sig.name.clone(),
+                    GInfo {
+                        tparams: f.sig.generics.iter().map(|g| g.name.clone()).collect(),
+                        param_tys: f.sig.params.iter().map(|p| p.ty.clone()).collect(),
+                        ret: f.sig.ret.clone(),
+                    },
+                );
+                generic_defs.insert(f.sig.name.clone(), f.clone());
+            }
+        }
+    }
+    let mut mono_queue: Vec<(String, Vec<String>)> = Vec::new();
+    for it in &m.items {
+        if let Item::Fn(f) = it {
+            if !f.sig.generics.is_empty() {
+                continue; // generisch → nur bei Bedarf instanziiert
+            }
+            match lower_fn(f, &sigs, &types, &variants, &generics, &mut prog.strings, None, None) {
+                Ok((func, mono)) => {
+                    prog.functions.push(func);
+                    mono_queue.extend(mono);
+                }
                 Err(mut e) => errs.append(&mut e),
             }
         }
-        // trait/const/use: M2+ — hier noch übersprungen
+        // trait/const/use: hier übersprungen (Trait-Dispatch offen)
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &mut prog.strings, Some(class), Some(&sym)) {
-            Ok(func) => prog.functions.push(func),
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &mut prog.strings, Some(class), Some(&sym)) {
+            Ok((func, mono)) => {
+                prog.functions.push(func);
+                mono_queue.extend(mono);
+            }
+            Err(mut e) => errs.append(&mut e),
+        }
+    }
+    // Monomorphisierungs-Worklist: jede angeforderte Instanz substituieren +
+    // absenken (kann weitere Instanzen anfordern), bis Fixpunkt.
+    let mut mono_done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some((gname, targs)) = mono_queue.pop() {
+        let sym = mono_sym(&gname, &targs);
+        if !mono_done.insert(sym.clone()) {
+            continue;
+        }
+        let Some(gdef) = generic_defs.get(&gname) else { continue };
+        let bind: HashMap<String, String> = gdef.sig.generics.iter().map(|g| g.name.clone()).zip(targs.iter().cloned()).collect();
+        let inst = subst_fndef(gdef, &bind);
+        // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
+        let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
+        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of(inst.sig.ret.as_ref()) });
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &mut prog.strings, None, Some(&sym)) {
+            Ok((func, mono)) => {
+                prog.functions.push(func);
+                mono_queue.extend(mono);
+            }
             Err(mut e) => errs.append(&mut e),
         }
     }
@@ -270,6 +428,10 @@ struct FnLower<'a> {
     types: &'a HashMap<String, Layout>,
     /// Varianten-Registry (Variantenname → Info) für Konstruktion + Match.
     variants: &'a HashMap<String, VariantInfo>,
+    /// Generische Funktionen (Name → Info) für Aufruf-Monomorphisierung.
+    generics: &'a HashMap<String, GInfo>,
+    /// Angeforderte Monomorph.-Instanzen: (generischer Name, konkrete Typargumente).
+    mono: Vec<(String, Vec<String>)>,
     /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
     local_class: HashMap<u32, String>,
     /// Elementart eines Array/List-Locals (für Index/len/for-über-Liste).
@@ -922,6 +1084,37 @@ impl<'a> FnLower<'a> {
             }
             return (Operand::ConstI64(0), Ty::Void);
         }
+        // Aufruf einer generischen Funktion → Typargumente aus den Argumenttypen
+        // binden, Monomorph.-Instanz `f$T…` anfordern, Aufruf auf die Instanz.
+        if let Some(g) = self.generics.get(&name).cloned() {
+            let mut bind: HashMap<String, String> = HashMap::new();
+            for (i, pty) in g.param_tys.iter().enumerate() {
+                if let Some(t) = pty {
+                    if g.tparams.contains(&t.name) {
+                        if let Some((op, ty)) = lowered.get(i) {
+                            let cls = self.class_of_operand(op);
+                            bind.entry(t.name.clone()).or_insert_with(|| concrete_tyname(*ty, cls.as_ref()));
+                        }
+                    }
+                }
+            }
+            let targs: Vec<String> = g.tparams.iter().map(|tp| bind.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
+            let sym = mono_sym(&name, &targs);
+            self.mono.push((name.clone(), targs.clone()));
+            let ret = g.ret.as_ref().map(|t| ty_of(Some(&subst_type(t, &bind)))).unwrap_or(Ty::Void);
+            let ret_class = g.ret.as_ref().and_then(|t| class_of(Some(&subst_type(t, &bind))));
+            let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
+            if ret == Ty::Void {
+                self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
+                return (Operand::ConstI64(0), Ty::Void);
+            }
+            let d = self.new_local(ret);
+            if let Some(c) = ret_class {
+                self.local_class.insert(d.0, c);
+            }
+            self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
+            return (Operand::Copy(d), ret);
+        }
         // Aufruf einer eigenen Funktion
         let (ret, ret_class) = self.sigs.get(&name).map(|s| (s.ret, s.ret_class.clone())).unwrap_or((Ty::I64, None));
         // Bequemlichkeit: an `py_*`-Brückenfunktionen werden String-Argumente
@@ -1281,15 +1474,17 @@ impl<'a> FnLower<'a> {
 // Der AST nennt Block; hier Alias, um Namenskollision mit ir::Block zu vermeiden.
 use crate::ast::Block as Block2;
 
+#[allow(clippy::too_many_arguments)]
 fn lower_fn(
     f: &FnDef,
     sigs: &HashMap<String, Sig>,
     types: &HashMap<String, Layout>,
     variants: &HashMap<String, VariantInfo>,
+    generics: &HashMap<String, GInfo>,
     strings: &mut Vec<String>,
     recv_class: Option<&str>,
     sym: Option<&str>,
-) -> Result<Function, Vec<String>> {
+) -> Result<(Function, Vec<(String, Vec<String>)>), Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = match sym {
         Some(s) => s.to_string(),
@@ -1304,6 +1499,8 @@ fn lower_fn(
         sigs,
         types,
         variants,
+        generics,
+        mono: Vec::new(),
         local_class: HashMap::new(),
         local_arr: HashMap::new(),
         strings,
@@ -1355,14 +1552,18 @@ fn lower_fn(
     if !fl.errs.is_empty() {
         return Err(fl.errs);
     }
-    Ok(Function {
-        name,
-        params: param_tys,
-        ret,
-        locals: fl.locals,
-        blocks: fl.blocks,
-        receiver_nonnull: false,
-    })
+    let mono = fl.mono;
+    Ok((
+        Function {
+            name,
+            params: param_tys,
+            ret,
+            locals: fl.locals,
+            blocks: fl.blocks,
+            receiver_nonnull: false,
+        },
+        mono,
+    ))
 }
 
 /// Enthält ein Block (rekursiv über verschachtelte Blöcke/Schleifen/if) ein
