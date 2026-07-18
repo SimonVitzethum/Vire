@@ -240,6 +240,8 @@ struct Ctx<'a> {
     /// ihrer Ausführung konstant → `GetStatic` liefert eine stabile, von der
     /// Static-Wurzel am Leben gehaltene Referenz und braucht kein retain/release.
     static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Interprozedurale Instanzfeld-Schreibmengen (+ opak-Flag) für Region-Inferenz.
+    field_writes: BTreeMap<String, (BTreeSet<(String, String)>, bool)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -396,7 +398,8 @@ pub fn emit(program: &Program) -> String {
         }
     }
     let static_writes = static_write_effects(program);
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes };
+    let field_writes = instance_field_writes(program);
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -941,6 +944,89 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
 /// Call-Graphen). Direkte `PutStatic` plus die Effekte aller Callees; Funktionen
 /// mit unaufgelöstem virtuellem Call gelten konservativ als „schreibt alles".
 /// Externe/`jrt_`-Aufrufe schreiben keine Java-Statics (C berührt sie nicht).
+/// Interprozedurale Instanzfeld-Schreib-Analyse: pro Funktion die Menge der
+/// (Klasse, Feld), die sie ODER ein transitiver Callee via `PutField` schreibt,
+/// plus ein `unknown`-Flag (opake Aufrufe: virtuell/poly/extern → könnten alles
+/// schreiben). Grundlage für die Region-Inferenz: ein `GetField` eines Feldes, das
+/// die Funktion (transitiv) NICHT schreibt und die von keinem opaken Aufruf
+/// geändert werden kann, darf borgen (kein retain/release) — auch in Funktionen,
+/// die andere (nicht-schreibende) Nutzerfunktionen rufen (der Fall, den v1 aussparte).
+fn instance_field_writes(program: &Program) -> BTreeMap<String, (BTreeSet<(String, String)>, bool)> {
+    let fn_names: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let mut writes: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut unknown: BTreeMap<String, bool> = BTreeMap::new();
+    let mut callees: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for f in &program.functions {
+        let mut d: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut c: BTreeSet<String> = BTreeSet::new();
+        let mut op = false;
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                match st {
+                    Statement::PutField { class, field, .. } => {
+                        d.insert((class.clone(), field.clone()));
+                    }
+                    Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => {
+                        if fn_names.contains(func.as_str()) {
+                            c.insert(func.clone());
+                        } else if !func.starts_with("jrt_") {
+                            op = true; // extern/unbekannt → könnte Felder ändern
+                        }
+                    }
+                    Statement::CallVirtual { .. } => op = true,
+                    Statement::CallPoly { targets, .. } => {
+                        for (_, sym) in targets {
+                            if fn_names.contains(sym.as_str()) {
+                                c.insert(sym.clone());
+                            } else {
+                                op = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        writes.insert(f.name.clone(), d);
+        unknown.insert(f.name.clone(), op);
+        callees.insert(f.name.clone(), c);
+    }
+    // Fixpunkt: Callee-Schreibmengen und -unknown hochziehen.
+    loop {
+        let mut changed = false;
+        let names: Vec<String> = writes.keys().cloned().collect();
+        for name in &names {
+            let cs = callees[name].clone();
+            let mut add: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut op = unknown[name];
+            for c in &cs {
+                if let Some(w) = writes.get(c) {
+                    for x in w {
+                        if !writes[name].contains(x) {
+                            add.insert(x.clone());
+                        }
+                    }
+                }
+                if unknown.get(c).copied().unwrap_or(true) {
+                    op = true;
+                }
+            }
+            if !add.is_empty() {
+                writes.get_mut(name).unwrap().extend(add);
+                changed = true;
+            }
+            if op != unknown[name] {
+                unknown.insert(name.clone(), op);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    writes.into_iter().map(|(k, w)| (k.clone(), (w, unknown[&k]))).collect()
+}
+
 fn static_write_effects(program: &Program) -> BTreeMap<String, BTreeSet<(String, String)>> {
     let fn_names: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
     let mut all_statics: BTreeSet<(String, String)> = BTreeSet::new();
@@ -1018,7 +1104,12 @@ fn static_write_effects(program: &Program) -> BTreeMap<String, BTreeSet<(String,
 /// aastore/PutStatic) den Wert selbst retainen und `return` ebenso — ein Borrow
 /// wird in jeder Verwendungsposition korrekt behandelt. Monotone Invalidierung
 /// bis zum Fixpunkt.
-fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>, static_writes: &BTreeSet<(String, String)>) -> BTreeSet<u32> {
+fn borrow_slots(
+    f: &Function,
+    borrowed: &BTreeSet<u32>,
+    static_writes: &BTreeSet<(String, String)>,
+    field_writes: &(BTreeSet<(String, String)>, bool),
+) -> BTreeSet<u32> {
     let n = f.locals.len();
     let n_params = f.params.len();
     let mut b = vec![false; n];
@@ -1027,30 +1118,16 @@ fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>, static_writes: &BTreeSet
             b[l] = true;
         }
     }
-    // Region-Inferenz-Inkrement (Traversal-Cursor): ein `GetField`-Load eines
-    // Feldes, das diese Funktion NIRGENDS schreibt, von einer stabilen (geborgten)
-    // Basis, ist selbst ein Borrow — das Feld hält den Wert am Leben. Das elidiert
-    // die heißen `cur = cur.next`-retain/release (M0.1c/T14). SOUND nur, wenn keine
-    // Nutzerfunktion gerufen wird, die das Feld ändern könnte: Runtime-Intrinsics
-    // (jrt_*) fassen keine Nutzerfelder an, also ist die Funktions-lokale
-    // PutField-Prüfung dann vollständig. Bei User-Calls konservativ aus.
-    let has_user_calls = f.blocks.iter().flat_map(|bb| &bb.statements).any(|st| match st {
-        Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => !func.starts_with("jrt_"),
-        Statement::CallVirtual { .. } | Statement::CallPoly { .. } => true,
-        _ => false,
-    });
-    let written_fields: BTreeSet<(&str, &str)> = f
-        .blocks
-        .iter()
-        .flat_map(|bb| &bb.statements)
-        .filter_map(|st| match st {
-            Statement::PutField { class, field, .. } => Some((class.as_str(), field.as_str())),
-            _ => None,
-        })
-        .collect();
+    // Region-Inferenz (interprozedural): ein `GetField`-Load eines Feldes, das
+    // diese Funktion UND ihre transitiven Callees NICHT schreiben (und das kein
+    // opaker Aufruf ändern kann), von einer stabilen (geborgten) Basis, ist ein
+    // Borrow — das Feld hält den Wert am Leben, retain/release entfällt. Das
+    // greift jetzt auch in Funktionen, die andere (nicht-schreibende) Nutzer-
+    // funktionen rufen (der Fall, den die funktions-lokale v1 aussparte).
+    let (written_fields, writes_unknown) = field_writes;
     let field_borrow_ok = |obj: &Operand, class: &str, field: &str, b: &[bool]| -> bool {
-        !has_user_calls
-            && !written_fields.contains(&(class, field))
+        !writes_unknown
+            && !written_fields.contains(&(class.to_string(), field.to_string()))
             && matches!(obj, Operand::Copy(s) if borrowed.contains(&s.0) || b[s.0 as usize])
     };
     loop {
@@ -1303,7 +1380,9 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let imm = immortal_only_locals(f);
     let empty_writes = BTreeSet::new();
     let sw = ctx.static_writes.get(&f.name).unwrap_or(&empty_writes);
-    let borrow = borrow_slots(f, &borrowed, sw);
+    let empty_fw = (BTreeSet::new(), true); // unbekannt → konservativ (kein Borrow)
+    let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
+    let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn };
 
