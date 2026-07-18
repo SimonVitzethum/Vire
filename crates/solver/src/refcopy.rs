@@ -1,22 +1,22 @@
-//! Elimination redundanter Referenz-Selbstkopien (RC-neutral).
+//! Elimination of redundant reference self-copies (RC-neutral).
 //!
-//! javac lädt eine Objekt-/Array-Referenz vor jedem Zugriff neu in einen
-//! Stack-Slot (`aload`), was das Frontend als `Assign(d, Copy(s))` auf einem
-//! Ref-Local materialisiert. Für Ref-Locals emittiert das Backend die
-//! Owning-Slot-Disziplin: `retain(neu); store; release(alt)`. In heißen
-//! Schleifen ist das ein retain/release-Paar **je Iteration** auf einer
-//! schleifeninvarianten Referenz — Overhead, den Rust nicht hat.
+//! javac reloads an object/array reference into a stack slot before every
+//! access (`aload`), which the frontend materializes as `Assign(d, Copy(s))` on a
+//! ref local. For ref locals the backend emits the
+//! owning-slot discipline: `retain(new); store; release(old)`. In hot
+//! loops this is a retain/release pair **per iteration** on a
+//! loop-invariant reference — overhead that Rust does not have.
 //!
-//! Beweist globales Value-Numbering, dass der Zielslot `d` an dieser Stelle
-//! *bereits* den Wert von `s` hält (`env[d] == env[s]`), dann ist die Kopie ein
-//! No-Op: `retain(x)` gefolgt von `release(alt = x)` hebt sich exakt auf, und
-//! der Store schreibt denselben Wert zurück. Das Statement ist damit **RC-
-//! neutral entfernbar** — unabhängig von Ownership, also ohne die Heap-Bilanz
-//! (0 live) zu gefährden. Genau die Selbst-Refreshes in Schleifen verschwinden.
+//! If global value numbering proves that the target slot `d` at this point
+//! *already* holds the value of `s` (`env[d] == env[s]`), then the copy is a
+//! no-op: `retain(x)` followed by `release(old = x)` cancels exactly, and
+//! the store writes the same value back. The statement is thus **RC-
+//! neutrally removable** — independent of ownership, so without endangering the
+//! heap balance (0 live). Exactly the self-refreshes in loops disappear.
 //!
-//! GVN wie in `bounds`: pessimistischer Fixpunkt (konkrete Nummer nur bei
-//! Pred-Einigkeit, sonst Phi) plus optimistischer Phi-Kollaps für
-//! schleifeninvariante Referenzen.
+//! GVN as in `bounds`: pessimistic fixpoint (concrete number only on
+//! pred agreement, otherwise phi) plus optimistic phi collapse for
+//! loop-invariant references.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -34,9 +34,9 @@ pub fn elide_redundant_ref_copies(program: &mut Program) -> usize {
 enum Sym {
     Null,
     Param(u32),
-    /// Frisch erzeugte Referenz (New/Call/GetField/…), per Definitionsstelle.
+    /// Freshly created reference (New/Call/GetField/…), by definition site.
     Def(u32),
-    /// Phi an einem Blockeingang: (Block, Local).
+    /// Phi at a block entry: (block, local).
     Phi(u32, u32),
 }
 
@@ -61,13 +61,13 @@ fn site(b: usize, si: usize) -> u32 {
     ((b as u32) << 16) | (si as u32 & 0xFFFF)
 }
 
-type Env = BTreeMap<u32, u32>; // Ref-Local → Sym-Id
+type Env = BTreeMap<u32, u32>; // ref local → sym id
 
 fn is_ref(f: &Function, l: u32) -> bool {
     f.locals.get(l as usize).copied() == Some(Ty::Ref)
 }
 
-/// Sym des von einem Statement definierten Ref-Locals (falls es eines gibt).
+/// Sym of the ref local defined by a statement (if there is one).
 fn def_sym(f: &Function, st: &Statement, env: &Env, it: &mut Interner, b: usize, si: usize) -> Option<(u32, u32)> {
     let (d, sym) = match st {
         Statement::Assign(d, Rvalue::Use(Operand::Copy(s))) if is_ref(f, d.0) => {
@@ -168,7 +168,7 @@ fn canon(repr: &[u32], mut s: u32) -> u32 {
     s
 }
 
-/// Phi-Kollaps: repr[p] = S, wenn alle Nicht-Selbst-Eingänge gleich S sind.
+/// Phi collapse: repr[p] = S if all non-self inputs are equal to S.
 fn compute_repr(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, incomplete: &BTreeSet<u32>) -> Vec<u32> {
     let n = it.syms.len();
     let mut repr: Vec<u32> = (0..n as u32).collect();
@@ -210,7 +210,7 @@ fn run(f: &mut Function) -> usize {
     let preds = predecessors(f);
     let mut it = Interner::default();
 
-    // GVN-Fixpunkt.
+    // GVN fixpoint.
     let mut env_out: Vec<Env> = vec![Env::new(); nb];
     let mut converged = false;
     for _ in 0..200 {
@@ -233,9 +233,9 @@ fn run(f: &mut Function) -> usize {
     }
     let env_in: Vec<Env> = (0..nb).map(|b| merge_in(f, b, &preds[b], &env_out, &mut it)).collect();
 
-    // Phi-Eingänge sammeln. Fehlt das Local in *irgendeinem* Pred, hat das Phi
-    // einen undefinierten/anderen Eingang → nicht kollabierbar (sonst würde es
-    // fälschlich mit dem einen definierten Zweig gleichgesetzt).
+    // Collect phi inputs. If the local is missing in *any* pred, the phi has
+    // an undefined/other input → not collapsible (otherwise it would be
+    // wrongly equated with the one defined branch).
     let mut phi_inc: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut incomplete: BTreeSet<u32> = BTreeSet::new();
     for b in 0..nb {
@@ -256,8 +256,8 @@ fn run(f: &mut Function) -> usize {
     }
     let repr = compute_repr(&it, &phi_inc, &incomplete);
 
-    // Redundante Selbstkopien entfernen: `Assign(d, Copy(s))` mit d,s Ref und
-    // env[d] == env[s] unmittelbar davor.
+    // Remove redundant self-copies: `Assign(d, Copy(s))` with d,s ref and
+    // env[d] == env[s] immediately before.
     let mut removed = 0;
     for b in 0..nb {
         let mut env = env_in[b].clone();

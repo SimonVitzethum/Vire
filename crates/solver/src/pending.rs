@@ -1,25 +1,25 @@
-//! Elimination toter pending-Exception-Prüfungen.
+//! Elimination of dead pending-exception checks.
 //!
-//! Das Exception-Modell fügt nach jedem potenziell werfenden Aufruf ein
-//! `jrt_pending_set` + Branch ein (Handler/Propagation vs. Fortsetzung). Kann
-//! der vorangehende Aufruf beweisbar *nicht* werfen, ist die Prüfung tot — ein
-//! `call jrt_pending_set` je Iteration, das Rust nicht hat. Diese Analyse
-//! entfernt sie.
+//! The exception model inserts a `jrt_pending_set` + branch after every
+//! potentially throwing call (handler/propagation vs. continuation). If
+//! the preceding call provably does *not* throw, the check is dead — a
+//! `call jrt_pending_set` per iteration that Rust does not have. This analysis
+//! removes it.
 //!
-//! Throw-Freiheit (Fixpunkt): eine Funktion setzt nie eine pending-Exception,
-//! wenn kein Statement das kann — Feldzugriffe nur auf beweisbar nicht-null
-//! Objekte (New-Ergebnisse), Aufrufe nur an throw-freie Funktionen bzw. bekannt
-//! harmlose Runtime-Helfer. Konservativ: im Zweifel „kann werfen" (dann bleibt
-//! die Prüfung stehen — korrekt, nur ungenutzte Optimierung).
+//! Throw-freedom (fixpoint): a function never sets a pending exception
+//! if no statement can — field accesses only on provably non-null
+//! objects (New results), calls only to throw-free functions or known
+//! harmless runtime helpers. Conservative: when in doubt "can throw" (then the
+//! check stays — correct, just an unused optimization).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
-/// Entfernt tote pending-Prüfungen. Gibt die Anzahl entfernter Prüfungen zurück.
+/// Removes dead pending checks. Returns the number of removed checks.
 pub fn elide_pending_checks(program: &mut Program) -> usize {
-    // Instanzmethoden: dort ist Local 0 = `this` und nie null (der Aufrufer
-    // prüft den Receiver bzw. `this` kommt aus `new`).
+    // Instance methods: there local 0 = `this` and never null (the caller
+    // checks the receiver, or `this` comes from `new`).
     let instance: BTreeSet<String> = program
         .classes
         .iter()
@@ -34,10 +34,10 @@ pub fn elide_pending_checks(program: &mut Program) -> usize {
     removed
 }
 
-/// Bekannt nicht-werfende Runtime-Helfer (setzen nie `pending`).
+/// Known non-throwing runtime helpers (never set `pending`).
 fn runtime_safe(func: &str) -> bool {
-    // werfende Helfer explizit ausschließen; alles andere jrt_* gilt als sicher,
-    // wenn es hier nicht als werfend gelistet ist.
+    // explicitly exclude throwing helpers; everything else jrt_* counts as safe
+    // if it is not listed here as throwing.
     const THROWS: &[&str] = &[
         "jrt_throw",
         "jrt_null_check",
@@ -77,8 +77,8 @@ fn runtime_safe(func: &str) -> bool {
     func.starts_with("jrt_") && !THROWS.contains(&func)
 }
 
-/// Nicht-null beweisbare Locals: `this` (bei Instanzmethoden), New/StackNew-
-/// Ergebnisse und Kopien davon.
+/// Provably non-null locals: `this` (in instance methods), New/StackNew
+/// results, and copies thereof.
 fn non_null_locals(f: &Function, is_instance: bool) -> BTreeSet<u32> {
     let mut nn = BTreeSet::new();
     if is_instance {
@@ -91,7 +91,7 @@ fn non_null_locals(f: &Function, is_instance: bool) -> BTreeSet<u32> {
             }
         }
     }
-    // Kopien: Fixpunkt über Assign(d, Copy(s)).
+    // Copies: fixpoint over Assign(d, Copy(s)).
     loop {
         let before = nn.len();
         for bb in &f.blocks {
@@ -103,14 +103,14 @@ fn non_null_locals(f: &Function, is_instance: bool) -> BTreeSet<u32> {
                 }
             }
         }
-        // Eine erneute Zuweisung eines nicht-nn Werts würde d entwerten; da wir
-        // flussunsensitiv arbeiten, entfernen wir d wieder, falls es auch einen
-        // Nicht-nn-Def hat.
+        // A reassignment of a non-nn value would invalidate d; since we
+        // work flow-insensitively, we remove d again if it also has a
+        // non-nn def.
         if nn.len() == before {
             break;
         }
     }
-    // Konservativ: Locals mit irgendeinem möglicherweise-null Def wieder streichen.
+    // Conservative: drop again locals with any possibly-null def.
     let mut maybe_null = BTreeSet::new();
     for bb in &f.blocks {
         for st in &bb.statements {
@@ -139,15 +139,15 @@ fn non_null_locals(f: &Function, is_instance: bool) -> BTreeSet<u32> {
     nn
 }
 
-/// Kann dieses Statement eine pending-Exception setzen?
+/// Can this statement set a pending exception?
 fn can_throw(st: &Statement, throw_free: &BTreeMap<String, bool>, non_null: &BTreeSet<u32>) -> bool {
     let call_throws = |func: &str, recv: Option<&Operand>| -> bool {
-        // Nutzer-Funktion: laut Summary. Runtime: laut Liste. Sonst konservativ.
+        // User function: per summary. Runtime: per list. Otherwise conservative.
         let target_ok = throw_free.get(func).copied().unwrap_or(false) || runtime_safe(func);
         if !target_ok {
             return true;
         }
-        // CallGuarded prüft den Receiver auf null → kann NPE, außer non-null.
+        // CallGuarded checks the receiver for null → can NPE, unless non-null.
         if let Some(Operand::Copy(l)) = recv {
             !non_null.contains(&l.0)
         } else {
@@ -161,7 +161,7 @@ fn can_throw(st: &Statement, throw_free: &BTreeMap<String, bool>, non_null: &BTr
         Statement::CallVirtual { .. } | Statement::CallPoly { .. } => true,
         Statement::GetField { obj, .. } => obj_may_null(obj),
         Statement::PutField { obj, .. } => obj_may_null(obj),
-        // Bounds-bewiesene (unchecked) Zugriffe sind throw-frei.
+        // Bounds-proven (unchecked) accesses are throw-free.
         Statement::ArrayLoad { checked, .. } | Statement::ArrayStore { checked, .. } => *checked,
         Statement::ArrayLen { .. } => true,
         Statement::InstanceOfPending { .. } | Statement::CheckCast { .. } => true,
@@ -169,7 +169,7 @@ fn can_throw(st: &Statement, throw_free: &BTreeMap<String, bool>, non_null: &BTr
     }
 }
 
-/// Throw-Freiheits-Fixpunkt.
+/// Throw-freedom fixpoint.
 fn compute_throw_free(functions: &[Function], instance: &BTreeSet<String>) -> BTreeMap<String, bool> {
     let mut tf: BTreeMap<String, bool> = functions.iter().map(|f| (f.name.clone(), true)).collect();
     let non_null: BTreeMap<String, BTreeSet<u32>> = functions
@@ -200,9 +200,9 @@ fn compute_throw_free(functions: &[Function], instance: &BTreeSet<String>) -> BT
     tf
 }
 
-/// Entfernt in einer Funktion die pending-Prüfungen, deren Block nicht werfen
-/// kann. Struktur je Prüfblock: … [werfende Op] ; `Call jrt_pending_set → c` ;
-/// `Branch{c, exc, cont}`. Ist keine Op im Block werfend → `Goto(cont)`.
+/// Removes, in a function, the pending checks whose block cannot throw.
+/// Structure per check block: … [throwing op] ; `Call jrt_pending_set → c` ;
+/// `Branch{c, exc, cont}`. If no op in the block throws → `Goto(cont)`.
 fn elide_in_function(
     f: &mut Function,
     throw_free: &BTreeMap<String, bool>,
@@ -210,8 +210,8 @@ fn elide_in_function(
 ) -> usize {
     let mut removed = 0;
     for bb in &mut f.blocks {
-        // Muster erkennen: letztes Statement ist jrt_pending_set, Terminator ist
-        // Branch auf dessen dest.
+        // Recognize the pattern: last statement is jrt_pending_set, terminator is
+        // a branch on its dest.
         let Some(Statement::Call { dest: Some(c), func, .. }) = bb.statements.last() else {
             continue;
         };
@@ -225,7 +225,7 @@ fn elide_in_function(
             continue;
         }
         let cont = *else_blk;
-        // Kann irgendein Statement (außer der pending-Prüfung selbst) werfen?
+        // Can any statement (other than the pending check itself) throw?
         let n = bb.statements.len();
         let throws = bb.statements[..n - 1]
             .iter()
@@ -233,7 +233,7 @@ fn elide_in_function(
         if throws {
             continue;
         }
-        bb.statements.pop(); // jrt_pending_set entfernen
+        bb.statements.pop(); // remove jrt_pending_set
         bb.terminator = Terminator::Goto(cont);
         removed += 1;
     }

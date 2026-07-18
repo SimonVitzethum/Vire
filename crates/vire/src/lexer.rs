@@ -1,31 +1,31 @@
-//! Vire-Lexer: `&str → Vec<Token>`.
+//! Vire lexer: `&str → Vec<Token>`.
 //!
-//! Besonderheiten (siehe sprache/PARSER.md §2): Newline ist ein *weicher*
-//! Anweisungsterminator (wie Go — nur nach Tokens, die eine Anweisung beenden
-//! können), Generics stehen in `[]` (nie `<>`), Kommentare `//` und schachtelbare
-//! `/* */`, Zahlen mit `_`/Basis/Suffix, Strings mit Escapes.
+//! Peculiarities (see language/PARSER.md §2): newline is a *soft*
+//! statement terminator (like Go — only after tokens that can end a statement),
+//! generics go in `[]` (never `<>`), comments `//` and nestable
+//! `/* */`, numbers with `_`/base/suffix, strings with escapes.
 
 use crate::diag::{Diag, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
-    // Literale
+    // literals
     Int(i128),
     Float(f64),
     Str(String),
     Char(char),
-    // Bezeichner / Schlüsselwörter
+    // identifiers / keywords
     Ident(String),
     Kw(Kw),
-    // Klammern & Trenner
+    // brackets & separators
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Colon, Semi, Arrow, FatArrow, Dot, DotDot, DotDotEq, At, Question,
-    // Operatoren
+    // operators
     Plus, Minus, Star, Slash, Percent, PlusPct, MinusPct, StarPct,
     EqEq, Ne, Lt, Le, Gt, Ge,
     Amp, Pipe, Caret, Shl, Shr,
     Eq, PlusEq, MinusEq, StarEq, SlashEq,
-    // Gesteuert
+    // control
     Newline, Eof,
 }
 
@@ -36,8 +36,8 @@ pub enum Kw {
     And, Or, Not, As, True, False, SelfLower, SelfType, Native,
 }
 
-/// Kanonische Standard-Schreibweise jedes Schlüsselworts. Einzige Wahrheit —
-/// `from_ident` UND die konfigurierbare `Syntax`-Tabelle leiten sich hieraus ab.
+/// Canonical default spelling of each keyword. Single source of truth —
+/// both `from_ident` AND the configurable `Syntax` table derive from this.
 pub const KW_TABLE: &[(&str, Kw)] = {
     use Kw::*;
     &[
@@ -54,7 +54,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
 };
 
 impl Kw {
-    /// Kanonischer Name (für Config-Dateien und Reverse-Mapping).
+    /// Canonical name (for config files and reverse mapping).
     pub fn canonical(self) -> &'static str {
         KW_TABLE.iter().find(|(_, k)| *k == self).map(|(sp, _)| *sp).unwrap_or("?")
     }
@@ -66,7 +66,7 @@ pub struct Token {
     pub span: Span,
 }
 
-/// Kann nach diesem Token ein Newline eine Anweisung beenden? (Go-artige Regel.)
+/// After this token, can a newline end a statement? (Go-like rule.)
 fn ends_stmt(t: &Tok) -> bool {
     matches!(
         t,
@@ -88,7 +88,7 @@ impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
         Lexer { src: src.as_bytes(), pos: 0, diags: Vec::new(), syntax: Default::default() }
     }
-    /// Lexer mit nutzerdefinierter Schlüsselwort-Schreibweise.
+    /// Lexer with user-defined keyword spelling.
     pub fn with_syntax(src: &'a str, syntax: crate::syntax::Syntax) -> Self {
         Lexer { src: src.as_bytes(), pos: 0, diags: Vec::new(), syntax }
     }
@@ -120,8 +120,8 @@ impl<'a> Lexer<'a> {
         (out, self.diags)
     }
 
-    /// Whitespace/Kommentare überspringen; signifikante Newlines als Token an
-    /// `out` anhängen (nur wenn das letzte Token eine Anweisung beenden kann).
+    /// Skip whitespace/comments; append significant newlines as tokens to
+    /// `out` (only when the last token can end a statement).
     fn skip_trivia(&mut self, out: &mut Vec<Token>) {
         loop {
             match self.peek() {
@@ -192,7 +192,7 @@ impl<'a> Lexer<'a> {
 
     fn number(&mut self) -> Tok {
         let start = self.pos;
-        // Basis-Präfix
+        // base prefix
         if self.peek() == b'0' && matches!(self.peek2(), b'x' | b'X' | b'b' | b'B' | b'o' | b'O') {
             let base_ch = self.peek2();
             self.pos += 2;
@@ -216,7 +216,7 @@ impl<'a> Lexer<'a> {
                 }
             };
         }
-        // Dezimal, evtl. Float
+        // decimal, possibly float
         while self.peek() == b'_' || self.peek().is_ascii_digit() {
             self.pos += 1;
         }
@@ -249,7 +249,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_num_suffix(&mut self) {
-        // i8/i16/i32/i64/u8/.../f32/f64 – für M1 nur konsumieren.
+        // i8/i16/i32/i64/u8/.../f32/f64 – for M1 just consume.
         if matches!(self.peek(), b'i' | b'u' | b'f') {
             self.pos += 1;
             while self.peek().is_ascii_digit() {
@@ -259,8 +259,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn string(&mut self) -> Tok {
-        // Mehrzeiliger Roh-String `"""…"""`: keine Escapes, ideal für eingebetteten
-        // Fremdcode (native-Blöcke) und lange Texte.
+        // Multi-line raw string `"""…"""`: no escapes, ideal for embedded
+        // foreign code (native blocks) and long texts.
         if self.peek() == b'"' && self.peek2() == b'"' && self.src.get(self.pos + 2) == Some(&b'"') {
             let open = self.pos;
             self.pos += 3;
@@ -407,14 +407,14 @@ impl<'a> Lexer<'a> {
                     &format!("unerwartetes Zeichen '{}'", other as char),
                     Span(self.pos - 1, self.pos),
                 ));
-                // als Space behandeln: nächster Aufruf macht weiter
+                // treat as whitespace: the next call continues
                 Tok::Newline
             }
         }
     }
 }
 
-/// Bequemer Einstieg.
+/// Convenient entry point.
 pub fn lex(src: &str) -> (Vec<Token>, Vec<Diag>) {
     Lexer::new(src).lex()
 }

@@ -1,19 +1,19 @@
-//! Bytecode → Mittel-IR.
+//! Bytecode → mid-level IR.
 //!
-//! Standardverfahren: Basic-Block-Aufteilung an Branch-Zielen, dann
-//! abstrakte Stack-Simulation — jeder Operandenstack-Slot wird auf ein
-//! IR-Local abgebildet (Schlüssel: Tiefe × Typ; der Verifier garantiert
-//! typkonsistente Stacks an Join-Punkten, JVMS 4.10).
+//! Standard approach: basic-block splitting at branch targets, then
+//! abstract stack simulation — each operand-stack slot is mapped to an
+//! IR local (key: depth × type; the verifier guarantees
+//! type-consistent stacks at join points, JVMS 4.10).
 //!
-//! `System.out.println` wird als Intrinsic auf `jrt_println_*` der
-//! Mini-Runtime abgebildet (DESIGN.md §6).
+//! `System.out.println` is mapped as an intrinsic onto `jrt_println_*` of
+//! the mini-runtime (DESIGN.md §6).
 
 use std::collections::HashMap;
 
 use fastllvm_classfile::{ArrTy, ClassFile, Cond, Const, Instr};
 use fastllvm_ir::*;
 
-/// Array-Elementtyp des Classfile-Decoders → IR-Elementart.
+/// Array element type from the classfile decoder → IR element kind.
 fn arrty_kind(t: ArrTy) -> ArrKind {
     match t {
         ArrTy::Bool => ArrKind::Bool,
@@ -53,16 +53,16 @@ impl From<fastllvm_classfile::ParseError> for FrontendError {
 
 type Result<T> = std::result::Result<T, FrontendError>;
 
-/// Referenzierter Zieltyp eines Feld-Deskriptors (für die Azyklizitäts-
-/// Analyse): `LNode;`/`[LNode;` → `Node`; Primitive und Primitiv-Arrays
-/// (`I`, `[I`) → `None` (referenzieren nichts, keine Zyklus-Kante).
+/// Referenced target type of a field descriptor (for the acyclicity
+/// analysis): `LNode;`/`[LNode;` → `Node`; primitives and primitive arrays
+/// (`I`, `[I`) → `None` (reference nothing, no cycle edge).
 fn ref_target_of(desc: &str) -> Option<String> {
     let elem = desc.trim_start_matches('[');
     elem.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string())
 }
 
-/// Phase 1: Klassenmodell registrieren (vor dem Absenken aller Methoden,
-/// damit Feld-/Methodenauflösung über Klassengrenzen funktioniert).
+/// Phase 1: register the class model (before lowering any methods, so that
+/// field/method resolution works across class boundaries).
 pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     let field_ty_of = |desc: &str| -> Result<Ty> {
         let mut chars = desc.chars().peekable();
@@ -75,7 +75,7 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     for f in &cf.fields {
         let ty = field_ty_of(&f.descriptor)?;
         if f.is_static() {
-            // ConstantValue → Compile-Zeit-Initialwert (statische finals).
+            // ConstantValue → compile-time initial value (static finals).
             let init = match f.constant_value {
                 Some(idx) => Some(match cf.constant_pool.get(idx as usize) {
                     Some(Const::Integer(v)) => ConstInit::I32(*v),
@@ -118,11 +118,11 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     Ok(())
 }
 
-/// Registriert die eingebauten Klassen, deren Methoden am virtuellen
-/// Dispatch teilnehmen. Aktuell `java/lang/String` mit `equals`/`hashCode`/
-/// `toString` (Runtime-Implementierungen `jrt_str_*`), damit ein
-/// `Object`-typisierter Aufruf `obj.equals(x)` auf einen String korrekt
-/// dispatcht (Grundlage für equals-basierte Collections).
+/// Registers the built-in classes whose methods participate in virtual
+/// dispatch. Currently `java/lang/String` with `equals`/`hashCode`/
+/// `toString` (runtime implementations `jrt_str_*`), so that an
+/// `Object`-typed call `obj.equals(x)` on a String dispatches correctly
+/// (basis for equals-based collections).
 pub fn register_builtins(program: &mut Program) {
     if program.class("java/lang/String").is_some() {
         return;
@@ -149,8 +149,8 @@ pub fn register_builtins(program: &mut Program) {
         ],
         has_clinit: false,
     };
-    // java.lang.Comparable: Interface mit compareTo (globaler Vtable-Slot), das
-    // die Wrapper und String implementieren (für generische Comparable-Bounds).
+    // java.lang.Comparable: interface with compareTo (global vtable slot),
+    // implemented by the wrappers and String (for generic Comparable bounds).
     program.classes.push(ClassInfo {
         name: "java/lang/Comparable".to_string(),
         super_name: None,
@@ -179,10 +179,10 @@ pub fn register_builtins(program: &mut Program) {
     register_concurrency(program);
 }
 
-/// java.lang.Runnable (Funktionsinterface) + java.lang.Thread. Thread hält den
-/// Runnable und ein natives Handle; `start()`/`join()` sind Frontend-Intrinsics
-/// (jrt_thread_start/join). `run()` wird von der Runtime-Trampoline über den
-/// globalen Runnable-Vtable-Slot aufgerufen.
+/// java.lang.Runnable (functional interface) + java.lang.Thread. Thread holds
+/// the Runnable and a native handle; `start()`/`join()` are frontend intrinsics
+/// (jrt_thread_start/join). `run()` is invoked by the runtime trampoline via
+/// the global Runnable vtable slot.
 fn register_concurrency(program: &mut Program) {
     program.classes.push(ClassInfo {
         name: "java/lang/Runnable".to_string(),
@@ -239,14 +239,14 @@ fn register_concurrency(program: &mut Program) {
     });
 }
 
-/// Throwable/Exception/RuntimeException als eingebaute Basisklassen: Throwable
-/// hält das `$message`-Feld, alle drei bekommen `<init>()V` und
-/// `<init>(String)V` (setzen die Message). `getMessage()` wird im Frontend als
-/// Intrinsic abgefangen. Damit funktionieren `new RuntimeException("…")` und
-/// benutzerdefinierte Exceptions mit Message; für das *catch* bleiben diese
-/// drei Basistypen catch-all (Sentinels tragen keinen Type-Descriptor).
+/// Throwable/Exception/RuntimeException as built-in base classes: Throwable
+/// holds the `$message` field, all three get `<init>()V` and
+/// `<init>(String)V` (which set the message). `getMessage()` is intercepted in
+/// the frontend as an intrinsic. This makes `new RuntimeException("…")` and
+/// user-defined exceptions with a message work; for the *catch*, these
+/// three base types remain catch-all (sentinels carry no type descriptor).
 fn register_throwables(program: &mut Program) {
-    // (Klasse, Superklasse)
+    // (class, superclass)
     let chain = [
         ("java/lang/Throwable", None),
         ("java/lang/Exception", Some("java/lang/Throwable")),
@@ -308,8 +308,8 @@ fn register_throwables(program: &mut Program) {
             }],
         });
     }
-    // java.lang.MatchException (exhaustive pattern-switch-Fallback) extends
-    // RuntimeException; <init>(String, Throwable) setzt $message (Cause ignoriert).
+    // java.lang.MatchException (exhaustive pattern-switch fallback) extends
+    // RuntimeException; <init>(String, Throwable) sets $message (cause ignored).
     let me_init = mangle("java/lang/MatchException", "<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V");
     program.classes.push(ClassInfo {
         name: "java/lang/MatchException".to_string(),
@@ -345,10 +345,10 @@ fn register_throwables(program: &mut Program) {
     });
 }
 
-/// java.lang.Enum als Basisklasse aller enums: hält name (String) und
-/// ordinal (int); name()/ordinal()/toString() lesen die Felder, der
-/// Konstruktor <init>(String,int) setzt sie. Methodenrümpfe werden direkt
-/// als IR erzeugt.
+/// java.lang.Enum as the base class of all enums: holds name (String) and
+/// ordinal (int); name()/ordinal()/toString() read the fields, the
+/// constructor <init>(String,int) sets them. Method bodies are generated
+/// directly as IR.
 fn register_enum(program: &mut Program) {
     let cls = "java/lang/Enum";
     let name_m = mangle(cls, "name", "()Ljava/lang/String;");
@@ -428,7 +428,7 @@ fn register_enum(program: &mut Program) {
     });
 }
 
-/// Phase 2: alle Methodenrümpfe absenken.
+/// Phase 2: lower all method bodies.
 pub fn lower_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     for m in &cf.methods {
         let Some(code) = &m.code else { continue };
@@ -440,7 +440,7 @@ pub fn lower_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
 
 pub use fastllvm_ir::{clinit_symbol as clinit_name, mangle};
 
-/// Parst einen Methodendeskriptor zu (Parametertypen, Rückgabetyp).
+/// Parses a method descriptor into (parameter types, return type).
 fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
     let inner = desc
         .strip_prefix('(')
@@ -461,25 +461,24 @@ fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
     Ok((params, ret))
 }
 
-/// Roh-Parameter-Deskriptoren eines Methodendeskriptors (z. B.
-/// `["I", "Ljava/lang/String;"]`) — für die String-Konkatenation, die je
-/// nach Typ eine andere `to_str`-Konvertierung braucht.
-/// Details eines Lambda-Callsites (aus dem invokedynamic + LambdaMetafactory).
+/// Raw parameter descriptors of a method descriptor (e.g.
+/// `["I", "Ljava/lang/String;"]`) — for string concatenation, which needs a
+/// different `to_str` conversion depending on the type.
+/// Details of a lambda callsite (from the invokedynamic + LambdaMetafactory).
 struct LambdaInfo {
-    iface: String,       // Funktionsinterface (Rückgabetyp des indy)
-    sam_method: String,  // Name der Interface-Methode (z. B. "apply")
-    sam_desc: String,    // Deskriptor der Interface-Methode
-    kind: u8,            // MethodHandle-Referenzart (5=virtual, 6=static, …)
-    impl_class: String,  // Klasse der Ziel-/Rumpf-Methode
-    impl_name: String,   // lambda$… oder referenzierte Methode
-    impl_desc: String,   // Deskriptor der Ziel-Methode
-    captures: Vec<Ty>,   // eingefangene Variablen (indy-Parameter)
+    iface: String,       // functional interface (return type of the indy)
+    sam_method: String,  // name of the interface method (e.g. "apply")
+    sam_desc: String,    // descriptor of the interface method
+    kind: u8,            // MethodHandle reference kind (5=virtual, 6=static, …)
+    impl_class: String,  // class of the target/body method
+    impl_name: String,   // lambda$… or the referenced method
+    impl_desc: String,   // descriptor of the target method
+    captures: Vec<Ty>,   // captured variables (indy parameters)
 }
 
-/// Registriert eine synthetische Klasse, die das Funktionsinterface
-/// implementiert und die SAM-Methode an die Lambda-Rumpf-Methode
-/// weiterleitet (captures aus Feldern + eigene Argumente). Liefert den
-/// Klassennamen (idempotent pro Rumpf-Methode).
+/// Registers a synthetic class that implements the functional interface and
+/// forwards the SAM method to the lambda body method (captures from fields +
+/// its own arguments). Returns the class name (idempotent per body method).
 fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     let class_name = format!(
         "$lambda${}${}${}${}",
@@ -488,13 +487,13 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     if program.class(&class_name).is_some() {
         return Ok(class_name);
     }
-    // Capture-Felder cap0.. mit den eingefangenen Typen.
+    // Capture fields cap0.. with the captured types.
     let fields: Vec<FieldInfo> = info
         .captures
         .iter()
         .enumerate()
-        // Eingefangene Ref-Variablen konservativ als Object-Referenz werten
-        // (breite Zyklus-Kante — sound für die Azyklizitäts-Analyse).
+        // Treat captured Ref variables conservatively as an Object reference
+        // (broad cycle edge — sound for the acyclicity analysis).
         .map(|(i, &ty)| FieldInfo {
             name: format!("cap{i}"),
             ty,
@@ -522,8 +521,8 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         has_clinit: false,
     });
 
-    // Rumpf der SAM-Methode: Captures aus Feldern laden, dann die
-    // Lambda-Rumpf-Methode mit (captures…, sam-args…) aufrufen.
+    // Body of the SAM method: load captures from fields, then call the
+    // lambda body method with (captures…, sam-args…).
     let mut locals = vec![Ty::Ref]; // Local 0 = this
     locals.extend(sam_params.iter().copied());
     let n_sam = sam_params.len();
@@ -545,11 +544,11 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         impl_args.push(Operand::Copy(Local((1 + k) as u32)));
     }
 
-    // Argument-Unboxing an der SAM-Grenze: erwartet die Zielmethode ein
-    // Primitiv, während das Interface Object übergibt (z. B. F.apply(Integer)
-    // → static int-Methode), wird via Wrapper-<prim>Value entpackt.
-    // impl_param_descs sind die Rohtypen der Ziel-Parameter; bei virtuellen
-    // Aufrufen ist der Receiver (Position 0) vorangestellt und bleibt Ref.
+    // Argument unboxing at the SAM boundary: if the target method expects a
+    // primitive while the interface passes Object (e.g. F.apply(Integer)
+    // → static int method), it is unpacked via the wrapper's <prim>Value.
+    // impl_param_descs are the raw types of the target parameters; for virtual
+    // calls the receiver (position 0) is prepended and stays Ref.
     let mut impl_param_descs = descriptor_params(&info.impl_desc)?;
     if matches!(info.kind, 5 | 9) {
         impl_param_descs.insert(0, "Ljava/lang/Object;".to_string());
@@ -578,8 +577,8 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         }
     }
 
-    // Intrinsic-gestützte Ziele (z. B. String::length) direkt aufrufen —
-    // sie haben keinen Vtable-Slot.
+    // Call intrinsic-backed targets (e.g. String::length) directly —
+    // they have no vtable slot.
     let intrinsic = match (info.impl_class.as_str(), info.impl_name.as_str(), info.impl_desc.as_str()) {
         ("java/lang/String", "length", "()I") => Some("jrt_str_length"),
         ("java/lang/String", "isEmpty", "()Z") => Some("jrt_str_is_empty"),
@@ -588,14 +587,14 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         _ => None,
     };
 
-    // Roher Rückgabetyp der Ziel-Methode (vor Adaption an den SAM-Typ).
+    // Raw return type of the target method (before adaptation to the SAM type).
     let impl_ret_char = info.impl_desc.rsplit_once(')').map(|(_, r)| r.chars().next()).flatten();
     let impl_ret = if info.kind == 8 {
-        Ty::Ref // Konstruktor liefert ein Objekt
+        Ty::Ref // constructor returns an object
     } else {
         parse_descriptor(&info.impl_desc)?.1
     };
-    // Roh-Ergebnis-Local (Typ der Ziel-Methode).
+    // Raw result local (type of the target method).
     let raw = if impl_ret == Ty::Void {
         None
     } else {
@@ -641,8 +640,8 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
         }
     }
 
-    // Rückgabe an den SAM-Typ anpassen: primitives Ergebnis → Wrapper boxen,
-    // wenn das Interface Object erwartet (LambdaMetafactory-Adaption).
+    // Adapt the return value to the SAM type: box a primitive result into a
+    // wrapper when the interface expects Object (LambdaMetafactory adaptation).
     let result = match (raw, sam_ret) {
         (Some(r), Ty::Ref) if impl_ret != Ty::Ref => {
             let box_fn = match impl_ret_char {
@@ -674,8 +673,8 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     Ok(class_name)
 }
 
-/// Fügt einen Konvertierungs-Call (`jrt_*_to_str`) ein und liefert das
-/// String-Ergebnis-Local als Operand.
+/// Inserts a conversion call (`jrt_*_to_str`) and returns the string result
+/// local as an operand.
 fn str_conv(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, func: &str, val: Local) -> Operand {
     let l = ml.fresh(Ty::Ref);
     stmts.push(Statement::Call {
@@ -686,7 +685,7 @@ fn str_conv(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, func: &str, val
     Operand::Copy(l)
 }
 
-/// Bytegröße eines Ref-/Primitiv-Felds (für Record-memcmp-equals).
+/// Byte size of a ref/primitive field (for record memcmp-equals).
 fn ty_size(t: Ty) -> i64 {
     match t {
         Ty::I64 | Ty::F64 | Ty::Ref => 8,
@@ -694,7 +693,7 @@ fn ty_size(t: Ty) -> i64 {
     }
 }
 
-/// Feldwert → String (für Record-toString).
+/// Field value → String (for record toString).
 fn record_val_str(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, val: Local) -> Operand {
     match ty {
         Ty::I32 => str_conv(ml, stmts, "jrt_int_to_str", val),
@@ -718,7 +717,7 @@ fn record_val_str(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, v
     }
 }
 
-/// Feldwert → i32-Hash (für Record-hashCode; muss nur konsistent/≠0 sein).
+/// Field value → i32 hash (for record hashCode; only needs to be consistent/≠0).
 fn record_val_hash(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, val: Local) -> Operand {
     match ty {
         Ty::I32 => Operand::Copy(val),
@@ -727,8 +726,8 @@ fn record_val_hash(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, 
             stmts.push(Statement::Assign(l, Rvalue::Convert(Operand::Copy(val))));
             Operand::Copy(l)
         }
-        // Float/Double: fester (konsistenter) Beitrag — gleiche Records hashen
-        // gleich; die Verteilung ist gröber, aber der Kontrakt bleibt gewahrt.
+        // Float/Double: fixed (consistent) contribution — equal records hash
+        // equally; the distribution is coarser, but the contract is preserved.
         Ty::F32 | Ty::F64 => Operand::ConstI32(1),
         Ty::Ref => {
             let l = ml.fresh(Ty::I32);
@@ -747,7 +746,7 @@ fn record_val_hash(ml: &mut MethodLowering, stmts: &mut Vec<Statement>, ty: Ty, 
     }
 }
 
-/// Schiebt angesammelte Literalzeichen als String-Konstante in die Teileliste.
+/// Pushes accumulated literal characters as a string constant into the parts list.
 fn flush_lit(lit: &mut String, parts: &mut Vec<Operand>, program: &mut Program) {
     if !lit.is_empty() {
         let sid = program.intern_string(lit);
@@ -791,7 +790,7 @@ fn field_ty(
     desc: &str,
 ) -> Result<Ty> {
     match c {
-        // boolean/byte/short/char sind auf Stack und in Locals int (JVMS 2.11.1).
+        // boolean/byte/short/char are int on the stack and in locals (JVMS 2.11.1).
         'I' | 'Z' | 'B' | 'S' | 'C' => Ok(Ty::I32),
         'J' => Ok(Ty::I64),
         'F' => Ok(Ty::F32),
@@ -805,7 +804,7 @@ fn field_ty(
             Err(FrontendError::Unsupported(format!("Deskriptor {desc}")))
         }
         '[' => {
-            // Array-Deskriptor konsumieren; Elementtyp egal, Wert ist Ref.
+            // Consume the array descriptor; element type irrelevant, value is Ref.
             let n = rest.next().ok_or_else(|| FrontendError::Unsupported(format!("Deskriptor {desc}")))?;
             field_ty(n, rest, desc).map(|_| Ty::Ref)
         }
@@ -813,10 +812,10 @@ fn field_ty(
     }
 }
 
-/// Woher der Wert eines Locals zuletzt kam — lokale Konstantenpropagation
-/// für die statische Reflection-Auflösung (DESIGN.md §1.3). javac legt
-/// `ldc`-Argumente direkt vor dem Aufruf ab, daher reicht der Blick in den
-/// aktuellen Block.
+/// Where a local's value last came from — local constant propagation for the
+/// static reflection resolution (DESIGN.md §1.3). javac places `ldc`
+/// arguments directly before the call, so looking within the current block
+/// suffices.
 enum Origin<'a> {
     Op(&'a Operand),
     New(&'a str),
@@ -827,8 +826,8 @@ fn origin_of<'a>(stmts: &'a [Statement], l: Local) -> Origin<'a> {
     origin_from(stmts, stmts.len(), l, 8)
 }
 
-/// Sucht die letzte Zuweisung an `l` vor Index `upto` und verfolgt
-/// Copy-Ketten (astore/aload legt Werte über JVM-Slot-Locals um).
+/// Finds the last assignment to `l` before index `upto` and follows
+/// copy chains (astore/aload moves values through JVM-slot locals).
 fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) -> Origin<'a> {
     if depth == 0 {
         return Origin::Opaque;
@@ -859,14 +858,14 @@ fn origin_from<'a>(stmts: &'a [Statement], upto: usize, l: Local, depth: u32) ->
 struct MethodLowering<'a> {
     cf: &'a ClassFile,
     locals: Vec<Ty>,
-    /// (JVM-Local-Slot, Typ) → IR-Local. Slots sind untypisiert wiederverwendbar.
+    /// (JVM local slot, type) → IR local. Slots are reusable untyped.
     slot_map: HashMap<(u16, Ty), Local>,
-    /// (Stack-Tiefe, Typ) → IR-Local.
+    /// (stack depth, type) → IR local.
     stack_map: HashMap<(usize, Ty), Local>,
-    /// IR-Local → bekannter ConstClass-Wert (Reflection). Wird über
-    /// Kopien (aload/astore) propagiert, damit `getName`/`newInstance` das
-    /// Class-Objekt auch blockübergreifend statisch auflösen (die
-    /// Origin-Analyse ist nur block-lokal, seit invokestatic splittet).
+    /// IR local → known ConstClass value (reflection). Propagated across
+    /// copies (aload/astore) so that `getName`/`newInstance` resolve the
+    /// Class object statically even across blocks (the origin analysis is
+    /// only block-local, since invokestatic splits).
     class_const: HashMap<Local, String>,
 }
 
@@ -902,9 +901,9 @@ fn lower_method(
     program: &mut Program,
 ) -> Result<Function> {
     let (mut params, ret) = parse_descriptor(&m.descriptor)?;
-    // Nur die (ggf. per Manifest gewählte) Einstiegsklasse liefert java_main;
-    // sonst jede main (Einzeldatei-Modus). So kollidieren mehrere main-Methoden
-    // in einem JAR nicht.
+    // Only the entry class (possibly chosen via the manifest) provides
+    // java_main; otherwise every main (single-file mode). This way multiple
+    // main methods in one JAR do not collide.
     let is_main = m.name == "main"
         && m.descriptor == "([Ljava/lang/String;)V"
         && match &program.main_class {
@@ -912,11 +911,11 @@ fn lower_method(
             None => true,
         };
     if is_main {
-        // args-Array wird nicht durchgereicht; Slot 0 bleibt ein
-        // uninitialisiertes Ref-Local (Nutzung → Linker-/Laufzeitfehler später).
+        // the args array is not passed through; slot 0 stays an
+        // uninitialized Ref local (use → linker/runtime error later).
         params = Vec::new();
     } else if !m.is_static() {
-        // this belegt JVM-Slot 0 (JVMS 2.6.1).
+        // this occupies JVM slot 0 (JVMS 2.6.1).
         params.insert(0, Ty::Ref);
     }
 
@@ -927,7 +926,7 @@ fn lower_method(
     })?;
     let pc_index: HashMap<usize, usize> = instrs.iter().enumerate().map(|(i, (pc, _))| (*pc, i)).collect();
 
-    // Block-Leader bestimmen: Einstieg, Branch-Ziele, Nachfolger von Branches.
+    // Determine block leaders: entry, branch targets, successors of branches.
     let mut leaders = vec![0usize];
     for (i, (_, instr)) in instrs.iter().enumerate() {
         match instr {
@@ -961,9 +960,9 @@ fn lower_method(
                     leaders.push(*next_pc);
                 }
             }
-            // Werfende Operationen beenden den Block (danach folgt der
-            // Exception-Check). invokedynamic (Konkatenation) wirft nicht;
-            // Division wirft ArithmeticException.
+            // Throwing operations end the block (the exception check follows).
+            // invokedynamic (concatenation) does not throw; division throws
+            // ArithmeticException.
             Instr::InvokeStatic(_) | Instr::InvokeVirtual(_) | Instr::InvokeSpecial(_)
             | Instr::InvokeInterface(_)
             | Instr::IDiv | Instr::IRem | Instr::LDiv | Instr::LRem
@@ -976,7 +975,7 @@ fn lower_method(
             _ => {}
         }
     }
-    // Exception-Handler-Einstiege sind Leader.
+    // Exception-handler entries are leaders.
     for e in &code.exceptions {
         leaders.push(e.handler_pc as usize);
     }
@@ -985,22 +984,22 @@ fn lower_method(
     let block_of_pc: HashMap<usize, Block> =
         leaders.iter().enumerate().map(|(i, pc)| (*pc, Block(i as u32))).collect();
 
-    // Synthetischer Propagate-Block (letzter Block): wird angesprungen, wenn
-    // eine Exception aus dieser Methode heraus propagiert. Er läuft ins
-    // Funktions-Cleanup (Backend released die Locals; die Exception bleibt in
-    // jrt_pending) und returnt einen Dummy — der Aufrufer prüft pending.
+    // Synthetic propagate block (last block): jumped to when an exception
+    // propagates out of this method. It runs into the function cleanup (the
+    // backend releases the locals; the exception stays in jrt_pending) and
+    // returns a dummy — the caller checks pending.
     let propagate_block = Block(leaders.len() as u32);
 
-    // Handler-Blöcke und, pro werfender Instruktion, das Sprungziel im
-    // Ausnahmefall (innerster umschließender Handler oder Propagate-Block).
+    // Handler blocks and, per throwing instruction, the jump target in the
+    // exception case (innermost enclosing handler or propagate block).
     let handler_blocks: std::collections::HashSet<Block> = code
         .exceptions
         .iter()
         .map(|e| block_of_pc[&(e.handler_pc as usize)])
         .collect();
-    // Alle Handler, die einen pc abdecken (in Table-Reihenfolge). catch_type 0
-    // oder eine nicht modellierte Klasse (java/lang/Exception, …) wirkt als
-    // catch-all (None); modellierte Klassen als echter instanceof-Typ.
+    // All handlers covering a pc (in table order). catch_type 0 or a
+    // non-modelled class (java/lang/Exception, …) acts as catch-all (None);
+    // modelled classes as a real instanceof type.
     let handlers_of_pc = |pc: usize| -> Vec<(Option<String>, Block)> {
         code.exceptions
             .iter()
@@ -1010,10 +1009,10 @@ fn lower_method(
                     None
                 } else {
                     match cf.class_name(e.catch_type) {
-                        // Die eingebauten Basis-Throwables bleiben catch-all:
-                        // Laufzeit-Sentinels (Arith/NPE/Bounds) tragen keinen
-                        // Type-Descriptor und würden einen typisierten
-                        // instanceof gegen RuntimeException sonst verfehlen.
+                        // The built-in base throwables remain catch-all:
+                        // runtime sentinels (Arith/NPE/Bounds) carry no
+                        // type descriptor and would otherwise miss a typed
+                        // instanceof against RuntimeException.
                         Ok("java/lang/Throwable")
                         | Ok("java/lang/Exception")
                         | Ok("java/lang/RuntimeException") => None,
@@ -1025,15 +1024,15 @@ fn lower_method(
             })
             .collect()
     };
-    // Länge der Dispatch-Kette: bis einschließlich des ersten catch-all.
+    // Length of the dispatch chain: up to and including the first catch-all.
     let chain_len = |list: &[(Option<String>, Block)]| -> usize {
         list.iter().position(|(cc, _)| cc.is_none()).map(|i| i + 1).unwrap_or(list.len())
     };
 
-    // Für jeden werfenden pc das Exception-Ziel: direkter Handler (einzelner
-    // catch-all), Kette (typspezifisch) oder Propagate-Block. Ketten werden
-    // nach Handler-Liste dedupliziert und synthetische Blöcke ab hinter dem
-    // Propagate-Block angesiedelt.
+    // For each throwing pc the exception target: direct handler (single
+    // catch-all), chain (type-specific), or propagate block. Chains are
+    // deduplicated by handler list and synthetic blocks are placed after the
+    // propagate block.
     let mut chain_entry: HashMap<Vec<(Option<String>, Block)>, Block> = HashMap::new();
     let mut chains: Vec<(Block, Vec<(Option<String>, Block)>)> = Vec::new();
     let mut next_synth = propagate_block.0 + 1;
@@ -1043,7 +1042,7 @@ fn lower_method(
         let target = if list.is_empty() {
             propagate_block
         } else if list[0].0.is_none() {
-            list[0].1 // erster Handler fängt alles → direkt
+            list[0].1 // first handler catches everything → direct
         } else {
             *chain_entry.entry(list.clone()).or_insert_with(|| {
                 let entry = Block(next_synth);
@@ -1063,8 +1062,8 @@ fn lower_method(
         class_const: HashMap::new(),
     };
 
-    // Parameter belegen die ersten IR-Locals; JVM-Slot-Zählung beachtet
-    // breite Typen (long/double = 2 Slots).
+    // Parameters occupy the first IR locals; JVM slot counting accounts for
+    // wide types (long/double = 2 slots).
     let mut jvm_slot = 0u16;
     for &p in &params {
         let l = ml.fresh(p);
@@ -1072,16 +1071,16 @@ fn lower_method(
         jvm_slot += if p == Ty::I64 { 2 } else { 1 };
     }
 
-    // Worklist über Blöcke; Stack-Zustand (Typen) wird an Nachfolger propagiert.
+    // Worklist over blocks; stack state (types) is propagated to successors.
     let mut block_entry_stack: HashMap<Block, Vec<Ty>> = HashMap::new();
     block_entry_stack.insert(Block(0), Vec::new());
-    // Handler betreten mit genau der Exception auf dem Stack (JVMS 4.10.1).
+    // Handlers are entered with exactly the exception on the stack (JVMS 4.10.1).
     for &hb in &handler_blocks {
         block_entry_stack.insert(hb, vec![Ty::Ref]);
     }
     let mut done: Vec<Option<BasicBlock>> = vec![None; leaders.len()];
-    // Handler sind eigene Einstiegspunkte: die Dispatch-Ketten springen sie
-    // an, nicht die werfenden Blöcke direkt.
+    // Handlers are their own entry points: the dispatch chains jump to them,
+    // not the throwing blocks directly.
     let mut worklist = vec![Block(0)];
     for &hb in &handler_blocks {
         worklist.push(hb);
@@ -1115,13 +1114,13 @@ fn lower_method(
             &exc_target_of_pc,
         )?;
         for (succ, stack) in succs {
-            // Propagate- und Dispatch-Ketten-Blöcke sind synthetisch (Index
-            // ab propagate_block) und werden separat generiert.
+            // Propagate and dispatch-chain blocks are synthetic (index from
+            // propagate_block) and generated separately.
             if succ.0 >= propagate_block.0 {
                 continue;
             }
-            // Handler-Eintrittsstacks sind fest [Ref] und werden nicht vom
-            // Vorgänger überschrieben (der Ausnahme-Zweig leert den Stack).
+            // Handler entry stacks are fixed [Ref] and are not overwritten by
+            // the predecessor (the exception branch empties the stack).
             if handler_blocks.contains(&succ) {
                 worklist.push(succ);
                 continue;
@@ -1144,14 +1143,14 @@ fn lower_method(
         done[blk.0 as usize] = Some(bb);
     }
 
-    // Unerreichte Blöcke (z. B. nach javac totem Code) als leere Returns.
+    // Unreached blocks (e.g. after javac dead code) as empty returns.
     let mut blocks: Vec<BasicBlock> = done
         .into_iter()
         .map(|b| b.unwrap_or(BasicBlock { statements: Vec::new(), terminator: Terminator::Return(None) }))
         .collect();
 
-    // Propagate-Block anhängen: Return eines Dummy passend zum Rückgabetyp
-    // (der Wert wird nie benutzt — der Aufrufer sieht die pending exception).
+    // Append the propagate block: return a dummy matching the return type
+    // (the value is never used — the caller sees the pending exception).
     let dummy = match ret {
         Ty::Void => None,
         Ty::I32 => Some(Operand::ConstI32(0)),
@@ -1162,8 +1161,8 @@ fn lower_method(
     };
     blocks.push(BasicBlock { statements: Vec::new(), terminator: Terminator::Return(dummy) });
 
-    // Dispatch-Ketten der typspezifischen catch-Blöcke anhängen. Reihenfolge
-    // = Zuweisungsreihenfolge, damit die vorab vergebenen Indizes stimmen.
+    // Append the dispatch chains of the type-specific catch blocks. Order
+    // = assignment order, so the pre-assigned indices are correct.
     for (entry, list) in &chains {
         let n = chain_len(list);
         for i in 0..n {
@@ -1190,14 +1189,14 @@ fn lower_method(
         ret,
         locals: ml.locals,
         blocks,
-        // Instanzmethode: Local 0 = `this`, nicht-null (Receiver vom Aufrufer
-        // geprüft) → inline-Null-Prüfung bei this-Feldzugriffen entfällt.
+        // Instance method: Local 0 = `this`, non-null (receiver checked by the
+        // caller) → the inline null check on this-field accesses is omitted.
         receiver_nonnull: !m.is_static(),
     })
 }
 
-/// Senkt einen Block ab. Liefert den fertigen Block plus die Nachfolger mit
-/// ihrem Eintritts-Stack (Typen).
+/// Lowers a block. Returns the finished block plus the successors with their
+/// entry stack (types).
 fn lower_block(
     ml: &mut MethodLowering,
     program: &mut Program,
@@ -1208,11 +1207,11 @@ fn lower_block(
     is_handler: bool,
     exc_target_of_pc: &HashMap<usize, Block>,
 ) -> Result<(BasicBlock, Vec<(Block, Vec<Ty>)>)> {
-    // Stack als Liste von Typen; Wert der Tiefe d liegt im Local stack_slot(d, ty).
+    // Stack as a list of types; the value at depth d lives in local stack_slot(d, ty).
     let mut stack: Vec<Ty> = entry_stack;
     let mut stmts: Vec<Statement> = Vec::new();
 
-    // Handler betreten mit der Exception auf dem Stack: aus jrt_pending holen.
+    // Handlers are entered with the exception on the stack: fetch from jrt_pending.
     if is_handler {
         let l = ml.stack_slot(0, Ty::Ref);
         stmts.push(Statement::Call {
@@ -1221,7 +1220,7 @@ fn lower_block(
             args: Vec::new(),
         });
     }
-    // Werfender Aufruf am Blockende → Terminator prüft die pending exception.
+    // Throwing call at the block end → the terminator checks the pending exception.
     let mut throw_after: Option<usize> = None;
 
     macro_rules! push {
@@ -1249,8 +1248,8 @@ fn lower_block(
     for (pc, instr) in instrs.iter() {
         last_pc_end = *pc;
         if terminator.is_some() {
-            // Darf nie passieren: hieße, die Leader-Berechnung hat einen
-            // Terminator-Opcode nicht als Blockende erkannt.
+            // Must never happen: it would mean the leader computation did not
+            // recognize a terminator opcode as a block end.
             return Err(FrontendError::Unsupported(format!(
                 "interner Fehler: Instruktion nach Terminator bei pc={pc}"
             )));
@@ -1269,7 +1268,7 @@ fn lower_block(
                     Some(Const::Float(v)) => {
                         push!(Ty::F32, Rvalue::Use(Operand::ConstF32(*v)));
                     }
-                    // ldc einer Klassenkonstante (`Widget.class`).
+                    // ldc of a class constant (`Widget.class`).
                     Some(Const::Class { .. }) => {
                         let class = ml.cf.class_name(*idx)?.to_string();
                         if program.class(&class).is_none() {
@@ -1337,7 +1336,7 @@ fn lower_block(
                 let l = ml.jvm_slot(*slot, Ty::Ref);
                 let dest = push!(Ty::Ref, Rvalue::Use(Operand::Copy(l)));
                 if let Some(c) = ml.class_const.get(&l).cloned() {
-                    ml.class_const.insert(dest, c); // ConstClass über Kopie propagieren
+                    ml.class_const.insert(dest, c); // propagate ConstClass across the copy
                 }
             }
             Instr::IStore(slot) => {
@@ -1351,7 +1350,7 @@ fn lower_block(
                 stmts.push(Statement::Assign(l, Rvalue::Use(Operand::Copy(v))));
                 match ml.class_const.get(&v).cloned() {
                     Some(c) => { ml.class_const.insert(l, c); }
-                    None => { ml.class_const.remove(&l); } // Slot überschrieben
+                    None => { ml.class_const.remove(&l); } // slot overwritten
                 }
             }
             Instr::IInc(slot, delta) => {
@@ -1418,7 +1417,7 @@ fn lower_block(
                 let a = pop!();
                 push!(Ty::F64, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
             }
-            // long-Division/Rest über Runtime (Java: /0 wirft, MIN/-1 definiert).
+            // long division/remainder via runtime (Java: /0 throws, MIN/-1 defined).
             Instr::LDiv | Instr::LRem => {
                 let func = if matches!(instr, Instr::LDiv) { "jrt_ldiv" } else { "jrt_lrem" };
                 let b = pop!();
@@ -1482,7 +1481,7 @@ fn lower_block(
                 let v = pop!();
                 push!(Ty::F32, Rvalue::Convert(Operand::Copy(v)));
             }
-            // d2i/d2l/f2i/f2l saturieren (Java-Semantik) → Runtime.
+            // d2i/d2l/f2i/f2l saturate (Java semantics) → runtime.
             Instr::D2I | Instr::D2L | Instr::F2I | Instr::F2L => {
                 let (func, ty) = match instr {
                     Instr::D2I => ("jrt_d2i", Ty::I32),
@@ -1516,7 +1515,7 @@ fn lower_block(
                 let a = pop!();
                 push!(Ty::I32, Rvalue::Binary(op, Operand::Copy(a), Operand::Copy(b)));
             }
-            // Division/Rest werfen ArithmeticException → werfender Runtime-Call.
+            // Division/remainder throw ArithmeticException → throwing runtime call.
             Instr::IDiv | Instr::IRem => {
                 let func = if matches!(instr, Instr::IDiv) { "jrt_idiv" } else { "jrt_irem" };
                 let b = pop!();
@@ -1533,8 +1532,8 @@ fn lower_block(
             Instr::Pop => {
                 pop!();
             }
-            // monitorenter/monitorexit → Runtime-Sperre (rekursiver globaler
-            // Mutex unter --threads, sonst No-Op). objectref ist geborgt.
+            // monitorenter/monitorexit → runtime lock (recursive global
+            // mutex under --threads, otherwise a no-op). objectref is borrowed.
             Instr::MonitorEnter => {
                 let obj = pop!();
                 stmts.push(Statement::Call {
@@ -1552,8 +1551,8 @@ fn lower_block(
                 });
             }
             Instr::Pop2 => {
-                // Kategorie-2 (long/double) belegt einen Stack-Eintrag; zwei
-                // Kategorie-1-Werte zwei.
+                // Category 2 (long/double) occupies one stack entry; two
+                // category-1 values occupy two.
                 let top = *stack.last().ok_or_else(|| {
                     FrontendError::Unsupported("pop2 auf leerem Stack".into())
                 })?;
@@ -1614,8 +1613,8 @@ fn lower_block(
                 };
                 let t = ml.fresh(Ty::I32);
                 stmts.push(Statement::Assign(t, Rvalue::Binary(op, a, b)));
-                // Ein bedingter Branch beendet den Block; der Else-Zweig ist
-                // der Fallthrough-Block direkt dahinter.
+                // A conditional branch ends the block; the else branch is the
+                // fallthrough block directly after it.
                 let then_blk = block_of_pc[target];
                 let else_blk = fallthrough.ok_or_else(|| {
                     FrontendError::Unsupported(format!("Branch ohne Folgeblock bei pc={pc}"))
@@ -1681,7 +1680,7 @@ fn lower_block(
                 let dest = ml.stack_slot(stack.len(), Ty::I32);
                 stmts.push(Statement::ArrayLen { dest, arr: Operand::Copy(arr) });
                 stack.push(Ty::I32);
-                throw_after = Some(*pc); // NPE bei null-Array
+                throw_after = Some(*pc); // NPE on null array
             }
             Instr::ArrLoad(t) => {
                 let kind = arrty_kind(*t);
@@ -1715,7 +1714,7 @@ fn lower_block(
             }
             Instr::New(idx) => {
                 let class = ml.cf.class_name(*idx)?.to_string();
-                // StringBuilder ist runtime-gestützt: new → jrt_sb_new.
+                // StringBuilder is runtime-backed: new → jrt_sb_new.
                 if class == "java/lang/StringBuilder" {
                     let l = ml.stack_slot(stack.len(), Ty::Ref);
                     stmts.push(Statement::Call { dest: Some(l), func: "jrt_sb_new".to_string(), args: vec![] });
@@ -1740,7 +1739,7 @@ fn lower_block(
                 let l = ml.stack_slot(stack.len(), fty);
                 stmts.push(Statement::GetField { dest: l, obj: Operand::Copy(obj), class, field });
                 stack.push(fty);
-                throw_after = Some(*pc); // NPE bei null-Objekt
+                throw_after = Some(*pc); // NPE on null object
             }
             Instr::PutField(idx) => {
                 let (class, field, _) = ml.cf.member_ref(*idx)?;
@@ -1756,7 +1755,7 @@ fn lower_block(
                     field,
                     value: Operand::Copy(value),
                 });
-                throw_after = Some(*pc); // NPE bei null-Objekt
+                throw_after = Some(*pc); // NPE on null object
             }
             Instr::InvokeSpecial(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;
@@ -1769,10 +1768,10 @@ fn lower_block(
                 let recv = pop!();
                 args.push(Operand::Copy(recv));
                 args.reverse();
-                // StringBuilder-Konstruktor (Objekt kam schon von jrt_sb_new):
-                // ()V ist ein No-Op, (String) hängt den String an.
+                // StringBuilder constructor (the object already came from
+                // jrt_sb_new): ()V is a no-op, (String) appends the string.
                 if class == "java/lang/StringBuilder" && name == "<init>" {
-                    // args = [receiver, string?] (schon eingesammelt, reversed).
+                    // args = [receiver, string?] (already collected, reversed).
                     if desc == "(Ljava/lang/String;)V" {
                         stmts.push(Statement::Call {
                             dest: None,
@@ -1783,13 +1782,13 @@ fn lower_block(
                     continue;
                 }
                 if name == "<init>" && program.class(&class).is_none() {
-                    // Konstruktor einer nicht modellierten Basisklasse
-                    // (Object, Throwable, RuntimeException, …): entfällt.
-                    // Argumente wurden bereits gepoppt.
+                    // Constructor of a non-modelled base class
+                    // (Object, Throwable, RuntimeException, …): omitted.
+                    // Arguments have already been popped.
                     continue;
                 }
-                // invokespecial dispatcht nicht: Konstruktor, super-Aufruf
-                // oder private Methode → direkter Call auf die Auflösung.
+                // invokespecial does not dispatch: constructor, super call, or
+                // private method → direct call to the resolution.
                 let mangled = program
                     .resolve_method(&class, &name, &desc)
                     .map(|(_, mi)| mi.mangled.clone())
@@ -1809,7 +1808,7 @@ fn lower_block(
             Instr::GetStatic(idx) => {
                 let (class, name, _) = ml.cf.member_ref(*idx)?;
                 if class == "java/lang/System" && (name == "out" || name == "err") {
-                    // Receiver-Dummy; das println-Intrinsic ignoriert ihn.
+                    // Receiver dummy; the println intrinsic ignores it.
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                 } else {
                     let (class, field) = (class.to_string(), name.to_string());
@@ -1852,7 +1851,7 @@ fn lower_block(
                 };
                 if let Some(intrinsic) = intrinsic {
                     let arg = if desc.starts_with("()") { None } else { Some(pop!()) };
-                    pop!(); // Receiver (System.out-Dummy)
+                    pop!(); // receiver (System.out dummy)
                     stmts.push(Statement::Call {
                         dest: None,
                         func: intrinsic.to_string(),
@@ -1860,15 +1859,15 @@ fn lower_block(
                     });
                     continue;
                 }
-                // System.out.printf(fmt, Object[]) → formatieren + ausgeben,
-                // gibt den Stream (Dummy) zurück.
+                // System.out.printf(fmt, Object[]) → format + print,
+                // returns the stream (dummy).
                 if class == "java/io/PrintStream"
                     && name == "printf"
                     && desc == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;"
                 {
                     let array = pop!();
                     let fmt = pop!();
-                    pop!(); // Receiver-Dummy
+                    pop!(); // receiver dummy
                     let s = ml.fresh(Ty::Ref);
                     stmts.push(Statement::Call {
                         dest: Some(s),
@@ -1883,14 +1882,13 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(Operand::ConstNull));
                     continue;
                 }
-                // print(ln)(Object): virtueller toString, dann als String
-                // ausgeben.
+                // print(ln)(Object): virtual toString, then print as a string.
                 if class == "java/io/PrintStream"
                     && (name == "println" || name == "print")
                     && desc == "(Ljava/lang/Object;)V"
                 {
                     let arg = pop!();
-                    pop!(); // Receiver-Dummy
+                    pop!(); // receiver dummy
                     let s = ml.fresh(Ty::Ref);
                     stmts.push(Statement::CallVirtual {
                         dest: Some(s),
@@ -1905,8 +1903,8 @@ fn lower_block(
                     stmts.push(Statement::Call { dest: None, func: f.to_string(), args: vec![Operand::Copy(s)] });
                     continue;
                 }
-                // StringBuilder-Methoden (runtime-gestützt). append gibt
-                // this zurück (Verkettung), toString einen neuen String.
+                // StringBuilder methods (runtime-backed). append returns this
+                // (chaining), toString a new string.
                 if class == "java/lang/StringBuilder" {
                     let (func, rty) = match (name, desc) {
                         ("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;") => ("jrt_sb_append_str", Ty::Ref),
@@ -1936,7 +1934,7 @@ fn lower_block(
                     stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
                     continue;
                 }
-                // Unboxing: Wrapper.<prim>Value() → eingepackter Wert.
+                // Unboxing: Wrapper.<prim>Value() → the boxed value.
                 let unbox = match (class, name, desc) {
                     ("java/lang/Integer", "intValue", "()I") => Some(("jrt_integer_intvalue", Ty::I32)),
                     ("java/lang/Long", "longValue", "()J") => Some(("jrt_long_longvalue", Ty::I64)),
@@ -1957,9 +1955,9 @@ fn lower_block(
                     stack.push(rty);
                     continue;
                 }
-                // String-Methoden als Runtime-Intrinsics (Receiver ist ein
-                // echtes Argument, kein Dummy). UTF-8/Byte-Semantik: charAt
-                // liefert das Byte — für ASCII korrekt (Java: UTF-16-Einheit).
+                // String methods as runtime intrinsics (the receiver is a real
+                // argument, not a dummy). UTF-8/byte semantics: charAt returns
+                // the byte — correct for ASCII (Java: UTF-16 code unit).
                 if class == "java/lang/String" {
                     let (func, rty) = match (name, desc) {
                         ("length", "()I") => ("jrt_str_length", Ty::I32),
@@ -1993,22 +1991,22 @@ fn lower_block(
                     let l = ml.stack_slot(stack.len(), rty);
                     stack.push(rty);
                     stmts.push(Statement::Call { dest: Some(l), func: func.to_string(), args });
-                    // Receiver-null/OOB werfen NPE/StringIndexOutOfBounds →
-                    // abfangbar (equals/compareTo sind null-tolerant genug).
+                    // Receiver-null/OOB throw NPE/StringIndexOutOfBounds →
+                    // catchable (equals/compareTo are null-tolerant enough).
                     if func != "jrt_str_equals" {
                         throw_after = Some(*pc);
                     }
                     continue;
                 }
-                // Throwable.addSuppressed (von try-with-resources erzeugt):
-                // unterdrückte Exceptions sind rein diagnostisch → no-op.
+                // Throwable.addSuppressed (generated by try-with-resources):
+                // suppressed exceptions are purely diagnostic → no-op.
                 if name == "addSuppressed" && desc == "(Ljava/lang/Throwable;)V" {
                     pop!(); // suppressed throwable
                     pop!(); // receiver
                     continue;
                 }
-                // Thread.start()/join(): Runtime übernimmt (pthread bzw.
-                // synchroner Lauf ohne --threads). objectref geborgt.
+                // Thread.start()/join(): the runtime takes over (pthread or a
+                // synchronous run without --threads). objectref borrowed.
                 if class == "java/lang/Thread" && (name == "start" || name == "join") && desc == "()V" {
                     let recv = pop!();
                     let func = if name == "start" { "jrt_thread_start" } else { "jrt_thread_join" };
@@ -2019,8 +2017,8 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Object.getClass(): Class-Singleton über den Type-Descriptor
-                // (Laufzeit-Reflection der Objektidentität).
+                // Object.getClass(): Class singleton via the type descriptor
+                // (runtime reflection of the object identity).
                 if name == "getClass" && desc == "()Ljava/lang/Class;" {
                     let recv = pop!();
                     let l = ml.stack_slot(stack.len(), Ty::Ref);
@@ -2032,8 +2030,8 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Throwable.getMessage(): $message-Feld lesen (Sentinel-sicher
-                // über die Runtime, die den Type-Descriptor prüft).
+                // Throwable.getMessage(): read the $message field (sentinel-safe
+                // via the runtime, which checks the type descriptor).
                 if name == "getMessage" && desc == "()Ljava/lang/String;" {
                     let recv = pop!();
                     let l = ml.stack_slot(stack.len(), Ty::Ref);
@@ -2045,8 +2043,8 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Array-clone() (u.a. von enum values() erzeugt): flache
-                // Kopie mit retain der Ref-Elemente in der Runtime.
+                // Array clone() (generated among others by enum values()):
+                // shallow copy with retain of the Ref elements in the runtime.
                 if class.starts_with('[') && name == "clone" {
                     let arr = pop!();
                     let (elem_size, is_ref) = match class.as_bytes().get(1) {
@@ -2070,11 +2068,11 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Reflection auf einem Class-Objekt.
+                // Reflection on a Class object.
                 if class == "java/lang/Class" {
-                    // getName/getSimpleName laufen auf JEDEM Class-Wert (statisch
-                    // via ConstClass oder Laufzeit via getClass()) → das @jclass
-                    // trägt die Namens-Strings, Zugriff über die Runtime.
+                    // getName/getSimpleName run on ANY Class value (statically
+                    // via ConstClass or at runtime via getClass()) → the @jclass
+                    // carries the name strings, accessed via the runtime.
                     if desc == "()Ljava/lang/String;"
                         && (name == "getName" || name == "getSimpleName")
                     {
@@ -2093,11 +2091,11 @@ fn lower_block(
                         });
                         continue;
                     }
-                    // newInstance u.ä. brauchen den statisch bekannten Zieltyp.
+                    // newInstance and similar need the statically known target type.
                     let recv = pop!();
                     let target = match origin_of(&stmts, recv) {
                         Origin::Op(Operand::ConstClass(c)) => c.clone(),
-                        // Blockübergreifend über die ConstClass-Verfolgung.
+                        // Across blocks via the ConstClass tracking.
                         _ => match ml.class_const.get(&recv).cloned() {
                             Some(c) => c,
                             None => {
@@ -2136,8 +2134,8 @@ fn lower_block(
                     continue;
                 }
                 let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
-                // java/lang/Object-Wurzelmethoden (equals/hashCode/toString)
-                // dispatchen global über die Vtable jeder Klasse.
+                // java/lang/Object root methods (equals/hashCode/toString)
+                // dispatch globally via the vtable of each class.
                 let is_object_root = class == "java/lang/Object"
                     && matches!(
                         (name.as_str(), desc.as_str()),
@@ -2171,15 +2169,15 @@ fn lower_block(
                 throw_after = Some(*pc);
             }
             Instr::InvokeDynamic(idx) => {
-                // Statisch aufgelöst (Closed World, DESIGN.md §1.3):
-                // String-Konkatenation und Lambdas (LambdaMetafactory).
+                // Statically resolved (closed world, DESIGN.md §1.3):
+                // string concatenation and lambdas (LambdaMetafactory).
                 let (dname, ddesc, bsm_name, bsm_args) = ml.cf.invoke_dynamic(*idx)?;
 
                 // --- Lambda (LambdaMetafactory.metafactory) ---
                 if bsm_name == "metafactory" || bsm_name == "altMetafactory" {
                     let iface = match parse_descriptor(ddesc)?.1 {
                         Ty::Ref => {
-                            // Rückgabetyp des indy = "L…;" → Interface-Name.
+                            // return type of the indy = "L…;" → interface name.
                             let d = ddesc.rsplit_once(')').unwrap().1;
                             d.trim_start_matches('L').trim_end_matches(';').to_string()
                         }
@@ -2205,14 +2203,14 @@ fn lower_block(
                             .collect::<Result<Vec<_>>>()?,
                     };
                     let lambda_class = register_lambda(program, &info)?;
-                    // Eingefangene Argumente vom Stack holen (in Reihenfolge).
+                    // Fetch the captured arguments from the stack (in order).
                     let n = info.captures.len();
                     let mut caps = Vec::with_capacity(n);
                     for _ in 0..n {
                         caps.push(pop!());
                     }
                     caps.reverse();
-                    // Lambda-Objekt erzeugen und Capture-Felder setzen.
+                    // Create the lambda object and set the capture fields.
                     let obj = ml.stack_slot(stack.len(), Ty::Ref);
                     stmts.push(Statement::New { dest: obj, class: lambda_class.clone() });
                     for (i, cap) in caps.into_iter().enumerate() {
@@ -2228,12 +2226,12 @@ fn lower_block(
                 }
 
                 // --- Records (java/lang/runtime/ObjectMethods.bootstrap) ---
-                // toString/hashCode/equals werden feldweise erzeugt. Feldnamen
-                // aus bsm_args[1] ("f1;f2"), Typen via resolve_field.
+                // toString/hashCode/equals are generated field by field. Field
+                // names from bsm_args[1] ("f1;f2"), types via resolve_field.
                 if bsm_name == "bootstrap"
                     && (dname == "toString" || dname == "hashCode" || dname == "equals")
                 {
-                    // Empfängertyp = erster Parameter des indy-Deskriptors.
+                    // Receiver type = first parameter of the indy descriptor.
                     let rec_class = descriptor_params(ddesc)?
                         .first()
                         .and_then(|p| p.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string()))
@@ -2255,7 +2253,7 @@ fn lower_block(
                         "toString" => {
                             let this = pop!();
                             let simple = rec_class.rsplit(['/', '$']).next().unwrap_or(&rec_class);
-                            // Teile: "Simple[", "f=", <wert>, ", g=", <wert>, "]"
+                            // Parts: "Simple[", "f=", <value>, ", g=", <value>, "]"
                             let mut acc = {
                                 let sid = program.intern_string(&format!("{simple}["));
                                 let l = ml.fresh(Ty::Ref);
@@ -2273,7 +2271,7 @@ fn lower_block(
                                 let pl = ml.fresh(Ty::Ref);
                                 stmts.push(Statement::Assign(pl, Rvalue::Use(Operand::ConstStr(pid))));
                                 acc = cat(ml, &mut stmts, acc, Operand::Copy(pl));
-                                // Feldwert → String.
+                                // Field value → String.
                                 let fv = ml.fresh(*fty);
                                 stmts.push(Statement::GetField { dest: fv, obj: Operand::Copy(this), class: rec_class.clone(), field: fname.clone() });
                                 let vs = record_val_str(ml, &mut stmts, *fty, fv);
@@ -2288,7 +2286,7 @@ fn lower_block(
                         }
                         "hashCode" => {
                             let this = pop!();
-                            // h = 0; für jedes Feld: h = h*31 + feldhash.
+                            // h = 0; for each field: h = h*31 + fieldhash.
                             let h = ml.fresh(Ty::I32);
                             stmts.push(Statement::Assign(h, Rvalue::Use(Operand::ConstI32(0))));
                             for (fname, fty) in &fields {
@@ -2303,7 +2301,7 @@ fn lower_block(
                             continue;
                         }
                         _ => {
-                            // equals(this, other): instanceof + memcmp der Felder.
+                            // equals(this, other): instanceof + memcmp of the fields.
                             let other = pop!();
                             let this = pop!();
                             let fb: i64 = fields.iter().map(|(_, t)| ty_size(*t)).sum();
@@ -2322,9 +2320,9 @@ fn lower_block(
                 }
 
                 // --- Pattern-Switch (SwitchBootstraps.typeSwitch) ---
-                // Liefert den Index des ersten passenden Typ-Labels (−1 bei null,
-                // N bei keinem Treffer); ein nachfolgendes lookupswitch verzweigt.
-                // Branch-frei für disjunkte Labels (sealed): idx = Σ k·(o instof
+                // Returns the index of the first matching type label (−1 for null,
+                // N if no match); a following lookupswitch branches.
+                // Branch-free for disjoint labels (sealed): idx = Σ k·(o instof
                 // Lk) + (1−Σ)·N − (o==null)·(N+1).
                 if bsm_name == "typeSwitch" && dname == "typeSwitch" {
                     let labels: Vec<String> = bsm_args
@@ -2335,7 +2333,7 @@ fn lower_block(
                             "typeSwitch mit nicht-Klassen-Label (guarded/constant pattern)".into(),
                         ))?;
                     let n = labels.len() as i32;
-                    let _restart = pop!(); // Restart-Index (0 bei einfachen Mustern)
+                    let _restart = pop!(); // restart index (0 for simple patterns)
                     let obj = pop!();
                     let isnull = ml.fresh(Ty::I32);
                     stmts.push(Statement::Assign(isnull, Rvalue::Binary(BinOp::CmpEq, Operand::Copy(obj), Operand::ConstNull)));
@@ -2388,7 +2386,7 @@ fn lower_block(
                 } else {
                     "\u{1}".repeat(param_descs.len())
                 };
-                // Konstante Bootstrap-Argumente (ab Index 1) vorab als Strings.
+                // Constant bootstrap arguments (from index 1) precomputed as strings.
                 let const_strings: Vec<String> = if with_constants {
                     bsm_args[1..]
                         .iter()
@@ -2398,8 +2396,8 @@ fn lower_block(
                     Vec::new()
                 };
 
-                // Dynamische Argumente vom Stack holen (in umgekehrter
-                // Reihenfolge) und zu String-Operanden konvertieren.
+                // Fetch the dynamic arguments from the stack (in reverse order)
+                // and convert them to string operands.
                 let mut arg_parts: Vec<Operand> = vec![Operand::ConstNull; param_descs.len()];
                 for k in (0..param_descs.len()).rev() {
                     let val = pop!();
@@ -2412,9 +2410,9 @@ fn lower_block(
                         "J" => str_conv(ml, &mut stmts, "jrt_long_to_str", val),
                         "D" => str_conv(ml, &mut stmts, "jrt_double_to_str", val),
                         "F" => str_conv(ml, &mut stmts, "jrt_float_to_str", val),
-                        // Beliebiges Objekt (Wrapper, user-Klasse) → virtueller
-                        // toString. (null-Argument → NPE statt "null"; der
-                        // StringConcatFactory-Sonderfall ist nicht abgebildet.)
+                        // Arbitrary object (wrapper, user class) → virtual
+                        // toString. (null argument → NPE instead of "null"; the
+                        // StringConcatFactory special case is not modelled.)
                         _ if pd.starts_with('L') => {
                             let l = ml.fresh(Ty::Ref);
                             stmts.push(Statement::CallVirtual {
@@ -2437,8 +2435,8 @@ fn lower_block(
                     arg_parts[k] = part;
                 }
 
-                // Recipe in Teile zerlegen:  = Argument,  =
-                // Konstante, sonst Literalzeichen.
+                // Break the recipe into parts:  = Argument,  =
+                // constant, otherwise a literal character.
                 let mut parts: Vec<Operand> = Vec::new();
                 let mut lit = String::new();
                 let mut ai = 0;
@@ -2461,7 +2459,7 @@ fn lower_block(
                 }
                 flush_lit(&mut lit, &mut parts, program);
 
-                // Teile mit jrt_str_concat falten.
+                // Fold the parts with jrt_str_concat.
                 let result = if parts.is_empty() {
                     Operand::ConstStr(program.intern_string(""))
                 } else {
@@ -2480,9 +2478,9 @@ fn lower_block(
                 push!(Ty::Ref, Rvalue::Use(result));
             }
             Instr::CheckCast(idx) => {
-                // Closed World: der Cast muss statisch beweisbar sein, sonst
-                // Build-Fehler. Ein Laufzeit-Typtest käme mit instanceof
-                // (Klassen-Metadaten im Header) in einer späteren Stufe.
+                // Closed world: the cast must be statically provable, otherwise
+                // a build error. A runtime type test would come with instanceof
+                // (class metadata in the header) in a later stage.
                 let target = ml.cf.class_name(*idx)?.to_string();
                 let top_ty = *stack.last().ok_or_else(|| {
                     FrontendError::Unsupported("checkcast auf leerem Stack".into())
@@ -2496,13 +2494,13 @@ fn lower_block(
                     _ => false,
                 };
                 if provable {
-                    // Statisch bewiesen → kein Code.
+                    // Statically proven → no code.
                 } else if program.class(&target).is_some() {
-                    // Modellierte Zielklasse → Laufzeit-Check.
+                    // Modelled target class → runtime check.
                     stmts.push(Statement::CheckCast { obj: Operand::Copy(top), class: target });
                 }
-                // Nicht modellierte Zielklasse (String, java/lang/*): Cast
-                // durchreichen (catch-all-Prinzip wie bei catch-Typen).
+                // Non-modelled target class (String, java/lang/*): pass the cast
+                // through (catch-all principle as with catch types).
             }
             Instr::InvokeInterface(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;
@@ -2539,16 +2537,16 @@ fn lower_block(
                 if program.class(&target).is_some() {
                     stmts.push(Statement::InstanceOf { dest: l, obj: Operand::Copy(obj), class: target });
                 } else {
-                    // Nicht modellierte Zielklasse → konservativ false.
+                    // Non-modelled target class → conservatively false.
                     stmts.push(Statement::Assign(l, Rvalue::Use(Operand::ConstI32(0))));
                 }
                 stack.push(Ty::I32);
             }
             Instr::InvokeStatic(idx) => {
                 let (class, name, desc) = ml.cf.member_ref(*idx)?;
-                // Reflection: Class.forName mit konstantem Argument wird zur
-                // Compile-Zeit aufgelöst — statisch bekanntes "dynamisches"
-                // Klassenladen im Sinne von DESIGN.md §1.3.
+                // Reflection: Class.forName with a constant argument is resolved
+                // at compile time — statically known "dynamic" class loading in
+                // the sense of DESIGN.md §1.3.
                 if class == "java/lang/Class" && name == "forName" {
                     if desc != "(Ljava/lang/String;)Ljava/lang/Class;" {
                         return Err(FrontendError::Unsupported(format!("Class.forName{desc}")));
@@ -2576,8 +2574,8 @@ fn lower_block(
                     ml.class_const.insert(l, target);
                     continue;
                 }
-                // Enum.valueOf(Class, name): über die values() des statisch
-                // bekannten enum iterieren und per $name-Feld vergleichen.
+                // Enum.valueOf(Class, name): iterate over the values() of the
+                // statically known enum and compare via the $name field.
                 if class == "java/lang/Enum"
                     && name == "valueOf"
                     && desc == "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;"
@@ -2608,7 +2606,7 @@ fn lower_block(
                     });
                     continue;
                 }
-                // String.format(fmt, Object[]) → Runtime-Formatter.
+                // String.format(fmt, Object[]) → runtime formatter.
                 if class == "java/lang/String"
                     && name == "format"
                     && desc == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
@@ -2624,7 +2622,7 @@ fn lower_block(
                     stack.push(Ty::Ref);
                     continue;
                 }
-                // Autoboxing: Wrapper.valueOf(primitive) → Runtime-Box.
+                // Autoboxing: Wrapper.valueOf(primitive) → runtime box.
                 let box_fn = match (class, name, desc) {
                     ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => Some("jrt_integer_valueof"),
                     ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => Some("jrt_long_valueof"),
@@ -2645,7 +2643,7 @@ fn lower_block(
                     stack.push(Ty::Ref);
                     continue;
                 }
-                // String.valueOf(x): primitive → *_to_str, Objekt → toString.
+                // String.valueOf(x): primitive → *_to_str, object → toString.
                 if class == "java/lang/String" && name == "valueOf" {
                     let arg = pop!();
                     let part = match desc {
@@ -2676,12 +2674,12 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(part));
                     continue;
                 }
-                // Objects.requireNonNull(x[, msg]) → x (NPE bei null). javac
-                // fügt es u.a. beim Zugriff auf die äußere Instanz innerer
-                // Klassen ein. Der Message-Overload verwirft das zweite Argument.
+                // Objects.requireNonNull(x[, msg]) → x (NPE on null). javac
+                // inserts it e.g. when accessing the outer instance of inner
+                // classes. The message overload discards the second argument.
                 if class == "java/util/Objects" && name == "requireNonNull" {
                     if desc == "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;" {
-                        pop!(); // Message
+                        pop!(); // message
                     }
                     let obj = pop!();
                     stmts.push(Statement::Call {
@@ -2692,8 +2690,8 @@ fn lower_block(
                     push!(Ty::Ref, Rvalue::Use(Operand::Copy(obj)));
                     continue;
                 }
-                // System.arraycopy: flache Kopie über die Runtime (bei
-                // NPE/Bounds/Store-Mismatch bricht sie ab — nicht abfangbar).
+                // System.arraycopy: shallow copy via the runtime (on
+                // NPE/bounds/store-mismatch it aborts — not catchable).
                 if class == "java/lang/System"
                     && name == "arraycopy"
                     && desc == "(Ljava/lang/Object;ILjava/lang/Object;II)V"
@@ -2716,8 +2714,8 @@ fn lower_block(
                     });
                     continue;
                 }
-                // Wertliefernde Runtime-Intrinsics (parse/Math/Zeit). clang -O2
-                // inlinet sie (gemeinsame Übersetzungseinheit mit runtime.c).
+                // Value-producing runtime intrinsics (parse/Math/time). clang -O2
+                // inlines them (shared translation unit with runtime.c).
                 let simple: Option<(&str, Ty)> = match (class, name, desc) {
                     ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => Some(("jrt_parse_int", Ty::I32)),
                     ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => Some(("jrt_parse_long", Ty::I64)),
@@ -2744,7 +2742,7 @@ fn lower_block(
                     }
                     args.reverse();
                     let dest = push!(rty, Rvalue::Use(Operand::ConstI32(0)));
-                    stmts.pop(); // Platzhalter
+                    stmts.pop(); // placeholder
                     stmts.push(Statement::Call { dest: Some(dest), func: func.to_string(), args });
                     continue;
                 }
@@ -2755,7 +2753,7 @@ fn lower_block(
                 }
                 args.reverse();
                 let dest = if rty == Ty::Void { None } else { Some(push!(rty, Rvalue::Use(Operand::ConstI32(0)))) };
-                // Der Platzhalter-Assign von push! wird durch den Call ersetzt:
+                // The placeholder assign from push! is replaced by the call:
                 if dest.is_some() {
                     stmts.pop();
                 }
@@ -2765,8 +2763,8 @@ fn lower_block(
         }
     }
 
-    // Werfender Aufruf am Blockende: pending prüfen → Handler/Propagation
-    // oder normal weiter.
+    // Throwing call at block end: check pending → handler/propagation
+    // or continue normally.
     if terminator.is_none() {
         if let Some(throw_pc) = throw_after {
             let target = exc_target_of_pc[&throw_pc];
@@ -2789,7 +2787,7 @@ fn lower_block(
         }
     }
 
-    // Block endet ohne expliziten Sprung → Fallthrough in den Folgeblock.
+    // Block ends without an explicit jump → fallthrough into the successor block.
     let terminator = match terminator {
         Some(t) => t,
         None => {

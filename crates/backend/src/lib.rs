@@ -1,23 +1,23 @@
-//! Naive Absenkung Mittel-IR → textuelles LLVM-IR.
+//! Naive lowering of mid-level IR → textual LLVM IR.
 //!
-//! Bewusst dumm gehalten: jedes IR-Local wird ein `alloca`, jeder Zugriff
-//! ein Load/Store — LLVMs mem2reg/SROA stellt SSA wieder her. Textuelle
-//! `.ll`-Ausgabe statt API-Bindings, weil llvm-sys/inkwell dem
-//! installierten LLVM 22 hinterherhinken.
+//! Deliberately kept dumb: every IR local becomes an `alloca`, every access
+//! a load/store — LLVM's mem2reg/SROA restores SSA. Textual
+//! `.ll` output instead of API bindings, because llvm-sys/inkwell lag
+//! behind the installed LLVM 22.
 //!
-//! Objektmodell (Stufe 2):
-//! - `%class.C = type { ptr, felder… }` — Slot 0 ist der Vtable-Zeiger;
-//!   Superklassen-Felder liegen vor den eigenen, dadurch sind GEP-Indizes
-//!   über die ganze Subklassen-Hierarchie stabil (Prefix-Layout).
-//! - Vtable-Slots: geerbte Slots zuerst (Overrides ersetzen in place),
-//!   neue virtuelle Methoden in Deklarationsreihenfolge dahinter.
-//! - getfield/putfield/invokevirtual prüfen den Receiver auf null
-//!   (Java-Semantik; HotSpots Segfault-Trick wäre Runtime, DESIGN.md §6).
+//! Object model (stage 2):
+//! - `%class.C = type { ptr, fields… }` — slot 0 is the vtable pointer;
+//!   superclass fields precede the class's own, which makes GEP indices
+//!   stable across the whole subclass hierarchy (prefix layout).
+//! - Vtable slots: inherited slots first (overrides replace in place),
+//!   new virtual methods after them in declaration order.
+//! - getfield/putfield/invokevirtual check the receiver for null
+//!   (Java semantics; HotSpot's segfault trick would be a runtime, DESIGN.md §6).
 //!
-//! Java-Semantik-Punkte:
-//! - idiv/irem via Runtime-Helfer (Exception bei /0, MIN/-1 definiert)
-//! - Shift-Betrag wird mit &31 maskiert (JLS 15.19)
-//! - Addition etc. wrappen (LLVM add ohne nsw/nuw wrappt bereits)
+//! Java semantics points:
+//! - idiv/irem via runtime helpers (exception on /0, MIN/-1 defined)
+//! - shift amount is masked with &31 (JLS 15.19)
+//! - addition etc. wrap (LLVM add without nsw/nuw already wraps)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -35,7 +35,7 @@ fn llty(ty: Ty) -> &'static str {
     }
 }
 
-/// Intrinsics und Runtime-Helfer, die die Mini-Runtime (runtime.c) definiert.
+/// Intrinsics and runtime helpers that the mini-runtime (runtime.c) defines.
 const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_println_str", "void (ptr)"),
     ("jrt_println_int", "void (i32)"),
@@ -208,48 +208,48 @@ fn array_vtable(kind: ArrKind) -> &'static str {
     }
 }
 
-/// Feste Header-Slots vor den Instanzfeldern:
+/// Fixed header slots before the instance fields:
 ///   Slot 0: refcount (i64), <0 = immortal
-///   Slot 1: rcflags (i64) — Farbe/Buffered-Bit für den Zyklen-Collector
+///   Slot 1: rcflags (i64) — color/buffered bit for the cycle collector
 ///   Slot 2: vtable (ptr)
-/// Instanzfelder beginnen daher bei GEP-Index 3.
+/// Instance fields therefore begin at GEP index 3.
 const HEADER_SLOTS: usize = 2;
-/// Word-Offset des Vtable-Zeigers im Header (für ptr-getelementptr).
+/// Word offset of the vtable pointer in the header (for ptr getelementptr).
 const VTABLE_WORD: usize = 1;
-/// Vtable-Slot 0 = Drop, Slot 1 = Trace (Zyklen-Collector), Slot 2 =
-/// Type-Descriptor (instanceof); Interface-/virtuelle Methoden ab Slot 3.
+/// Vtable slot 0 = drop, slot 1 = trace (cycle collector), slot 2 =
+/// type descriptor (instanceof); interface/virtual methods from slot 3 on.
 const VTABLE_METHOD_OFFSET: usize = 3;
-/// Vtable-Slot des Type-Descriptors.
+/// Vtable slot of the type descriptor.
 const VTABLE_TYPEDESC_SLOT: usize = 2;
 
-/// Klassen-Kontext: Layouts und Vtables, aus `Program::classes` berechnet.
+/// Class context: layouts and vtables, computed from `Program::classes`.
 struct Ctx<'a> {
     program: &'a Program,
-    /// Globale Vtable-Slots für aufgerufene Interface-Methoden, damit
-    /// dieselbe Interface-Methode in jeder implementierenden Klasse am
-    /// selben Slot liegt. Schlüssel: (interface, name, desc).
+    /// Global vtable slots for called interface methods, so that
+    /// the same interface method sits at the same slot in every
+    /// implementing class. Key: (interface, name, desc).
     iface_slots: Vec<(String, String, String)>,
-    /// TBAA-Zugriffs-Tag (Metadaten-Nummer `!N`) pro deklariertem Instanzfeld
-    /// (Owner-Klasse, Feldname). Verschiedene Felder → Geschwister-Typknoten →
-    /// beweisbar alias-frei; gleiches Feld → selber Knoten → LLVM bleibt
-    /// konservativ. Nicht getaggte Zugriffe (RC-Header, Vtable, Arrays über die
-    /// Runtime) aliasieren konservativ mit allem — daher soundness-neutral.
+    /// TBAA access tag (metadata number `!N`) per declared instance field
+    /// (owner class, field name). Different fields → sibling type nodes →
+    /// provably alias-free; same field → same node → LLVM stays
+    /// conservative. Untagged accesses (RC header, vtable, arrays via the
+    /// runtime) alias conservatively with everything — hence soundness-neutral.
     tbaa: BTreeMap<(String, String), usize>,
-    /// Je Funktion die (transitiv über Callees) geschriebenen statischen Felder.
-    /// Ein Feld, das eine Funktion (und ihre Callees) NICHT schreibt, ist während
-    /// ihrer Ausführung konstant → `GetStatic` liefert eine stabile, von der
-    /// Static-Wurzel am Leben gehaltene Referenz und braucht kein retain/release.
+    /// Per function, the static fields written (transitively through callees).
+    /// A field that a function (and its callees) does NOT write is constant
+    /// during its execution → `GetStatic` yields a stable reference kept alive
+    /// by the static root and needs no retain/release.
     static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
-    /// Interprozedurale Instanzfeld-Schreibmengen (+ opak-Flag) für Region-Inferenz.
+    /// Interprocedural instance-field write sets (+ opaque flag) for region inference.
     field_writes: BTreeMap<String, (BTreeSet<(String, String)>, bool)>,
-    /// AOT-Hotpath: Metadaten-IDs der zwei geteilten `branch_weights`-Knoten
-    /// (then-heiß, else-heiß). Aus statischer Schleifen-Schätzung an `!prof`
-    /// gesetzt — LLVM ordnet/optimiert dann heiße Pfade selbst.
+    /// AOT hot path: metadata IDs of the two shared `branch_weights` nodes
+    /// (then-hot, else-hot). Set from static loop estimation on `!prof` —
+    /// LLVM then orders/optimizes hot paths itself.
     bw_then: usize,
     bw_else: usize,
-    /// Metadaten-Knoten für `!invariant.load` (leerer Knoten). Markiert Loads
-    /// beweisbar unveränderlicher Speicherstellen (Array-Länge, Vtable-Zeiger) —
-    /// LLVM darf sie aus Schleifen hoisten und CSEn (wie Rusts Slice-Länge).
+    /// Metadata node for `!invariant.load` (empty node). Marks loads of
+    /// provably immutable memory locations (array length, vtable pointer) —
+    /// LLVM may hoist them out of loops and CSE them (like Rust's slice length).
     md_inv: usize,
 }
 
@@ -258,13 +258,13 @@ impl<'a> Ctx<'a> {
         self.program.class(name)
     }
 
-    /// Erster Vtable-Slot der klassen-eigenen virtuellen Methoden (hinter
-    /// drop, trace und den globalen Interface-Slots).
+    /// First vtable slot of the class's own virtual methods (after
+    /// drop, trace, and the global interface slots).
     fn method_base(&self) -> usize {
         VTABLE_METHOD_OFFSET + self.iface_slots.len()
     }
 
-    /// TBAA-Zugriffs-Tag-Suffix (`, !tbaa !N`) für ein Feld, sonst leer.
+    /// TBAA access-tag suffix (`, !tbaa !N`) for a field, otherwise empty.
     fn tbaa_suffix(&self, owner: &str, field: &str) -> String {
         match self.tbaa.get(&(owner.to_string(), field.to_string())) {
             Some(n) => format!(", !tbaa !{n}"),
@@ -278,8 +278,8 @@ impl<'a> Ctx<'a> {
             .position(|(i, n, d)| i == iface && n == name && d == desc)
     }
 
-    /// Wird `class` global (über konsistente Vtable-Slots) dispatcht?
-    /// Interfaces und die Object-Wurzelmethoden.
+    /// Is `class` dispatched globally (via consistent vtable slots)?
+    /// Interfaces and the Object root methods.
     fn is_global_dispatch(&self, class: &str) -> bool {
         class == "java/lang/Object" || self.class(class).map(|c| c.is_interface).unwrap_or(false)
     }
@@ -288,7 +288,7 @@ impl<'a> Ctx<'a> {
         format!("%class.{}", sanitize(class))
     }
 
-    /// Instanzfelder in Layout-Reihenfolge: Superklassen zuerst.
+    /// Instance fields in layout order: superclasses first.
     fn flatten_fields(&self, class: &str) -> Vec<(String, String, Ty)> {
         let Some(ci) = self.class(class) else { return Vec::new() };
         let mut out = match &ci.super_name {
@@ -301,8 +301,8 @@ impl<'a> Ctx<'a> {
         out
     }
 
-    /// GEP-Index (nach dem Header) und Typ eines Felds, aufgelöst
-    /// ab `class` die Superkette hoch.
+    /// GEP index (after the header) and type of a field, resolved
+    /// from `class` up the super chain.
     fn field_slot(&self, class: &str, field: &str) -> Option<(String, usize, Ty)> {
         let (owner, ty) = self.program.resolve_field(class, field)?;
         let owner = owner.to_string();
@@ -311,14 +311,14 @@ impl<'a> Ctx<'a> {
         Some((owner, idx + HEADER_SLOTS, ty))
     }
 
-    /// Global-Symbol und Typ eines statischen Feldes (Superkette hoch).
+    /// Global symbol and type of a static field (up the super chain).
     fn static_field(&self, class: &str, field: &str) -> Option<(String, Ty)> {
         let (owner, ty) = self.program.resolve_static_field(class, field)?;
         Some((format!("@sf.{}.{}", sanitize(owner), sanitize(field)), ty))
     }
 
-    /// Ref-Felder von `class` (inkl. geerbter) als GEP-Index-Liste — für
-    /// die generierte Drop-Funktion.
+    /// Ref fields of `class` (including inherited) as a GEP index list — for
+    /// the generated drop function.
     fn ref_field_slots(&self, class: &str) -> Vec<usize> {
         self.flatten_fields(class)
             .iter()
@@ -328,7 +328,7 @@ impl<'a> Ctx<'a> {
             .collect()
     }
 
-    /// Vtable-Slots von `class`: (name, desc, Implementierungs-Symbol).
+    /// Vtable slots of `class`: (name, desc, implementation symbol).
     fn vtable_slots(&self, class: &str) -> Vec<(String, String, Option<String>)> {
         let Some(ci) = self.class(class) else { return Vec::new() };
         let mut slots = match &ci.super_name {
@@ -349,8 +349,8 @@ impl<'a> Ctx<'a> {
         slots
     }
 
-    /// GEP-Index eines Methoden-Slots in der Vtable. Interface-Methoden
-    /// liegen in den globalen Interface-Slots, virtuelle danach.
+    /// GEP index of a method slot in the vtable. Interface methods
+    /// sit in the global interface slots, virtual ones after them.
     fn vtable_index(&self, class: &str, name: &str, desc: &str) -> Option<usize> {
         if self.is_global_dispatch(class) {
             return self.iface_index(class, name, desc).map(|i| VTABLE_METHOD_OFFSET + i);
@@ -366,8 +366,8 @@ pub fn emit(program: &Program) -> String {
     let mut out = String::new();
     let w = &mut out;
 
-    // Aufgerufene Interface-Methoden global sammeln (für konsistente
-    // Vtable-Slots über alle implementierenden Klassen).
+    // Collect called interface methods globally (for consistent
+    // vtable slots across all implementing classes).
     let mut iface_slots: Vec<(String, String, String)> = Vec::new();
     for f in &program.functions {
         for bb in &f.blocks {
@@ -385,17 +385,17 @@ pub fn emit(program: &Program) -> String {
             }
         }
     }
-    // Runnable.run() wird nur über die native Thread-Trampoline dispatcht
-    // (kein CallVirtual im IR) → globalen Vtable-Slot erzwingen, damit
-    // @jrt_invoke_runnable ihn findet.
+    // Runnable.run() is dispatched only via the native thread trampoline
+    // (no CallVirtual in the IR) → force a global vtable slot so that
+    // @jrt_invoke_runnable finds it.
     if program.class("java/lang/Runnable").is_some() {
         let key = ("java/lang/Runnable".to_string(), "run".to_string(), "()V".to_string());
         if !iface_slots.contains(&key) {
             iface_slots.push(key);
         }
     }
-    // TBAA-Registry: jedem deklarierten Instanzfeld ein Zugriffs-Tag zuweisen.
-    // Layout der Metadaten: !0 = Wurzel; Feld k → Typknoten !(1+2k), Tag !(2+2k).
+    // TBAA registry: assign an access tag to every declared instance field.
+    // Metadata layout: !0 = root; field k → type node !(1+2k), tag !(2+2k).
     let mut tbaa: BTreeMap<(String, String), usize> = BTreeMap::new();
     for c in &program.classes {
         for f in &c.fields {
@@ -408,8 +408,8 @@ pub fn emit(program: &Program) -> String {
     }
     let static_writes = static_write_effects(program);
     let field_writes = instance_field_writes(program);
-    // AOT-Hotpath: Metadaten-IDs für die zwei geteilten branch_weights-Knoten,
-    // oberhalb der TBAA-IDs (max TBAA-ID = 2*len bei len Feldern, sonst 0).
+    // AOT hot path: metadata IDs for the two shared branch_weights nodes,
+    // above the TBAA IDs (max TBAA ID = 2*len for len fields, otherwise 0).
     let bw_base = if tbaa.is_empty() { 0 } else { 2 * tbaa.len() + 1 };
     let bw_then = bw_base;
     let bw_else = bw_base + 1;
@@ -425,10 +425,10 @@ pub fn emit(program: &Program) -> String {
     writeln!(w, "@jrt_double_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_character_vt = external global ptr").unwrap();
     writeln!(w, "@jrt_float_vt = external global ptr").unwrap();
-    // String-Literale: voller Objekt-Header (uniform mit Laufzeit-Strings),
-    // aber refcount -1 = immortal → retain/release/Collector No-Op, die
-    // Read-only-Konstante bleibt unberührt. Vtable = @vt.java_lang_String
-    // (Object-Methoden-Slots), damit obj.equals/hashCode auf Strings greift.
+    // String literals: full object header (uniform with runtime strings),
+    // but refcount -1 = immortal → retain/release/collector no-op, the
+    // read-only constant stays untouched. Vtable = @vt.java_lang_String
+    // (Object method slots), so obj.equals/hashCode works on strings.
     for (i, s) in program.strings.iter().enumerate() {
         let bytes = s.as_bytes();
         writeln!(
@@ -439,11 +439,11 @@ pub fn emit(program: &Program) -> String {
         )
         .unwrap();
     }
-    // Class-Objekt-Singletons für JEDE Klasse (Reflection: getClass/getName/
-    // getSimpleName). Immortaler Header {refcount=-1, rcflags, vtable=null},
-    // dann name- und simpleName-JStr-Zeiger. Pointer-Identität ersetzt Javas
-    // Class-Gleichheit; die Type-Descriptoren verlinken hierauf (getClass).
-    let _ = &program.class_objects; // (früherer Reflection-Pfad, jetzt generell)
+    // Class object singletons for EVERY class (reflection: getClass/getName/
+    // getSimpleName). Immortal header {refcount=-1, rcflags, vtable=null},
+    // then name and simpleName JStr pointers. Pointer identity replaces Java's
+    // Class equality; the type descriptors link to these (getClass).
+    let _ = &program.class_objects; // (former reflection path, now general)
     for c in &program.classes {
         let dotted = c.name.replace('/', ".");
         let simple = dotted.rsplit(['.', '$']).next().unwrap_or(&dotted).to_string();
@@ -459,26 +459,26 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Struct-Typen: { i64 refcount, i64 rcflags, ptr vtable, felder… }.
+    // Struct types: { i64 refcount, i64 rcflags, ptr vtable, fields… }.
     for c in &program.classes {
         let mut parts = vec!["i64".to_string(), "ptr".to_string()];
         parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
-    // Array-Typen (Header + i64 Länge + flexibles Elementfeld) und ihre
-    // Vtables. int[] hat keine Ref-Elemente → No-Op-Drop/Trace; ref[]
-    // released/besucht seine Elemente über Runtime-Helfer.
-    // Header (packed 16 B): refcount, vtable, length, elem_size (dann Elemente).
+    // Array types (header + i64 length + flexible element field) and their
+    // vtables. int[] has no ref elements → no-op drop/trace; ref[]
+    // releases/visits its elements via runtime helpers.
+    // Header (packed 16 B): refcount, vtable, length, elem_size (then elements).
     writeln!(w, "%arr.int = type {{ i64, ptr, i64, i64, [0 x i32] }}").unwrap();
     writeln!(w, "%arr.ref = type {{ i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
-    // Arrays haben keinen Type-Descriptor (Slot 2 = null → instanceof false).
+    // Arrays have no type descriptor (slot 2 = null → instanceof false).
     writeln!(w, "@vt.array.int = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
     writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
     writeln!(w).unwrap();
 
-    // Type-Descriptoren für instanceof: { ptr super, ptr name }. Die Kette
-    // endet bei null (Object/nicht modellierte Basis). jrt_instanceof läuft
-    // sie ab; der Name (gepunktet) dient der Uncaught-Meldung.
+    // Type descriptors for instanceof: { ptr super, ptr name }. The chain
+    // ends at null (Object/non-modeled base). jrt_instanceof walks
+    // it; the name (dotted) serves the uncaught message.
     for c in &program.classes {
         let super_td = match &c.super_name {
             Some(s) if program.class(s).is_some() => format!("@td.{}", sanitize(s)),
@@ -494,8 +494,8 @@ pub fn emit(program: &Program) -> String {
             esc = escape_ll(bytes),
         )
         .unwrap();
-        // Transitive Interface-Menge als nullterminiertes Array von Type-
-        // Descriptoren (für instanceof/checkcast gegen Interfaces).
+        // Transitive interface set as a null-terminated array of type
+        // descriptors (for instanceof/checkcast against interfaces).
         let ifaces: Vec<String> = program
             .all_interfaces(&c.name)
             .iter()
@@ -525,7 +525,7 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Statische Felder als globale Variablen (mit ConstantValue-Initialwert).
+    // Static fields as global variables (with ConstantValue initial value).
     for c in &program.classes {
         for f in &c.static_fields {
             let init = match &f.init {
@@ -551,9 +551,9 @@ pub fn emit(program: &Program) -> String {
 
     let defined: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
 
-    // Vtables für instanziierte Klassen. Slots, deren Implementierung dem
-    // Pruning zum Opfer fiel (RTA-tot), werden null — kein erreichbarer
-    // Site kann dorthin dispatchen.
+    // Vtables for instantiated classes. Slots whose implementation fell
+    // victim to pruning (RTA-dead) become null — no reachable
+    // site can dispatch there.
     let instantiated: BTreeSet<&str> = program
         .functions
         .iter()
@@ -564,8 +564,8 @@ pub fn emit(program: &Program) -> String {
             _ => None,
         })
         .collect();
-    // Strings/Wrapper nehmen am virtuellen Dispatch teil (equals/hashCode/
-    // toString) → eigene Vtable, obwohl sie nicht via `new` erzeugt werden.
+    // Strings/wrappers take part in virtual dispatch (equals/hashCode/
+    // toString) → their own vtable, even though they are not created via `new`.
     let mut instantiated = instantiated;
     if program.class("java/lang/String").is_some() {
         instantiated.insert("java/lang/String");
@@ -578,7 +578,7 @@ pub fn emit(program: &Program) -> String {
             .flat_map(|b| &b.statements)
             .any(|st| matches!(st, Statement::Call { func, .. } if func == sym))
     };
-    // (valueOf-Funktion, Klasse, dynamischer Vtable-Zeiger)
+    // (valueOf function, class, dynamic vtable pointer)
     let wrappers = [
         ("jrt_integer_valueof", "java/lang/Integer", "jrt_integer_vt"),
         ("jrt_long_valueof", "java/lang/Long", "jrt_long_vt"),
@@ -593,21 +593,21 @@ pub fn emit(program: &Program) -> String {
         }
     }
     for class in &instantiated {
-        // Slot 0: Drop, Slot 1: Trace (Zyklen-Collector); dann die globalen
-        // Interface-Slots, dann die klassen-eigenen virtuellen Methoden.
+        // Slot 0: drop, slot 1: trace (cycle collector); then the global
+        // interface slots, then the class's own virtual methods.
         let mut entries = vec![
             format!("ptr @drop.{}", sanitize(class)),
             format!("ptr @trace.{}", sanitize(class)),
             format!("ptr @td.{}", sanitize(class)),
         ];
-        // jrt_*-Symbole sind Runtime-Funktionen (extern), gelten als gültig.
+        // jrt_* symbols are runtime functions (external), considered valid.
         let sym_entry = |sym: Option<String>| match sym {
             Some(s) if s.starts_with("jrt_") || defined.contains(s.as_str()) => format!("ptr @{s}"),
             _ => "ptr null".to_string(),
         };
         for (iface, name, desc) in &ctx.iface_slots {
             let sym = if iface == "java/lang/Object" {
-                // Wurzelmethode: Überschreibung der Klasse oder Object-Default.
+                // Root method: the class's override or the Object default.
                 Some(
                     program
                         .resolve_method(class, name, desc)
@@ -633,18 +633,18 @@ pub fn emit(program: &Program) -> String {
         )
         .unwrap();
     }
-    // Vire-Programme nutzen String-Literale (print), definieren aber keine
-    // java/lang/String-Klasse → deren Vtable fehlt, während die @jstr-Konstanten
-    // sie referenzieren. Minimal-Vtable nachreichen (nur No-Op-Drop/Trace +
-    // null-Typdeskriptor); String-Methoden-Dispatch gibt es in Vire noch nicht.
-    // Auch die Klassennamen-Konstanten (@jclassname.*) sind @jstr → String-Vtable.
+    // Vire programs use string literals (print) but define no
+    // java/lang/String class → its vtable is missing while the @jstr constants
+    // reference it. Supply a minimal vtable (only no-op drop/trace +
+    // null type descriptor); string method dispatch does not exist in Vire yet.
+    // The class-name constants (@jclassname.*) are also @jstr → String vtable.
     if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
         writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
     }
     writeln!(w).unwrap();
 
-    // Drop-Funktionen: released die Ref-Felder des Objekts (die Runtime
-    // steigt via jrt_release rekursiv ab).
+    // Drop functions: release the object's ref fields (the runtime
+    // descends recursively via jrt_release).
     for class in &instantiated {
         writeln!(w, "define internal void @drop.{}(ptr %o) {{", sanitize(class)).unwrap();
         for (k, slot) in ctx.ref_field_slots(class).into_iter().enumerate() {
@@ -657,9 +657,9 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Trace-Funktionen: rufen den Collector-Visitor auf jedes Ref-Feld.
-    // Der Bacon-Rajan-Collector nutzt sie, um Objektgraphen zu durchlaufen,
-    // ohne die Feldstruktur zu kennen.
+    // Trace functions: call the collector visitor on each ref field.
+    // The Bacon-Rajan collector uses them to traverse object graphs
+    // without knowing the field structure.
     for class in &instantiated {
         writeln!(w, "define internal void @trace.{}(ptr %o, ptr %visit) {{", sanitize(class)).unwrap();
         for (k, slot) in ctx.ref_field_slots(class).into_iter().enumerate() {
@@ -672,9 +672,9 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
-    // Fehler-/Ausnahme-Helfer sind kalt: als `cold` markiert ordnet LLVM ihre
-    // Aufrufe aus dem heißen Pfad heraus (bessere Block-Layout, Branch-Vorhersage
-    // wie Rusts `#[cold]` panic). Kein `noreturn` — Vires Pending-Modell kehrt zurück.
+    // Error/exception helpers are cold: marked `cold`, LLVM moves their
+    // calls out of the hot path (better block layout, branch prediction
+    // like Rust's `#[cold]` panic). No `noreturn` — Vire's pending model returns.
     const COLD: &[&str] = &["jrt_throw_npe", "jrt_throw_bounds", "jrt_throw", "jrt_check_uncaught"];
     for (name, sig) in RUNTIME_DECLS {
         let (ret, params) = sig.split_once(' ').unwrap();
@@ -682,7 +682,7 @@ pub fn emit(program: &Program) -> String {
         writeln!(w, "declare {ret} @{name}{params}{attr}").unwrap();
     }
 
-    // Aufgerufene, aber nicht definierte Funktionen deklarieren.
+    // Declare functions that are called but not defined.
     let mut external: BTreeMap<&str, (Ty, Vec<Ty>)> = BTreeMap::new();
     for f in &program.functions {
         for bb in &f.blocks {
@@ -710,8 +710,8 @@ pub fn emit(program: &Program) -> String {
         emit_function(w, &ctx, f);
     }
 
-    // Thread-Trampoline: von der Runtime (pthread bzw. synchron) aufgerufen,
-    // dispatcht run() auf dem Runnable über den globalen Vtable-Slot.
+    // Thread trampoline: called by the runtime (pthread or synchronous),
+    // dispatches run() on the Runnable via the global vtable slot.
     if let Some(slot) = ctx.vtable_index("java/lang/Runnable", "run", "()V") {
         writeln!(w, "define void @jrt_invoke_runnable(ptr %r) {{").unwrap();
         writeln!(w, "  %vtp = getelementptr ptr, ptr %r, i64 {VTABLE_WORD}").unwrap();
@@ -725,9 +725,9 @@ pub fn emit(program: &Program) -> String {
 
     if defined.contains("java_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
-        // Vtable-Zeiger für zur Laufzeit erzeugte String-/Wrapper-Objekte —
-        // nur wenn die String-Klasse überhaupt vorkommt (Vire-Programme ohne
-        // Strings definieren `@vt.java_lang_String` nicht).
+        // Vtable pointer for String/wrapper objects created at runtime —
+        // only if the String class occurs at all (Vire programs without
+        // strings do not define `@vt.java_lang_String`).
         if instantiated.contains("java/lang/String") {
             writeln!(w, "  store ptr @vt.java_lang_String, ptr @jrt_dyn_string_vt").unwrap();
         }
@@ -736,14 +736,14 @@ pub fn emit(program: &Program) -> String {
                 writeln!(w, "  store ptr @vt.{}, ptr @{vt}", sanitize(cls)).unwrap();
             }
         }
-        // Statische Initialisierer vor main, Superklasse vor Subklasse.
+        // Static initializers before main, superclass before subclass.
         let mut emitted: BTreeSet<String> = BTreeSet::new();
         for c in &program.classes {
             emit_clinit_chain(w, &ctx, &c.name, &defined, &mut emitted);
         }
         writeln!(w, "  call void @java_main()").unwrap();
-        // Statische Ref-Felder freigeben (GC-Wurzeln bis Programmende) —
-        // hält die Heap-Bilanz sauber.
+        // Release static ref fields (GC roots until program end) —
+        // keeps the heap balance clean.
         for c in &program.classes {
             for f in &c.static_fields {
                 if f.ty == Ty::Ref {
@@ -753,13 +753,13 @@ pub fn emit(program: &Program) -> String {
                 }
             }
         }
-        // Unbehandelte Exception aus main melden (statt still zu ignorieren).
+        // Report an unhandled exception from main (instead of silently ignoring it).
         writeln!(w, "  call void @jrt_check_uncaught()").unwrap();
         writeln!(w, "  ret i32 0").unwrap();
         writeln!(w, "}}").unwrap();
     }
 
-    // TBAA-Metadatenbaum: Wurzel !0, pro Feld ein Typknoten + Zugriffs-Tag.
+    // TBAA metadata tree: root !0, one type node + access tag per field.
     if !ctx.tbaa.is_empty() {
         writeln!(w, "\n!0 = !{{!\"fastllvm-tbaa\"}}").unwrap();
         let mut fields: Vec<(&(String, String), &usize)> = ctx.tbaa.iter().collect();
@@ -770,7 +770,7 @@ pub fn emit(program: &Program) -> String {
             writeln!(w, "!{tag} = !{{!{tynode}, !{tynode}, i64 0}}").unwrap();
         }
     }
-    // AOT-Hotpath: die zwei geteilten branch_weights-Knoten (100:3 / 3:100).
+    // AOT hot path: the two shared branch_weights nodes (100:3 / 3:100).
     if ctx.tbaa.is_empty() {
         writeln!(w).unwrap();
     }
@@ -781,13 +781,13 @@ pub fn emit(program: &Program) -> String {
     out
 }
 
-/// AOT-Hotpath: statische Schleifen-Schätzung. Für jede bedingte Verzweigung
-/// wird geschätzt, welcher Zweig in einer Schleife bleibt (heiß). Reduzibler
-/// CFG aus unserer Absenkung: eine Kante `u → v` mit `v ≤ u` ist eine
-/// Rückwärtskante (Schleifen-Header `v`, Latch `u`); Blöcke in `[v, u]` sind im
-/// Schleifenkörper. Ein Branch, dessen einer Ziel-Block im Körper liegt und der
-/// andere nicht (Schleifen-Ausgang), gewichtet den Körper-Zweig heiß.
-/// Rückgabe: Block-Index → true (then heiß) / false (else heiß).
+/// AOT hot path: static loop estimation. For each conditional branch,
+/// estimate which branch stays in a loop (hot). Reducible
+/// CFG from our lowering: an edge `u → v` with `v ≤ u` is a
+/// back edge (loop header `v`, latch `u`); blocks in `[v, u]` are in the
+/// loop body. A branch with one target block in the body and the
+/// other outside (loop exit) weights the body branch as hot.
+/// Returns: block index → true (then hot) / false (else hot).
 fn loop_branch_bias(f: &Function) -> std::collections::HashMap<usize, bool> {
     let succ = |bb: &BasicBlock| -> Vec<usize> {
         match &bb.terminator {
@@ -801,7 +801,7 @@ fn loop_branch_bias(f: &Function) -> std::collections::HashMap<usize, bool> {
             Terminator::Return(_) => vec![],
         }
     };
-    // Schleifen-Spannen: Header v → größter Latch-Index u (Rückwärtskante u→v).
+    // Loop spans: header v → largest latch index u (back edge u→v).
     let mut span_max: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (u, bb) in f.blocks.iter().enumerate() {
         for v in succ(bb) {
@@ -832,8 +832,8 @@ fn loop_branch_bias(f: &Function) -> std::collections::HashMap<usize, bool> {
     bias
 }
 
-/// Ruft die <clinit> von `class` auf, aber erst die der Superklasse
-/// (JVMS 5.5) — jede höchstens einmal.
+/// Calls the <clinit> of `class`, but the superclass's first
+/// (JVMS 5.5) — each at most once.
 fn emit_clinit_chain(
     w: &mut String,
     ctx: &Ctx,
@@ -850,11 +850,11 @@ fn emit_clinit_chain(
         }
         if ci.has_clinit {
             let sym = fastllvm_ir::clinit_symbol(class);
-            // Statische Abhängigkeiten: liest/erzeugt der <clinit> die Statik
-            // einer anderen Klasse (z.B. der enum-switch-Helfer Main$1 ruft
-            // Dir.values() und liest Dir.N), muss deren <clinit> vorher laufen.
-            // Java initialisiert lazy bei erstem Zugriff; wir eager, daher hier
-            // topologisch vorziehen (der emitted-Guard bricht etwaige Zyklen).
+            // Static dependencies: if the <clinit> reads/creates another
+            // class's statics (e.g. the enum-switch helper Main$1 calls
+            // Dir.values() and reads Dir.N), that class's <clinit> must run first.
+            // Java initializes lazily on first access; we do it eagerly, so pull
+            // it forward topologically here (the emitted guard breaks any cycles).
             if let Some(f) = ctx.program.functions.iter().find(|f| f.name == sym) {
                 for dep in clinit_deps(ctx, f) {
                     if dep != class {
@@ -869,11 +869,11 @@ fn emit_clinit_chain(
     }
 }
 
-/// Klassen, deren Statik ein `<clinit>`-Rumpf berührt (Feld-/New-/Cast-/
-/// virtueller Zugriff sowie direkte Calls in ihre Methoden) — Kandidaten,
-/// die vor diesem `<clinit>` initialisiert sein müssen.
+/// Classes whose statics a `<clinit>` body touches (field/new/cast/
+/// virtual access as well as direct calls into their methods) — candidates
+/// that must be initialized before this `<clinit>`.
 fn clinit_deps(ctx: &Ctx, f: &Function) -> BTreeSet<String> {
-    // Symbol → deklarierende Klasse, um Call-Ziele einer Klasse zuzuordnen.
+    // Symbol → declaring class, to map call targets to a class.
     let sym_class = |sym: &str| -> Option<String> {
         ctx.program
             .classes
@@ -914,7 +914,7 @@ fn clinit_deps(ctx: &Ctx, f: &Function) -> BTreeSet<String> {
     deps
 }
 
-/// Runtime-Default-Implementierung einer Object-Wurzelmethode.
+/// Runtime default implementation of an Object root method.
 fn object_default(name: &str) -> String {
     match name {
         "hashCode" => "jrt_obj_hashcode",
@@ -939,25 +939,25 @@ struct FnEmitter<'a> {
     f: &'a Function,
     tmp: u32,
     label: u32,
-    /// Laufender Index der StackNew-Slots (%sn<k>), im Entry-Block reserviert.
+    /// Running index of the StackNew slots (%sn<k>), reserved in the entry block.
     sn: u32,
-    /// Geborgte Ref-Parameter-Slots (nie neu zugewiesen): RC-Elision — kein
-    /// Entry-retain, keine Cleanup-release. Der Aufrufer hält die Referenz für
-    /// die Aufrufdauer (Argumente sind geborgt), Kopien in andere Locals
-    /// retainen selbst.
+    /// Borrowed ref-parameter slots (never reassigned): RC elision — no
+    /// entry retain, no cleanup release. The caller holds the reference for
+    /// the call's duration (arguments are borrowed); copies into other locals
+    /// retain themselves.
     borrowed: BTreeSet<u32>,
-    /// Locals, die nur immortale Werte halten (StackNew/Literal/null): RC-frei.
+    /// Locals that hold only immortal values (StackNew/literal/null): RC-free.
     imm: BTreeSet<u32>,
-    /// Borrow-Slots: Nicht-Parameter-Ref-Locals, die ausschließlich Kopien
-    /// geborgter Parameter (z.B. `this`) bzw. null halten — RC-frei, weil der
-    /// Aufrufer den Wert für die Aufrufdauer lebendig hält (javacs `aload_0`-
-    /// Reloads von `this` vor jedem `getfield`).
+    /// Borrow slots: non-parameter ref locals that hold exclusively copies
+    /// of borrowed parameters (e.g. `this`) or null — RC-free, because the
+    /// caller keeps the value alive for the call's duration (javac's `aload_0`
+    /// reloads of `this` before every `getfield`).
     borrow: BTreeSet<u32>,
-    /// Beweisbar nicht-null Locals — die inline-Null-Prüfung bei Feldzugriffen
-    /// entfällt.
+    /// Provably non-null locals — the inline null check on field accesses
+    /// is omitted.
     nn: BTreeSet<u32>,
-    /// Metadaten-ID für `!invariant.load` (unveränderliche Loads: Array-Länge,
-    /// Vtable). Erlaubt LLVM Hoisting/CSE über Schleifen hinweg.
+    /// Metadata ID for `!invariant.load` (immutable loads: array length,
+    /// vtable). Lets LLVM hoist/CSE across loops.
     md_inv: usize,
 }
 
@@ -967,10 +967,10 @@ impl FnEmitter<'_> {
     }
 }
 
-/// Locals, die ausschließlich immortale Werte halten (Stack-Objekte, String-/
-/// Class-Literale, null) — dort sind retain/release beweisbar No-Ops. Monotone
-/// Invalidierung: startet optimistisch (alle Ref-Nicht-Parameter), entfernt
-/// jedes Local mit einem möglicherweise Heap-erzeugenden Def bis zum Fixpunkt.
+/// Locals that hold exclusively immortal values (stack objects, string/
+/// class literals, null) — there retain/release are provably no-ops. Monotone
+/// invalidation: starts optimistically (all ref non-parameters), removes
+/// every local with a possibly heap-creating def until the fixpoint.
 fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
     let n = f.locals.len();
     let n_params = f.params.len();
@@ -1021,17 +1021,17 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
     (0..n as u32).filter(|&l| imm[l as usize]).collect()
 }
 
-/// Je Funktion die transitiv geschriebenen statischen Felder (Fixpunkt über den
-/// Call-Graphen). Direkte `PutStatic` plus die Effekte aller Callees; Funktionen
-/// mit unaufgelöstem virtuellem Call gelten konservativ als „schreibt alles".
-/// Externe/`jrt_`-Aufrufe schreiben keine Java-Statics (C berührt sie nicht).
-/// Interprozedurale Instanzfeld-Schreib-Analyse: pro Funktion die Menge der
-/// (Klasse, Feld), die sie ODER ein transitiver Callee via `PutField` schreibt,
-/// plus ein `unknown`-Flag (opake Aufrufe: virtuell/poly/extern → könnten alles
-/// schreiben). Grundlage für die Region-Inferenz: ein `GetField` eines Feldes, das
-/// die Funktion (transitiv) NICHT schreibt und die von keinem opaken Aufruf
-/// geändert werden kann, darf borgen (kein retain/release) — auch in Funktionen,
-/// die andere (nicht-schreibende) Nutzerfunktionen rufen (der Fall, den v1 aussparte).
+/// Per function, the statically written fields computed transitively (fixpoint over the
+/// call graph). Direct `PutStatic` plus the effects of all callees; functions
+/// with an unresolved virtual call are conservatively treated as "writes everything".
+/// External/`jrt_` calls write no Java statics (C does not touch them).
+/// Interprocedural instance-field write analysis: per function, the set of
+/// (class, field) that it OR a transitive callee writes via `PutField`,
+/// plus an `unknown` flag (opaque calls: virtual/poly/external → could write
+/// anything). Basis for region inference: a `GetField` of a field that
+/// the function does NOT (transitively) write and that no opaque call
+/// can change may borrow (no retain/release) — even in functions
+/// that call other (non-writing) user functions (the case v1 left out).
 fn instance_field_writes(program: &Program) -> BTreeMap<String, (BTreeSet<(String, String)>, bool)> {
     let fn_names: BTreeSet<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
     let mut writes: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
@@ -1051,7 +1051,7 @@ fn instance_field_writes(program: &Program) -> BTreeMap<String, (BTreeSet<(Strin
                         if fn_names.contains(func.as_str()) {
                             c.insert(func.clone());
                         } else if !func.starts_with("jrt_") {
-                            op = true; // extern/unbekannt → könnte Felder ändern
+                            op = true; // external/unknown → could change fields
                         }
                     }
                     Statement::CallVirtual { .. } => op = true,
@@ -1072,7 +1072,7 @@ fn instance_field_writes(program: &Program) -> BTreeMap<String, (BTreeSet<(Strin
         unknown.insert(f.name.clone(), op);
         callees.insert(f.name.clone(), c);
     }
-    // Fixpunkt: Callee-Schreibmengen und -unknown hochziehen.
+    // Fixpoint: propagate callee write sets and unknown upward.
     loop {
         let mut changed = false;
         let names: Vec<String> = writes.keys().cloned().collect();
@@ -1149,7 +1149,7 @@ fn static_write_effects(program: &Program) -> BTreeMap<String, BTreeSet<(String,
     for name in &conservative {
         writes.get_mut(name).unwrap().extend(all_statics.iter().cloned());
     }
-    // Fixpunkt: Callee-Effekte hochziehen.
+    // Fixpoint: propagate callee effects upward.
     loop {
         let mut changed = false;
         let names: Vec<String> = writes.keys().cloned().collect();
@@ -1177,14 +1177,14 @@ fn static_write_effects(program: &Program) -> BTreeMap<String, BTreeSet<(String,
     writes
 }
 
-/// Borrow-Slots: Nicht-Parameter-Ref-Locals, deren *jede* Definition eine Kopie
-/// eines geborgten Parameters, eines anderen Borrow-Slots oder ein immortaler
-/// Konstant-Wert (null/String-/Class-Literal) ist. Solche Slots besitzen nie
-/// eine Referenz (der geborgte Ursprung lebt für die ganze Methode), also sind
-/// retain/release beweisbar überflüssig. Sound, weil Heap-Stores (PutField/
-/// aastore/PutStatic) den Wert selbst retainen und `return` ebenso — ein Borrow
-/// wird in jeder Verwendungsposition korrekt behandelt. Monotone Invalidierung
-/// bis zum Fixpunkt.
+/// Borrow slots: non-parameter ref locals whose *every* definition is a copy
+/// of a borrowed parameter, of another borrow slot, or an immortal
+/// constant value (null/string/class literal). Such slots never own
+/// a reference (the borrowed origin lives for the whole method), so
+/// retain/release are provably superfluous. Sound, because heap stores (PutField/
+/// aastore/PutStatic) retain the value themselves and so does `return` — a borrow
+/// is handled correctly in every use position. Monotone invalidation
+/// until the fixpoint.
 fn borrow_slots(
     f: &Function,
     borrowed: &BTreeSet<u32>,
@@ -1199,12 +1199,12 @@ fn borrow_slots(
             b[l] = true;
         }
     }
-    // Region-Inferenz (interprozedural): ein `GetField`-Load eines Feldes, das
-    // diese Funktion UND ihre transitiven Callees NICHT schreiben (und das kein
-    // opaker Aufruf ändern kann), von einer stabilen (geborgten) Basis, ist ein
-    // Borrow — das Feld hält den Wert am Leben, retain/release entfällt. Das
-    // greift jetzt auch in Funktionen, die andere (nicht-schreibende) Nutzer-
-    // funktionen rufen (der Fall, den die funktions-lokale v1 aussparte).
+    // Region inference (interprocedural): a `GetField` load of a field that
+    // this function AND its transitive callees do NOT write (and that no
+    // opaque call can change), from a stable (borrowed) base, is a
+    // borrow — the field keeps the value alive, retain/release is dropped. This
+    // now applies even in functions that call other (non-writing) user
+    // functions (the case that the function-local v1 left out).
     let (written_fields, writes_unknown) = field_writes;
     let field_borrow_ok = |obj: &Operand, class: &str, field: &str, b: &[bool]| -> bool {
         !writes_unknown
@@ -1225,16 +1225,16 @@ fn borrow_slots(
                         (Some(d.0), ok)
                     }
                     Statement::Assign(d, _) if f.locals[d.0 as usize] == Ty::Ref => (Some(d.0), false),
-                    // Stabiles statisches Feld (in dieser Funktion nicht geschrieben):
-                    // die Static-Wurzel hält den Wert am Leben → Borrow, kein RC.
+                    // Stable static field (not written in this function):
+                    // the static root keeps the value alive → borrow, no RC.
                     Statement::GetStatic { dest, class, field }
                         if f.locals[dest.0 as usize] == Ty::Ref =>
                     {
                         let stable = !static_writes.contains(&(class.clone(), field.clone()));
                         (Some(dest.0), stable)
                     }
-                    // Traversal-Cursor: Load eines nie geschriebenen Feldes von
-                    // stabiler Basis → Borrow (siehe field_borrow_ok oben).
+                    // Traversal cursor: load of a never-written field from
+                    // a stable base → borrow (see field_borrow_ok above).
                     Statement::GetField { dest, obj, class, field }
                         if f.locals[dest.0 as usize] == Ty::Ref =>
                     {
@@ -1269,10 +1269,10 @@ fn borrow_slots(
     (0..n as u32).filter(|&l| b[l as usize]).collect()
 }
 
-/// Beweisbar nicht-null Ref-Locals: `this` (bei Instanzmethoden, `receiver_
-/// nonnull`), New/StackNew-Ergebnisse und Kopien davon. Erlaubt, die inline-
-/// Null-Prüfung bei Feldzugriffen wegzulassen (der Aufrufer prüft den Receiver;
-/// `this.f` re-prüft sonst redundant je Zugriff — heiße virtuelle Methoden).
+/// Provably non-null ref locals: `this` (in instance methods, `receiver_
+/// nonnull`), New/StackNew results, and copies of them. Allows omitting the
+/// inline null check on field accesses (the caller checks the receiver;
+/// `this.f` would otherwise re-check redundantly per access — hot virtual methods).
 fn non_null_locals(f: &Function) -> BTreeSet<u32> {
     let n = f.locals.len();
     let mut nn = vec![false; n];
@@ -1289,7 +1289,7 @@ fn non_null_locals(f: &Function) -> BTreeSet<u32> {
             }
         }
     }
-    // Kopien nicht-null Werte: Fixpunkt.
+    // Copies of non-null values: fixpoint.
     loop {
         let mut changed = false;
         for bb in &f.blocks {
@@ -1306,8 +1306,8 @@ fn non_null_locals(f: &Function) -> BTreeSet<u32> {
             break;
         }
     }
-    // Locals mit irgendeinem möglicherweise-null Def wieder streichen (flow-
-    // insensitiv konservativ): jeder Nicht-nn-Def entwertet.
+    // Strike out locals with any possibly-null def again (flow-
+    // insensitive conservative): every non-nn def invalidates.
     let mut maybe_null = vec![false; n];
     for bb in &f.blocks {
         for st in &bb.statements {
@@ -1336,15 +1336,15 @@ fn non_null_locals(f: &Function) -> BTreeSet<u32> {
             }
         }
     }
-    // `this` (Local 0) ist trotz Nicht-Def nicht-null; wird nie neu definiert
-    // in korrektem Bytecode, aber schütze den Fall.
+    // `this` (local 0) is non-null despite the non-def; it is never redefined
+    // in correct bytecode, but guard the case.
     if f.receiver_nonnull && !f.params.is_empty() && f.params[0] == Ty::Ref {
         maybe_null[0] = false;
     }
     (0..n as u32).filter(|&l| nn[l as usize] && !maybe_null[l as usize]).collect()
 }
 
-/// Locals, die irgendwo als Schreibziel auftreten (für die Borrow-Analyse).
+/// Locals that appear anywhere as a write target (for the borrow analysis).
 fn written_locals(f: &Function) -> BTreeSet<u32> {
     let mut w = BTreeSet::new();
     let mut mark = |l: &Local| {
@@ -1384,14 +1384,14 @@ impl<'a> FnEmitter<'a> {
         format!("%t{}", self.tmp)
     }
 
-    /// Frisches LLVM-Blocklabel (für Mid-Block-Verzweigungen wie den
-    /// Null-Skip bei Feld-/Receiver-Zugriffen).
+    /// Fresh LLVM block label (for mid-block branches like the
+    /// null skip on field/receiver accesses).
     fn fresh_label(&mut self) -> String {
         self.label += 1;
         format!("nz{}", self.label)
     }
 
-    /// Materialisiert einen Operanden als SSA-Wert; Locals werden geladen.
+    /// Materializes an operand as an SSA value; locals are loaded.
     fn operand(&mut self, w: &mut String, op: &Operand) -> String {
         match op {
             Operand::Copy(l) => {
@@ -1402,9 +1402,9 @@ impl<'a> FnEmitter<'a> {
             }
             Operand::ConstI32(v) => v.to_string(),
             Operand::ConstI64(v) => v.to_string(),
-            // LLVM verlangt exakte double-Literale → Bit-Muster als Hex.
+            // LLVM requires exact double literals → bit pattern as hex.
             Operand::ConstF64(v) => format!("0x{:016X}", v.to_bits()),
-            // float-Literale in LLVM: Hex des exakt promoteten double-Werts.
+            // float literals in LLVM: hex of the exactly promoted double value.
             Operand::ConstF32(v) => format!("0x{:016X}", (*v as f64).to_bits()),
             Operand::ConstStr(i) => format!("@jstr.{i}"),
             Operand::ConstClass(c) => format!("@jclass.{}", sanitize(c)),
@@ -1426,31 +1426,31 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     for (i, ty) in f.locals.iter().enumerate() {
         writeln!(w, "  %l{i} = alloca {}", llty(*ty)).unwrap();
     }
-    // Ref-Locals müssen vor dem ersten (Cleanup-)Load null sein, damit das
-    // Massen-Release am Funktionsende keinen Garbage dereferenziert.
+    // Ref locals must be null before the first (cleanup) load, so that the
+    // bulk release at the function end dereferences no garbage.
     let n_params = f.params.len();
     for (i, ty) in f.locals.iter().enumerate() {
         if *ty == Ty::Ref && i >= n_params {
             writeln!(w, "  store ptr null, ptr %l{i}").unwrap();
         }
     }
-    // Borrow-Analyse: nie neu zugewiesene Ref-Parameter bleiben geborgt
-    // (RC-Elision). `this` in Instanzmethoden ist fast immer so.
+    // Borrow analysis: never-reassigned ref parameters stay borrowed
+    // (RC elision). `this` in instance methods is almost always like this.
     let written = written_locals(f);
     let borrowed: BTreeSet<u32> = (0..n_params as u32)
         .filter(|i| f.params[*i as usize] == Ty::Ref && !written.contains(i))
         .collect();
     for (i, ty) in f.params.iter().enumerate() {
         writeln!(w, "  store {} %p{i}, ptr %l{i}", llty(*ty)).unwrap();
-        // Ref-Parameter: retain (→ owned, Cleanup darf uniform releasen), außer
-        // geborgte (nie neu zugewiesen) — dort ist retain/release redundant.
+        // Ref parameters: retain (→ owned, cleanup may release uniformly), except
+        // borrowed ones (never reassigned) — there retain/release is redundant.
         if *ty == Ty::Ref && !borrowed.contains(&(i as u32)) {
             writeln!(w, "  call void @jrt_retain(ptr %p{i})").unwrap();
         }
     }
-    // StackNew-Objektspeicher vorab im Entry-Block reservieren (%sn<k>), in
-    // Statement-Reihenfolge — so ist der Slot in Schleifen ein fester,
-    // wiederverwendeter Alloca statt einer Allokation je Iteration.
+    // Reserve StackNew object storage ahead in the entry block (%sn<k>), in
+    // statement order — so in loops the slot is a fixed,
+    // reused alloca instead of an allocation per iteration.
     let mut snk = 0u32;
     for bb in &f.blocks {
         for st in &bb.statements {
@@ -1465,14 +1465,14 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let imm = immortal_only_locals(f);
     let empty_writes = BTreeSet::new();
     let sw = ctx.static_writes.get(&f.name).unwrap_or(&empty_writes);
-    let empty_fw = (BTreeSet::new(), true); // unbekannt → konservativ (kein Borrow)
+    let empty_fw = (BTreeSet::new(), true); // unknown → conservative (no borrow)
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn, md_inv: ctx.md_inv };
-    // AOT-Hotpath: statische Schleifen-Schätzung → welcher Branch-Zweig bleibt
-    // in der Schleife (heiß). Setzt `!prof`-Weights, LLVM optimiert den Rest.
-    // `FASTLLVM_NO_PROF` schaltet die Weights ab (für A/B-Messung der Decke).
+    // AOT hot path: static loop estimation → which branch stays
+    // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
+    // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
     let bw_bias = if std::env::var_os("FASTLLVM_NO_PROF").is_some() {
         std::collections::HashMap::new()
     } else {
@@ -1490,8 +1490,8 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 let c = e.operand(w, cond);
                 let b = e.fresh();
                 writeln!(w, "  {b} = icmp ne i32 {c}, 0").unwrap();
-                // `!prof`-Branch-Weights aus der Schleifen-Schätzung: der in der
-                // Schleife bleibende Zweig ist heiß.
+                // `!prof` branch weights from the loop estimation: the branch
+                // that stays in the loop is hot.
                 let prof = match bw_bias.get(&bi) {
                     Some(true) => format!(", !prof !{}", ctx.bw_then),
                     Some(false) => format!(", !prof !{}", ctx.bw_else),
@@ -1515,8 +1515,8 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
             Terminator::Return(Some(op)) => {
                 let ty = operand_ty(f, op);
                 let v = e.operand(w, op);
-                // Rückgabe-Ref muss das Cleanup überleben → retain, dann
-                // transferiert der Aufrufer die +1.
+                // The returned ref must survive the cleanup → retain, then
+                // the caller transfers the +1.
                 if ty == Ty::Ref {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
@@ -1528,17 +1528,17 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     writeln!(w, "}}\n").unwrap();
 }
 
-/// Released alle Ref-Locals der Funktion (Owning-Slot-Modell): jedes
-/// Ref-Local hält eine Referenz, die beim Verlassen der Funktion endet.
+/// Releases all of the function's ref locals (owning-slot model): each
+/// ref local holds a reference that ends when the function is left.
 ///
-/// Stack-allozierte Objekte (`StackNew`, immortal) brauchen keine Feld-
-/// Freigabe: die feld-sensitive Escape-Analyse promoviert Container und Inhalt
-/// nur gemeinsam (both-or-neither), sodass ein Stack-Container ausschließlich
-/// immortale Inhalte hält — nichts, das lecken könnte.
+/// Stack-allocated objects (`StackNew`, immortal) need no field
+/// release: the field-sensitive escape analysis promotes container and contents
+/// only together (both-or-neither), so a stack container holds exclusively
+/// immortal contents — nothing that could leak.
 fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
     for (i, ty) in e.f.locals.iter().enumerate() {
-        // Geborgte Parameter (nie retained) und immortal-only Slots (nur No-Op-
-        // Werte) brauchen keine Cleanup-release.
+        // Borrowed parameters (never retained) and immortal-only slots (only no-op
+        // values) need no cleanup release.
         if *ty == Ty::Ref
             && !e.borrowed.contains(&(i as u32))
             && !e.imm.contains(&(i as u32))
@@ -1586,7 +1586,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                         (Ty::I64, Ty::I32) => "trunc",
                         (Ty::F32, Ty::F64) => "fpext",
                         (Ty::F64, Ty::F32) => "fptrunc",
-                        // Gleitkomma → Ganzzahl (Trunkierung).
+                        // Floating point → integer (truncation).
                         (Ty::F64, Ty::I64) | (Ty::F64, Ty::I32) | (Ty::F32, Ty::I64) | (Ty::F32, Ty::I32) => "fptosi",
                         _ => panic!("unerwartete Konvertierung {from:?} -> {to:?}"),
                     };
@@ -1595,8 +1595,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 }
             };
             let _ = dty;
-            // Kopien/Konstanten ins Ref-Local sind geborgt → retain der neue,
-            // release der alte (store_dest). Nicht-Ref: schlichter store.
+            // Copies/constants into the ref local are borrowed → retain the new,
+            // release the old (store_dest). Non-ref: a plain store.
             store_dest(w, e, *dest, &val, true);
         }
         Statement::Call { dest, func, args } => {
@@ -1607,12 +1607,12 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     let rty = llty(e.f.locals[d.0 as usize]);
                     let t = e.fresh();
                     writeln!(w, "  {t} = call {rty} @{func}({avs})").unwrap();
-                    // Ref-Rückgabe transferiert +1 (kein retain).
+                    // Ref return transfers +1 (no retain).
                     store_dest(w, e, *d, &t, false);
                 }
             }
         }
-        // Devirtualisierter Instanzaufruf mit abfangbarer Receiver-NPE.
+        // Devirtualized instance call with catchable receiver NPE.
         Statement::CallGuarded { dest, func, args } => {
             let recv = e.operand(w, &args[0]);
             let avs = call_args(w, e, args);
@@ -1641,8 +1641,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 .vtable_index(class, name, desc)
                 .unwrap_or_else(|| panic!("Vtable-Slot {class}.{name}{desc} fehlt"));
             let recv = e.operand(w, &args[0]);
-            // Restliche Argumente vor dem Verzweigen materialisieren (dürfen
-            // in beiden Zweigen benutzt werden).
+            // Materialize the remaining arguments before branching (may be
+            // used in both branches).
             let mut avs = vec![format!("ptr {recv}")];
             for a in &args[1..] {
                 let ty = llty(operand_ty(e.f, a));
@@ -1650,7 +1650,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 avs.push(format!("{ty} {v}"));
             }
             let _ = params;
-            // Abfangbare Receiver-NPE: bei null zum npe-Block, sonst Dispatch.
+            // Catchable receiver NPE: on null go to the npe block, otherwise dispatch.
             let (nb, ok, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label());
             let isnull = e.fresh();
             writeln!(w, "  {isnull} = icmp eq ptr {recv}, null").unwrap();
@@ -1659,7 +1659,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  call void @jrt_throw_npe()").unwrap();
             writeln!(w, "  br label %{cont}").unwrap();
             writeln!(w, "{ok}:").unwrap();
-            // Vtable liegt im Header (hinter refcount + rcflags).
+            // The vtable sits in the header (after refcount + rcflags).
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
@@ -1673,7 +1673,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 Some(d) => {
                     let t = e.fresh();
                     writeln!(w, "  {t} = call {} {fnp}({})", llty(*ret), avs.join(", ")).unwrap();
-                    // Ref-Rückgabe transferiert +1 (kein retain).
+                    // Ref return transfers +1 (no retain).
                     store_dest(w, e, *d, &t, false);
                 }
             }
@@ -1682,7 +1682,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         }
         Statement::CallPoly { dest, ret, args, targets } => {
             let recv = e.operand(w, &args[0]);
-            // Argumente einmal materialisieren (in allen Zweigen gültig).
+            // Materialize the arguments once (valid in all branches).
             let mut avs = vec![format!("ptr {recv}")];
             for a in &args[1..] {
                 let ty = llty(operand_ty(e.f, a));
@@ -1691,7 +1691,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             }
             let avs = avs.join(", ");
             let cont = e.fresh_label();
-            // Abfangbare Receiver-NPE: bei null → npe-Block.
+            // Catchable receiver NPE: on null → npe block.
             let (nb, ok) = (e.fresh_label(), e.fresh_label());
             let isnull = e.fresh();
             writeln!(w, "  {isnull} = icmp eq ptr {recv}, null").unwrap();
@@ -1700,14 +1700,14 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  call void @jrt_throw_npe()").unwrap();
             writeln!(w, "  br label %{cont}").unwrap();
             writeln!(w, "{ok}:").unwrap();
-            // Vtable-Zeiger des Receivers laden.
+            // Load the receiver's vtable pointer.
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
             writeln!(w, "  {vt} = load ptr, ptr {vtp}, !invariant.load !{}", e.md_inv).unwrap();
-            // Kaskade: pro Klasse ein Vtable-Vergleich → Direkt-Call; das
-            // letzte Ziel ist der else-Zweig (Closed World: Receiver ist
-            // garantiert eine der instanziierten Zielklassen).
+            // Cascade: one vtable comparison per class → direct call; the
+            // last target is the else branch (closed world: the receiver is
+            // guaranteed to be one of the instantiated target classes).
             let emit_call = |w: &mut String, e: &mut FnEmitter, sym: &str| {
                 match dest {
                     None => writeln!(w, "  call {} @{sym}({avs})", llty(*ret)).unwrap(),
@@ -1720,7 +1720,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             };
             for (k, (cls, sym)) in targets.iter().enumerate() {
                 if k + 1 == targets.len() {
-                    // letztes Ziel: unbedingt (else)
+                    // last target: unconditional (else)
                     emit_call(w, e, sym);
                     writeln!(w, "  br label %{cont}").unwrap();
                 } else {
@@ -1739,22 +1739,22 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         Statement::New { dest, class } => {
             let sn = ctx.struct_name(class);
             let t = e.fresh();
-            // sizeof über GEP-Konstante; jrt_alloc nullt Felder und setzt
-            // refcount=1 (Java-Defaultwerte + erste Referenz).
+            // sizeof via a GEP constant; jrt_alloc zeroes fields and sets
+            // refcount=1 (Java default values + first reference).
             writeln!(
                 w,
                 "  {t} = call ptr @jrt_alloc(i64 ptrtoint (ptr getelementptr ({sn}, ptr null, i32 1) to i64))"
             )
             .unwrap();
             store_vtable(w, e, &t, class);
-            store_dest(w, e, *dest, &t, false); // alloc gab +1
+            store_dest(w, e, *dest, &t, false); // alloc gave +1
         }
         Statement::StackNew { dest, class } => {
             let sn = ctx.struct_name(class);
-            // Der Alloca-Slot ist im Entry-Block vorab reserviert (%sn<k>) —
-            // sonst würde ein StackNew in einer Schleife je Iteration Stack
-            // allozieren (Überlauf). Hier nur (re)initialisieren: refcount=-1
-            // macht das Objekt immortal (retain/release = No-Op, nie befreit).
+            // The alloca slot is pre-reserved in the entry block (%sn<k>) —
+            // otherwise a StackNew in a loop would allocate stack per
+            // iteration (overflow). Here only (re)initialize: refcount=-1
+            // makes the object immortal (retain/release = no-op, never freed).
             let t = format!("%sn{}", e.sn);
             e.sn += 1;
             writeln!(w, "  store {sn} zeroinitializer, ptr {t}").unwrap();
@@ -1768,8 +1768,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 .unwrap_or_else(|| panic!("Feld {class}.{field} fehlt"));
             let nonnull = e.nonnull(obj);
             let o = e.operand(w, obj);
-            // Abfangbare NPE: bei null zum npe-Block (pending), sonst Zugriff.
-            // Bei beweisbar nicht-null Receiver (z.B. `this`) entfällt die Prüfung.
+            // Catchable NPE: on null go to the npe block (pending), otherwise access.
+            // For a provably non-null receiver (e.g. `this`) the check is omitted.
             let cont = if nonnull {
                 None
             } else {
@@ -1787,7 +1787,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {p}{}", llty(ty), ctx.tbaa_suffix(&owner, field)).unwrap();
-            // Feldwert ist geborgt; die Kopie ins Local wird owned → retain.
+            // The field value is borrowed; the copy into the local becomes owned → retain.
             store_dest(w, e, *dest, &t, true);
             if let Some(cont) = cont {
                 writeln!(w, "  br label %{cont}").unwrap();
@@ -1818,10 +1818,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let tb = ctx.tbaa_suffix(&owner, field);
             if ty == Ty::Ref {
-                // Feld übernimmt eine owning-Referenz: retain neu, release alt.
-                // `retain(null)` ist ein beweisbarer No-Op (Konstante null) →
-                // weglassen (spart einen Call je `x.f = null` / Feld-Init auf null;
-                // hilft allokationslastigem Code wie `Tree(null, null)`).
+                // The field takes over an owning reference: retain new, release old.
+                // `retain(null)` is a provable no-op (constant null) →
+                // omit it (saves a call per `x.f = null` / field init to null;
+                // helps allocation-heavy code like `Tree(null, null)`).
                 if !matches!(value, Operand::ConstNull) {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
@@ -1841,7 +1841,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {g}", llty(ty)).unwrap();
-            // Ref aus globalem Feld ins Local kopiert → owned (retain).
+            // Ref copied from a global field into the local → owned (retain).
             store_dest(w, e, *dest, &t, ty == Ty::Ref);
         }
         Statement::PutStatic { class, field, value } => {
@@ -1886,7 +1886,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 array_vtable(*kind),
             )
             .unwrap();
-            store_dest(w, e, *dest, &t, false); // alloc gab +1
+            store_dest(w, e, *dest, &t, false); // alloc gave +1
         }
         Statement::ArrayLen { dest, arr } => {
             let a = e.operand(w, arr);
@@ -1899,10 +1899,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let i = e.operand(w, index);
             let vty = kind.value_ty();
             let _ = vty;
-            // Inline (auch geprüft): null-/Bounds-Test setzen pending über
-            // jrt_throw_npe/jrt_throw_bounds, der Zugriff bleibt ein sichtbarer
-            // load — LLVM hoistet die Längenprüfung aus Schleifen und kann
-            // vektorisieren, statt einen opaken jrt_?aload-Call je Element.
+            // Inline (even when checked): null/bounds tests set pending via
+            // jrt_throw_npe/jrt_throw_bounds, the access stays a visible
+            // load — LLVM hoists the length check out of loops and can
+            // vectorize, instead of an opaque jrt_?aload call per element.
             let ann = e.nonnull(arr);
             let v = if *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none() {
                 emit_array_elem_load_checked(w, e, &a, &i, *kind, ann)
@@ -1916,9 +1916,9 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let i = e.operand(w, index);
             let v = e.operand(w, value);
             let vty = kind.value_ty();
-            // Ref-Stores geprüft über die Runtime (jrt_aastore trägt die
-            // Kovarianz-/ArrayStoreException-Prüfung, die der inline-Pfad nicht
-            // hätte). Primitive Stores werden inline geprüft.
+            // Ref stores checked via the runtime (jrt_aastore carries the
+            // covariance/ArrayStoreException check that the inline path would
+            // not have). Primitive stores are checked inline.
             let bck = *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none();
             if bck && kind.is_ref() {
                 writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
@@ -1943,7 +1943,7 @@ fn arr_store_fn(k: ArrKind) -> &'static str {
         ArrKind::Ref => "jrt_aastore",
     }
 }
-/// LLVM-Speichertyp eines Array-Elements.
+/// LLVM storage type of an array element.
 fn arr_store_ty(k: ArrKind) -> &'static str {
     match k {
         ArrKind::Bool | ArrKind::Byte => "i8",
@@ -1966,7 +1966,7 @@ fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: 
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
     writeln!(w, "  {raw} = load {}, ptr {ep}", arr_store_ty(k)).unwrap();
-    // Schmale Typen auf i32 erweitern (byte/short signed, bool/char unsigned).
+    // Extend narrow types to i32 (byte/short signed, bool/char unsigned).
     match k {
         ArrKind::Byte | ArrKind::Short => {
             let x = e.fresh();
@@ -1990,7 +1990,7 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
     writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
-    // Wert auf die Speicherbreite kürzen (byte/char/short).
+    // Truncate the value to the storage width (byte/char/short).
     let sv = match k {
         ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
             let x = e.fresh();
@@ -2002,7 +2002,7 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
     writeln!(w, "  store {} {sv}, ptr {ep}", arr_store_ty(k)).unwrap();
 }
 
-/// Neutral-Wert (LLVM-Literal) für den Fehler-Zweig eines geprüften Loads.
+/// Neutral value (LLVM literal) for the error branch of a checked load.
 fn zero_lit(vty: Ty) -> &'static str {
     match vty {
         Ty::Ref => "null",
@@ -2011,16 +2011,16 @@ fn zero_lit(vty: Ty) -> &'static str {
     }
 }
 
-/// Geprüfter Load, komplett inline: null-Test → NPE, `idx (unsigned) >= length`
-/// → Bounds (beide setzen pending und liefern einen Neutralwert; die vom Frontend
-/// eingefügte pending-Prüfung übernimmt danach den Kontrollfluss). Der eigentliche
-/// Zugriff bleibt ein LLVM-`load` (hoistbar/vektorisierbar).
+/// Checked load, fully inline: null test → NPE, `idx (unsigned) >= length`
+/// → bounds (both set pending and yield a neutral value; the pending check
+/// inserted by the frontend then takes over control flow). The actual
+/// access stays an LLVM `load` (hoistable/vectorizable).
 fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind, nn: bool) -> String {
     let vty = k.value_ty();
     let sty = arr_store_ty(k);
     let (npe, ck, bd, ld, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
-    // Null-Check nur, wenn das Array NICHT nachweislich nicht-null ist (lokal via
-    // `array(n)` erzeugt o.ä.). Spart pro Zugriff einen Branch in engen Schleifen.
+    // Null check only if the array is NOT provably non-null (created locally via
+    // `array(n)` or similar). Saves a branch per access in tight loops.
     if !nn {
         let isnull = e.fresh();
         writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
@@ -2078,8 +2078,8 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     v
 }
 
-/// Geprüfter Store, inline (primitive Elemente). Null-/Bounds-Fehler setzen
-/// pending; im gültigen Fall ein sichtbarer `store`.
+/// Checked store, inline (primitive elements). Null/bounds errors set
+/// pending; in the valid case a visible `store`.
 fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind, nn: bool) {
     let sty = arr_store_ty(k);
     let (npe, ck, bd, st, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
@@ -2124,34 +2124,34 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     writeln!(w, "{cont}:").unwrap();
 }
 
-/// Speichert die Vtable im Objektheader (hinter refcount + rcflags).
+/// Stores the vtable in the object header (after refcount + rcflags).
 fn store_vtable(w: &mut String, e: &mut FnEmitter, obj: &str, class: &str) {
     let vtp = e.fresh();
     writeln!(w, "  {vtp} = getelementptr ptr, ptr {obj}, i64 {VTABLE_WORD}").unwrap();
     writeln!(w, "  store ptr @vt.{}, ptr {vtp}", sanitize(class)).unwrap();
 }
 
-/// Schreibt `val` in ein Local. Für Ref-Locals gilt die Owning-Slot-
-/// Disziplin: der alte Wert wird released, der neue ggf. retained
-/// (`retain_new`: true bei Kopie/geborgtem Wert, false bei transferierter
-/// +1-Referenz aus New/Call).
+/// Writes `val` into a local. For ref locals the owning-slot
+/// discipline applies: the old value is released, the new one retained if needed
+/// (`retain_new`: true for a copy/borrowed value, false for a transferred
+/// +1 reference from New/Call).
 fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_new: bool) {
     let ty = e.f.locals[dest.0 as usize];
     if ty != Ty::Ref {
         writeln!(w, "  store {} {val}, ptr %l{}", llty(ty), dest.0).unwrap();
         return;
     }
-    // Phase 4: hält der Slot nur immortale Werte (Stack-Objekte/Literale/null),
-    // sind retain/release beweisbar No-Ops → weglassen. Das entkoppelt das
-    // Objekt von der RC-Buchhaltung, sodass LLVM es (bei totem Objekt) ganz
-    // eliminieren kann — Rust-artiges Ownership für den Stack-Teil.
+    // Phase 4: if the slot holds only immortal values (stack objects/literals/null),
+    // retain/release are provably no-ops → omit them. This decouples the
+    // object from the RC bookkeeping, so LLVM can eliminate it entirely
+    // (for a dead object) — Rust-like ownership for the stack part.
     if e.imm.contains(&dest.0) || e.borrow.contains(&dest.0) {
         writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
         return;
     }
     let old = e.fresh();
     writeln!(w, "  {old} = load ptr, ptr %l{}", dest.0).unwrap();
-    // `retain(null)` ist ein No-Op → weglassen (Konstante null rendert als "null").
+    // `retain(null)` is a no-op → omit it (constant null renders as "null").
     if retain_new && val != "null" {
         writeln!(w, "  call void @jrt_retain(ptr {val})").unwrap();
     }
@@ -2172,11 +2172,11 @@ fn call_args(w: &mut String, e: &mut FnEmitter, args: &[Operand]) -> String {
 
 fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b: &str) -> String {
     let t = e.fresh();
-    // Vergleiche liefern immer i32 (0/1); Operanden sind i32 oder ptr
-    // (long/double-Vergleiche laufen über Runtime-lcmp/dcmp).
+    // Comparisons always yield i32 (0/1); operands are i32 or ptr
+    // (long/double comparisons go through runtime lcmp/dcmp).
     if matches!(op, BinOp::CmpEq | BinOp::CmpNe | BinOp::CmpLt | BinOp::CmpGe | BinOp::CmpGt | BinOp::CmpLe) {
         let is_float = aty == Ty::F64 || aty == Ty::F32;
-        // Float → fcmp mit geordneten Prädikaten (o*); ganzzahlig/Zeiger → icmp.
+        // Float → fcmp with ordered predicates (o*); integer/pointer → icmp.
         let cc = match (op, is_float) {
             (BinOp::CmpEq, false) => "eq",
             (BinOp::CmpNe, false) => "ne",
@@ -2199,7 +2199,7 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         return t;
     }
 
-    // Gleitkomma-Arithmetik (double/float).
+    // Floating-point arithmetic (double/float).
     if aty == Ty::F64 || aty == Ty::F32 {
         let inst = match op {
             BinOp::Add => "fadd",
@@ -2209,19 +2209,19 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
             BinOp::Rem => "frem",
             _ => panic!("Bit-/Shift-Operation auf Gleitkomma"),
         };
-        // `contract`: erlaubt LLVM, `a*b+c` zu einer FMA zu fusionieren (mit
-        // -march=native → echte FMA-Instruktion). Die sicherste fast-math-Stufe —
-        // nur Kontraktion (meist HÖHERE Präzision), KEINE Reassoziation/NaN-
-        // Annahmen. Entspricht clangs Default (`-ffp-contract=on`); schließt den
-        // gemessenen ~12%-Gap zu clang auf float-lastigem Code (mandelbrot).
+        // `contract`: lets LLVM fuse `a*b+c` into an FMA (with
+        // -march=native → a real FMA instruction). The safest fast-math level —
+        // contraction only (usually HIGHER precision), NO reassociation/NaN
+        // assumptions. Matches clang's default (`-ffp-contract=on`); closes the
+        // measured ~12% gap to clang on float-heavy code (mandelbrot).
         writeln!(w, "  {t} = {inst} contract {} {a}, {b}", llty(aty)).unwrap();
         return t;
     }
 
-    // int/long-Arithmetik. div/rem laufen für beide über Runtime (nicht hier).
+    // int/long arithmetic. div/rem go through the runtime for both (not here).
     let ty = llty(aty);
-    // Shift-Beträge maskieren (JLS 15.19): & 31 (int) bzw. & 63 (long); der
-    // Betrag ist immer int und wird für long auf i64 erweitert.
+    // Mask shift amounts (JLS 15.19): & 31 (int) or & 63 (long); the
+    // amount is always int and is extended to i64 for long.
     let masked = |w: &mut String, e: &mut FnEmitter, b: &str| -> String {
         if aty == Ty::I64 {
             let ext = e.fresh();
@@ -2239,13 +2239,13 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
         BinOp::Add => writeln!(w, "  {t} = add {ty} {a}, {b}").unwrap(),
         BinOp::Sub => writeln!(w, "  {t} = sub {ty} {a}, {b}").unwrap(),
         BinOp::Mul => writeln!(w, "  {t} = mul {ty} {a}, {b}").unwrap(),
-        // div/rem: bei NICHT-NULL konstantem Divisor kann keine Division-durch-Null
-        // auftreten → inline `sdiv`/`srem` (LLVM stärke-reduziert: `/2`→Shift,
-        // `%2^n`→and, `/const`→Multiplikations-Trick). Das ist der große Hebel für
-        // Index-/RNG-lastigen Code (binsearch `(lo+hi)/2`, LCG `%2^31`). Sonst
-        // (Laufzeit-Divisor) über die Runtime, die den Null-Check + ArithmeticException
-        // trägt. Java/Vire-Semantik (trunc-toward-zero, Rest mit Dividenden-Vorzeichen)
-        // = LLVMs sdiv/srem.
+        // div/rem: with a NON-ZERO constant divisor no division-by-zero
+        // can occur → inline `sdiv`/`srem` (LLVM strength-reduces: `/2`→shift,
+        // `%2^n`→and, `/const`→multiplication trick). This is the big lever for
+        // index/RNG-heavy code (binsearch `(lo+hi)/2`, LCG `%2^31`). Otherwise
+        // (runtime divisor) through the runtime, which carries the null check + ArithmeticException.
+        // Java/Vire semantics (trunc-toward-zero, remainder with the dividend's sign)
+        // = LLVM's sdiv/srem.
         BinOp::Div | BinOp::Rem => {
             let inst = if matches!(op, BinOp::Div) { "sdiv" } else { "srem" };
             let const_nonzero = b.parse::<i64>().map(|d| d != 0).unwrap_or(false);
@@ -2279,8 +2279,8 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
     t
 }
 
-/// Emittiert einen immortalen JStr-Konstanten `@<sym>` (voller Objekt-Header
-/// + Länge + Bytes), wie ein String-Literal — für Reflection-Namen.
+/// Emits an immortal JStr constant `@<sym>` (full object header
+/// + length + bytes), like a string literal — for reflection names.
 fn emit_jstr_const(w: &mut String, sym: &str, bytes: &[u8]) {
     let n = bytes.len();
     writeln!(

@@ -1,0 +1,38 @@
+// Compile-time reflection (@typeinfo) + derivation (@derive). Everything runs in the
+// compiler — at runtime only pure, specialized code remains, no metadata.
+
+// @derive generates impls via reflection (no macro voodoo, no RTTI):
+@derive(Json, Eq, Hash)
+type User {
+    id: Int
+    name: Str
+    admin: Bool
+}
+
+// Generic JSON serializer: walks the fields AT COMPILE TIME and
+// generates exactly one line per field — the generated code is as fast as
+// hand-written.
+fn to_json[T](v: T) -> Str {
+    info = @typeinfo(T)
+    comptime match info.kind {
+        .Struct -> {
+            mut parts = []
+            comptime for f in info.fields {
+                parts.push("\"{f.name}\":" + to_json(v.@field(f.name)))
+            }
+            "{{" + parts.join(",") + "}}"
+        }
+        .Str  -> "\"{v}\""
+        .Int  -> "{v}"
+        .Bool -> if v { "true" } else { "false" }
+    }
+}
+
+// Static check at compile time (no runtime check):
+comptime assert @typeinfo(User).fields.len() == 3
+
+fn main() {
+    u = User(1, "Ada", true)
+    print(to_json(u))            // {"id":1,"name":"Ada","admin":true}
+    print(u == User(1, "Ada", true))   // true  (via @derive(Eq))
+}

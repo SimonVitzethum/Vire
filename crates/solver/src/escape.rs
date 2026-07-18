@@ -1,34 +1,34 @@
-//! Escape-Analyse (Choi et al. 1999, stark vereinfacht): Objekte, die ihre
-//! Funktion beweisbar nie verlassen, werden stack-alloziert (`StackNew`).
+//! Escape analysis (Choi et al. 1999, heavily simplified): objects that
+//! provably never leave their function are stack-allocated (`StackNew`).
 //!
-//! Das ist der erste Speichersicherheits-/Ownership-Baustein (DESIGN.md
-//! §6a): ein nicht entkommendes Objekt hat exakt einen Besitzer — den
-//! Stack-Frame — und eine statisch bewiesene Lebenszeit, wie ein Rust-Wert.
-//! Läuft nach Devirtualisierung + Inlining: erst durch das Inlining der
-//! Konstruktoren wird der Receiver-Store sichtbar statt als entkommendes
-//! Call-Argument (Synergie aus DESIGN.md §4).
+//! This is the first memory-safety/ownership building block (DESIGN.md
+//! §6a): a non-escaping object has exactly one owner — the
+//! stack frame — and a statically proven lifetime, like a Rust value.
+//! Runs after devirtualization + inlining: only through the inlining of
+//! the constructors does the receiver store become visible instead of an
+//! escaping call argument (synergy from DESIGN.md §4).
 //!
-//! Konservative Escape-Quellen:
-//! - Rückgabe (`Return`) eines Alias
-//! - Argument eines Calls (außer `jrt_null_check`) oder virtuellen Calls
-//! - als *Wert* in `putfield` gespeichert (Stores *in* das Objekt sind ok)
+//! Conservative escape sources:
+//! - return (`Return`) of an alias
+//! - argument of a call (except `jrt_null_check`) or virtual calls
+//! - stored as a *value* in `putfield` (stores *into* the object are ok)
 //!
-//! Stack-Allokation nur außerhalb von Schleifen: der Alloca-Slot würde
-//! sonst über Iterationen wiederverwendet, während Aliase aus früheren
-//! Iterationen noch leben könnten.
+//! Stack allocation only outside of loops: otherwise the alloca slot
+//! would be reused across iterations while aliases from earlier
+//! iterations could still be alive.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
 pub fn stack_allocate(program: &mut Program) -> usize {
-    // Interprozedurale Escape-Summaries: welche Ref-Parameter jeder Funktion
-    // ihren Aufrufer entkommen lässt. Damit muss ein an einen Call übergebenes
-    // Objekt nicht mehr blind als entkommend gelten — nur wenn der Callee es
-    // wirklich festhält. Präzisionsschub (Phase 5) → mehr Stack-Allokation.
+    // Interprocedural escape summaries: which ref parameters of each function
+    // let their caller's object escape. This means an object passed to a call
+    // no longer has to be blindly considered escaping — only when the callee
+    // actually holds onto it. Precision boost (phase 5) → more stack allocation.
     let summaries = compute_param_summaries(&program.functions);
-    // Klassen mit (geerbten) Ref-Feldern — für die Leck-Sicherheit der
-    // interprozeduralen Relaxation (Callee könnte Heap-Refs hineinschreiben).
+    // Classes with (inherited) ref fields — for the leak safety of the
+    // interprocedural relaxation (the callee could write heap refs into them).
     let ref_field_classes = classes_with_ref_fields(&program.classes);
     let mut total = 0;
     for f in &mut program.functions {
@@ -37,8 +37,8 @@ pub fn stack_allocate(program: &mut Program) -> usize {
     total
 }
 
-/// Klassen, deren Instanzen (inkl. geerbter Felder) mindestens ein Ref-Feld
-/// haben.
+/// Classes whose instances (including inherited fields) have at least one
+/// ref field.
 fn classes_with_ref_fields(classes: &[ClassInfo]) -> BTreeSet<String> {
     let class_of = |n: &str| classes.iter().find(|c| c.name == n);
     let mut out = BTreeSet::new();
@@ -61,8 +61,8 @@ fn classes_with_ref_fields(classes: &[ClassInfo]) -> BTreeSet<String> {
     out
 }
 
-/// Entkommt Argument `j` an den Callee `func`? `jrt_null_check` nie; bekannte
-/// Funktionen laut Summary; externe/Runtime-Funktionen konservativ ja.
+/// Does argument `j` escape to the callee `func`? `jrt_null_check` never; known
+/// functions per summary; external/runtime functions conservatively yes.
 fn arg_escapes(func: &str, j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool {
     if func == "jrt_null_check" {
         return false;
@@ -73,15 +73,15 @@ fn arg_escapes(func: &str, j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool
     }
 }
 
-/// Entkommt Argument `j` an einen der (bekannten) Ziele eines polymorphen
-/// Calls? Nur wenn ES BEI KEINEM Ziel entkommt, ist es sicher lokal.
+/// Does argument `j` escape to any of the (known) targets of a polymorphic
+/// call? Only if it escapes at NO target is it safely local.
 fn poly_arg_escapes(targets: &[(String, String)], j: usize, summ: &BTreeMap<String, Vec<bool>>) -> bool {
     targets.iter().any(|(_, sym)| arg_escapes(sym, j, summ))
 }
 
-/// Fixpunkt über den Aufrufgraphen: für jede Funktion die Ref-Parameter, die
-/// entkommen (Return / Feld-/Statik-/Array-Store / Weitergabe an einen Call,
-/// der sie entkommen lässt / virtueller Call mit unbekanntem Ziel).
+/// Fixpoint over the call graph: for each function the ref parameters that
+/// escape (return / field/static/array store / forwarding to a call
+/// that lets them escape / virtual call with unknown target).
 fn compute_param_summaries(functions: &[Function]) -> BTreeMap<String, Vec<bool>> {
     let mut summ: BTreeMap<String, Vec<bool>> = functions
         .iter()
@@ -158,7 +158,7 @@ fn run_function(
 ) -> usize {
     let cyclic = cyclic_blocks(f);
 
-    // Objekte = Allokations-Sites. Position (bi, si) + Ziel-Local + Klasse.
+    // Objects = allocation sites. Position (bi, si) + target local + class.
     let news: Vec<(usize, usize, Local, String)> = f
         .blocks
         .iter()
@@ -174,10 +174,10 @@ fn run_function(
         return 0;
     }
 
-    // Alias-Menge pro Objekt (flussunsensitiver Kopie-Fixpunkt; wegen
-    // Local-Slot-Wiederverwendung konservativ überschätzt → nur mehr Escapes).
+    // Alias set per object (flow-insensitive copy fixpoint; due to
+    // local-slot reuse conservatively over-estimated → only more escapes).
     let aliases: Vec<BTreeSet<Local>> = news.iter().map(|(_, _, d, _)| alias_set(f, *d)).collect();
-    // Objekte, die ein Operand referenzieren kann.
+    // Objects that an operand can reference.
     let objs_of = |op: &Operand| -> Vec<usize> {
         match op {
             Operand::Copy(l) => (0..news.len()).filter(|&i| aliases[i].contains(l)).collect(),
@@ -185,10 +185,10 @@ fn run_function(
         }
     };
 
-    // direct[o] = o entkommt unmittelbar; edges = ungerichtete Kanten zwischen
-    // Objekten, die per Feld verbunden sind (both-or-neither: Container und
-    // Inhalt werden nur gemeinsam promoviert). So hält ein Stack-Container
-    // ausschließlich immortale Inhalte → keine Feld-Freigabe/Leck möglich.
+    // direct[o] = o escapes immediately; edges = undirected edges between
+    // objects connected via a field (both-or-neither: container and
+    // content are promoted only together). This way a stack container holds
+    // exclusively immortal contents → no field release/leak possible.
     let n = news.len();
     let mut direct = vec![false; n];
     let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
@@ -202,26 +202,26 @@ fn run_function(
     for bb in &f.blocks {
         for st in &bb.statements {
             match st {
-                // Aufrufargumente entkommen nur, wenn der Callee sie laut
-                // Summary festhält (interprozedural); direkte + devirtualisierte
-                // Calls haben ein bekanntes Ziel.
+                // Call arguments escape only if the callee holds onto them per
+                // summary (interprocedural); direct + devirtualized
+                // calls have a known target.
                 Statement::Call { func, args, .. } | Statement::CallGuarded { func, args, .. } => {
                     for (j, a) in args.iter().enumerate() {
                         let esc = arg_escapes(func, j, summ);
                         for oi in objs_of(a) {
-                            // Leck-Sicherheit: der Callee könnte eine Heap-Ref in
-                            // ein Ref-Feld von O schreiben (für uns unsichtbar) —
-                            // ein O mit Ref-Feldern, das an einen echten Call geht,
-                            // muss darum Heap bleiben.
+                            // Leak safety: the callee could write a heap ref into
+                            // a ref field of O (invisible to us) —
+                            // an O with ref fields that goes to a real call
+                            // must therefore stay on the heap.
                             if esc || (func != "jrt_null_check" && ref_field_classes.contains(&news[oi].3)) {
                                 direct[oi] = true;
                             }
                         }
                     }
                 }
-                // Polymorpher Call mit bekannten Zielen: entkommt nur, wenn es
-                // bei mindestens einem Ziel entkommt (interprozedural). Leck-
-                // Sicherheit wie bei direkten Calls (Ref-Feld-Objekte → Heap).
+                // Polymorphic call with known targets: escapes only if it
+                // escapes at at least one target (interprocedural). Leak
+                // safety as with direct calls (ref-field objects → heap).
                 Statement::CallPoly { args, targets, .. } => {
                     for (j, a) in args.iter().enumerate() {
                         let esc = poly_arg_escapes(targets, j, summ);
@@ -232,7 +232,7 @@ fn run_function(
                         }
                     }
                 }
-                // Virtueller Call mit unbekanntem Ziel → konservativ entkommend.
+                // Virtual call with unknown target → conservatively escaping.
                 Statement::CallVirtual { args, .. } => {
                     for a in args {
                         mark(&mut direct, a);
@@ -241,13 +241,13 @@ fn run_function(
                 Statement::PutStatic { value, .. } | Statement::ArrayStore { value, .. } => {
                     mark(&mut direct, value);
                 }
-                // Feld-Sensitivität, `obj.field = value`:
-                //  - value verfolgt, obj verfolgt  → ungerichtete Kante value↔obj
-                //  - value verfolgt, obj unbekannt → value entkommt (in fremden
-                //    Container gespeichert)
-                //  - value unbekannte Ref, obj verfolgt → obj entkommt (ein
-                //    immortaler Stack-Container hielte sonst eine Heap-Referenz,
-                //    deren Drop nie läuft → Leck)
+                // Field sensitivity, `obj.field = value`:
+                //  - value tracked, obj tracked  → undirected edge value↔obj
+                //  - value tracked, obj unknown → value escapes (stored in a
+                //    foreign container)
+                //  - value unknown ref, obj tracked → obj escapes (an
+                //    immortal stack container would otherwise hold a heap reference
+                //    whose drop never runs → leak)
                 Statement::PutField { obj, value, .. } => {
                     let vs = objs_of(value);
                     let os = objs_of(obj);
@@ -278,13 +278,13 @@ fn run_function(
         }
     }
 
-    // Schleifen-Sicherheit (Phase 3): ein Objekt in einem Zyklus-Block darf nur
-    // stack-alloziert werden (Slot je Iteration wiederverwendet), wenn beim New
-    // kein Alias aus einer früheren Iteration mehr lebt. Sonst „entkommt" es
-    // (bleibt Heap). Als direkte Escape-Quelle behandelt, damit die Komponenten-
-    // Propagation unten die both-or-neither-Invariante wahrt: ein unsicheres
-    // Loop-Objekt zieht seine ganze Komponente auf Heap (verhindert, dass ein
-    // Zyklus-Partner promoviert wird, während der andere Heap bleibt → dangling).
+    // Loop safety (phase 3): an object in a cycle block may only be
+    // stack-allocated (slot reused per iteration) if at the New
+    // no alias from an earlier iteration is still alive. Otherwise it "escapes"
+    // (stays on the heap). Treated as a direct escape source so the component
+    // propagation below preserves the both-or-neither invariant: an unsafe
+    // loop object drags its whole component onto the heap (prevents one
+    // cycle partner being promoted while the other stays on the heap → dangling).
     if news.iter().any(|(bi, _, _, _)| cyclic[*bi]) {
         let live_in = liveness(f);
         for (idx, (bi, si, dest, _)) in news.iter().enumerate() {
@@ -297,8 +297,8 @@ fn run_function(
         }
     }
 
-    // Fixpunkt: Entkommen über die ungerichteten Kanten propagieren — eine
-    // Zusammenhangskomponente entkommt, sobald ein Mitglied entkommt.
+    // Fixpoint: propagate escaping over the undirected edges — a
+    // connected component escapes as soon as one member escapes.
     let mut escape = direct;
     loop {
         let mut changed = false;
@@ -313,8 +313,8 @@ fn run_function(
         }
     }
 
-    // Nicht entkommende Objekte stack-allozieren (Schleifen-Sicherheit steckt
-    // bereits in `escape`, s.o.).
+    // Stack-allocate non-escaping objects (loop safety is already
+    // in `escape`, see above).
     let mut count = 0;
     for (idx, (bi, si, _, _)) in news.iter().enumerate() {
         if escape[idx] {
@@ -329,9 +329,9 @@ fn run_function(
     count
 }
 
-/// Rückwärts-Liveness: `live_in[block][stmt]` = die vor Statement `stmt` (im
-/// Block) lebendigen Locals. Standard-Datenfluss (live-out = ∪ live-in der
-/// Nachfolger; live-in = use ∪ (live-out ∖ def)).
+/// Backward liveness: `live_in[block][stmt]` = the locals alive before
+/// statement `stmt` (in the block). Standard data flow (live-out = ∪ live-in of
+/// the successors; live-in = use ∪ (live-out ∖ def)).
 fn liveness(f: &Function) -> Vec<Vec<BTreeSet<Local>>> {
     let nb = f.blocks.len();
     let succs: Vec<Vec<usize>> = f
@@ -363,7 +363,7 @@ fn liveness(f: &Function) -> Vec<Vec<BTreeSet<Local>>> {
         })
         .collect();
     let mut live_out_block = vec![BTreeSet::<Local>::new(); nb];
-    // Fixpunkt über live-out je Block.
+    // Fixpoint over live-out per block.
     loop {
         let mut changed = false;
         for bi in (0..nb).rev() {
@@ -380,7 +380,7 @@ fn liveness(f: &Function) -> Vec<Vec<BTreeSet<Local>>> {
             break;
         }
     }
-    // Pro Statement rückwärts auflösen.
+    // Resolve per statement backward.
     let mut result: Vec<Vec<BTreeSet<Local>>> = Vec::with_capacity(nb);
     for (bi, bb) in f.blocks.iter().enumerate() {
         let mut cur = live_out_block[bi].clone();
@@ -399,7 +399,7 @@ fn liveness(f: &Function) -> Vec<Vec<BTreeSet<Local>>> {
     result
 }
 
-/// Live-in eines ganzen Blocks (für die Block-Fixpunkt-Iteration).
+/// Live-in of an entire block (for the block fixpoint iteration).
 fn block_live_in(
     f: &Function,
     bi: usize,
@@ -424,7 +424,7 @@ fn add_use(set: &mut BTreeSet<Local>, op: &Operand) {
     }
 }
 
-/// (definiertes Local, benutzte Locals) eines Statements.
+/// (defined local, used locals) of a statement.
 fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
     let mut uses = Vec::new();
     let mut u = |op: &Operand| {
@@ -497,7 +497,7 @@ fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
     (def, uses)
 }
 
-/// Alias-Fixpunkt: alle Locals, die den Wert von `root` halten können.
+/// Alias fixpoint: all locals that can hold the value of `root`.
 fn alias_set(f: &Function, root: Local) -> BTreeSet<Local> {
     let mut aliases: BTreeSet<Local> = BTreeSet::new();
     aliases.insert(root);
@@ -519,7 +519,7 @@ fn alias_set(f: &Function, root: Local) -> BTreeSet<Local> {
     aliases
 }
 
-/// Blöcke, die auf einem Zyklus liegen (sich selbst erreichen können).
+/// Blocks that lie on a cycle (can reach themselves).
 fn cyclic_blocks(f: &Function) -> Vec<bool> {
     let succs: Vec<Vec<usize>> = f
         .blocks
@@ -539,7 +539,7 @@ fn cyclic_blocks(f: &Function) -> Vec<bool> {
         .collect();
     (0..f.blocks.len())
         .map(|start| {
-            // DFS von den Nachfolgern; erreicht sie `start`, liegt er im Zyklus.
+            // DFS from the successors; if they reach `start`, it lies in a cycle.
             let mut seen = vec![false; f.blocks.len()];
             let mut stack: Vec<usize> = succs[start].clone();
             while let Some(b) = stack.pop() {

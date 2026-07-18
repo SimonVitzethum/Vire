@@ -1,7 +1,7 @@
-//! Absenkung Vire-AST → `crates/ir` (SSA-nah, keine Slot-Wiederverwendung).
-//! Deckt den M2-Kern ab: Funktionen, Arithmetik, Kontrollfluss (if/while/
-//! for-über-Range), `print`, Aufrufe eigener Funktionen. Generics/Traits/
-//! Closures/capsule folgen (FRONTEND-PLAN F5–F8).
+//! Lowering Vire AST → `crates/ir` (SSA-like, no slot reuse).
+//! Covers the M2 core: functions, arithmetic, control flow (if/while/
+//! for-over-Range), `print`, calls to own functions. Generics/traits/
+//! closures/capsule follow (FRONTEND-PLAN F5–F8).
 
 use std::collections::HashMap;
 
@@ -9,29 +9,29 @@ use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Oper
 
 use crate::ast::*;
 
-/// Feldlayout eines Nutzertyps: (Feldname, IR-Typ, Ref-Ziel-Klasse).
+/// Field layout of a user type: (field name, IR type, ref target class).
 type Layout = Vec<(String, Ty, Option<String>)>;
 
-/// Variante eines Summentyps: (Summentyp-Name, Tag, Felder als (geflachter Name, Typ, Ref-Klasse)).
+/// Variant of a sum type: (sum type name, tag, fields as (flattened name, type, ref class)).
 type VariantInfo = (String, i64, Vec<(String, Ty, Option<String>)>);
 
-/// Info über eine generische Funktion für die Monomorphisierung an Aufrufstellen.
+/// Info about a generic function for monomorphization at call sites.
 #[derive(Clone)]
 struct GInfo {
-    /// Typ-Parameter-Namen, z.B. `["T"]` bei `fn f[T](…)`.
+    /// Type parameter names, e.g. `["T"]` for `fn f[T](…)`.
     tparams: Vec<String>,
-    /// Parameter-Typannotate (mit T-Platzhaltern), zum Binden der Typargumente.
+    /// Parameter type annotations (with T placeholders), for binding the type arguments.
     param_tys: Vec<Option<Type>>,
-    /// Rückgabe-Annotat (mit T).
+    /// Return annotation (with T).
     ret: Option<Type>,
 }
 
-/// Symbolname einer Monomorph.-Instanz: `f$Int$Point`.
+/// Symbol name of a monomorph. instance: `f$Int$Point`.
 fn mono_sym(name: &str, targs: &[String]) -> String {
     format!("{name}${}", targs.join("$"))
 }
 
-/// Konkreter Typname eines Arguments (für Typ-Argument-Bindung).
+/// Concrete type name of an argument (for type argument binding).
 fn concrete_tyname(ty: Ty, class: Option<&String>) -> String {
     match ty {
         Ty::F64 => "Float".into(),
@@ -42,17 +42,17 @@ fn concrete_tyname(ty: Ty, class: Option<&String>) -> String {
     }
 }
 
-/// Ersetzt Typparameter-Namen in einem `Type` durch konkrete Typen.
+/// Replaces type parameter names in a `Type` with concrete types.
 fn subst_type(t: &Type, bind: &HashMap<String, String>) -> Type {
     let name = bind.get(&t.name).cloned().unwrap_or_else(|| t.name.clone());
     Type { name, args: t.args.iter().map(|a| subst_type(a, bind)).collect(), borrowed: t.borrowed, span: t.span }
 }
 
-/// Klont eine generische FnDef und substituiert die Typparameter in Signatur +
-/// Body-Annotaten (Let/Cast). Der Rest des Bodies läuft über Inferenz.
+/// Clones a generic FnDef and substitutes the type parameters in the signature +
+/// body annotations (Let/Cast). The rest of the body goes through inference.
 fn subst_fndef(f: &FnDef, bind: &HashMap<String, String>) -> FnDef {
     let mut nf = f.clone();
-    nf.sig.generics = vec![]; // Instanz ist nicht mehr generisch
+    nf.sig.generics = vec![]; // instance is no longer generic
     for p in &mut nf.sig.params {
         if let Some(t) = &p.ty {
             p.ty = Some(subst_type(t, bind));
@@ -71,7 +71,7 @@ fn subst_block(b: &mut crate::ast::Block, bind: &HashMap<String, String>) {
     for s in &mut b.stmts {
         subst_stmt(s, bind);
     }
-    // Tail-Ausdrücke enthalten selten Typannotate; Casts darin über subst_expr.
+    // Tail expressions rarely contain type annotations; casts within them via subst_expr.
     if let Some(t) = &mut b.tail {
         subst_expr(t, bind);
     }
@@ -121,8 +121,8 @@ fn subst_expr(e: &mut Expr, bind: &HashMap<String, String>) {
     }
 }
 
-/// Eingebaute FFI-/Python-Brücken-Signaturen (Ptr = i64). Immer verfügbar, damit
-/// Python aus reinem Vire ohne `extern`-Block nutzbar ist.
+/// Built-in FFI/Python bridge signatures (Ptr = i64). Always available, so that
+/// Python is usable from pure Vire without an `extern` block.
 fn builtin_ffi_sigs() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     use Ty::*;
     vec![
@@ -143,7 +143,7 @@ fn builtin_ffi_sigs() -> Vec<(&'static str, Vec<Ty>, Ty)> {
     ]
 }
 
-/// Alle Methoden (Type-inline + `impl`-Blöcke) als (Klassenname, Methode).
+/// All methods (type-inline + `impl` blocks) as (class name, method).
 fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
     let mut out = Vec::new();
     for it in &m.items {
@@ -156,8 +156,8 @@ fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
     out
 }
 
-/// Aufruf-Signatur einer Funktion: Parametertypen, Rückgabetyp, Rückgabe-Klasse
-/// (bei Objekt-Rückgabe der Klassenname — für Feldzugriff auf das Ergebnis).
+/// Call signature of a function: parameter types, return type, return class
+/// (for object returns the class name — for field access on the result).
 struct Sig {
     params: Vec<Ty>,
     ret: Ty,
@@ -168,21 +168,21 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     let mut prog = Program::default();
     let mut errs = Vec::new();
 
-    // Produkttypen → Klassen. Summentypen → EINE getaggte Klasse: Feld `__tag`
-    // (I64) + alle Variantenfelder geflacht (`Variant_field`). Match dispatcht
-    // über `__tag`. (Platz = Summe aller Varianten; einfach, passt zum flachen
-    // Klassenmodell. Kompaktere Union folgt später.)
+    // Product types → classes. Sum types → ONE tagged class: field `__tag`
+    // (I64) + all variant fields flattened (`Variant_field`). Match dispatches
+    // via `__tag`. (Space = sum of all variants; simple, fits the flat
+    // class model. A more compact union follows later.)
     let mut types: HashMap<String, Layout> = HashMap::new();
     let mut variants: HashMap<String, VariantInfo> = HashMap::new();
-    // Generische Produkttypen (`type Box[T] { value: T }`): NICHT direkt als
-    // Klasse registrieren (Felder referenzieren T). Stattdessen pro benutzter
-    // Typargument-Kombination monomorphisiert (`Box$Float`) — wie generische
-    // Funktionen. Name → (Typparameter, Felder).
+    // Generic product types (`type Box[T] { value: T }`): do NOT register
+    // directly as a class (fields reference T). Instead monomorphized per used
+    // type argument combination (`Box$Float`) — like generic
+    // functions. Name → (type parameters, fields).
     let mut generic_ptypes: HashMap<String, (Vec<String>, Vec<Field>)> = HashMap::new();
-    // Generische Summentypen (`type Maybe[T] { Some2(T) | Nothing }` + eingebautes
-    // Option[T]): pro Typargument monomorphisiert (`Option$Float`), damit Float-
-    // Payloads typkorrekt (kein i64-Erasen). Name → (Typparameter, [(Variante,
-    // [(Feldname, Typname)])]). Einzel-parametrig; Result bleibt i64-gelöscht.
+    // Generic sum types (`type Maybe[T] { Some2(T) | Nothing }` + the built-in
+    // Option[T]): monomorphized per type argument (`Option$Float`), so that Float
+    // payloads are type-correct (no i64 erasure). Name → (type parameter, [(variant,
+    // [(field name, type name)])]). Single-parameter; Result stays i64-erased.
     let mut generic_stypes: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)> = HashMap::new();
     let mut variant_owner_g: HashMap<String, String> = HashMap::new();
     for it in &m.items {
@@ -195,7 +195,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
                 continue;
             }
             if !t.generics.is_empty() {
-                // Generischer Summentyp.
+                // Generic sum type.
                 let tparams: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
                 let variants_g: Vec<(String, Vec<(String, String)>)> = t
                     .variants
@@ -243,9 +243,9 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // Eingebaute Summentypen Option/Result (falls nicht vom Nutzer definiert).
-    // Payload ist derzeit i64-breit (Int/Zeiger); typisierte/Float-Payloads
-    // brauchen generische Typen (nächster Schritt).
+    // Built-in sum types Option/Result (if not defined by the user).
+    // Payload is currently i64-wide (Int/pointer); typed/Float payloads
+    // need generic types (next step).
     if !types.contains_key("Option") {
         types.insert("Option".into(), vec![("__tag".into(), Ty::I64, None), ("Some_value".into(), Ty::I64, None)]);
         variants.insert("Some".into(), ("Option".into(), 0, vec![("Some_value".into(), Ty::I64, None)]));
@@ -256,8 +256,8 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         variants.insert("Ok".into(), ("Result".into(), 0, vec![("Ok_value".into(), Ty::I64, None)]));
         variants.insert("Err".into(), ("Result".into(), 1, vec![("Err_error".into(), Ty::I64, None)]));
     }
-    // Eingebautes generisches Option[T]: `Some(x)` wird typ-korrekt monomorphisiert
-    // (`Option$Float` trägt F64), `None` bleibt über die gelöschte Option (nur __tag).
+    // Built-in generic Option[T]: `Some(x)` is monomorphized type-correctly
+    // (`Option$Float` carries F64), `None` stays over the erased Option (only __tag).
     if !generic_stypes.contains_key("Option") {
         generic_stypes.insert(
             "Option".into(),
@@ -266,10 +266,10 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         variant_owner_g.entry("Some".into()).or_insert("Option".into());
         variant_owner_g.entry("None".into()).or_insert("Option".into());
     }
-    // TRAIT-OBJEKTE (dynamischer Dispatch): Traits werden als Interfaces
-    // registriert, `impl Trait for Typ` fügt die Methoden in die Typ-Vtable an
-    // konsistenten globalen Slots (die bestehende Interface-/CallVirtual-Maschinerie
-    // des Backends). Trait → [(Methode, Deskriptor, Param-Typen inkl. self, Rückgabe)].
+    // TRAIT OBJECTS (dynamic dispatch): traits are registered as interfaces,
+    // `impl Trait for Typ` adds the methods into the type vtable at
+    // consistent global slots (the backend's existing interface/CallVirtual
+    // machinery). Trait → [(method, descriptor, param types incl. self, return)].
     let mut trait_methods: HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>> = HashMap::new();
     for it in &m.items {
         if let Item::Trait(tr) = it {
@@ -284,7 +284,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             trait_methods.insert(tr.name.clone(), ms);
         }
     }
-    // Typ → implementierte Traits (aus `impl Trait for Typ`).
+    // Type → implemented traits (from `impl Trait for Typ`).
     let mut type_traits: HashMap<String, Vec<String>> = HashMap::new();
     for it in &m.items {
         if let Item::Impl(im) = it {
@@ -295,7 +295,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // ClassInfo je Typ (Nutzer + eingebaut) registrieren.
+    // Register ClassInfo per type (user + built-in).
     let mut all_type_names: Vec<String> = m
         .items
         .iter()
@@ -312,8 +312,8 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             .iter()
             .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
             .collect();
-        // Implementierte Traits → Interfaces + die Impl-Methoden in die Vtable
-        // (mangled = `Typ.methode`, wie collect_methods sie absenkt).
+        // Implemented traits → interfaces + the impl methods into the vtable
+        // (mangled = `Typ.methode`, as collect_methods lowers them).
         let ifaces = type_traits.get(tname).cloned().unwrap_or_default();
         let mut methods = Vec::new();
         for tn in &ifaces {
@@ -340,7 +340,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             has_clinit: false,
         });
     }
-    // Traits als Interface-ClassInfos (abstrakte Methoden → globale Vtable-Slots).
+    // Traits as interface ClassInfos (abstract methods → global vtable slots).
     for (tname, ms) in &trait_methods {
         let methods = ms
             .iter()
@@ -358,17 +358,17 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         });
     }
 
-    // Signatur-Tabelle (Name → (ParamTypen, RückgabeTyp, Rückgabe-Klasse)) für Aufrufe.
+    // Signature table (name → (param types, return type, return class)) for calls.
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
             let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
             sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
         }
-        // extern "C" { fn name(...) -> T }: C-ABI-Funktion, direkt unter ihrem
-        // Namen (keine Mangling). Aufrufe lösen darüber auf; das Backend
-        // deklariert die gerufene-aber-undefinierte Funktion, clang linkt sie
-        // (libc/libm/-lstdc++ / verlinkte Objekte).
+        // extern "C" { fn name(...) -> T }: C-ABI function, directly under its
+        // name (no mangling). Calls resolve through this; the backend
+        // declares the called-but-undefined function, clang links it
+        // (libc/libm/-lstdc++ / linked objects).
         if let Item::Extern { items, .. } = it {
             for sig in items {
                 let ps = sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
@@ -376,13 +376,13 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // Eingebaute Python-Brücke: Signaturen immer registrieren, damit `py_import`
-    // & Co. OHNE `extern`-Block aus reinem Vire aufrufbar sind (die Absenkung
-    // emittiert Calls, das Backend deklariert, der Treiber linkt die Brücke).
+    // Built-in Python bridge: always register the signatures, so that `py_import`
+    // & co. are callable from pure Vire WITHOUT an `extern` block (the lowering
+    // emits calls, the backend declares, the driver links the bridge).
     for (name, params, ret) in builtin_ffi_sigs() {
         sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None });
     }
-    // Methoden (Type-inline + impl-Blöcke) → Symbol `Class.method`, self = Ref.
+    // Methods (type-inline + impl blocks) → symbol `Class.method`, self = Ref.
     let methods = collect_methods(m);
     for (class, meth) in &methods {
         let ps = meth
@@ -394,9 +394,9 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         let sym = format!("{class}.{}", meth.sig.name);
         sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
     }
-    // Generische Funktionen sammeln (NICHT direkt absenken — pro Aufruf-Typargument
-    // eine Monomorph.-Instanz). Trait-Schranken werden geparst, aber noch nicht
-    // aufgelöst (Trait-Solving/Kohärenz ist die offene schwere Hälfte).
+    // Collect generic functions (do NOT lower directly — one monomorph.
+    // instance per call type argument). Trait bounds are parsed, but not yet
+    // resolved (trait solving/coherence is the open hard half).
     let mut generics: HashMap<String, GInfo> = HashMap::new();
     let mut generic_defs: HashMap<String, FnDef> = HashMap::new();
     for it in &m.items {
@@ -414,7 +414,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // Nicht-generische Funktions-ASTs für Higher-Order-Inlining.
+    // Non-generic function ASTs for higher-order inlining.
     let mut fn_defs: HashMap<String, FnDef> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
@@ -423,10 +423,10 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
-    // Pre-Pass: annotationsgetriebene generische Instanzen (`-> Option[Float]`,
-    // `b: Box[Int]`) modulweit instanziieren, damit Aufrufstellen/Matches die
-    // konkrete Instanz (Layout + Varianten) sehen — auch in Funktionen, die den
-    // Typ nur benutzen, aber nicht annotieren.
+    // Pre-pass: instantiate annotation-driven generic instances (`-> Option[Float]`,
+    // `b: Box[Int]`) module-wide, so that call sites/matches see the
+    // concrete instance (layout + variants) — even in functions that only
+    // use the type but do not annotate it.
     let mut shared_inst: HashMap<String, Layout> = HashMap::new();
     let mut shared_svars: HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>> = HashMap::new();
     {
@@ -465,17 +465,17 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         }
     }
     let mut mono_queue: Vec<(String, Vec<String>)> = Vec::new();
-    // Instanziierte generische Typen (gemangelte Klasse → Layout), aus allen
-    // Funktionen gesammelt und danach als Klassen fürs Backend registriert.
+    // Instantiated generic types (mangled class → layout), collected from all
+    // functions and afterwards registered as classes for the backend.
     let mut all_insts: HashMap<String, Layout> = HashMap::new();
     let mut str_index: HashMap<String, u32> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
             if !f.sig.generics.is_empty() {
-                continue; // generisch → nur bei Bedarf instanziiert
+                continue; // generic → only instantiated on demand
             }
             if is_higher_order(f) {
-                continue; // Higher-Order-Template → nur inline (Defunktionalisierung)
+                continue; // higher-order template → only inline (defunctionalization)
             }
             match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None) {
                 Ok((func, mono, insts)) => {
@@ -486,7 +486,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
                 Err(mut e) => errs.append(&mut e),
             }
         }
-        // trait/const/use: hier übersprungen (Trait-Dispatch offen)
+        // trait/const/use: skipped here (trait dispatch open)
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
@@ -499,8 +499,8 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             Err(mut e) => errs.append(&mut e),
         }
     }
-    // Monomorphisierungs-Worklist: jede angeforderte Instanz substituieren +
-    // absenken (kann weitere Instanzen anfordern), bis Fixpunkt.
+    // Monomorphization worklist: substitute + lower each requested instance
+    // (may request further instances), until fixpoint.
     let mut mono_done: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some((gname, targs)) = mono_queue.pop() {
         let sym = mono_sym(&gname, &targs);
@@ -510,7 +510,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         let Some(gdef) = generic_defs.get(&gname) else { continue };
         let bind: HashMap<String, String> = gdef.sig.generics.iter().map(|g| g.name.clone()).zip(targs.iter().cloned()).collect();
         let inst = subst_fndef(gdef, &bind);
-        // Instanz-Signatur registrieren (für Rekursion/gegenseitige Aufrufe).
+        // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
         match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym)) {
@@ -522,8 +522,8 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             Err(mut e) => errs.append(&mut e),
         }
     }
-    // Instanziierte generische Typen als Klassen registrieren (Backend-Layout).
-    // Annotationsgetriebene (shared) + payload-getriebene (all_insts) vereinen.
+    // Register instantiated generic types as classes (backend layout).
+    // Merge annotation-driven (shared) + payload-driven (all_insts).
     for (k, v) in &shared_inst {
         all_insts.entry(k.clone()).or_insert_with(|| v.clone());
     }
@@ -558,15 +558,15 @@ fn ty_of(t: Option<&Type>) -> Ty {
         Some("Str") => Ty::Ref,
         Some("I32") | Some("U32") => Ty::I32,
         Some("Int") | Some("I64") | Some("U64") => Ty::I64,
-        // `Ptr` = opaker Roh-Zeiger (FFI): i64-breit, KEIN RC (kein Vire-Objekt).
+        // `Ptr` = opaque raw pointer (FFI): i64-wide, NO RC (not a Vire object).
         Some("Ptr") => Ty::I64,
-        Some("Unit") | None => Ty::I64, // Default-Ganzzahl, wenn nichts steht
-        // Alles andere ist ein (Nutzer-)Referenztyp: Objekt auf dem Heap.
+        Some("Unit") | None => Ty::I64, // default integer when nothing is given
+        // Everything else is a (user) reference type: object on the heap.
         Some(_) => Ty::Ref,
     }
 }
 
-/// Klassenname eines Referenztyp-Annotats (für GetField/New), sonst None.
+/// Class name of a reference type annotation (for GetField/New), otherwise None.
 fn class_of(t: Option<&Type>) -> Option<String> {
     let name = t?.name.as_str();
     match name {
@@ -575,9 +575,9 @@ fn class_of(t: Option<&Type>) -> Option<String> {
     }
 }
 
-/// Klasse eines Annotats mit Rücksicht auf generische Typen: `Option[Float]` →
-/// `Option$Float` (die monomorphisierte Instanz), sonst wie `class_of`. Für
-/// Rückgabe-Klassen in Signaturen, damit Aufrufstellen die konkrete Instanz sehen.
+/// Class of an annotation taking generic types into account: `Option[Float]` →
+/// `Option$Float` (the monomorphized instance), otherwise like `class_of`. For
+/// return classes in signatures, so that call sites see the concrete instance.
 fn class_of_ann(
     t: Option<&Type>,
     gp: &HashMap<String, (Vec<String>, Vec<Field>)>,
@@ -591,8 +591,8 @@ fn class_of_ann(
     class_of(Some(t))
 }
 
-/// Instanziiert einen generischen Produkttyp `base[targs]` → gemangelte Klasse
-/// `base$targs`; legt das substituierte Layout in `layouts` ab.
+/// Instantiates a generic product type `base[targs]` → mangled class
+/// `base$targs`; stores the substituted layout in `layouts`.
 fn inst_ptype(base: &str, tparams: &[String], fields: &[Field], targs: &[String], layouts: &mut HashMap<String, Layout>) -> String {
     let mangled = format!("{base}${}", targs.join("$"));
     if !layouts.contains_key(&mangled) {
@@ -610,8 +610,8 @@ fn inst_ptype(base: &str, tparams: &[String], fields: &[Field], targs: &[String]
     mangled
 }
 
-/// Instanziiert einen generischen Summentyp `sum[targs]` → gemangelte Klasse.
-/// Füllt `layouts` (Klassen-Layout) + `svars` (Variante → (tag, Feldlayout)).
+/// Instantiates a generic sum type `sum[targs]` → mangled class.
+/// Fills `layouts` (class layout) + `svars` (variant → (tag, field layout)).
 fn inst_stype(
     sum: &str,
     tparams: &[String],
@@ -644,8 +644,8 @@ fn inst_stype(
     mangled
 }
 
-/// Synthetischer Methoden-Deskriptor (für konsistente Vtable-Slot-Zuordnung
-/// zwischen Trait-Aufruf und Impl). `self` (erster Param) wird ausgelassen.
+/// Synthetic method descriptor (for consistent vtable slot assignment
+/// between trait call and impl). `self` (first param) is omitted.
 fn method_desc(params: &[Ty]) -> String {
     let mut s = String::from("(");
     for t in params.iter().skip(1) {
@@ -671,13 +671,13 @@ fn ret_ty(sig: &FnSig) -> Ty {
     }
 }
 
-/// Rückgabetyp einer Funktion — bis Typinferenz (F5) steht.
-/// Mit `-> T`-Annotation: exakt. Ohne: strukturell aus dem Tail-Ausdruck
-/// geschätzt (kein Tail → Void). Wird für Aufrufstellen UND die Funktion selbst
-/// benutzt, damit beide übereinstimmen.
+/// Return type of a function — until type inference (F5) exists.
+/// With `-> T` annotation: exact. Without: estimated structurally from the tail
+/// expression (no tail → Void). Used for call sites AND the function itself,
+/// so that both agree.
 fn guess_ret_ty(f: &FnDef) -> Ty {
-    // `main` ist der Einstieg — immer Void, egal ob die letzte Zeile ein
-    // (Void-)Ausdruck wie `print(x)` als Tail geparst wurde.
+    // `main` is the entry point — always Void, regardless of whether the last line
+    // was parsed as a (Void) expression like `print(x)` as tail.
     if f.sig.name == "main" {
         return Ty::Void;
     }
@@ -690,11 +690,11 @@ fn guess_ret_ty(f: &FnDef) -> Ty {
     }
 }
 
-/// Grobe, annotationsfreie Typ-Schätzung eines Ausdrucks (nur Literale/Struktur).
-/// Idents/Aufrufe ohne Kontext → I64 (Default-Ganzzahl). Ersetzt echte Inferenz.
+/// Rough, annotation-free type estimate of an expression (only literals/structure).
+/// Idents/calls without context → I64 (default integer). Replaces real inference.
 fn guess_expr_ty(e: &Expr) -> Ty {
     match e {
-        // `print(...)` gibt Void zurück (Intrinsic).
+        // `print(...)` returns Void (intrinsic).
         Expr::Call { callee, .. } if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "print") => Ty::Void,
         Expr::Float(..) => Ty::F64,
         Expr::Bool(..) => Ty::I32,
@@ -729,52 +729,52 @@ struct FnLower<'a> {
     cur: usize,
     scopes: Vec<HashMap<String, (Local, Ty)>>,
     sigs: &'a HashMap<String, Sig>,
-    /// Nutzertyp-Layouts (Name → Felder) für New/GetField.
+    /// User type layouts (name → fields) for New/GetField.
     types: &'a HashMap<String, Layout>,
-    /// Varianten-Registry (Variantenname → Info) für Konstruktion + Match.
+    /// Variant registry (variant name → info) for construction + match.
     variants: &'a HashMap<String, VariantInfo>,
-    /// Generische Funktionen (Name → Info) für Aufruf-Monomorphisierung.
+    /// Generic functions (name → info) for call monomorphization.
     generics: &'a HashMap<String, GInfo>,
-    /// Traits (Name → Methoden) für dynamischen Dispatch (Trait-Objekte): ein
-    /// Methodenaufruf auf einem trait-typisierten Empfänger wird zu `CallVirtual`.
+    /// Traits (name → methods) for dynamic dispatch (trait objects): a
+    /// method call on a trait-typed receiver becomes `CallVirtual`.
     trait_methods: &'a HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>>,
-    /// Funktions-ASTs (Name → Def) für Higher-Order-Inlining: wird ein Lambda
-    /// übergeben, expandiert die aufgerufene Funktion an der Stelle inline
-    /// (Defunktionalisierung — direkter, spezialisierter Code statt Funktionszeiger).
+    /// Function ASTs (name → def) for higher-order inlining: when a lambda
+    /// is passed, the called function expands inline at that spot
+    /// (defunctionalization — direct, specialized code instead of a function pointer).
     fn_defs: &'a HashMap<String, FnDef>,
-    /// Stack der gerade inline-expandierten Funktionen (Rekursions-Guard).
+    /// Stack of the currently inline-expanded functions (recursion guard).
     inlining: Vec<String>,
-    /// Generische Produkttypen (Name → (Typparameter, Felder)) für `Box(x)`.
+    /// Generic product types (name → (type parameters, fields)) for `Box(x)`.
     generic_ptypes: &'a HashMap<String, (Vec<String>, Vec<Field>)>,
-    /// Generische Summentypen (Name → (Typparameter, Varianten)) für `Some(x)`.
+    /// Generic sum types (name → (type parameters, variants)) for `Some(x)`.
     generic_stypes: &'a HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)>,
-    /// Variante → generischer Summentyp (`Some` → `Option`) für Konstruktion/Match.
+    /// Variant → generic sum type (`Some` → `Option`) for construction/match.
     variant_owner_g: &'a HashMap<String, String>,
-    /// Modulweite generische Instanzen (annotationsgetrieben): Layout + Varianten.
+    /// Module-wide generic instances (annotation-driven): layout + variants.
     shared_inst: &'a HashMap<String, Layout>,
     shared_svars: &'a HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
-    /// Instanziierte generische Typen dieser Funktion (gemangelter Name → Layout).
-    /// Konstruktion + annotierte Parameter füllen dies; das Modul registriert
-    /// daraus die Klassen fürs Backend.
+    /// Instantiated generic types of this function (mangled name → layout).
+    /// Construction + annotated parameters fill this; the module registers
+    /// the classes for the backend from it.
     local_inst: HashMap<String, Layout>,
-    /// Payload-getriebene Summen-Instanzen dieser Funktion (Variante-Registry).
+    /// Payload-driven sum instances of this function (variant registry).
     local_svars: HashMap<String, HashMap<String, (i64, Vec<(String, Ty, Option<String>)>)>>,
-    /// Angeforderte Monomorph.-Instanzen: (generischer Name, konkrete Typargumente).
+    /// Requested monomorph. instances: (generic name, concrete type arguments).
     mono: Vec<(String, Vec<String>)>,
-    /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
+    /// Class of a ref local (object local index → class name) for field access.
     local_class: HashMap<u32, String>,
-    /// Elementart eines Array/List-Locals (für Index/len/for-über-Liste).
+    /// Element kind of an array/list local (for index/len/for-over-list).
     local_arr: HashMap<u32, ArrKind>,
-    /// Lambda-Locals: `mut f = x -> …` → (Parameter, Rumpf). Aufruf `f(a)` wird
-    /// an der Stelle inline expandiert (fangende Closures im gleichen Scope gratis).
+    /// Lambda locals: `mut f = x -> …` → (parameter, body). The call `f(a)` is
+    /// inline-expanded at that spot (capturing closures in the same scope for free).
     local_lambda: HashMap<u32, (Vec<String>, Expr)>,
-    /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
+    /// Shared string literal pool (Program::strings); `intern` returns indices.
     strings: &'a mut Vec<String>,
-    /// O(1)-Index in den String-Pool (Literal → Index) — sonst wäre `intern`
-    /// lineare Suche = O(n²) Compilezeit bei vielen Literalen (Skalierung große Prog.).
+    /// O(1) index into the string pool (literal → index) — otherwise `intern`
+    /// would be a linear search = O(n²) compile time with many literals (scaling for large prog.).
     str_idx: &'a mut HashMap<String, u32>,
     errs: Vec<String>,
-    /// Ziel-Blöcke der umgebenden Schleifen: (continue → header, break → exit).
+    /// Target blocks of the enclosing loops: (continue → header, break → exit).
     loops: Vec<(Block, Block)>,
 }
 
@@ -813,7 +813,7 @@ impl<'a> FnLower<'a> {
     fn bind(&mut self, name: &str, l: Local, t: Ty) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), (l, t));
     }
-    /// Layout einer Klasse — Nutzertyp ODER instanziierter generischer Typ.
+    /// Layout of a class — user type OR instantiated generic type.
     fn layout_of(&self, class: &str) -> Option<Layout> {
         self.types
             .get(class)
@@ -821,15 +821,15 @@ impl<'a> FnLower<'a> {
             .or_else(|| self.shared_inst.get(class))
             .cloned()
     }
-    /// Varianten-Info (tag, Feldlayout) einer Variante IN einer konkreten
-    /// (evtl. generischen) Instanz-Klasse. None → nicht in dieser Instanz.
+    /// Variant info (tag, field layout) of a variant IN a concrete
+    /// (possibly generic) instance class. None → not in this instance.
     fn variant_in(&self, class: &str, variant: &str) -> Option<(String, i64, Vec<(String, Ty, Option<String>)>)> {
         let m = self.local_svars.get(class).or_else(|| self.shared_svars.get(class))?;
         let (tag, vf) = m.get(variant)?;
         Some((class.to_string(), *tag, vf.clone()))
     }
-    /// Konkreter Typname eines gesenkten Werts (für Typargument-Inferenz von
-    /// generischen Konstruktoren): Klasse eines Ref sonst Skalar-Name.
+    /// Concrete type name of a lowered value (for type argument inference of
+    /// generic constructors): class of a ref, otherwise scalar name.
     fn ty_name(&self, op: &Operand, ty: Ty) -> String {
         if let Some(c) = self.class_of_operand(op) {
             return c;
@@ -843,26 +843,26 @@ impl<'a> FnLower<'a> {
         }
         .to_string()
     }
-    /// Instanziiert einen generischen Produkttyp `base[targs]` → gemangelte Klasse
-    /// `base$targs`. Legt das (substituierte) Layout einmalig in `local_inst` ab.
+    /// Instantiates a generic product type `base[targs]` → mangled class
+    /// `base$targs`. Stores the (substituted) layout once in `local_inst`.
     fn instantiate_ptype(&mut self, base: &str, tparams: &[String], fields: &[Field], targs: &[String]) -> String {
         inst_ptype(base, tparams, fields, targs, &mut self.local_inst)
     }
-    /// Klasse eines Operanden, falls er ein Ref-Local mit bekannter Klasse ist.
+    /// Class of an operand, if it is a ref local with a known class.
     fn class_of_operand(&self, op: &Operand) -> Option<String> {
         match op {
             Operand::Copy(l) => self.local_class.get(&l.0).cloned(),
             _ => None,
         }
     }
-    /// Array-Elementart eines Operanden, falls er ein Array/List-Local ist.
+    /// Array element kind of an operand, if it is an array/list local.
     fn arr_of_operand(&self, op: &Operand) -> Option<ArrKind> {
         match op {
             Operand::Copy(l) => self.local_arr.get(&l.0).copied(),
             _ => None,
         }
     }
-    /// Operand auf i32 bringen (Array-Index/Länge sind Java-`int`).
+    /// Bring an operand to i32 (array index/length are Java `int`).
     fn to_i32(&mut self, op: Operand) -> Operand {
         match op {
             Operand::ConstI64(v) => Operand::ConstI32(v as i32),
@@ -874,7 +874,7 @@ impl<'a> FnLower<'a> {
             }
         }
     }
-    /// Operand → String (Ref). Ref bleibt; Skalare über jrt_*_to_str.
+    /// Operand → String (Ref). Ref stays; scalars via jrt_*_to_str.
     fn to_str(&mut self, op: Operand, ty: Ty) -> Operand {
         if ty == Ty::Ref {
             return op;
@@ -890,7 +890,7 @@ impl<'a> FnLower<'a> {
         self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![arg] });
         Operand::Copy(d)
     }
-    /// ArrayLen (i32) → i64-Operand für Vire (Ints sind i64).
+    /// ArrayLen (i32) → i64 operand for Vire (Ints are i64).
     fn array_len_i64(&mut self, arr: Operand) -> Operand {
         let li32 = self.new_local(Ty::I32);
         self.emit(Statement::ArrayLen { dest: li32, arr });
@@ -899,8 +899,8 @@ impl<'a> FnLower<'a> {
         Operand::Copy(l64)
     }
 
-    /// i32-Operand vorzeichen-erweitert auf i64 (für gemischte Int-Arithmetik mit
-    /// gepackten `I32`-Feldern). Konstanten direkt, sonst ein `Convert` (sext).
+    /// i32 operand sign-extended to i64 (for mixed int arithmetic with
+    /// packed `I32` fields). Constants directly, otherwise a `Convert` (sext).
     fn widen_i32(&mut self, op: Operand) -> Operand {
         if let Operand::ConstI32(v) = op {
             return Operand::ConstI64(v as i64);
@@ -911,11 +911,11 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_block(&mut self, b: &Block2) {
-        let _ = self.lower_block_val(b); // Void-Kontext: Tail-Wert verworfen
+        let _ = self.lower_block_val(b); // Void context: tail value discarded
     }
 
-    /// Name, dessen Aufruf ein Heap-Objekt erzeugt (Konstruktor eines Nutzer-/
-    /// generischen Typs, Variante, oder Collection-Builtin).
+    /// Name whose call creates a heap object (constructor of a user/
+    /// generic type, variant, or collection builtin).
     fn is_alloc_name(&self, n: &str) -> bool {
         self.types.contains_key(n)
             || self.variants.contains_key(n)
@@ -924,23 +924,23 @@ impl<'a> FnLower<'a> {
             || matches!(n, "list" | "map" | "array" | "farray")
     }
 
-    /// AUTOMATISCHE SCHLEIFEN-ARENA (escape→arena). Eine `while`-Iteration, deren
-    /// Allokationen die Iteration nachweislich NICHT verlassen, wird in eine
-    /// per-Iteration-Bump-Arena gelegt (wie eine automatische capsule): kein
-    /// malloc/free je Knoten, en-bloc-Freigabe am Iterationsende. Trifft den
-    /// EINZIGEN gemessenen Gap (Allokator; btree 2,57×-Decke). Konservativ —
-    /// jede Unsicherheit ⇒ nicht promoten (kein Arena ⇒ keine Unsoundness).
+    /// AUTOMATIC LOOP ARENA (escape→arena). A `while` iteration whose
+    /// allocations provably do NOT leave the iteration is placed into a
+    /// per-iteration bump arena (like an automatic capsule): no
+    /// malloc/free per node, en-bloc release at the end of the iteration. Hits the
+    /// ONLY measured gap (allocator; btree 2.57× ceiling). Conservative —
+    /// any uncertainty ⇒ do not promote (no arena ⇒ no unsoundness).
     ///
-    /// Sicher, wenn der Rumpf (transitiv über Nutzer-Callees):
-    ///  - alloziert (sonst kein Nutzen),
-    ///  - KEIN Feld/Index schreibt (Mutation eines existierenden Objekts könnte
-    ///    eine Arena-Referenz nach außen speichern; Konstruktoren zählen NICHT als
-    ///    Feld-Schreibung — sie sind Calls auf frische Objekte),
-    ///  - KEINE Mutator-Methode (push/put/set/pop/add/insert) ruft,
-    ///  - KEIN `return`/`break`/`continue` (auf Rumpf-Ebene) enthält,
-    ///  - nur Nutzerfunktionen + Konstruktoren ruft (kein extern/builtin/Lambda —
-    ///    könnte eine Referenz einfangen),
-    ///  - keiner äußeren (iterationsübergreifenden) Variable eine Ref zuweist.
+    /// Safe if the body (transitively over user callees):
+    ///  - allocates (otherwise no benefit),
+    ///  - writes NO field/index (mutating an existing object could
+    ///    store an arena reference to the outside; constructors do NOT count as
+    ///    field writes — they are calls on fresh objects),
+    ///  - calls NO mutator method (push/put/set/pop/add/insert),
+    ///  - contains NO `return`/`break`/`continue` (at body level),
+    ///  - only calls user functions + constructors (no extern/builtin/lambda —
+    ///    could capture a reference),
+    ///  - assigns no ref to an outer (cross-iteration) variable.
     fn while_arena_safe(&self, body: &Block2) -> bool {
         let mut outer: std::collections::HashSet<String> = std::collections::HashSet::new();
         for s in &self.scopes {
@@ -964,20 +964,20 @@ impl<'a> FnLower<'a> {
     fn region_bad_stmt(&self, s: &Stmt, top: bool, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
         match s {
             Stmt::Return(..) => true,
-            Stmt::Break(_) | Stmt::Continue(_) => top, // verlässt UNSERE Arena-Iteration
-            // `name = expr` ist im Vire-AST ein Let (Neubindung). Re-bindet es eine
-            // ÄUSSERE Variable (vor der Schleife deklariert) mit einer Ref, entkommt
-            // die Ref über die Iteration hinaus → verboten. Neue Rumpf-lokale Namen
-            // (nicht in `outer`) sind harmlos (sterben mit der Iteration).
+            Stmt::Break(_) | Stmt::Continue(_) => top, // leaves OUR arena iteration
+            // `name = expr` is a Let (rebinding) in the Vire AST. If it re-binds an
+            // OUTER variable (declared before the loop) with a ref, the ref escapes
+            // beyond the iteration → forbidden. New body-local names
+            // (not in `outer`) are harmless (they die with the iteration).
             Stmt::Let { name, value, .. } => {
                 let escapes = top && outer.contains(name) && value.as_ref().map(|v| self.expr_may_be_ref(v)).unwrap_or(false);
                 escapes || value.as_ref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
             }
             Stmt::Assign { target, value, .. } => {
                 let target_bad = match target {
-                    // Feld-/Index-Mutation = Schreiben in existierendes Objekt → verboten.
+                    // Field/index mutation = writing into an existing object → forbidden.
                     Expr::Field { .. } | Expr::Index { .. } => true,
-                    // Ref an eine äußere Variable (compound `x op= e`) → entkommt.
+                    // Ref to an outer variable (compound `x op= e`) → escapes.
                     Expr::Ident(n, _) => top && outer.contains(n) && self.expr_may_be_ref(value),
                     _ => false,
                 };
@@ -998,18 +998,18 @@ impl<'a> FnLower<'a> {
                             if seen.insert(n.clone()) {
                                 match &fd.body {
                                     Some(b) => self.region_bad_block(b, false, outer, seen),
-                                    None => true, // nur Signatur → opak
+                                    None => true, // only signature → opaque
                                 }
                             } else {
-                                false // schon in Prüfung (Rekursion) → für den Zyklus ok
+                                false // already being checked (recursion) → ok for the cycle
                             }
                         } else if self.is_alloc_name(n) {
-                            false // Konstruktor eines frischen Objekts — erlaubt
+                            false // constructor of a fresh object — allowed
                         } else {
-                            true // builtin/extern/unbekannt → konservativ opak
+                            true // builtin/extern/unknown → conservatively opaque
                         }
                     }
-                    // Mutator-Methode auf einem (evtl. äußeren) Objekt → könnte speichern.
+                    // Mutator method on a (possibly outer) object → could store.
                     _ => true,
                 };
                 callee_bad || args.iter().any(|a| self.region_bad_expr(a, outer, seen))
@@ -1032,7 +1032,7 @@ impl<'a> FnLower<'a> {
             Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, outer, seen)),
             Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, outer, seen),
             Expr::Range { start, end, .. } => self.region_bad_expr(start, outer, seen) || self.region_bad_expr(end, outer, seen),
-            // Lambda/Comprehension/MapLit/Capsule: konservativ opak (könnten fangen/außen speichern).
+            // Lambda/Comprehension/MapLit/Capsule: conservatively opaque (could capture/store outside).
             Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) | Expr::Capsule { .. } => true,
             _ => false,
         }
@@ -1092,13 +1092,13 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Konservativ: kann der Ausdruck eine Referenz liefern? (Für die
-    /// „Ref an äußere Variable"-Escape-Prüfung.) Nur offensichtlich Skalares → false.
+    /// Conservative: can the expression yield a reference? (For the
+    /// "ref to outer variable" escape check.) Only obviously scalar → false.
     fn expr_may_be_ref(&self, e: &Expr) -> bool {
         match e {
             Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Unary { .. } => false,
             Expr::Binary { op, lhs, rhs, .. } => {
-                // String-`+` liefert Ref; sonstige Arithmetik/Vergleich/Logik = Skalar.
+                // String `+` yields Ref; other arithmetic/comparison/logic = scalar.
                 matches!(op, BinOp::Add) && (self.expr_may_be_ref(lhs) || self.expr_may_be_ref(rhs))
             }
             Expr::Ident(n, _) => self.lookup(n).map(|(_, t)| t == Ty::Ref).unwrap_or(true),
@@ -1110,8 +1110,8 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Wie `lower_block`, liefert aber den Tail-Wert (für if-/Block-Ausdrücke).
-    /// Ohne Tail → (_, Void).
+    /// Like `lower_block`, but yields the tail value (for if/block expressions).
+    /// Without tail → (_, Void).
     fn lower_block_val(&mut self, b: &Block2) -> (Operand, Ty) {
         self.scopes.push(HashMap::new());
         for s in &b.stmts {
@@ -1128,24 +1128,24 @@ impl<'a> FnLower<'a> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Let { mutable, name, value, .. } => {
-                // `mut f = x -> …`: Lambda merken (Aufruf wird inline expandiert).
+                // `mut f = x -> …`: remember lambda (the call is inline-expanded).
                 if let Some(Expr::Lambda { params, body, .. }) = value {
                     let l = self.new_local(Ty::I64);
                     self.local_lambda.insert(l.0, (params.clone(), (**body).clone()));
                     self.bind(name, l, Ty::I64);
                     return;
                 }
-                // Binding-vs-Zuweisung (F3-Ersatz bis Resolve steht): `mut x = …`
-                // bindet immer neu; ein schlichtes `x = …` auf einen bereits
-                // sichtbaren Namen ist eine Zuweisung, kein Shadowing.
+                // Binding-vs-assignment (F3 replacement until Resolve exists): `mut x = …`
+                // always binds anew; a plain `x = …` on an already
+                // visible name is an assignment, not shadowing.
                 if !mutable {
                     if let Some((l, _)) = self.lookup(name) {
                         let (op, _) = match value {
                             Some(v) => self.lower_expr(v),
                             None => (Operand::ConstI64(0), Ty::I64),
                         };
-                        // Objekt-Klasse bei Neuzuweisung aktualisieren (Traversal
-                        // `cur = cur.next` muss cur weiter als Node kennen).
+                        // Update object class on reassignment (traversal
+                        // `cur = cur.next` must keep knowing cur as a Node).
                         if let Some(c) = self.class_of_operand(&op) {
                             self.local_class.insert(l.0, c);
                         }
@@ -1158,7 +1158,7 @@ impl<'a> FnLower<'a> {
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
                 let l = self.new_local(ty);
-                // Objekt-Klasse bzw. Array-Elementart an den neuen Local weiterreichen.
+                // Pass the object class resp. array element kind on to the new local.
                 if let Some(c) = self.class_of_operand(&op) {
                     self.local_class.insert(l.0, c);
                 }
@@ -1186,7 +1186,7 @@ impl<'a> FnLower<'a> {
                         self.errs.push(format!("unbekannte Variable: {name}"));
                     }
                 }
-                // Feldmutation `p.x = v` bzw. `p.x op= v` → (Get)+Binary+PutField.
+                // Field mutation `p.x = v` resp. `p.x op= v` → (Get)+Binary+PutField.
                 Expr::Field { base, name, .. } => {
                     let (obj, _) = self.lower_expr(base);
                     let class = match self.class_of_operand(&obj) {
@@ -1205,7 +1205,7 @@ impl<'a> FnLower<'a> {
                     };
                     let (mut v, _) = self.lower_expr(value);
                     if let Some(o) = op {
-                        // compound: alten Wert lesen, verrechnen.
+                        // compound: read old value, combine.
                         let cur = self.new_local(fty);
                         self.emit(Statement::GetField { dest: cur, obj: obj.clone(), class: class.clone(), field: name.clone() });
                         let d = self.new_local(fty);
@@ -1217,7 +1217,7 @@ impl<'a> FnLower<'a> {
                     }
                     self.emit(Statement::PutField { obj, class, field: name.clone(), value: v });
                 }
-                // Index-Zuweisung `xs[i] = v` (Array oder wachsende Liste).
+                // Index assignment `xs[i] = v` (array or growable list).
                 Expr::Index { base, index, .. } => {
                     let (arr, _) = self.lower_expr(base);
                     let (idx, _) = self.lower_expr(index);
@@ -1251,7 +1251,7 @@ impl<'a> FnLower<'a> {
                 };
                 let cur = self.cur;
                 self.term(cur, t);
-                // Rest wird ein neuer (unerreichbarer) Block
+                // Rest becomes a new (unreachable) block
                 let nb = self.new_block();
                 self.cur = nb.0 as usize;
             }
@@ -1287,8 +1287,8 @@ impl<'a> FnLower<'a> {
                 let exit = self.new_block();
                 self.term(header.0 as usize, Terminator::Branch { cond: c, then_blk: bodyb, else_blk: exit });
                 self.cur = bodyb.0 as usize;
-                // AUTO-ARENA (escape→arena): nachweislich nicht-entkommende Allok.
-                // in eine per-Iteration-Bump-Arena legen (kein malloc/free je Knoten).
+                // AUTO-ARENA (escape→arena): place provably non-escaping alloc.
+                // into a per-iteration bump arena (no malloc/free per node).
                 let arena = self.while_arena_safe(body);
                 let body_locals_start = self.locals.len();
                 if arena {
@@ -1298,9 +1298,9 @@ impl<'a> FnLower<'a> {
                 self.lower_block(body);
                 self.loops.pop();
                 if arena {
-                    // Im Rumpf erzeugte Ref-Locals zeigen in die Arena. Nach dem Pop
-                    // ist der Speicher weg → VOR dem Pop nullen, sonst liest die
-                    // Funktions-Ende-Freigabe (jrt_release) freien Speicher (UAF).
+                    // Ref locals created in the body point into the arena. After the pop
+                    // the memory is gone → null them BEFORE the pop, otherwise the
+                    // function-end release (jrt_release) reads freed memory (UAF).
                     for idx in body_locals_start..self.locals.len() {
                         if self.locals[idx] == Ty::Ref {
                             self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
@@ -1321,11 +1321,11 @@ impl<'a> FnLower<'a> {
                         return;
                     }
                 };
-                // `for x in liste` (nicht-Range) → über Array iterieren:
+                // `for x in liste` (non-Range) → iterate over the array:
                 // i=0; while i<len { x = arr[i]; body; i++ }.
                 if !matches!(iter, Expr::Range { .. }) {
                     let (arr, _) = self.lower_expr(iter);
-                    // for über eine wachsende Liste ($List) → vire_list_len/get.
+                    // for over a growable list ($List) → vire_list_len/get.
                     if self.class_of_operand(&arr).as_deref() == Some("$List") {
                         let len = self.new_local(Ty::I64);
                         self.emit(Statement::Call { dest: Some(len), func: "vire_list_len".into(), args: vec![arr.clone()] });
@@ -1415,13 +1415,13 @@ impl<'a> FnLower<'a> {
                 let cmp = if incl { IB::CmpLe } else { IB::CmpLt };
                 self.emit(Statement::Assign(cond, Rvalue::Binary(cmp, Operand::Copy(ivar), to_i64(end_op))));
                 let bodyb = self.new_block();
-                let latch = self.new_block(); // Inkrement-Block: `continue`-Ziel
+                let latch = self.new_block(); // increment block: `continue` target
                 let exit = self.new_block();
                 self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(cond), then_blk: bodyb, else_blk: exit });
                 self.cur = bodyb.0 as usize;
                 self.scopes.push(HashMap::new());
                 self.bind(&name, ivar, Ty::I64);
-                self.loops.push((latch, exit)); // continue → latch (nicht header!), sonst kein Inkrement
+                self.loops.push((latch, exit)); // continue → latch (not header!), otherwise no increment
                 self.lower_block(body);
                 self.loops.pop();
                 self.scopes.pop();
@@ -1435,7 +1435,7 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Liefert (Operand, Typ). Emittiert bei Bedarf Temporäre.
+    /// Returns (operand, type). Emits temporaries as needed.
     fn lower_expr(&mut self, e: &Expr) -> (Operand, Ty) {
         match e {
             Expr::Int(v, _) => (Operand::ConstI64(*v as i64), Ty::I64),
@@ -1445,14 +1445,14 @@ impl<'a> FnLower<'a> {
                 let id = self.intern(s);
                 (Operand::ConstStr(id), Ty::Ref)
             }
-            // `null` — MESS-BOOTSTRAP (nicht die endgültige Sprache; die hat kein
-            // null, sondern Option). Nur nötig, um verkettete/zyklische Graphen
-            // zu konstruieren und damit ZUM ERSTEN MAL den RC-/Kollektor-Pfad auf
-            // Vire-IR zu betreten (M0.1b-auf-Vire). Wird durch Option[T] ersetzt.
+            // `null` — MEASUREMENT BOOTSTRAP (not the final language; that has no
+            // null, but Option). Only needed to construct linked/cyclic graphs
+            // and thereby enter the RC/collector path on Vire IR FOR THE FIRST
+            // TIME (M0.1b-on-Vire). Will be replaced by Option[T].
             Expr::Ident(name, _) if name == "null" && self.lookup(name).is_none() => {
                 (Operand::ConstNull, Ty::Ref)
             }
-            // Nullary-Variante als Ausdruck: `Empty` → getaggte Instanz.
+            // Nullary variant as expression: `Empty` → tagged instance.
             Expr::Ident(name, _) if self.variants.contains_key(name) && self.lookup(name).is_none() => {
                 self.build_variant(name, &[])
             }
@@ -1463,7 +1463,7 @@ impl<'a> FnLower<'a> {
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
-            // `self` = der als Parameter gebundene Empfänger.
+            // `self` = the receiver bound as a parameter.
             Expr::SelfExpr(_) => match self.lookup("self") {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
@@ -1487,8 +1487,8 @@ impl<'a> FnLower<'a> {
                 }
             }
             Expr::Binary { .. } if const_eval(e).is_some() => {
-                // Allgemeine Konstantenfaltung: `2 + 3`, `WIDTH * HEIGHT` etc. →
-                // Konstante zur Compilezeit (nicht nur unter `comptime`).
+                // General constant folding: `2 + 3`, `WIDTH * HEIGHT` etc. →
+                // constant at compile time (not only under `comptime`).
                 match const_eval(e).unwrap() {
                     CVal::Int(v) => (Operand::ConstI64(v), Ty::I64),
                     CVal::Float(v) => (Operand::ConstF64(v), Ty::F64),
@@ -1498,8 +1498,8 @@ impl<'a> FnLower<'a> {
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (mut l, mut lt) = self.lower_expr(lhs);
                 let (mut r, mut rt) = self.lower_expr(rhs);
-                // String-Verkettung: `+` mit mindestens einer Ref-Seite → Concat,
-                // Zahlen werden automatisch zu Strings (`"n=" + n`).
+                // String concatenation: `+` with at least one ref side → Concat,
+                // numbers are automatically converted to strings (`"n=" + n`).
                 if matches!(op, BinOp::Add) && (lt == Ty::Ref || rt == Ty::Ref) {
                     let ls = self.to_str(l, lt);
                     let rs = self.to_str(r, rt);
@@ -1507,10 +1507,10 @@ impl<'a> FnLower<'a> {
                     self.emit(Statement::Call { dest: Some(d), func: "jrt_str_concat".into(), args: vec![ls, rs] });
                     return (Operand::Copy(d), Ty::Ref);
                 }
-                // Ganzzahl-Breiten angleichen: mischt der Ausdruck ein schmales i32
-                // (z.B. ein gepacktes `I32`-Feld) mit i64, wird das i32 vorzeichen-
-                // erweitert. Sonst emittierte das Backend `add i64 %a, %i32` (Typfehler).
-                // Macht opt-in `I32`-Field-Packing voll nutzbar (RAM-Ersparnis).
+                // Align integer widths: if the expression mixes a narrow i32
+                // (e.g. a packed `I32` field) with i64, the i32 is sign-
+                // extended. Otherwise the backend would emit `add i64 %a, %i32` (type error).
+                // Makes opt-in `I32` field packing fully usable (RAM savings).
                 if lt == Ty::I32 && rt == Ty::I64 {
                     l = self.widen_i32(l);
                     lt = Ty::I64;
@@ -1554,8 +1554,8 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
-            // `comptime <expr>` → Compilezeit-Faltung konstanter Ausdrücke.
-            // `x as T` — numerische Konvertierung (int↔float, Breiten).
+            // `comptime <expr>` → compile-time folding of constant expressions.
+            // `x as T` — numeric conversion (int↔float, widths).
             Expr::Cast { inner, ty, .. } => {
                 let (op, from) = self.lower_expr(inner);
                 let to = ty_of(Some(ty));
@@ -1575,8 +1575,8 @@ impl<'a> FnLower<'a> {
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
-            // `e?` — Fehler-Propagation für Result: Ok(v) → v; Err(_) → return e.
-            // (Desugart zu match; die umgebende Funktion muss Result zurückgeben.)
+            // `e?` — error propagation for Result: Ok(v) → v; Err(_) → return e.
+            // (Desugared to match; the enclosing function must return Result.)
             Expr::Try { inner, .. } => {
                 let (obj, _) = self.lower_expr(inner);
                 let tag = self.new_local(Ty::I64);
@@ -1587,16 +1587,16 @@ impl<'a> FnLower<'a> {
                 let errb = self.new_block();
                 let cur = self.cur;
                 self.term(cur, Terminator::Branch { cond: Operand::Copy(is_ok), then_blk: okb, else_blk: errb });
-                // Err-Zweig: das ganze Result weiterreichen.
+                // Err branch: pass the whole Result on.
                 self.term(errb.0 as usize, Terminator::Return(Some(obj.clone())));
-                // Ok-Zweig: den Wert extrahieren.
+                // Ok branch: extract the value.
                 self.cur = okb.0 as usize;
                 let v = self.new_local(Ty::I64);
                 self.emit(Statement::GetField { dest: v, obj, class: "Result".into(), field: "Ok_value".into() });
                 (Operand::Copy(v), Ty::I64)
             }
-            // List-Literal `[a, b, c]` → NewArray + ArrayStore. Elementart aus dem
-            // ersten Element (homogen). Leere Liste → Long (Default).
+            // List literal `[a, b, c]` → NewArray + ArrayStore. Element kind from the
+            // first element (homogeneous). Empty list → Long (default).
             Expr::List(elems, _) => {
                 let lowered: Vec<(Operand, Ty)> = elems.iter().map(|e| self.lower_expr(e)).collect();
                 let kind = lowered.first().map(|(_, t)| arrkind_of(*t)).unwrap_or(ArrKind::Long);
@@ -1613,7 +1613,7 @@ impl<'a> FnLower<'a> {
                 (Operand::Copy(arr), Ty::Ref)
             }
             Expr::Comprehension { elem, var, iter, cond, .. } => self.lower_comprehension(elem, var, iter, cond.as_deref()),
-            // Map-Literal `[k: v, …]` → map() + put je Paar.
+            // Map literal `[k: v, …]` → map() + put per pair.
             Expr::MapLit(pairs, _) => {
                 let m = self.new_local(Ty::Ref);
                 self.local_class.insert(m.0, "$Map".into());
@@ -1627,7 +1627,7 @@ impl<'a> FnLower<'a> {
                 }
                 (Operand::Copy(m), Ty::Ref)
             }
-            // Indexierung `xs[i]` → ArrayLoad (bounds-gecheckt) bzw. vire_list_get.
+            // Indexing `xs[i]` → ArrayLoad (bounds-checked) resp. vire_list_get.
             Expr::Index { base, index, .. } => {
                 let (arr, _) = self.lower_expr(base);
                 if self.class_of_operand(&arr).as_deref() == Some("$List") {
@@ -1651,13 +1651,13 @@ impl<'a> FnLower<'a> {
                 (Operand::Copy(d), vty)
             }
             Expr::Block(b) => self.lower_block_val(b),
-            // capsule (reine Form, Skalar-rein/-raus): der Rumpf läuft in einer
-            // eigenen Arena. `jrt_arena_push` vor dem Rumpf routet alle Heap-
-            // Allokationen dorthin (immortal → kein RC/Kollektor), `jrt_arena_pop`
-            // danach gibt die Arena en bloc frei. NUR Skalar-Eingaben/-Ergebnis
-            // erlaubt (harte Fehler sonst): Werte können nicht aliasieren, und kein
-            // Objektzeiger überlebt die Arena → Isolation + Fault-Containment ohne
-            // Deep-Copy. Objekt-rein/-raus (Deep-Copy) bleibt offen.
+            // capsule (pure form, scalar-in/-out): the body runs in its
+            // own arena. `jrt_arena_push` before the body routes all heap
+            // allocations there (immortal → no RC/collector), `jrt_arena_pop`
+            // afterwards releases the arena en bloc. ONLY scalar inputs/result
+            // allowed (hard errors otherwise): values cannot alias, and no
+            // object pointer survives the arena → isolation + fault containment without
+            // deep copy. Object-in/-out (deep copy) remains open.
             Expr::Capsule { inputs, body, .. } => {
                 for (nm, _borrowed) in inputs {
                     if let Some((_, Ty::Ref)) = self.lookup(nm) {
@@ -1669,15 +1669,15 @@ impl<'a> FnLower<'a> {
                         ));
                     }
                 }
-                // `return` im Rumpf würde arena_pop überspringen (Arena-Leck) →
-                // verbieten. break/continue: die Loop-Ziele werden gespeichert und
-                // während des Rumpfs geleert (innere Schleifen setzen eigene).
+                // `return` in the body would skip arena_pop (arena leak) →
+                // forbid it. break/continue: the loop targets are saved and
+                // cleared during the body (inner loops set their own).
                 if body_has_return(body) {
                     self.errs.push("capsule: `return` im Rumpf nicht erlaubt (würde die Arena lecken) — nutze den Blockwert".into());
                 }
                 self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
                 let saved_loops = std::mem::take(&mut self.loops);
-                let body_locals_start = self.locals.len(); // ab hier: Rumpf-Locals
+                let body_locals_start = self.locals.len(); // from here on: body locals
                 let (val, ty) = self.lower_block_val(body);
                 self.loops = saved_loops;
                 if ty == Ty::Ref {
@@ -1687,15 +1687,15 @@ impl<'a> FnLower<'a> {
                             .into(),
                     );
                 }
-                // Skalar-Ergebnis zuerst festhalten (Register/Const, überlebt den Pop).
+                // Capture the scalar result first (register/const, survives the pop).
                 let res = self.new_local(if ty == Ty::Void { Ty::I64 } else { ty });
                 if ty != Ty::Void {
                     self.emit(Statement::Assign(res, Rvalue::Use(val)));
                 }
-                // Alle im Rumpf erzeugten Ref-Locals zeigen in die Arena. Nach dem
-                // Pop ist der Speicher weg; das Backend gibt Ref-Locals aber beim
-                // Funktionsende frei (liest den Header → use-after-free). Deshalb VOR
-                // dem Pop auf null setzen → jrt_release(null) ist ein No-Op.
+                // All ref locals created in the body point into the arena. After the
+                // pop the memory is gone; but the backend releases ref locals at
+                // function end (reads the header → use-after-free). Therefore set them to
+                // null BEFORE the pop → jrt_release(null) is a no-op.
                 for idx in body_locals_start..self.locals.len() {
                     if self.locals[idx] == Ty::Ref {
                         self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
@@ -1720,16 +1720,16 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr]) -> (Operand, Ty) {
-        // Methodenaufruf `obj.method(args)` → direkter Aufruf `Class.method(obj, args)`
-        // (monomorph, kein virtueller Dispatch — Vire-Typen sind (noch) flach).
+        // Method call `obj.method(args)` → direct call `Class.method(obj, args)`
+        // (monomorphic, no virtual dispatch — Vire types are (still) flat).
         if let Expr::Field { base, name, .. } = callee {
             let (obj, _) = self.lower_expr(base);
-            // `xs.len()` auf einem Array → ArrayLen.
+            // `xs.len()` on an array → ArrayLen.
             if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
                 let l = self.array_len_i64(obj);
                 return (l, Ty::I64);
             }
-            // Methoden auf wachsenden Listen ($List) und Maps ($Map).
+            // Methods on growing lists ($List) and maps ($Map).
             if let Some(sent) = self.class_of_operand(&obj) {
                 if sent == "$List" {
                     let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
@@ -1784,9 +1784,9 @@ impl<'a> FnLower<'a> {
                     return (Operand::ConstI64(0), Ty::I64);
                 }
             };
-            // TRAIT-OBJEKT: ist der Empfänger trait-typisiert (`s: Show`), dynamisch
-            // über die Vtable dispatchen (CallVirtual) — der konkrete Typ ist erst
-            // zur Laufzeit bekannt. Sonst statischer `Typ.methode`-Aufruf.
+            // TRAIT OBJECT: if the receiver is trait-typed (`s: Show`), dispatch
+            // dynamically via the vtable (CallVirtual) — the concrete type is only
+            // known at runtime. Otherwise a static `Typ.methode` call.
             if let Some(tms) = self.trait_methods.get(&class) {
                 if let Some((mn, desc, params, ret)) = tms.iter().find(|(n, ..)| n == name).cloned() {
                     let mut arg_ops = vec![obj];
@@ -1828,7 +1828,7 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
-        // Aufruf eines Lambda-Locals `f(args)` → Rumpf inline (Parameter gebunden).
+        // Call of a lambda local `f(args)` → body inline (parameters bound).
         if let Some((l, _)) = self.lookup(&name) {
             if let Some((params, body)) = self.local_lambda.get(&l.0).cloned() {
                 self.scopes.push(HashMap::new());
@@ -1846,21 +1846,21 @@ impl<'a> FnLower<'a> {
                 return r;
             }
         }
-        // Datentragende Variante eines generischen Summentyps (`Some(3.5)`) →
-        // typ-korrekt monomorphisiert. Datenlose Varianten (`None`) laufen über
-        // den gelöschten Pfad (nur __tag; Payload-Typ irrelevant).
+        // Data-carrying variant of a generic sum type (`Some(3.5)`) →
+        // monomorphized type-correctly. Data-less variants (`None`) go through
+        // the erased path (only __tag; payload type irrelevant).
         if self.variant_owner_g.contains_key(&name) && !args.is_empty() {
             return self.build_generic_variant(&name, args);
         }
-        // Varianten-Konstruktor eines Summentyps: `Circle(2.0)` → getaggte Instanz.
+        // Variant constructor of a sum type: `Circle(2.0)` → tagged instance.
         if self.variants.contains_key(&name) {
             return self.build_variant(&name, args);
         }
-        // Konstruktor eines generischen Produkttyps: `Box(x)` → Typargumente aus
-        // den Argumenttypen inferieren, `Box$Float` instanziieren, New + PutField.
+        // Constructor of a generic product type: `Box(x)` → infer the type arguments
+        // from the argument types, instantiate `Box$Float`, New + PutField.
         if let Some((tparams, fields)) = self.generic_ptypes.get(&name).cloned() {
             let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
-            // Typparameter aus dem ersten Feld ableiten, das genau `T` ist.
+            // Derive the type parameter from the first field that is exactly `T`.
             let mut tmap: HashMap<String, String> = HashMap::new();
             for (i, f) in fields.iter().enumerate() {
                 if tparams.iter().any(|tp| tp == &f.ty.name) {
@@ -1886,8 +1886,8 @@ impl<'a> FnLower<'a> {
             }
             return (Operand::Copy(obj), Ty::Ref);
         }
-        // Konstruktor eines Nutzertyps: `Point(x, y)` → New + PutField je Feld
-        // (Feldreihenfolge = Deklarationsreihenfolge).
+        // Constructor of a user type: `Point(x, y)` → New + PutField per field
+        // (field order = declaration order).
         if let Some(layout) = self.types.get(&name).cloned() {
             let obj = self.new_local(Ty::Ref);
             self.local_class.insert(obj.0, name.clone());
@@ -1909,10 +1909,10 @@ impl<'a> FnLower<'a> {
             }
             return (Operand::Copy(obj), Ty::Ref);
         }
-        // Higher-Order: wird ein Lambda übergeben, expandiere die aufgerufene
-        // Funktion an dieser Stelle inline (Parameter gebunden, Lambda als
-        // local_lambda). VOR der eager-Argument-Senkung — ein Lambda ist kein
-        // Wert und darf nicht direkt gesenkt werden.
+        // Higher-order: if a lambda is passed, expand the called
+        // function inline at this spot (parameters bound, lambda as
+        // local_lambda). BEFORE the eager argument lowering — a lambda is not a
+        // value and must not be lowered directly.
         if args.iter().any(|a| matches!(a, Expr::Lambda { .. })) {
             if let Some(fdef) = self.fn_defs.get(&name).cloned() {
                 if fdef.body.is_some() {
@@ -1920,19 +1920,19 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
-        // DEVIRT: wird ein KONKRET-typisiertes Objekt an einen Trait-Parameter
-        // übergeben (`run(a, …)` mit `a: AddOp`, Param `o: Op`), die Funktion inline
-        // expandieren → im Rumpf ist `o` konkret → `o.apply()` wird ein STATISCHER
-        // Aufruf (kein Vtable/Typ-Check). Das ist g++s Devirtualisierungs-Gewinn,
-        // im Closed-World-Solver sauber gemacht. Nur bei kleinem Rumpf (Bloat).
+        // DEVIRT: if a CONCRETELY-typed object is passed to a trait parameter
+        // (`run(a, …)` with `a: AddOp`, param `o: Op`), expand the function
+        // inline → in the body `o` is concrete → `o.apply()` becomes a STATIC
+        // call (no vtable/type check). This is g++'s devirtualization gain,
+        // done cleanly in the closed-world solver. Only for a small body (bloat).
         if let Some(fdef) = self.fn_defs.get(&name).cloned() {
             if fdef.body.is_some() && self.devirt_inline_ok(&fdef, args) {
                 return self.inline_higher_order(&name, &fdef, args);
             }
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
-        // Dimensionierte typisierte Arrays: `array(n)` (Int), `farray(n)` (Float) —
-        // echte bounds-gecheckte/-elidierbare Arrays (im Gegensatz zur i64-Liste).
+        // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float) —
+        // real bounds-checked/-elidable arrays (as opposed to the i64 list).
         if name == "array" || name == "farray" {
             let kind = if name == "farray" { ArrKind::Double } else { ArrKind::Long };
             let n = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstI64(0));
@@ -1942,7 +1942,7 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
             return (Operand::Copy(arr), Ty::Ref);
         }
-        // Collection-Builtins: `list()` (wachsende Liste), `map()` (Int→Int).
+        // Collection builtins: `list()` (growing list), `map()` (Int→Int).
         if name == "list" || name == "map" {
             let (func, sentinel) = if name == "list" { ("vire_list_new", "$List") } else { ("vire_map_new", "$Map") };
             let d = self.new_local(Ty::Ref);
@@ -1950,19 +1950,19 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![] });
             return (Operand::Copy(d), Ty::Ref);
         }
-        // Builtin `str(x)` → Text-Repräsentation (Ref).
+        // Builtin `str(x)` → text representation (Ref).
         if name == "str" {
             let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
             return (self.to_str(op, ty), Ty::Ref);
         }
-        // FFI-Builtin `cstr(s)` → NUL-terminierter char* (als Ptr/i64).
+        // FFI builtin `cstr(s)` → NUL-terminated char* (as Ptr/i64).
         if name == "cstr" {
             let arg = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstNull);
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "vire_cstr".into(), args: vec![arg] });
             return (Operand::Copy(d), Ty::I64);
         }
-        // Intrinsic `print` — mehrargumentig: jedes Argument in eigener Zeile.
+        // Intrinsic `print` — multi-argument: each argument on its own line.
         if name == "print" {
             if lowered.is_empty() {
                 let empty = self.intern("");
@@ -1979,8 +1979,8 @@ impl<'a> FnLower<'a> {
             }
             return (Operand::ConstI64(0), Ty::Void);
         }
-        // Aufruf einer generischen Funktion → Typargumente aus den Argumenttypen
-        // binden, Monomorph.-Instanz `f$T…` anfordern, Aufruf auf die Instanz.
+        // Call of a generic function → bind the type arguments from the argument
+        // types, request the monomorph instance `f$T…`, call on the instance.
         if let Some(g) = self.generics.get(&name).cloned() {
             let mut bind: HashMap<String, String> = HashMap::new();
             for (i, pty) in g.param_tys.iter().enumerate() {
@@ -2010,11 +2010,11 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
             return (Operand::Copy(d), ret);
         }
-        // Aufruf einer eigenen Funktion
+        // Call of an own function
         let (ret, ret_class) = self.sigs.get(&name).map(|s| (s.ret, s.ret_class.clone())).unwrap_or((Ty::I64, None));
-        // Bequemlichkeit: an `py_*`-Brückenfunktionen werden String-Argumente
-        // automatisch zu C-Strings (`cstr`), damit man `py_import("math")` statt
-        // `py_import(cstr("math"))` schreiben kann.
+        // Convenience: for `py_*` bridge functions, string arguments are
+        // automatically turned into C strings (`cstr`), so that one can write
+        // `py_import("math")` instead of `py_import(cstr("math"))`.
         let auto_cstr = name.starts_with("py_");
         let arg_ops: Vec<Operand> = lowered
             .into_iter()
@@ -2034,20 +2034,20 @@ impl<'a> FnLower<'a> {
         } else {
             let d = self.new_local(ret);
             if let Some(c) = ret_class {
-                self.local_class.insert(d.0, c); // Objekt-Rückgabe: Klasse merken
+                self.local_class.insert(d.0, c); // object return: remember the class
             }
             self.emit(Statement::Call { dest: Some(d), func: name, args: arg_ops });
             (Operand::Copy(d), ret)
         }
     }
 
-    /// Higher-Order-Funktion inline expandieren: `apply(x -> x+1, 5)` →
-    /// Rumpf von `apply` an der Aufrufstelle, `f` als local_lambda gebunden,
-    /// Wert-Parameter als Locals. Voll spezialisiert (direkter Code, LLVM kann
-    /// weiter inlinen); Captures des Lambdas bleiben über den Scope-Stack sichtbar.
-    /// Lohnt sich eine Devirt-Inline-Expansion? Ja, wenn ein KONKRET-typisiertes
-    /// Objekt an einen Trait-Parameter geht (dann wird der Methodenaufruf im Rumpf
-    /// statisch) UND der Rumpf klein genug ist (Code-Bloat-Schranke).
+    /// Expand a higher-order function inline: `apply(x -> x+1, 5)` →
+    /// body of `apply` at the call site, `f` bound as local_lambda,
+    /// value parameters as locals. Fully specialized (direct code, LLVM can
+    /// inline further); the lambda's captures stay visible via the scope stack.
+    /// Is a devirt inline expansion worthwhile? Yes, if a CONCRETELY-typed
+    /// object goes to a trait parameter (then the method call in the body becomes
+    /// static) AND the body is small enough (code-bloat bound).
     fn devirt_inline_ok(&self, fdef: &FnDef, args: &[Expr]) -> bool {
         let has_devirt = fdef.sig.params.iter().zip(args).any(|(p, a)| {
             let is_trait_param = p.ty.as_ref().map(|t| self.trait_methods.contains_key(&t.name)).unwrap_or(false);
@@ -2057,7 +2057,7 @@ impl<'a> FnLower<'a> {
             if let Expr::Ident(n, _) = a {
                 if let Some((l, _)) = self.lookup(n) {
                     if let Some(c) = self.local_class.get(&l.0) {
-                        // konkrete Klasse (kein Trait) → Aufruf wird statisch.
+                        // concrete class (not a trait) → the call becomes static.
                         return !self.trait_methods.contains_key(c);
                     }
                 }
@@ -2109,8 +2109,8 @@ impl<'a> FnLower<'a> {
         r
     }
 
-    /// List-Comprehension `[elem for var in src (if cond)]` → Zwei-Pass:
-    /// zählen (mit Filter) → Ergebnis-Array allozieren → füllen.
+    /// List comprehension `[elem for var in src (if cond)]` → two-pass:
+    /// count (with filter) → allocate result array → fill.
     fn lower_comprehension(&mut self, elem: &Expr, var: &str, iter: &Expr, cond: Option<&Expr>) -> (Operand, Ty) {
         let (src, _) = self.lower_expr(iter);
         let src_kind = match self.arr_of_operand(&src) {
@@ -2121,7 +2121,7 @@ impl<'a> FnLower<'a> {
             }
         };
         let src_vty = src_kind.value_ty();
-        // Elementart des Ergebnisses: elem in einem toten Block proben.
+        // Element kind of the result: probe elem in a dead block.
         let elem_kind = {
             let saved = self.cur;
             let dead = self.new_block();
@@ -2134,18 +2134,18 @@ impl<'a> FnLower<'a> {
             self.cur = saved;
             arrkind_of(ety)
         };
-        // Pass 1: zählen.
+        // Pass 1: count.
         let count = self.new_local(Ty::I64);
         self.emit(Statement::Assign(count, Rvalue::Use(Operand::ConstI64(0))));
         self.comp_loop(src.clone(), src_kind, var, src_vty, cond, &mut |s, _elem_local| {
             s.emit(Statement::Assign(count, Rvalue::Binary(IB::Add, Operand::Copy(count), Operand::ConstI64(1))));
         });
-        // Ergebnis-Array allozieren.
+        // Allocate the result array.
         let count32 = self.to_i32(Operand::Copy(count));
         let res = self.new_local(Ty::Ref);
         self.local_arr.insert(res.0, elem_kind);
         self.emit(Statement::NewArray { dest: res, kind: elem_kind, len: count32 });
-        // Pass 2: füllen (elem auswerten, an Position j schreiben).
+        // Pass 2: fill (evaluate elem, write at position j).
         let j = self.new_local(Ty::I64);
         self.emit(Statement::Assign(j, Rvalue::Use(Operand::ConstI64(0))));
         let elem_c = elem.clone();
@@ -2161,8 +2161,8 @@ impl<'a> FnLower<'a> {
         (Operand::Copy(res), Ty::Ref)
     }
 
-    /// Emittiert `for var in src { if cond { body } }` — Schleifengerüst für
-    /// Comprehensions. `body` wird im Rumpf (nach optionalem cond-Filter) gerufen.
+    /// Emits `for var in src { if cond { body } }` — loop scaffold for
+    /// comprehensions. `body` is called in the body (after an optional cond filter).
     fn comp_loop(&mut self, src: Operand, kind: ArrKind, var: &str, vty: Ty, cond: Option<&Expr>, body: &mut dyn FnMut(&mut Self, Local)) {
         let len = self.array_len_i64(src.clone());
         let ivar = self.new_local(Ty::I64);
@@ -2183,7 +2183,7 @@ impl<'a> FnLower<'a> {
         self.emit(Statement::ArrayLoad { dest: elem, arr: src, index: idx32, kind, checked: true });
         self.scopes.push(HashMap::new());
         self.bind(var, elem, vty);
-        // optionaler Filter
+        // optional filter
         if let Some(cnd) = cond {
             let (cv, _) = self.lower_expr(cnd);
             let keep = self.new_block();
@@ -2199,7 +2199,7 @@ impl<'a> FnLower<'a> {
         self.cur = exit.0 as usize;
     }
 
-    /// Getaggte Variante bauen: `New Sum`, `__tag = t`, Felder aus den Argumenten.
+    /// Build a tagged variant: `New Sum`, `__tag = t`, fields from the arguments.
     fn build_variant(&mut self, vname: &str, args: &[Expr]) -> (Operand, Ty) {
         let (sum, tag, vfields) = self.variants.get(vname).cloned().unwrap();
         let obj = self.new_local(Ty::Ref);
@@ -2219,15 +2219,15 @@ impl<'a> FnLower<'a> {
         (Operand::Copy(obj), Ty::Ref)
     }
 
-    /// Datentragende Variante eines generischen Summentyps (`Some(3.5)`) typ-korrekt
-    /// bauen: Typargumente aus den Payload-Typen inferieren, `Option$Float`
-    /// instanziieren (F64-Payload), getaggte Instanz mit Instanz-Klasse.
+    /// Build a data-carrying variant of a generic sum type (`Some(3.5)`) type-correctly:
+    /// infer the type arguments from the payload types, instantiate `Option$Float`
+    /// (F64 payload), tagged instance with the instance class.
     fn build_generic_variant(&mut self, vname: &str, args: &[Expr]) -> (Operand, Ty) {
         let sum = self.variant_owner_g[vname].clone();
         let (tparams, variants) = self.generic_stypes[&sum].clone();
         let vdef = variants.iter().find(|(n, _)| n == vname).cloned().unwrap_or((vname.into(), vec![]));
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
-        // Typparameter aus den Payload-Feldern ableiten, die genau `T` sind.
+        // Derive the type parameters from the payload fields that are exactly `T`.
         let mut tmap: HashMap<String, String> = HashMap::new();
         for (i, (_, tyname)) in vdef.1.iter().enumerate() {
             if tparams.iter().any(|tp| tp == tyname) {
@@ -2252,12 +2252,12 @@ impl<'a> FnLower<'a> {
         (Operand::Copy(obj), Ty::Ref)
     }
 
-    /// `match s { Variant(binds) -> body … _ -> body }` → Dispatch über `__tag`,
-    /// Feld-Extraktion je Arm, Phi-Ersatz über ein Ergebnis-Local (wie lower_if).
+    /// `match s { Variant(binds) -> body … _ -> body }` → dispatch via `__tag`,
+    /// field extraction per arm, phi stand-in via a result local (like lower_if).
     fn lower_match(&mut self, scrut: &Expr, arms: &[(Pattern, Option<Expr>, Expr)]) -> (Operand, Ty) {
         let (obj, oty) = self.lower_expr(scrut);
         let class = self.class_of_operand(&obj);
-        // Oder-Muster auf Arm-Ebene auffalten: `A | B -> body` → zwei Arme.
+        // Unfold or-patterns at arm level: `A | B -> body` → two arms.
         let mut flat: Vec<(Pattern, Option<Expr>, Expr)> = Vec::new();
         for (pat, guard, body) in arms {
             match pat {
@@ -2269,7 +2269,7 @@ impl<'a> FnLower<'a> {
                 _ => flat.push((pat.clone(), guard.clone(), body.clone())),
             }
         }
-        // Erschöpfungsprüfung (Compilezeit): nicht-erschöpfend = HARTER FEHLER.
+        // Exhaustiveness check (compile time): non-exhaustive = HARD ERROR.
         self.check_exhaustive(&class, &flat);
         let merge = self.new_block();
         let mut ends: Vec<(usize, Operand, Ty)> = Vec::new();
@@ -2277,7 +2277,7 @@ impl<'a> FnLower<'a> {
             let fail = self.new_block();
             self.scopes.push(HashMap::new());
             self.emit_pattern_test(obj.clone(), oty, class.clone(), pat, fail);
-            // Guard nach erfolgreichem Muster.
+            // Guard after a successful pattern.
             if let Some(g) = guard {
                 let (gc, _) = self.lower_expr(g);
                 let cont = self.new_block();
@@ -2288,7 +2288,7 @@ impl<'a> FnLower<'a> {
             let (v, t) = self.lower_expr(body);
             self.scopes.pop();
             ends.push((self.cur, v, t));
-            self.cur = fail.0 as usize; // nächster Arm beginnt im fail-Block
+            self.cur = fail.0 as usize; // the next arm begins in the fail block
         }
         let rty = ends.iter().map(|(_, _, t)| *t).find(|t| *t != Ty::Void).unwrap_or(Ty::Void);
         let res = if rty != Ty::Void { Some(self.new_local(rty)) } else { None };
@@ -2298,7 +2298,7 @@ impl<'a> FnLower<'a> {
             }
             self.blocks[*end].terminator = Terminator::Goto(merge);
         }
-        // Fallthrough (unerreichbar, weil erschöpfend geprüft) typkorrekt schließen.
+        // Close the fallthrough (unreachable because exhaustively checked) type-correctly.
         let cur = self.cur;
         if let Some(r) = res {
             self.blocks[cur].statements.push(Statement::Assign(r, Rvalue::Use(zero_of(rty))));
@@ -2311,9 +2311,9 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Emittiert die Tests für EIN Muster gegen `obj`. Bei Nicht-Übereinstimmung
-    /// → `fail`; bei Übereinstimmung läuft `self.cur` weiter (mit Bindungen im
-    /// Scope). Rekursiv für verschachtelte Muster.
+    /// Emits the tests for ONE pattern against `obj`. On non-match
+    /// → `fail`; on a match `self.cur` continues (with bindings in
+    /// scope). Recursive for nested patterns.
     fn emit_pattern_test(&mut self, obj: Operand, ty: Ty, class: Option<String>, pat: &Pattern, fail: Block) {
         match pat {
             Pattern::Wildcard(_) => {}
@@ -2334,8 +2334,8 @@ impl<'a> FnLower<'a> {
             Pattern::Int(v, _) => self.emit_eq_test(obj, to_i64(Operand::ConstI64(*v as i64)), fail),
             Pattern::Bool(b, _) => self.emit_eq_test(obj, Operand::ConstI32(if *b { 1 } else { 0 }), fail),
             Pattern::Ctor { name, args, .. } => {
-                // Bei generischer Instanz-Klasse (`Option$Float`): das Instanz-Layout
-                // nutzen (typ-korrekte Feld-Extraktion), sonst die gelöschte Variante.
+                // For a generic instance class (`Option$Float`): use the instance layout
+                // (type-correct field extraction), otherwise the erased variant.
                 let inst = class.as_deref().and_then(|c| self.variant_in(c, name));
                 let (sum, vtag, vfields) = match inst.or_else(|| self.variants.get(name).cloned()) {
                     Some(v) => v,
@@ -2359,7 +2359,7 @@ impl<'a> FnLower<'a> {
                 }
             }
             Pattern::Or(ps, _) => {
-                // Verschachteltes Oder: der Reihe nach probieren; passt eins → weiter.
+                // Nested or: try in order; if one matches → continue.
                 let matched = self.new_block();
                 for p in ps {
                     let next = self.new_block();
@@ -2376,7 +2376,7 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// `obj == val ? weiter : fail`.
+    /// `obj == val ? continue : fail`.
     fn emit_eq_test(&mut self, obj: Operand, val: Operand, fail: Block) {
         let c = self.new_local(Ty::I32);
         self.emit(Statement::Assign(c, Rvalue::Binary(IB::CmpEq, obj, val)));
@@ -2386,16 +2386,16 @@ impl<'a> FnLower<'a> {
         self.cur = cont.0 as usize;
     }
 
-    /// Compilezeit-Erschöpfungsprüfung. Summentyp: alle Varianten oder `_`/Bind.
-    /// Skalar/Literal: `_`/Bind-Zweig nötig. Sonst harter Fehler.
+    /// Compile-time exhaustiveness check. Sum type: all variants or `_`/Bind.
+    /// Scalar/literal: a `_`/Bind branch required. Otherwise a hard error.
     fn check_exhaustive(&mut self, class: &Option<String>, arms: &[(Pattern, Option<Expr>, Expr)]) {
         let has_catchall = arms.iter().any(|(p, g, _)| g.is_none() && matches!(p, Pattern::Wildcard(_) | Pattern::Bind(..)));
         if has_catchall {
             return;
         }
         if let Some(sum) = class {
-            // Generische Instanz-Klasse (`Option$Float`) → Varianten aus der
-            // Instanz-Registry; sonst die gelöschten Varianten des Summentyps.
+            // Generic instance class (`Option$Float`) → variants from the
+            // instance registry; otherwise the erased variants of the sum type.
             let inst_vars = self.local_svars.get(sum).or_else(|| self.shared_svars.get(sum));
             let all: Vec<(String, i64)> = if let Some(m) = inst_vars {
                 m.iter().map(|(n, (t, _))| (n.clone(), *t)).collect()
@@ -2403,7 +2403,7 @@ impl<'a> FnLower<'a> {
                 self.variants.iter().filter(|(_, (s, _, _))| s == sum).map(|(n, (_, t, _))| (n.clone(), *t)).collect()
             };
             if all.is_empty() {
-                return; // kein Summentyp (z.B. Produkttyp) → keine Prüfung
+                return; // not a sum type (e.g. product type) → no check
             }
             let tag_of = |name: &str| -> Option<i64> {
                 if let Some(m) = inst_vars {
@@ -2415,10 +2415,10 @@ impl<'a> FnLower<'a> {
             let mut covered = std::collections::HashSet::new();
             for (p, g, _) in arms {
                 if g.is_some() {
-                    continue; // Guard kann fehlschlagen → deckt nicht sicher
+                    continue; // guard can fail → does not reliably cover
                 }
                 if let Pattern::Ctor { name, args, .. } = p {
-                    // deckt den Tag nur, wenn alle Argumente unwiderlegbar sind
+                    // covers the tag only if all arguments are irrefutable
                     if args.iter().all(is_irrefutable) {
                         if let Some(t) = tag_of(name) {
                             covered.insert(t);
@@ -2442,11 +2442,11 @@ impl<'a> FnLower<'a> {
         let merge = self.new_block();
         let cur = self.cur;
         self.term(cur, Terminator::Branch { cond: c, then_blk: thenb, else_blk: elseb });
-        // then-Zweig → Wert + Endblock (noch nicht terminiert).
+        // then branch → value + end block (not yet terminated).
         self.cur = thenb.0 as usize;
         let (tv, tty) = self.lower_block_val(then);
         let te = self.cur;
-        // else-Zweig: weitere `elif`s rekursiv, sonst `else`-Block, sonst kein Wert.
+        // else branch: further `elif`s recursively, else the `else` block, else no value.
         self.cur = elseb.0 as usize;
         let (ev, ety) = if !elifs.is_empty() {
             let (ec, eb) = &elifs[0];
@@ -2458,10 +2458,10 @@ impl<'a> FnLower<'a> {
             (Operand::ConstI64(0), Ty::Void)
         };
         let ee = self.cur;
-        // Ergebnistyp: der nicht-Void-Zweig gewinnt (beide gleich, wenn Wert-if).
+        // Result type: the non-Void branch wins (both equal for a value-if).
         let rty = if tty != Ty::Void { tty } else { ety };
         if rty != Ty::Void {
-            // Phi-Ersatz: gemeinsames Ergebnis-Local, in beiden Endblöcken belegt.
+            // Phi replacement: shared result local, assigned in both end blocks.
             let res = self.new_local(rty);
             self.blocks[te].statements.push(Statement::Assign(res, Rvalue::Use(tv)));
             self.blocks[ee].statements.push(Statement::Assign(res, Rvalue::Use(ev)));
@@ -2478,7 +2478,7 @@ impl<'a> FnLower<'a> {
     }
 }
 
-// Der AST nennt Block; hier Alias, um Namenskollision mit ir::Block zu vermeiden.
+// The AST calls it Block; here an alias to avoid a name collision with ir::Block.
 use crate::ast::Block as Block2;
 
 #[allow(clippy::too_many_arguments)]
@@ -2539,12 +2539,12 @@ fn lower_fn(
     // Parameter → Locals 0..n
     let mut param_tys = Vec::new();
     for p in &f.sig.params {
-        // `self`-Empfänger: Ref auf die Methoden-Klasse.
+        // `self` receiver: Ref to the method class.
         let (t, cls) = if p.name == "self" {
             (Ty::Ref, recv_class.map(|c| c.to_string()))
         } else if let Some(pt) = p.ty.as_ref().filter(|pt| !pt.args.is_empty() && fl.generic_ptypes.contains_key(&pt.name)) {
-            // Annotierter generischer Typ `b: Box[Int]` → Instanz `Box$Int`, damit
-            // Feldzugriffe im Rumpf das konkrete Layout finden.
+            // Annotated generic type `b: Box[Int]` → instance `Box$Int`, so that
+            // field accesses in the body find the concrete layout.
             let (tparams, fields) = fl.generic_ptypes[&pt.name].clone();
             let targs: Vec<String> = pt.args.iter().map(|a| a.name.clone()).collect();
             let mangled = fl.instantiate_ptype(&pt.name, &tparams, &fields, &targs);
@@ -2560,7 +2560,7 @@ fn lower_fn(
         fl.bind(&p.name, l, t);
     }
     if let Some(body) = &f.body {
-        // Statements + Tail (Tail = Rückgabewert, falls ret != Void)
+        // Statements + tail (tail = return value, if ret != Void)
         fl.scopes.push(HashMap::new());
         for s in &body.stmts {
             fl.lower_stmt(s);
@@ -2571,9 +2571,9 @@ fn lower_fn(
         } else if ret == Ty::Void {
             Terminator::Return(None)
         } else {
-            // Kein Tail, aber typisierter Rückgabewert: der Wert kommt aus einem
-            // `return`-Statement; dieser Fallthrough-Block ist unerreichbar. Er
-            // muss aber typkorrekt terminieren (sonst `ret void` in i64-Funktion).
+            // No tail, but a typed return value: the value comes from a
+            // `return` statement; this fallthrough block is unreachable. But it
+            // must terminate type-correctly (otherwise `ret void` in an i64 function).
             Terminator::Return(Some(zero_of(ret)))
         };
         fl.scopes.pop();
@@ -2602,10 +2602,10 @@ fn lower_fn(
     ))
 }
 
-/// Higher-Order-Template? Wahr, wenn ein Parameter im Rumpf als Aufruf-Ziel
-/// benutzt wird (`f(x)` mit `f` = Parameter). Solche Funktionen werden NUR
-/// inline expandiert (Defunktionalisierung) — nie eigenständig gesenkt, weil der
-/// Funktionsparameter keinen Laufzeitwert hat.
+/// Higher-order template? True if a parameter is used as a call target in the
+/// body (`f(x)` with `f` = parameter). Such functions are ONLY
+/// inline-expanded (defunctionalization) — never lowered standalone, because the
+/// function parameter has no runtime value.
 fn is_higher_order(f: &FnDef) -> bool {
     let params: std::collections::HashSet<&str> = f.sig.params.iter().map(|p| p.name.as_str()).collect();
     match &f.body {
@@ -2654,8 +2654,8 @@ fn expr_calls_param(e: &Expr, params: &std::collections::HashSet<&str>) -> bool 
     }
 }
 
-/// Enthält ein Block (rekursiv über verschachtelte Blöcke/Schleifen/if) ein
-/// `return`-Statement? Für die capsule-Prüfung (return würde arena_pop überspringen).
+/// Does a block contain (recursively over nested blocks/loops/if) a
+/// `return` statement? For the capsule check (return would skip arena_pop).
 fn body_has_return(b: &Block2) -> bool {
     b.stmts.iter().any(stmt_has_return)
 }
@@ -2667,14 +2667,14 @@ fn stmt_has_return(s: &Stmt) -> bool {
     }
 }
 
-/// Compilezeit-Konstantenwert (für `comptime`).
+/// Compile-time constant value (for `comptime`).
 enum CVal {
     Int(i64),
     Float(f64),
     Bool(bool),
 }
 
-/// Faltet einen konstanten Ausdruck zur Compilezeit. `None` = nicht konstant.
+/// Folds a constant expression at compile time. `None` = not constant.
 fn const_eval(e: &Expr) -> Option<CVal> {
     Some(match e {
         Expr::Int(v, _) => CVal::Int(*v as i64),
@@ -2734,12 +2734,12 @@ fn const_eval(e: &Expr) -> Option<CVal> {
     })
 }
 
-/// Muster, das immer passt (deckt seinen Slot vollständig ab).
+/// Pattern that always matches (covers its slot completely).
 fn is_irrefutable(p: &Pattern) -> bool {
     matches!(p, Pattern::Wildcard(_) | Pattern::Bind(..))
 }
 
-/// IR-Wertetyp → Array-Elementart.
+/// IR value type → array element kind.
 fn arrkind_of(t: Ty) -> ArrKind {
     match t {
         Ty::F64 => ArrKind::Double,
@@ -2750,7 +2750,7 @@ fn arrkind_of(t: Ty) -> ArrKind {
     }
 }
 
-/// Typkorrekter Null-/Default-Operand (für unerreichbare typisierte Returns).
+/// Type-correct null/default operand (for unreachable typed returns).
 fn zero_of(t: Ty) -> Operand {
     match t {
         Ty::F64 => Operand::ConstF64(0.0),
@@ -2782,7 +2782,7 @@ fn map_op(o: BinOp) -> IB {
     }
 }
 
-/// Für Vergleiche/Range mit gemischten Const-Breiten: i32-Konstanten als i64 nutzen.
+/// For comparisons/range with mixed const widths: use i32 constants as i64.
 fn to_i64(op: Operand) -> Operand {
     match op {
         Operand::ConstI32(v) => Operand::ConstI64(v as i64),

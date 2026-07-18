@@ -1,5 +1,5 @@
-//! Typinferenz-Tests (F5-Kern): un-annotierte Parameter-/Rückgabetypen werden
-//! aus Nutzung + Aufrufstellen erschlossen und in den AST zurückgeschrieben.
+//! Type-inference tests (F5 core): un-annotated parameter/return types are
+//! derived from usage + call sites and written back into the AST.
 
 use vire::{infer_module, parse};
 
@@ -32,8 +32,8 @@ fn ret_of(src: &str, fn_name: &str) -> Option<String> {
 }
 
 #[test]
-fn float_param_aus_arithmetik_und_aufruf() {
-    // avg(a,b) mit `(a+b)/2.0` und Aufruf mit Float-Args → Parameter Float.
+fn float_param_from_arithmetic_and_call() {
+    // avg(a,b) with `(a+b)/2.0` and a call with float args → parameter Float.
     let src = "fn avg(a, b) {\n (a + b) / 2.0\n}\nfn main() {\n print(avg(10.0, 20.0))\n}\n";
     assert_eq!(ty_of_param(src, "avg", 0).as_deref(), Some("Float"));
     assert_eq!(ty_of_param(src, "avg", 1).as_deref(), Some("Float"));
@@ -41,16 +41,16 @@ fn float_param_aus_arithmetik_und_aufruf() {
 }
 
 #[test]
-fn int_param_bleibt_int() {
+fn int_param_stays_int() {
     let src = "fn dbl(x) {\n x * 2\n}\nfn main() {\n print(dbl(21))\n}\n";
-    // Int wird als "Int" zurückgeschrieben (ty_of → I64).
+    // Int is written back as "Int" (ty_of → I64).
     assert_eq!(ty_of_param(src, "dbl", 0).as_deref(), Some("Int"));
 }
 
 #[test]
-fn typkonflikt_wird_gemeldet_nicht_geschluckt() {
-    // `x` als Int UND Float benutzt → Konflikt. Muss gemeldet werden, nicht still
-    // auf I64 defaulten (sonst Miskompilat statt Ablehnung).
+fn type_conflict_is_reported_not_swallowed() {
+    // `x` used as Int AND Float → conflict. Must be reported, not silently
+    // defaulted to I64 (otherwise miscompilation instead of rejection).
     let (mut m, diags) = parse("fn bad(x) {\n mut a = x + 1\n mut b = x + 2.0\n a\n}\n");
     assert!(diags.is_empty());
     let conflicts = infer_module(&mut m);
@@ -58,7 +58,7 @@ fn typkonflikt_wird_gemeldet_nicht_geschluckt() {
 }
 
 #[test]
-fn main_bleibt_ohne_rueckgabetyp() {
+fn main_stays_without_return_type() {
     let src = "fn main() {\n print(1)\n}\n";
     assert_eq!(ret_of(src, "main"), None);
 }

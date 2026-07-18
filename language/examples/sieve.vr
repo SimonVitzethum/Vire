@@ -1,0 +1,23 @@
+// Sieve of Eratosthenes — low-level, numeric domain (C/Rust territory).
+// Matches the Sieve benchmark: counted loops, array, long induction.
+// The solver elides bounds checks (index provably in [0, n)) → GEP without check.
+
+fn count_primes(n: Int) -> Int {
+    mut sieve = [false] * n          // Bool array of length n (1 byte/element)
+    mut count = 0
+    for i in 2..n {
+        if not sieve[i] {            // unchecked: i < n from the loop guard
+            count = count + 1
+            mut j = i * i
+            while j < n {            // long induction, unchecked (int)j
+                sieve[j] = true
+                j = j + i
+            }
+        }
+    }
+    count
+}
+
+fn main() {
+    print(count_primes(50_000_000))  // 3_001_134
+}

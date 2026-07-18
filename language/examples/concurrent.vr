@@ -1,0 +1,46 @@
+// Concurrency "safe by construction": sharing only via channels (move) or
+// encapsulated sync types (Mutex/Atomic). The solver rejects shared bare
+// mutable state at COMPILE TIME. Refcounts are atomic across threads.
+
+use std.io
+
+// 1) CSP: distribute work over a channel and collect it (move values, no
+//    shared state → no data race possible).
+fn parallel_sum(xs: List[Int], workers: Int) -> Int {
+    chunks  = xs.chunks(xs.len() / workers)
+    results = Channel[Int]()
+    for chunk in chunks {
+        spawn {
+            mut acc = 0
+            for x in chunk { acc = acc + x }
+            results.send(acc)
+        }
+    }
+    mut total = 0
+    for partial in results.take(chunks.len()) { total = total + partial }
+    total
+}
+
+// 2) Shared mutable state ONLY encapsulated — the type enforces the lock:
+fn count_hits(events: List[Event]) -> Int {
+    hits = Mutex(0)
+    parallel_for(events, |e| {
+        if e.is_hit() { hits.lock(|n| n + 1) }   // access only inside the lock closure
+    })
+    hits.get()
+}
+
+// 3) What the compiler REJECTS (commented out): bare shared mutable state
+// fn broken(xs: List[Int]) {
+//     mut sum = 0
+//     for x in xs { spawn { sum = sum + x } }   // ERROR: `sum` crosses a
+// }                                             // thread boundary without Mutex/Atomic
+
+fn main() {
+    data = [i for i in 1..=1_000_000]
+    print("Sum: {parallel_sum(data, 8)}")         // 500000500000
+
+    // Fork-join data parallelism without channels:
+    squares = parallel_map(data, |x| x * x)
+    print("Elements: {squares.len()}")
+}

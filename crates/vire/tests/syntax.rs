@@ -1,4 +1,4 @@
-//! Nutzer-konfigurierbare Schlüsselwort-Schreibweisen.
+//! User-configurable keyword spellings.
 
 use vire::ast::Item;
 use vire::{parse_with_syntax, Syntax};
@@ -16,17 +16,17 @@ fn renamed_keywords_parse() {
 
 #[test]
 fn default_keyword_is_free_after_rename() {
-    // Nach `fn = funktion` ist `fn` ein normaler Bezeichner, `funktion` das Keyword.
+    // After `fn = funktion`, `fn` is a normal identifier, `funktion` the keyword.
     let syn = Syntax::parse("fn = funktion\n").unwrap();
     let (m, diags) = parse_with_syntax("funktion fn() {\n print(1)\n}\n", syn);
     assert!(diags.is_empty(), "{diags:?}");
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    assert_eq!(f.sig.name, "fn"); // `fn` jetzt als Name nutzbar
+    assert_eq!(f.sig.name, "fn"); // `fn` now usable as a name
 }
 
 #[test]
 fn collision_is_rejected() {
-    // Zwei Schlüsselwörter auf dieselbe Schreibweise → Fehler.
+    // Two keywords on the same spelling → error.
     let err = Syntax::parse("fn = x\ntype = x\n").unwrap_err();
     assert!(err.iter().any(|e| e.contains("schon")));
 }
@@ -39,7 +39,7 @@ fn unknown_keyword_is_rejected() {
 
 #[test]
 fn top_level_statements_become_main() {
-    // Skript-Stil: Top-Level-Anweisungen → implizites fn main().
+    // Script style: top-level statements → implicit fn main().
     let (m, diags) = parse_with_syntax("mut s = 0\nfor i in 0..3 { s = s + i }\nprint(s)\n", Syntax::default());
     assert!(diags.is_empty(), "{diags:?}");
     let has_main = m.items.iter().any(|it| matches!(it, Item::Fn(f) if f.sig.name == "main"));
@@ -54,15 +54,15 @@ fn top_level_and_explicit_main_conflict() {
 
 #[test]
 fn triple_quoted_raw_string() {
-    // """…""" ist ein mehrzeiliger Roh-String: Backslash + inneres " wörtlich.
-    let src = "\"\"\"a\\n b\"\"\"".to_string(); // Quelle: """a\n b"""
+    // """…""" is a multi-line raw string: backslash + inner " literally.
+    let src = "\"\"\"a\\n b\"\"\"".to_string(); // source: """a\n b"""
     let (toks, diags) = vire::lexer::lex(&src);
     assert!(diags.is_empty(), "{diags:?}");
     let got = toks.iter().find_map(|t| match &t.tok {
         vire::lexer::Tok::Str(s) => Some(s.clone()),
         _ => None,
     });
-    assert_eq!(got.as_deref(), Some("a\\n b")); // Backslash-n NICHT interpretiert
+    assert_eq!(got.as_deref(), Some("a\\n b")); // backslash-n NOT interpreted
 }
 
 #[test]

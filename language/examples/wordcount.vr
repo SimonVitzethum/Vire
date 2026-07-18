@@ -1,0 +1,29 @@
+// High-level-language domain (Python/Go): text processing with maps, iterators,
+// comprehensions, Option and errors — reads like Python, compiles natively.
+
+use std.io
+
+fn word_counts(text: Str) -> Map[Str, Int] {
+    mut counts = {}                                  // Map[Str, Int] inferred
+    for word in text.lower().split_whitespace() {
+        counts[word] = counts.get(word).or(0) + 1    // Option.or yields the default
+    }
+    counts
+}
+
+fn top_n(counts: Map[Str, Int], n: Int) -> List[(Str, Int)] {
+    counts.items()
+          .sorted_by(pair -> -pair.1)                // by frequency, descending
+          .take(n)
+}
+
+fn main() -> Result[Unit, Error] {
+    text = read_file("book.txt")?                    // ? propagates Err
+    counts = word_counts(text)
+    unique = [w for w, _ in counts.items()].len()
+    print("{unique} distinct words, top 10:")
+    for word, n in top_n(counts, 10) {
+        print("{n:6}  {word}")
+    }
+    Ok(())
+}

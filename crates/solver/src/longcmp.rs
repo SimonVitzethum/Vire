@@ -1,16 +1,16 @@
-//! Fusion von Long-/Double-Vergleichen mit ihrem nachfolgenden 0-Test.
+//! Fusion of long/double comparisons with their following 0-test.
 //!
-//! javac senkt `j < N` (long) als `lcmp; if<cond>` — im Bytecode ein
-//! eigenständiges `lcmp`, das `sign(x−y) ∈ {-1,0,1}` liefert, gefolgt von einem
-//! Verzweigungstest gegen 0. Das Frontend bildet das auf einen `jrt_lcmp`-Call
-//! plus `CmpX(result, 0)` ab — ein **Funktionsaufruf pro Iteration** in heißen
-//! Schleifen, den Rust als eine native `icmp slt i64` erledigt.
+//! javac lowers `j < N` (long) as `lcmp; if<cond>` — in the bytecode a
+//! standalone `lcmp` yielding `sign(x−y) ∈ {-1,0,1}`, followed by a
+//! branch test against 0. The frontend maps this onto a `jrt_lcmp` call
+//! plus `CmpX(result, 0)` — a **function call per iteration** in hot
+//! loops that Rust handles as a native `icmp slt i64`.
 //!
-//! Da `sign(x−y) <op> 0 ⟺ x <op> y` für alle sechs Vergleiche gilt, ersetzt
-//! diese Peephole-Optimierung das Paar durch einen direkten `Binary(op, x, y)`
-//! auf den i64-Operanden (das Backend emittiert `icmp <cc> i64`) und entfernt
-//! den nun toten `jrt_lcmp`-Aufruf. Konservativ: nur wenn der lcmp-Ergebnis-Slot
-//! ausschließlich vom unmittelbar folgenden 0-Test gelesen wird.
+//! Since `sign(x−y) <op> 0 ⟺ x <op> y` holds for all six comparisons,
+//! this peephole optimization replaces the pair with a direct `Binary(op, x, y)`
+//! on the i64 operands (the backend emits `icmp <cc> i64`) and removes
+//! the now-dead `jrt_lcmp` call. Conservative: only when the lcmp result slot
+//! is read exclusively by the immediately following 0-test.
 
 use fastllvm_ir::*;
 
@@ -35,7 +35,7 @@ fn fuse_block(bb: &mut BasicBlock) -> usize {
     let mut fused = 0;
     let mut i = 0;
     while i + 1 < bb.statements.len() {
-        // Muster: Call(d, jrt_lcmp|dcmp, [x, y]) ; Assign(c, CmpX(Copy(d), 0)).
+        // Pattern: Call(d, jrt_lcmp|dcmp, [x, y]) ; Assign(c, CmpX(Copy(d), 0)).
         let (d, x, y) = match &bb.statements[i] {
             Statement::Call { dest: Some(d), func, args }
                 if (func == "jrt_lcmp") && args.len() == 2 =>
@@ -59,26 +59,26 @@ fn fuse_block(bb: &mut BasicBlock) -> usize {
             i += 1;
             continue;
         };
-        // d darf nach dem 0-Test nicht mehr gelesen werden (bis zur nächsten
-        // Definition) und nicht im Terminator vorkommen.
+        // d must not be read after the 0-test (up to the next
+        // definition) and must not occur in the terminator.
         if reads_local_after(bb, i + 2, d) {
             i += 1;
             continue;
         }
-        // Fusion: Vergleich direkt auf die i64-Operanden, lcmp-Call entfernen.
+        // Fusion: comparison directly on the i64 operands, remove the lcmp call.
         if let Statement::Assign(_, rv) = &mut bb.statements[i + 1] {
             *rv = Rvalue::Binary(op, x, y);
         }
         bb.statements.remove(i);
         fused += 1;
-        // i zeigt jetzt auf den (ehemaligen) Assign; weiter dahinter suchen.
+        // i now points at the (former) Assign; keep searching after it.
         i += 1;
     }
     fused
 }
 
-/// Wird `local` ab `from` als Operand gelesen, bevor es neu definiert wird?
-/// (Terminator zählt als "danach".)
+/// Is `local` read as an operand from `from` on, before it is redefined?
+/// (The terminator counts as "after".)
 fn reads_local_after(bb: &BasicBlock, from: usize, local: u32) -> bool {
     for st in &bb.statements[from..] {
         let mut reads = false;
@@ -99,10 +99,10 @@ fn reads_local_after(bb: &BasicBlock, from: usize, local: u32) -> bool {
             return true;
         }
         if defines {
-            return false; // neu definiert → altes d tot
+            return false; // redefined → old d dead
         }
     }
-    // Terminator prüfen.
+    // Check the terminator.
     let mut reads = false;
     match &bb.terminator {
         Terminator::Branch { cond, .. } | Terminator::Switch { value: cond, .. } => {

@@ -1,38 +1,38 @@
-//! Absenkungs-Tests: Vire-AST → crates/ir. Prüfen die M2-Semantik strukturell
-//! (ohne clang) — Einstiegspunkt, Rückgabetyp-Schätzung, Binding-vs-Zuweisung,
-//! Schleifen/Kontrollfluss.
+//! Lowering tests: Vire AST → crates/ir. Check the M2 semantics structurally
+//! (without clang) — entry point, return-type estimation, binding-vs-assignment,
+//! loops/control flow.
 
 use fastllvm_ir::Ty;
 use vire::{expand_macros, infer_module, inline_recursion, lower_module, parse};
 
 #[test]
-fn field_packing_i32_mit_mischarithmetik() {
-    // `I32`-Felder packen auf 4 Byte (RAM), UND gemischte i32/i64-Arithmetik
-    // (gepacktes Feld + i64-Local) wird jetzt korrekt vorzeichen-erweitert
-    // (vorher: Backend-Typfehler `i32 aber i64 erwartet`).
+fn field_packing_i32_with_mixed_arithmetic() {
+    // `I32` fields pack to 4 bytes (RAM), AND mixed i32/i64 arithmetic
+    // (packed field + i64 local) is now correctly sign-extended
+    // (previously: backend type error `i32 but i64 expected`).
     let p = lower("type T { small: I32  big: Int }\nfn main() {\n mut t = T(5, 1000000000000)\n print(t.big + t.small)\n}\n");
-    // Feld `small` ist i32 im Struct (gepackt).
+    // Field `small` is i32 in the struct (packed).
     let t = p.classes.iter().find(|c| c.name == "T").expect("T");
     let small = t.fields.iter().find(|f| f.name == "small").expect("small");
     assert_eq!(small.ty, Ty::I32, "I32-Feld muss als i32 gepackt sein");
-    // main enthält einen Convert (i32→i64 sext) für die Mischarithmetik.
+    // main contains a Convert (i32→i64 sext) for the mixed arithmetic.
     let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
     let has_convert = main.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Convert(_))));
     assert!(has_convert, "gemischte i32/i64-Arithmetik muss das i32-Feld auf i64 erweitern");
 }
 
 #[test]
-fn trait_objekte_dynamischer_dispatch() {
-    // `fn f(s: Shape)` + `s.area()` → dynamischer Dispatch (CallVirtual über die
-    // Vtable), weil der konkrete Typ erst zur Laufzeit feststeht. Der Trait wird
-    // als Interface registriert, Impls füllen die Vtable-Slots.
+fn trait_objects_dynamic_dispatch() {
+    // `fn f(s: Shape)` + `s.area()` → dynamic dispatch (CallVirtual through the
+    // vtable), because the concrete type is only known at runtime. The trait is
+    // registered as an interface, impls fill the vtable slots.
     let src = "trait Shape {\n fn area(self) -> Int\n}\ntype Circle { r: Int }\nimpl Shape for Circle {\n fn area(self) -> Int { self.r * self.r }\n}\nfn describe(s: Shape) -> Int {\n s.area()\n}\nfn main() { print(describe(Circle(5))) }\n";
     let p = lower(src);
-    // describe ruft area() virtuell (CallVirtual), nicht statisch.
+    // describe calls area() virtually (CallVirtual), not statically.
     let describe = p.functions.iter().find(|f| f.name == "describe").expect("describe");
     let has_virtual = describe.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::CallVirtual { class, name, .. } if class == "Shape" && name == "area"));
     assert!(has_virtual, "trait-typisierter Empfänger muss CallVirtual auf Shape.area emittieren");
-    // Der Trait ist als Interface registriert; Circle implementiert ihn.
+    // The trait is registered as an interface; Circle implements it.
     let shape = p.classes.iter().find(|c| c.name == "Shape").expect("Shape-Interface");
     assert!(shape.is_interface, "Trait muss als Interface registriert sein");
     let circle = p.classes.iter().find(|c| c.name == "Circle").expect("Circle");
@@ -40,8 +40,8 @@ fn trait_objekte_dynamischer_dispatch() {
 }
 
 #[test]
-fn rueckgabetyp_kurzform_gt() {
-    // `> T` als Kurzform für `-> T` beim Rückgabetyp; `->` gilt weiter.
+fn return_type_shorthand_gt() {
+    // `> T` as shorthand for `-> T` in the return type; `->` still applies.
     let p = lower("fn add(a: Int, b: Int) > Int { a + b }\nfn classic(n: Int) -> Int { n * n }\nfn main() { print(add(3, 4))  print(classic(5)) }\n");
     let add = p.functions.iter().find(|f| f.name == "add").expect("add");
     assert_eq!(add.ret, Ty::I64, "`> Int` muss den Rückgabetyp korrekt setzen");
@@ -50,10 +50,10 @@ fn rueckgabetyp_kurzform_gt() {
 }
 
 #[test]
-fn shallow_recursive_inlining_reduziert_selbstaufrufe() {
-    // fib: 2 Selbstaufrufe. Nach dem shallow-inline-Pass (Tiefe 2) hat der Rumpf
-    // deutlich MEHR Aufruf-Statements (aufgefaltete Kopien) und die verbleibenden
-    // Selbstaufrufe liegen tiefer — die Call-Zahl je Frame sinkt drastisch.
+fn shallow_recursive_inlining_reduces_self_calls() {
+    // fib: 2 self-calls. After the shallow-inline pass (depth 2) the body has
+    // significantly MORE call statements (unfolded copies) and the remaining
+    // self-calls sit deeper — the call count per frame drops drastically.
     let (mut m, _) = parse("fn fib(n: Int) -> Int {\n if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\nfn main() { print(fib(10)) }\n");
     expand_macros(&mut m).unwrap();
     inline_recursion(&mut m);
@@ -61,13 +61,13 @@ fn shallow_recursive_inlining_reduziert_selbstaufrufe() {
     let p = lower_module(&m).unwrap();
     let fib = p.functions.iter().find(|f| f.name == "fib").expect("fib");
     let calls = fib.blocks.iter().flat_map(|b| &b.statements).filter(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "fib")).count();
-    // Naiv wären es 2 Calls; nach Tiefe-2-Entfaltung stehen viele aufgefaltete
-    // fib-Calls im Rumpf (jeder Frame deckt 3 Ebenen ab).
+    // Naively there would be 2 calls; after depth-2 unfolding there are many
+    // unfolded fib calls in the body (each frame covers 3 levels).
     assert!(calls > 2, "shallow-inline muss die Selbstaufrufe auffalten (>2), fand {calls}");
 }
 
 fn lower(src: &str) -> fastllvm_ir::Program {
-    // Reale Pipeline: parsen → Makro-Expansion → Typinferenz → absenken.
+    // Real pipeline: parse → macro expansion → type inference → lowering.
     let (mut m, diags) = parse(src);
     assert!(diags.is_empty(), "Parse-Diagnosen: {diags:?}");
     expand_macros(&mut m).unwrap_or_else(|e| panic!("Makro-Expansion: {e:?}"));
@@ -77,35 +77,35 @@ fn lower(src: &str) -> fastllvm_ir::Program {
 }
 
 #[test]
-fn main_wird_java_main_und_void() {
+fn main_becomes_java_main_and_void() {
     let p = lower("fn main() {\n print(1)\n}\n");
     let f = p.functions.iter().find(|f| f.name == "java_main").expect("java_main");
     assert_eq!(f.ret, Ty::Void);
 }
 
 #[test]
-fn tail_ausdruck_bestimmt_rueckgabetyp() {
-    // Ohne `-> T`: Rückgabetyp aus dem Tail geschätzt (Ident → I64-Default).
+fn tail_expression_determines_return_type() {
+    // Without `-> T`: return type estimated from the tail (Ident → I64 default).
     let p = lower("fn f(n) {\n mut a = n\n a\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
 }
 
 #[test]
-fn float_tail_wird_f64() {
+fn float_tail_becomes_f64() {
     let p = lower("fn f() {\n 1.5 + 2.5\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::F64);
 }
 
 #[test]
-fn binding_dann_zuweisung_kein_shadowing() {
-    // `mut s = 0` bindet; `s = s + 1` im Rumpf ist Zuweisung auf DENSELBEN Local
-    // (kein neuer). Erwartung: nur ein Local trägt `s` → Akku funktioniert.
+fn binding_then_assignment_no_shadowing() {
+    // `mut s = 0` binds; `s = s + 1` in the body is an assignment to the SAME local
+    // (not a new one). Expectation: only one local carries `s` → accumulator works.
     let p = lower("fn main() {\n mut s = 0\n for i in 0..3 { s = s + i }\n print(s)\n}\n");
     let f = p.functions.iter().find(|f| f.name == "java_main").unwrap();
-    // Der Akku-Local (0) wird mehrfach zugewiesen (Init + Reassign in der
-    // Schleife), nicht je Iteration frisch gebunden (kein Shadowing).
+    // The accumulator local (0) is assigned multiple times (init + reassign in the
+    // loop), not freshly bound each iteration (no shadowing).
     let assigns_to_zero = f.blocks.iter().flat_map(|b| &b.statements).filter(|s| {
         matches!(s, fastllvm_ir::Statement::Assign(l, _) if l.0 == 0)
     }).count();
@@ -113,21 +113,21 @@ fn binding_dann_zuweisung_kein_shadowing() {
 }
 
 #[test]
-fn if_als_ausdruck_liefert_wert() {
-    // `if a>b {a} else {b}` als Tail → Funktion gibt I64 zurück (nicht Void),
-    // und der merge-Block liefert ein Ergebnis-Local.
+fn if_as_expression_yields_value() {
+    // `if a>b {a} else {b}` as tail → function returns I64 (not Void),
+    // and the merge block yields a result local.
     let p = lower("fn max(a, b) {\n if a > b { a } else { b }\n}\n");
     let f = p.functions.iter().find(|f| f.name == "max").unwrap();
     assert_eq!(f.ret, Ty::I64);
-    // Der letzte Block gibt einen Wert zurück (Return(Some(..))), kein Return(None).
+    // The last block returns a value (Return(Some(..))), not Return(None).
     let has_value_return = f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(Some(_))));
     assert!(has_value_return, "if-Ausdruck muss einen Wert zurückgeben");
 }
 
 #[test]
-fn string_literale_landen_im_pool() {
+fn string_literals_land_in_pool() {
     let p = lower("fn main() {\n print(\"a\")\n print(\"b\")\n print(\"a\")\n}\n");
-    // Zwei eindeutige Literale (a dedupliziert), print(str)→jrt_println_str.
+    // Two unique literals (a deduplicated), print(str)→jrt_println_str.
     assert_eq!(p.strings, vec!["a".to_string(), "b".to_string()]);
     let calls_str = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_println_str")
@@ -136,15 +136,15 @@ fn string_literale_landen_im_pool() {
 }
 
 #[test]
-fn produkttyp_new_und_feldzugriff() {
+fn product_type_new_and_field_access() {
     let src = "type P {\n x: Int\n y: Int\n}\nfn main() {\n mut p = P(3, 4)\n print(p.x)\n}\n";
     let p = lower(src);
-    // Klasse P registriert mit zwei I64-Feldern.
+    // Class P registered with two I64 fields.
     let c = p.classes.iter().find(|c| c.name == "P").expect("Klasse P");
     assert_eq!(c.fields.len(), 2);
     assert_eq!(c.fields[0].name, "x");
     assert_eq!(c.fields[0].ty, Ty::I64);
-    // Konstruktion → New + zwei PutField; Zugriff → GetField.
+    // Construction → New + two PutField; access → GetField.
     let stmts: Vec<_> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).collect();
     assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::New { class, .. } if class == "P")));
     assert_eq!(stmts.iter().filter(|s| matches!(s, fastllvm_ir::Statement::PutField { .. })).count(), 2);
@@ -152,18 +152,18 @@ fn produkttyp_new_und_feldzugriff() {
 }
 
 #[test]
-fn feldmutation_erzeugt_putfield() {
+fn field_mutation_produces_putfield() {
     let src = "type C {\n n: Int\n}\nfn main() {\n mut c = C(0)\n c.n = 5\n c.n += 1\n}\n";
     let p = lower(src);
     let puts = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .filter(|s| matches!(s, fastllvm_ir::Statement::PutField { field, .. } if field == "n")).count();
-    // 1× Konstruktion + `= 5` + `+= 1` = 3 PutField auf n.
+    // 1× construction + `= 5` + `+= 1` = 3 PutField on n.
     assert_eq!(puts, 3);
 }
 
 #[test]
-fn capsule_umklammert_rumpf_mit_arena() {
-    // Reine Form: arena_push vor dem Rumpf, arena_pop danach; Skalar-Ergebnis raus.
+fn capsule_wraps_body_with_arena() {
+    // Pure form: arena_push before the body, arena_pop afterward; scalar result out.
     let p = lower("fn f(n) {\n capsule(n) {\n mut s = 0\n s = s + n\n s\n }\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
@@ -175,8 +175,8 @@ fn capsule_umklammert_rumpf_mit_arena() {
 }
 
 #[test]
-fn capsule_ref_ergebnis_ist_fehler() {
-    // Objekt-Ergebnis würde in die freigegebene Arena zeigen → harter Fehler.
+fn capsule_ref_result_is_error() {
+    // An object result would point into the freed arena → hard error.
     let (mut m, _) = parse("type P {\n x: Int\n}\nfn f(n) {\n capsule(n) {\n P(n)\n }\n}\n");
     let _ = infer_module(&mut m);
     let errs = lower_module(&m).unwrap_err();
@@ -184,17 +184,17 @@ fn capsule_ref_ergebnis_ist_fehler() {
 }
 
 #[test]
-fn capsule_objekt_eingabe_ist_fehler() {
-    // Der gefährliche Fall (aliasierte Ref-Eingabe) muss ein HARTER Fehler sein,
-    // kein stiller Stub — sonst verspräche capsule Containment ohne es zu liefern.
+fn capsule_object_input_is_error() {
+    // The dangerous case (aliased ref input) must be a HARD error,
+    // not a silent stub — otherwise capsule would promise containment without delivering it.
     let (m, _) = parse("type P {\n x: Int\n}\nfn f(p: P) -> Int {\n capsule(p) {\n p.x\n }\n}\n");
     let errs = lower_module(&m).unwrap_err();
     assert!(errs.iter().any(|e| e.contains("capsule") && e.contains("Objekt-Eingabe")));
 }
 
 #[test]
-fn null_senkt_zu_constnull() {
-    // `null` (Mess-Bootstrap) → ConstNull; erlaubt verkettete/zyklische Graphen.
+fn null_lowers_to_constnull() {
+    // `null` (measurement bootstrap) → ConstNull; allows linked/cyclic graphs.
     let src = "type N {\n next: N\n v: Int\n}\nfn main() {\n mut a = N(null, 1)\n print(a.v)\n}\n";
     let p = lower(src);
     let has_null = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
@@ -204,21 +204,21 @@ fn null_senkt_zu_constnull() {
 }
 
 #[test]
-fn return_statement_liefert_typisierten_wert() {
-    // Funktion, deren Wert aus einem `return`-Statement kommt (kein Tail): der
-    // unerreichbare Fallthrough muss typkorrekt terminieren, nicht `ret void`.
+fn return_statement_yields_typed_value() {
+    // Function whose value comes from a `return` statement (no tail): the
+    // unreachable fallthrough must terminate type-correctly, not `ret void`.
     let p = lower("fn f(n) {\n mut s = 0\n s = s + n\n return s\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
-    // Kein Return(None) in einer I64-Funktion.
+    // No Return(None) in an I64 function.
     let has_void_return = f.blocks.iter().any(|b| matches!(&b.terminator, fastllvm_ir::Terminator::Return(None)));
     assert!(!has_void_return, "I64-Funktion darf kein Return(None) haben");
 }
 
 #[test]
-fn extern_c_aufruf_loest_direkt_auf() {
-    // extern "C"-Signatur registriert → Aufruf lowert als direkter Call (kein
-    // Mangling); das Backend deklariert, clang linkt.
+fn extern_c_call_resolves_directly() {
+    // extern "C" signature registered → call lowers as a direct call (no
+    // mangling); the backend declares, clang links.
     let p = lower("extern \"C\" {\n fn sqrt(x: F64) -> F64\n}\nfn main() {\n print(sqrt(16.0))\n}\n");
     let calls_sqrt = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "sqrt")
@@ -227,19 +227,19 @@ fn extern_c_aufruf_loest_direkt_auf() {
 }
 
 #[test]
-fn break_ausserhalb_schleife_ist_fehler() {
+fn break_outside_loop_is_error() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());
 }
 
 #[test]
-fn methoden_und_impl_bloecke() {
+fn methods_and_impl_blocks() {
     let src = "type P {\n x: Int\n y: Int\n}\nimpl P {\n fn sum(self) -> Int { self.x + self.y }\n}\nfn main() {\n mut p = P(3, 4)\n print(p.sum())\n}\n";
     let p = lower(src);
-    // Methode als Funktion `P.sum` mit self-Ref-Parameter registriert + abgesenkt.
+    // Method registered + lowered as function `P.sum` with a self-ref parameter.
     let m = p.functions.iter().find(|f| f.name == "P.sum").expect("P.sum");
     assert_eq!(m.params.first().copied(), Some(Ty::Ref)); // self
-    // Aufrufstelle emittiert Call(P.sum, [p]).
+    // Call site emits Call(P.sum, [p]).
     let calls = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "P.sum")
     });
@@ -247,13 +247,13 @@ fn methoden_und_impl_bloecke() {
 }
 
 #[test]
-fn summentyp_und_match() {
+fn sum_type_and_match() {
     let src = "type Sh {\n Circle(r: Int)\n Rect(w: Int, h: Int)\n Empty\n}\nfn area(s: Sh) -> Int {\n match s {\n Circle(r) -> r * r\n Rect(w, h) -> w * h\n Empty -> 0\n }\n}\nfn main() {\n print(area(Circle(3)))\n}\n";
     let p = lower(src);
-    // Getaggte Klasse Sh mit __tag als erstem Feld.
+    // Tagged class Sh with __tag as the first field.
     let c = p.classes.iter().find(|c| c.name == "Sh").expect("Sh");
     assert_eq!(c.fields[0].name, "__tag");
-    // Konstruktion setzt __tag; match liest __tag (GetField __tag).
+    // Construction sets __tag; match reads __tag (GetField __tag).
     let reads_tag = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "__tag")
     });
@@ -261,8 +261,8 @@ fn summentyp_und_match() {
 }
 
 #[test]
-fn listen_und_comprehensions() {
-    // List-Literal → NewArray+ArrayStore; Comprehension mit Filter → NewArray + Loop.
+fn lists_and_comprehensions() {
+    // List literal → NewArray+ArrayStore; comprehension with filter → NewArray + Loop.
     let p = lower("fn main() {\n mut xs = [1, 2, 3]\n mut ys = [x * x for x in xs if x > 1]\n print(ys.len())\n}\n");
     let stmts: Vec<_> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).collect();
     assert!(stmts.iter().any(|s| matches!(s, fastllvm_ir::Statement::NewArray { .. })), "List/Comprehension braucht NewArray");
@@ -271,8 +271,8 @@ fn listen_und_comprehensions() {
 }
 
 #[test]
-fn match_erschoepfung_ist_pflicht() {
-    // Nicht-erschöpfendes match = HARTER FEHLER (kein stiller Default mehr).
+fn match_exhaustiveness_is_mandatory() {
+    // Non-exhaustive match = HARD ERROR (no more silent default).
     let (mut m, _) = parse("type T {\n A(x: Int)\n B\n}\nfn f(t: T) -> Int {\n match t {\n A(x) -> x\n }\n}\n");
     let _ = infer_module(&mut m);
     let errs = lower_module(&m).unwrap_err();
@@ -280,15 +280,15 @@ fn match_erschoepfung_ist_pflicht() {
 }
 
 #[test]
-fn match_verschachtelt_bindet_korrekt() {
-    // Verschachteltes Muster B(A(y)) bindet y (kein stilles Ignorieren mehr).
+fn match_nested_binds_correctly() {
+    // Nested pattern B(A(y)) binds y (no more silent ignoring).
     let src = "type T {\n A(x: Int)\n B(i: T)\n C\n}\nfn f(t: T) -> Int {\n match t {\n B(A(y)) -> y\n A(x) -> x\n B(z) -> 0\n C -> 0\n }\n}\nfn main() {\n print(f(C))\n}\n";
-    let p = lower(src); // kompiliert = erschöpfend + verschachtelt akzeptiert
+    let p = lower(src); // compiles = exhaustive + nested accepted
     assert!(p.functions.iter().any(|f| f.name == "f"));
 }
 
 #[test]
-fn string_concat_und_auto_konvert() {
+fn string_concat_and_auto_convert() {
     let p = lower("fn main() {\n mut n = 42\n print(\"n=\" + n)\n}\n");
     let calls: Vec<&str> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
@@ -297,8 +297,8 @@ fn string_concat_und_auto_konvert() {
 }
 
 #[test]
-fn generics_monomorphisieren_pro_typ() {
-    // id[T] wird pro Aufruf-Typ instanziiert: id$Int, id$Float.
+fn generics_monomorphize_per_type() {
+    // id[T] is instantiated per call type: id$Int, id$Float.
     let p = lower("fn id[T](x: T) -> T { x }\nfn main() {\n print(id(1))\n print(id(2.5))\n}\n");
     let names: Vec<&str> = p.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(names.iter().any(|n| n.starts_with("id$Int")), "id$Int-Instanz fehlt: {names:?}");
@@ -306,9 +306,9 @@ fn generics_monomorphisieren_pro_typ() {
 }
 
 #[test]
-fn auto_arena_promoviert_nicht_entkommende_schleife() {
-    // Schleife, die eine temporäre Struktur alloziert, einen Skalar reduziert und
-    // sie verwirft → per-Iteration-Arena (jrt_arena_push/pop im Rumpf).
+fn auto_arena_promotes_non_escaping_loop() {
+    // Loop that allocates a temporary structure, reduces a scalar and
+    // discards it → per-iteration arena (jrt_arena_push/pop in the body).
     let src = "type Tree { l: Tree  r: Tree }\nfn make(d: Int) -> Tree {\n if d == 0 { Tree(null, null) } else { Tree(make(d - 1), make(d - 1)) }\n}\nfn check(t: Tree, d: Int) -> Int {\n if d == 0 { 1 } else { 1 + check(t.l, d - 1) + check(t.r, d - 1) }\n}\nfn main() {\n mut s = 0\n mut n = 0\n while n < 10 {\n s = s + check(make(5), 5)\n n = n + 1\n }\n print(s)\n}\n";
     let p = lower(src);
     let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
@@ -318,10 +318,10 @@ fn auto_arena_promoviert_nicht_entkommende_schleife() {
 }
 
 #[test]
-fn auto_arena_meidet_entkommende_schleife() {
-    // Schleife, die eine Liste BAUT (frische Node fließt in die äußere `head`,
-    // wird nach der Schleife genutzt) → darf NICHT arena-promotet werden
-    // (sonst dangling). `head = Node(head, i)` ist ein Let einer äußeren Ref.
+fn auto_arena_avoids_escaping_loop() {
+    // Loop that BUILDS a list (a fresh node flows into the outer `head`,
+    // used after the loop) → must NOT be arena-promoted
+    // (otherwise dangling). `head = Node(head, i)` is a let of an outer ref.
     let src = "type Node { next: Node  v: Int }\nfn main() {\n mut head = null\n mut i = 0\n while i < 100 {\n head = Node(head, i)\n i = i + 1\n }\n mut s = 0\n mut cur = head\n while cur != null {\n s = s + cur.v\n cur = cur.next\n }\n print(s)\n}\n";
     let p = lower(src);
     let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
@@ -330,16 +330,16 @@ fn auto_arena_meidet_entkommende_schleife() {
 }
 
 #[test]
-fn makro_expandiert_und_ist_hygienisch() {
-    // add_one(x) führt ein lokales `tmp` ein. Aufruf mit einem Argument, das
-    // ebenfalls `tmp` heißt: das makro-lokale `tmp` wird gensym-umbenannt, fängt
-    // das Argument NICHT ein. Ergebnis 11 (10+1), nicht 2 (tmp+tmp).
+fn macro_expands_and_is_hygienic() {
+    // add_one(x) introduces a local `tmp`. Called with an argument that
+    // is also named `tmp`: the macro-local `tmp` is gensym-renamed and does
+    // NOT capture the argument. Result 11 (10+1), not 2 (tmp+tmp).
     let src = "macro add_one(x) = { mut tmp = 1\n x + tmp }\nfn main() {\n mut tmp = 10\n print(add_one(tmp))\n}\n";
     let p = lower(src);
-    // Makro-Definition ist verschwunden; nur main bleibt.
+    // The macro definition is gone; only main remains.
     let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
-    // Das eingeführte `tmp` wurde umbenannt → im IR steht eine Addition mit dem
-    // Argument (Local des Aufrufer-tmp) + der lokalen 1, kein Doppel-Argument.
+    // The introduced `tmp` was renamed → the IR has an addition of the
+    // argument (local of the caller's tmp) + the local 1, not a double argument.
     let adds = main.blocks.iter().flat_map(|b| &b.statements).filter(|s| {
         matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Add, ..)))
     }).count();
@@ -347,21 +347,21 @@ fn makro_expandiert_und_ist_hygienisch() {
 }
 
 #[test]
-fn makro_aritaetskonflikt_ist_fehler() {
+fn macro_arity_conflict_is_error() {
     let (mut m, _) = parse("macro pair(a, b) = a + b\nfn main() {\n print(pair(1))\n}\n");
     let errs = expand_macros(&mut m).unwrap_err();
     assert!(errs.iter().any(|e| e.contains("Makro")), "Aritätskonflikt muss Fehler sein: {errs:?}");
 }
 
 #[test]
-fn higher_order_inline_defunktionalisiert() {
-    // apply(f, x) mit Lambda-Argument → an der Aufrufstelle inline expandiert
-    // (kein Funktionszeiger); Capture über den Scope; das Template selbst wird
-    // NICHT als eigenständige Funktion emittiert.
+fn higher_order_inline_defunctionalized() {
+    // apply(f, x) with a lambda argument → expanded inline at the call site
+    // (no function pointer); capture over the scope; the template itself is
+    // NOT emitted as a standalone function.
     let src = "fn apply(f, x) -> Int {\n f(x)\n}\nfn main() {\n mut c = 10\n print(apply(y -> y + c, 5))\n}\n";
     let p = lower(src);
     assert!(!p.functions.iter().any(|f| f.name == "apply"), "Higher-Order-Template darf nicht eigenständig emittiert werden");
-    // Der Lambda-Rumpf (y + c) ist in main inline → ein Add mit der Capture c.
+    // The lambda body (y + c) is inlined in main → an Add with the capture c.
     let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
     let has_add = main.blocks.iter().flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Add, ..)))
@@ -370,9 +370,9 @@ fn higher_order_inline_defunktionalisiert() {
 }
 
 #[test]
-fn generische_produkttypen() {
-    // type Box[T] pro Typargument monomorphisiert: Box$Int, Box$Float —
-    // je mit dem korrekten Feldtyp (I64 vs F64).
+fn generic_product_types() {
+    // type Box[T] monomorphized per type argument: Box$Int, Box$Float —
+    // each with the correct field type (I64 vs F64).
     let src = "type Box[T] {\n value: T\n}\nfn main() {\n mut a = Box(42)\n mut b = Box(3.5)\n print(a.value)\n print(b.value)\n}\n";
     let p = lower(src);
     let bi = p.classes.iter().find(|c| c.name == "Box$Int").expect("Box$Int fehlt");
@@ -382,8 +382,8 @@ fn generische_produkttypen() {
 }
 
 #[test]
-fn generische_summentypen_typkorrekt() {
-    // Option[Float]: Some(3.5) trägt F64 (kein i64-Erasen → kein Truncation-Bug).
+fn generic_sum_types_type_correct() {
+    // Option[Float]: Some(3.5) carries F64 (no i64 erasure → no truncation bug).
     let src = "fn g() -> Option[Float] {\n Some(3.5)\n}\nfn main() {\n match g() {\n Some(x) -> print(x)\n None -> print(0.0)\n }\n}\n";
     let p = lower(src);
     let of = p.classes.iter().find(|c| c.name == "Option$Float").expect("Option$Float fehlt");
@@ -392,9 +392,9 @@ fn generische_summentypen_typkorrekt() {
 }
 
 #[test]
-fn generische_summen_erschoepfung_pflicht() {
-    // Nicht-erschöpfendes match auf typisierte Option = HARTER FEHLER (kein Loch
-    // durch die Instanz-Klasse Option$Float).
+fn generic_sum_exhaustiveness_mandatory() {
+    // Non-exhaustive match on a typed Option = HARD ERROR (no hole
+    // through the instance class Option$Float).
     let (mut m, _) = parse("fn g() -> Option[Float] {\n Some(1.5)\n}\nfn main() {\n match g() {\n Some(x) -> print(x)\n }\n}\n");
     let _ = infer_module(&mut m);
     let errs = lower_module(&m).unwrap_err();
@@ -402,11 +402,11 @@ fn generische_summen_erschoepfung_pflicht() {
 }
 
 #[test]
-fn option_result_und_try() {
-    // Eingebaute Summentypen + `?`-Propagation.
+fn option_result_and_try() {
+    // Built-in sum types + `?` propagation.
     let src = "fn d(a: Int, b: Int) -> Result {\n if b == 0 { Err(1) } else { Ok(a / b) }\n}\nfn c(a: Int, b: Int) -> Result {\n mut q = d(a, b)?\n Ok(q + 1)\n}\nfn main() {\n print(1)\n}\n";
     let p = lower(src);
-    // Result-Klasse registriert; `?` liest __tag + Ok_value.
+    // Result class registered; `?` reads __tag + Ok_value.
     assert!(p.classes.iter().any(|c| c.name == "Result"));
     let reads_ok = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "Ok_value")
@@ -415,7 +415,7 @@ fn option_result_und_try() {
 }
 
 #[test]
-fn wachsende_liste_und_map() {
+fn growing_list_and_map() {
     let p = lower("fn main() {\n mut xs = list()\n xs.push(1)\n print(xs.len())\n mut m = [1: 2]\n print(m.get(1))\n}\n");
     let calls: Vec<&str> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
@@ -424,19 +424,19 @@ fn wachsende_liste_und_map() {
 }
 
 #[test]
-fn lambda_inline_mit_capture() {
-    // `mut f = x -> x*k` fängt k; f(5) wird inline expandiert.
+fn lambda_inline_with_capture() {
+    // `mut f = x -> x*k` captures k; f(5) is expanded inline.
     let src = "fn main() {\n mut k = 10\n mut f = x -> x * k\n print(f(5))\n}\n";
     let p = lower(src);
-    // Inline: die Multiplikation landet im main-Body (kein separater Call an f).
+    // Inline: the multiplication lands in the main body (no separate call to f).
     let has_mul = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Mul, ..))));
     assert!(has_mul, "Lambda-Rumpf muss inline expandiert werden");
 }
 
 #[test]
-fn comptime_faltet_konstanten() {
-    // `comptime 2 + 3 * 4` → ConstI64(14), keine Laufzeit-Arithmetik.
+fn comptime_folds_constants() {
+    // `comptime 2 + 3 * 4` → ConstI64(14), no runtime arithmetic.
     let p = lower("fn main() {\n print(comptime 2 + 3 * 4)\n}\n");
     let has_arith = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(..))));
@@ -444,13 +444,13 @@ fn comptime_faltet_konstanten() {
 }
 
 #[test]
-fn traits_statische_dispatch() {
-    // `impl Show for Point` → Methode Point.show; `display[T: Show]` monomorphisiert
-    // und ruft die konkrete Impl (statische Dispatch, kein vtable).
+fn traits_static_dispatch() {
+    // `impl Show for Point` → method Point.show; `display[T: Show]` monomorphized
+    // and calls the concrete impl (static dispatch, no vtable).
     let src = "trait Show { fn show(self) -> Int }\ntype P { x: Int }\nimpl Show for P {\n fn show(self) -> Int { self.x }\n}\nfn display[T: Show](it: T) -> Int { it.show() }\nfn main() {\n print(display(P(9)))\n}\n";
     let p = lower(src);
     assert!(p.functions.iter().any(|f| f.name == "P.show"), "impl-Methode P.show fehlt");
-    // display$P-Instanz ruft P.show.
+    // The display$P instance calls P.show.
     let calls_show = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "P.show"));
     assert!(calls_show, "monomorphisierte display muss P.show rufen");

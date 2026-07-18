@@ -1,15 +1,15 @@
-//! Leichte, ganzprogrammweite Typinferenz (F5-Kern, monomorph).
+//! Lightweight, whole-program type inference (F5 core, monomorphic).
 //!
-//! Zweck bis zur vollen HM/bidirektionalen Inferenz: **un-annotierte
-//! Parametertypen ausfüllen**, damit z.B. Float-Funktionen ohne `: Float` korrekt
-//! absenken. Arbeitet über Union-Find auf dem skalaren Typgitter
-//! (I64/F64/I32/Ref/Void); alles Höhere (Generics/Traits/Referenztypen von
-//! Nutzertypen) bleibt späteren Stufen und wird hier konservativ als `Ref`/offen
-//! behandelt. Best-effort: bei Konflikten wird nicht abgebrochen, der betroffene
-//! Parameter bleibt un-annotiert (die Absenkung defaultet dann zu I64).
+//! Purpose until full HM/bidirectional inference: **fill in un-annotated
+//! parameter types**, so that e.g. float functions without `: Float` lower
+//! correctly. Works via union-find over the scalar type lattice
+//! (I64/F64/I32/Ref/Void); everything higher (generics/traits/reference types of
+//! user types) is left to later stages and is treated conservatively here as
+//! `Ref`/open. Best-effort: on conflicts it does not abort, the affected
+//! parameter stays un-annotated (lowering then defaults to I64).
 //!
-//! Ergebnis: `infer_module` **mutiert** den AST und schreibt konkrete Typen in
-//! bislang `None`-Parameter. Die Absenkung (`lower`) liest sie unverändert.
+//! Result: `infer_module` **mutates** the AST and writes concrete types into
+//! previously `None` parameters. Lowering (`lower`) reads them unchanged.
 
 use std::collections::HashMap;
 
@@ -26,11 +26,11 @@ enum T {
     Var(u32),
 }
 
-/// Union-Find über Typvariablen; konkrete Typen sind Blätter.
+/// Union-find over type variables; concrete types are leaves.
 struct Unifier {
-    parent: Vec<T>, // parent[v] für Var(v); nicht-Var = gebundener konkreter Typ
-    /// Kollisionen zweier konkreter Typen — das sind fehlgetypte Programme, die
-    /// gemeldet werden MÜSSEN (sonst still auf I64-Default miskompiliert).
+    parent: Vec<T>, // parent[v] for Var(v); non-Var = bound concrete type
+    /// Collisions of two concrete types — these are mistyped programs that
+    /// MUST be reported (otherwise silently miscompiled to the I64 default).
     conflicts: Vec<(T, T)>,
 }
 
@@ -48,14 +48,14 @@ impl Unifier {
         while let T::Var(v) = cur {
             let p = self.parent[v as usize];
             if p == T::Var(v) {
-                return cur; // freie Variable
+                return cur; // free variable
             }
             cur = p;
         }
         cur
     }
-    /// Vereinigt zwei Typen. Bei Konflikt (zwei verschiedene konkrete Typen)
-    /// passiert nichts (best-effort) — der Aufrufer verlässt sich nicht darauf.
+    /// Unifies two types. On conflict (two different concrete types)
+    /// nothing happens (best-effort) — the caller does not rely on it.
     fn unify(&mut self, a: T, b: T) {
         let (ra, rb) = (self.resolve(a), self.resolve(b));
         if ra == rb {
@@ -65,32 +65,32 @@ impl Unifier {
             (T::Var(v), other) | (other, T::Var(v)) => {
                 self.parent[v as usize] = other;
             }
-            // Konflikt zweier konkreter Typen: NICHT still schlucken — merken und
-            // melden. Der Default-Fallback (I64) darf ein fehlgetyptes Programm
-            // nicht klammheimlich durchwinken.
+            // Conflict of two concrete types: do NOT swallow silently — record and
+            // report. The default fallback (I64) must not quietly wave through a
+            // mistyped program.
             _ => self.conflicts.push((ra, rb)),
         }
     }
 }
 
-/// Globale Signatur einer Funktion: Typvariablen der Parameter + Rückgabe.
+/// Global signature of a function: type variables of the parameters + return.
 struct Sig {
     params: Vec<T>,
     ret: T,
 }
 
-/// Inferiert Parameter-/Rückgabetypen und schreibt sie in den AST. Liefert
-/// Konflikt-Diagnosen (fehlgetypte Programme) — die MÜSSEN gemeldet werden, denn
-/// der Default-Fallback (I64) würde sie sonst still miskompilieren.
+/// Infers parameter/return types and writes them into the AST. Returns
+/// conflict diagnostics (mistyped programs) — these MUST be reported, because
+/// the default fallback (I64) would otherwise silently miscompile them.
 pub fn infer_module(m: &mut Module) -> Vec<String> {
     let mut u = Unifier::new();
-    // 1. Globale Signaturvariablen anlegen (annotiert → konkret, sonst frisch).
+    // 1. Create global signature variables (annotated → concrete, otherwise fresh).
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            // Generische Funktionen NICHT monomorph typprüfen — ihr Rumpf ist
-            // polymorph (T ist kein konkreter Typ). Jede Monomorph.-Instanz wird
-            // beim Absenken erzeugt; Aufrufe `id(42)` bleiben hier unconstrained.
+            // Do NOT type-check generic functions monomorphically — their body is
+            // polymorphic (T is not a concrete type). Each monomorph. instance is
+            // created during lowering; calls `id(42)` stay unconstrained here.
             if !f.sig.generics.is_empty() {
                 continue;
             }
@@ -109,8 +109,8 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
             };
             sigs.insert(f.sig.name.clone(), Sig { params, ret });
         }
-        // extern "C"-Signaturen sind voll annotiert (C-ABI) → konkrete Typen,
-        // damit Aufrufe (`sqrt(x)`) ihre Argumente korrekt constrainen.
+        // extern "C" signatures are fully annotated (C-ABI) → concrete types,
+        // so that calls (`sqrt(x)`) constrain their arguments correctly.
         if let Item::Extern { items, .. } = it {
             for s in items {
                 let params = s.params.iter().map(|p| ann_ty(p.ty.as_ref()).unwrap_or(T::I64)).collect();
@@ -119,11 +119,11 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
             }
         }
     }
-    // 2. Rümpfe durchlaufen, Constraints sammeln.
+    // 2. Traverse bodies, collect constraints.
     for it in &m.items {
         if let Item::Fn(f) = it {
             if !f.sig.generics.is_empty() {
-                continue; // generisch → nicht monomorph inferieren
+                continue; // generic → do not infer monomorphically
             }
             if let Some(body) = &f.body {
                 let sig = &sigs[&f.sig.name];
@@ -140,8 +140,8 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
             }
         }
     }
-    // 3. Aufgelöste Parameter- UND Rückgabetypen zurückschreiben (nur bisher
-    //    un-annotierte). `main` bleibt außen vor — bleibt in der Absenkung Void.
+    // 3. Write back resolved parameter AND return types (only previously
+    //    un-annotated ones). `main` is left out — stays Void in lowering.
     let resolved: HashMap<String, (Vec<T>, T)> = sigs
         .iter()
         .map(|(n, s)| (n.clone(), (s.params.iter().map(|t| u.resolve(*t)).collect(), u.resolve(s.ret))))
@@ -165,8 +165,8 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
             }
         }
     }
-    // 4. Typkonflikte melden (dedupliziert). Best-effort-Inferenz, aber ein
-    //    erkannter Konflikt ist ein echter Typfehler, kein Rauschen.
+    // 4. Report type conflicts (deduplicated). Best-effort inference, but a
+    //    detected conflict is a real type error, not noise.
     let mut msgs: Vec<String> = u
         .conflicts
         .iter()
@@ -229,7 +229,7 @@ impl<'a> Ctx<'a> {
                 let vt = value.as_ref().map(|v| self.infer_expr(v)).unwrap_or_else(|| self.u.fresh());
                 if !mutable {
                     if let Some(existing) = self.lookup(name) {
-                        self.u.unify(existing, vt); // Zuweisung, kein neues Binding
+                        self.u.unify(existing, vt); // assignment, not a new binding
                         return;
                     }
                 }
@@ -260,9 +260,9 @@ impl<'a> Ctx<'a> {
                 self.infer_block(body, false);
             }
             Stmt::For { pat, iter, body, .. } => {
-                // `for i in a..b`: i:I64, Range-Enden I64. `for x in liste`: das
-                // Element-Typ ist der Inferenz (ohne Array-Typ) unbekannt → frische
-                // Variable, damit die Nutzung sie constraint (kein I64-Zwang).
+                // `for i in a..b`: i:I64, range ends I64. `for x in liste`: the
+                // element type is unknown to the inference (without array type) → fresh
+                // variable, so that the usage constrains it (no I64 coercion).
                 let is_range = matches!(iter, Expr::Range { .. });
                 if let Expr::Range { start, end, .. } = iter {
                     let s = self.infer_expr(start);
@@ -302,8 +302,8 @@ impl<'a> Ctx<'a> {
             Expr::Binary { op, lhs, rhs, .. } => {
                 let l = self.infer_expr(lhs);
                 let r = self.infer_expr(rhs);
-                // `+` mit einer Ref/String-Seite = String-Verkettung → NICHT
-                // unifizieren (Zahlen werden zur Laufzeit zu Strings), Ergebnis Ref.
+                // `+` with a Ref/String side = string concatenation → do NOT
+                // unify (numbers become strings at runtime), result Ref.
                 if matches!(op, BinOp::Add) {
                     let (rl, rr) = (self.u.resolve(l), self.u.resolve(r));
                     if rl == T::Ref || rr == T::Ref {
@@ -347,13 +347,13 @@ impl<'a> Ctx<'a> {
                 t
             }
             Expr::Block(b) => self.infer_block(b, false),
-            // `x as T` → Zieltyp (Argument frei, es wird konvertiert).
+            // `x as T` → target type (argument free, it is converted).
             Expr::Cast { inner, ty, .. } => {
                 self.infer_expr(inner);
                 ann_ty(Some(ty)).unwrap_or(T::I64)
             }
-            // Comprehension: Variable frisch binden (Element-Typ der Inferenz ohne
-            // Array-Typ unbekannt), elem/cond inferieren. Ergebnis = frisch (Array).
+            // Comprehension: bind the variable freshly (element type unknown to
+            // the inference without array type), infer elem/cond. Result = fresh (array).
             Expr::Comprehension { var, iter, elem, cond, .. } => {
                 self.infer_expr(iter);
                 self.scopes.push(std::collections::HashMap::new());
@@ -371,8 +371,8 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Annotationsname → skalarer Typ (analog `lower::ty_of`, aber im T-Gitter).
-/// Unbekannte/Nutzertypen → `Ref` (konservativ). None → None (frei).
+/// Annotation name → scalar type (analogous to `lower::ty_of`, but in the T lattice).
+/// Unknown/user types → `Ref` (conservative). None → None (free).
 fn ann_ty(t: Option<&Type>) -> Option<T> {
     let t = t?;
     Some(match t.name.as_str() {
@@ -387,7 +387,7 @@ fn ann_ty(t: Option<&Type>) -> Option<T> {
     })
 }
 
-/// T → Annotationsname für die Rückschrift (nur konkrete skalare Typen).
+/// T → annotation name for the write-back (only concrete scalar types).
 fn concrete_name(t: T) -> Option<&'static str> {
     match t {
         T::I64 => Some("Int"),

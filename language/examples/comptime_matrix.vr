@@ -1,0 +1,36 @@
+// Value generics + comptime: matrix sizes are type parameters → the size is
+// fixed at compile time, the data sits as a fixed array on the stack (no heap,
+// no RC), loops are unrollable. C++ template-metaprogramming territory,
+// but as ordinary code.
+
+type Matrix[T, comptime R: Int, comptime C: Int] {
+    data: [T; R * C]                              // size comptime → stack layout
+
+    fn get(self, r: Int, c: Int) -> T = self.data[r * C + c]
+
+    fn set(mut self, r: Int, c: Int, v: T) {
+        self.data[r * C + c] = v
+    }
+
+    // Dimension-correct multiplication: the compiler checks C == other.R at
+    // compile time (type error instead of runtime error on mismatched sizes).
+    fn mul[comptime K: Int](self, o: Matrix[T, C, K]) -> Matrix[T, R, K] {
+        mut out = Matrix[T, R, K]()
+        comptime for i in 0..R {                  // unrolled for small sizes
+            comptime for j in 0..K {
+                mut acc = zero[T]()
+                for k in 0..C { acc = acc + self.get(i, k) * o.get(k, j) }
+                out.set(i, j, acc)
+            }
+        }
+        out
+    }
+}
+
+fn main() {
+    a = Matrix[Float, 2, 3]()                     // 2×3
+    b = Matrix[Float, 3, 2]()                     // 3×2
+    c = a.mul(b)                                  // → Matrix[Float, 2, 2], checked
+    // a.mul(a)  // ERROR at compile time: 3 != 2 (dimensions do not match)
+    print(c.get(0, 0))
+}

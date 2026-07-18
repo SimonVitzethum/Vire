@@ -1,9 +1,9 @@
-//! fastjavac — Java-Classfiles → natives Binary.
+//! fastjavac — Java class files → native binary.
 //!
-//! Pipeline (DESIGN.md §2, Stufe 1 der Priorisierung §7):
-//!   .class → Parser → Mittel-IR → textuelles LLVM-IR → clang → Binary
+//! Pipeline (DESIGN.md §2, stage 1 of the prioritization §7):
+//!   .class → parser → mid-level IR → textual LLVM IR → clang → binary
 //!
-//! Aufruf: fastjavac [-o BIN] [--emit-ir] [--emit-llvm] KLASSE.class ...
+//! Usage: fastjavac [-o BIN] [--emit-ir] [--emit-llvm] CLASS.class ...
 
 use std::path::PathBuf;
 use std::process::{exit, Command};
@@ -49,9 +49,9 @@ fn main() {
         die("keine Eingabedateien (erwartet .class oder .jar)");
     }
 
-    // JARs entpacken (Closed-World-Sammlung): jede .class-Datei wird Input,
-    // die Manifest-`Main-Class` bestimmt den Einstiegspunkt. Das Extraktions-
-    // verzeichnis muss bis zum Ende der Kompilierung leben.
+    // Unpack JARs (closed-world collection): each .class file becomes an input,
+    // the manifest `Main-Class` determines the entry point. The extraction
+    // directory must live until the end of compilation.
     let extract_root = std::env::temp_dir().join(format!("fastjavac-jars-{}", std::process::id()));
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut manifest_main: Option<String> = None;
@@ -75,8 +75,8 @@ fn main() {
     }
     let main_class = main_override.or(manifest_main);
 
-    // Zweiphasig: erst alle Klassen registrieren (Closed World), dann
-    // absenken — Feld-/Methodenauflösung geht über Klassengrenzen.
+    // Two-phase: first register all classes (closed world), then
+    // lower — field/method resolution crosses class boundaries.
     let mut classfiles = Vec::new();
     for path in &inputs {
         let data = match std::fs::read(path) {
@@ -88,7 +88,7 @@ fn main() {
             Err(e) => return die(&format!("{}: {e}", path.display())),
         }
     }
-    // Klassendaten sind eingelesen — das JAR-Extraktionsverzeichnis kann weg.
+    // Class data has been read — the JAR extraction directory can go.
     let _ = std::fs::remove_dir_all(&extract_root);
 
     let mut program = fastllvm_ir::Program::default();
@@ -105,28 +105,27 @@ fn main() {
         }
     }
 
-    // Azyklisch beweisbar → Zyklen-Collector entfällt (nur wenn der Solver
-    // lief; ohne ihn konservativ Collector behalten).
+    // Provably acyclic → cycle collector is omitted (only if the solver
+    // ran; without it, conservatively keep the collector).
     let mut acyclic = false;
     if !no_solver {
         let mut s = fastllvm_solver::run(&mut program);
-        // Redundante Ref-Selbstkopien (RC-neutral) entfernen: javacs `aload`-
-        // Reloads einer schleifeninvarianten Referenz erzeugen sonst je Iteration
-        // ein retain/release-Paar, das Rust nicht hat.
+        // Remove redundant ref self-copies (RC-neutral): javac's `aload`
+        // reloads of a loop-invariant reference otherwise produce a
+        // retain/release pair per iteration that Rust does not have.
         let _rcopies = fastllvm_solver::elide_redundant_ref_copies(&mut program);
-        // Long-/Double-Vergleiche mit ihrem 0-Test verschmelzen: `jrt_lcmp`-Call
-        // je Schleifeniteration → native `icmp i64`. Vor der Bounds-Elision,
-        // damit deren Schleifenwächter-Erkennung direkt auf dem i64-Vergleich
-        // arbeitet.
+        // Fuse long/double comparisons with their 0-test: a `jrt_lcmp` call
+        // per loop iteration → native `icmp i64`. Before bounds elision, so
+        // its loop-guard detection operates directly on the i64 comparison.
         let _fused = fastllvm_solver::fuse_long_compares(&mut program);
-        // Bounds-Check-Elision vor der pending-Elision: beweisbar in-bounds
-        // markierte Array-Zugriffe sind throw-frei, sodass ihre pending-Prüfung
-        // gleich mitentfernt wird.
+        // Bounds-check elision before pending elision: array accesses proven
+        // in-bounds are throw-free, so their pending check is removed along
+        // with them.
         let _bounds = fastllvm_solver::elide_bounds(&mut program);
-        // Tote pending-Prüfungen VOR dem Inlining entfernen: dort steht die
-        // Prüfung noch im selben Block wie der (werfende) Aufruf; danach wandern
-        // eingeflochtene Rümpfe über Blockgrenzen und die Block-lokale Analyse
-        // wäre unsound.
+        // Remove dead pending checks BEFORE inlining: there the check still
+        // sits in the same block as the (throwing) call; afterwards, inlined
+        // bodies move across block boundaries and the block-local analysis
+        // would be unsound.
         let _elided = fastllvm_solver::elide_pending_checks(&mut program);
         s.inlined_calls = fastllvm_solver::inline_program(&mut program);
         s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
@@ -171,37 +170,36 @@ fn main() {
         return die(&format!("Schreiben nach {}: {e}", build_dir.display()));
     }
 
-    // Freestanding (seL4): keine libc, kein Startup. Ergebnis ist ein
-    // relozierbares Objekt (`clang -r`), das die Zielumgebung mit ihrem
-    // _start und den schwachen Hooks (jrt_debug_putchar/jrt_platform_halt)
-    // zusammenlinkt.
+    // Freestanding (seL4): no libc, no startup. The result is a relocatable
+    // object (`clang -r`) that the target environment links together with its
+    // own _start and the weak hooks (jrt_debug_putchar/jrt_platform_halt).
     let mut cmd = Command::new("clang");
     cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
-    // Phase 2: jede Funktion/Datenobjekt in eigene Section, ungenutzte beim
-    // Linken strippen — so zieht z.B. `Hello` nur die tatsächlich gerufenen
-    // jrt_-Funktionen statt der ganzen Runtime.
+    // Phase 2: each function/data object in its own section, strip unused
+    // ones at link time — so e.g. `Hello` pulls in only the jrt_ functions
+    // actually called instead of the whole runtime.
     cmd.args(["-ffunction-sections", "-fdata-sections"]);
-    // LTO: das generierte Programm und runtime.c werden als getrennte Objekte
-    // übersetzt — ohne LTO inlinet clang die Runtime-Helfer (jrt_iaload,
-    // jrt_pending_set, jrt_lcmp …) NICHT über die Dateigrenze in die heißen
-    // Schleifen. LTO ermöglicht genau dieses cross-file-Inlining.
+    // LTO: the generated program and runtime.c are compiled as separate
+    // objects — without LTO, clang does NOT inline the runtime helpers
+    // (jrt_iaload, jrt_pending_set, jrt_lcmp …) across the file boundary into
+    // the hot loops. LTO enables exactly this cross-file inlining.
     if !freestanding {
         cmd.arg("-flto");
     }
     if !freestanding {
         cmd.arg("-Wl,--gc-sections");
-        // Closed-World-AOT auf der Zielmaschine: für die native ISA übersetzen
-        // (AVX2/BMI etc.), wie man optimiertes C++ mit `-O3 -march=native` baut.
-        // Vektorisiert heiße Schleifen (Arithmetik 2,4× schneller als der
-        // SSE-Baseline-Build). Freestanding/Cross-Ziele bleiben ausgenommen.
+        // Closed-world AOT on the target machine: compile for the native ISA
+        // (AVX2/BMI etc.), as one builds optimized C++ with `-O3 -march=native`.
+        // Vectorizes hot loops (arithmetic 2.4× faster than the SSE baseline
+        // build). Freestanding/cross targets remain excluded.
         cmd.arg("-march=native");
     }
     if threads {
         cmd.args(["-DFASTLLVM_THREADS", "-pthread"]);
     }
     if acyclic {
-        // Phase 1: kein Typ zyklenfähig → Zyklen-Collector wird nicht mitgelinkt,
-        // retain/release werden farb-/pufferfrei.
+        // Phase 1: no type can form cycles → cycle collector is not linked in,
+        // retain/release become color-/buffer-free.
         cmd.arg("-DFASTLLVM_NO_CYCLES");
     }
     if freestanding {
@@ -228,16 +226,16 @@ fn die(msg: &str) {
     exit(1);
 }
 
-/// Entpackt ein JAR (ZIP) nach `<root>/<jar-stem>/` und liefert die Liste der
-/// enthaltenen `.class`-Dateien sowie die `Main-Class` aus dem Manifest.
-/// Nutzt `unzip` bzw. das JDK-`jar` (beide bei einer Java-Toolchain vorhanden);
-/// so bleibt der Compiler dependency-frei und die Runtime unberührt.
+/// Unpacks a JAR (ZIP) into `<root>/<jar-stem>/` and returns the list of
+/// contained `.class` files as well as the `Main-Class` from the manifest.
+/// Uses `unzip` or the JDK `jar` (both present with a Java toolchain);
+/// this keeps the compiler dependency-free and the runtime untouched.
 fn unpack_jar(jar: &std::path::Path, root: &std::path::Path) -> std::io::Result<(Vec<PathBuf>, Option<String>)> {
     let stem = jar.file_stem().and_then(|s| s.to_str()).unwrap_or("jar");
     let dir = root.join(stem);
     std::fs::create_dir_all(&dir)?;
     let jar_abs = std::fs::canonicalize(jar)?;
-    // Bevorzugt `unzip`, sonst `jar xf` (im Zielverzeichnis ausgeführt).
+    // Prefers `unzip`, otherwise `jar xf` (executed in the target directory).
     let ok = Command::new("unzip")
         .args(["-oq"])
         .arg(&jar_abs)
@@ -259,10 +257,10 @@ fn unpack_jar(jar: &std::path::Path, root: &std::path::Path) -> std::io::Result<
             "Entpacken fehlgeschlagen (weder `unzip` noch `jar` verfügbar)",
         ));
     }
-    // .class-Dateien rekursiv einsammeln.
+    // Collect .class files recursively.
     let mut classes = Vec::new();
     collect_classes(&dir, &mut classes)?;
-    // Main-Class aus dem Manifest (dotted → intern mit '/').
+    // Main-Class from the manifest (dotted → internal with '/').
     let manifest = dir.join("META-INF").join("MANIFEST.MF");
     let main = std::fs::read_to_string(&manifest).ok().and_then(|txt| {
         txt.lines()

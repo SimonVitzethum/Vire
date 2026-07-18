@@ -1,13 +1,13 @@
-//! Whole-Program Solver, Stufe 2 (DESIGN.md §7):
-//! Closed-World-Reachability (RTA), CHA-Devirtualisierung, Dead-Code-Pruning.
+//! Whole-program solver, stage 2 (DESIGN.md §7):
+//! closed-world reachability (RTA), CHA devirtualization, dead-code pruning.
 //!
-//! Rapid Type Analysis (Bacon/Sweeney 1996): erreichbare Methoden und
-//! instanziierte Klassen werden gemeinsam im Fixpunkt bestimmt — ein
-//! virtueller Call-Site kann nur Methoden von Klassen treffen, die
-//! irgendwo im erreichbaren Code mit `new` erzeugt werden. Sites mit
-//! genau einem Ziel werden zu direkten Calls umgeschrieben
-//! (Devirtualisierung nach Dean/Grove/Chambers 1995, sound unter
-//! Closed World); der Receiver behält seinen Null-Check.
+//! Rapid Type Analysis (Bacon/Sweeney 1996): reachable methods and
+//! instantiated classes are determined jointly in a fixpoint — a
+//! virtual call site can only reach methods of classes that are
+//! created with `new` somewhere in the reachable code. Sites with
+//! exactly one target are rewritten to direct calls
+//! (devirtualization after Dean/Grove/Chambers 1995, sound under
+//! closed world); the receiver keeps its null check.
 
 mod bounds;
 mod escape;
@@ -28,8 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
-/// Höchstzahl konkreter Zielklassen, bis zu der ein polymorpher Site zur
-/// Typ-Wächter-Kaskade wird (darüber bleibt Vtable-Dispatch günstiger).
+/// Maximum number of concrete target classes up to which a polymorphic site
+/// becomes a type-guard cascade (above this, vtable dispatch stays cheaper).
 const MAX_POLY_CLASSES: usize = 3;
 
 #[derive(Debug, Default)]
@@ -42,12 +42,12 @@ pub struct Stats {
     pub poly_devirtualized: usize,
     pub inlined_calls: usize,
     pub stack_allocated: usize,
-    /// Kein instanziierter Typ kann in einem Referenzzyklus liegen → der
-    /// Zyklen-Collector ist überflüssig (Phase 1 der Runtime-Elimination).
+    /// No instantiated type can lie in a reference cycle → the
+    /// cycle collector is superfluous (phase 1 of the runtime elimination).
     pub acyclic: bool,
 }
 
-/// Schlüssel eines virtuellen Call-Sites: statische Klasse + Name + Deskriptor.
+/// Key of a virtual call site: static class + name + descriptor.
 type SiteKey = (String, String, String);
 
 pub fn run(program: &mut Program) -> Stats {
@@ -60,10 +60,10 @@ pub fn run(program: &mut Program) -> Stats {
     let mut roots: Vec<String> = if func_index.contains_key("java_main") {
         vec!["java_main".to_string()]
     } else {
-        // Library-Modus: kein Einstiegspunkt bekannt → alles ist Wurzel.
+        // Library mode: no entry point known → everything is a root.
         func_index.keys().cloned().collect()
     };
-    // Statische Initialisierer laufen beim Programmstart → immer erreichbar.
+    // Static initializers run at program startup → always reachable.
     for c in &program.classes {
         if c.has_clinit {
             let clinit = fastllvm_ir::clinit_symbol(&c.name);
@@ -72,8 +72,8 @@ pub fn run(program: &mut Program) -> Stats {
             }
         }
     }
-    // Runnable.run()-Implementierungen werden über die native Thread-Trampoline
-    // aufgerufen (für RTA unsichtbar) → als Wurzeln behandeln.
+    // Runnable.run() implementations are invoked through the native thread
+    // trampoline (invisible to RTA) → treat them as roots.
     if program.class("java/lang/Runnable").is_some() {
         for c in &program.classes {
             let implements_runnable = c.interfaces.iter().any(|i| i == "java/lang/Runnable");
@@ -88,14 +88,14 @@ pub fn run(program: &mut Program) -> Stats {
 
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut instantiated: BTreeSet<String> = BTreeSet::new();
-    // Strings entstehen aus Literalen/Konkatenation, nicht via `new`; sie
-    // sind aber als Object-Subtyp instanziiert und dürfen Object-Methoden-
-    // Calls nicht fälschlich devirtualisieren lassen.
+    // Strings arise from literals/concatenation, not via `new`; but they
+    // are instantiated as an Object subtype and must not let Object-method
+    // calls be wrongly devirtualized.
     if program.class("java/lang/String").is_some() {
         instantiated.insert("java/lang/String".to_string());
     }
-    // Autoboxing-Wrapper gelten als instanziiert, sobald ihre valueOf-Box
-    // aufgerufen wird (sie entstehen nicht via `new`).
+    // Autoboxing wrappers count as instantiated as soon as their valueOf box
+    // is called (they do not arise via `new`).
     let calls_fn = |sym: &str| {
         program
             .functions
@@ -146,8 +146,8 @@ pub fn run(program: &mut Program) -> Stats {
                 }
             }
         }
-        // Virtuelle Sites gegen die aktuell instanziierten Klassen auflösen;
-        // neue Ziele stoßen die nächste Fixpunkt-Runde an.
+        // Resolve virtual sites against the currently instantiated classes;
+        // new targets trigger the next fixpoint round.
         for (class, name, desc) in &sites {
             for target in resolve_targets(program, &instantiated, class, name, desc) {
                 if !reachable.contains(&target) {
@@ -164,7 +164,7 @@ pub fn run(program: &mut Program) -> Stats {
     stats.instantiated_classes = instantiated.len();
     stats.virtual_sites = sites.len();
 
-    // --- CHA/RTA-Devirtualisierung: Sites mit genau einem Ziel ---
+    // --- CHA/RTA devirtualization: sites with exactly one target ---
     for f in &mut program.functions {
         for bb in &mut f.blocks {
             let mut i = 0;
@@ -175,8 +175,8 @@ pub fn run(program: &mut Program) -> Stats {
                         let Statement::CallVirtual { dest, args, .. } = bb.statements.remove(i) else {
                             unreachable!()
                         };
-                        // Java-Semantik: auch der devirtualisierte Aufruf
-                        // wirft NPE bei null-Receiver (abfangbar via CallGuarded).
+                        // Java semantics: the devirtualized call, too,
+                        // throws NPE on a null receiver (catchable via CallGuarded).
                         bb.statements.insert(
                             i,
                             Statement::CallGuarded { dest, func: targets.into_iter().next().unwrap(), args },
@@ -185,9 +185,9 @@ pub fn run(program: &mut Program) -> Stats {
                         i += 1;
                         continue;
                     }
-                    // Bikonditionale Devirtualisierung: wenige (≤3) konkrete
-                    // Zielklassen → Typ-Wächter-Kaskade aus Direkt-Aufrufen
-                    // statt Vtable-Dispatch (LLVM inlinet die Direkt-Calls).
+                    // Biconditional devirtualization: few (≤3) concrete
+                    // target classes → type-guard cascade of direct calls
+                    // instead of vtable dispatch (LLVM inlines the direct calls).
                     let pairs = resolve_target_pairs(&program.classes, &instantiated, class, name, desc);
                     let distinct: BTreeSet<&String> = pairs.iter().map(|(_, s)| s).collect();
                     if pairs.len() >= 2 && pairs.len() <= MAX_POLY_CLASSES && distinct.len() >= 2 {
@@ -205,7 +205,7 @@ pub fn run(program: &mut Program) -> Stats {
         }
     }
 
-    // --- Pruning: nur erreichbare Funktionen behalten ---
+    // --- Pruning: keep only reachable functions ---
     let before = program.functions.len();
     program.functions.retain(|f| reachable.contains(&f.name));
     stats.reachable_functions = program.functions.len();
@@ -214,8 +214,8 @@ pub fn run(program: &mut Program) -> Stats {
     stats
 }
 
-/// Mögliche Implementierungen eines virtuellen Sites unter den
-/// instanziierten Klassen (RTA-Zielmenge).
+/// Possible implementations of a virtual site among the
+/// instantiated classes (RTA target set).
 fn resolve_targets(
     program: &Program,
     instantiated: &BTreeSet<String>,
@@ -234,10 +234,10 @@ fn resolve_targets_ref(
     desc: &str,
 ) -> BTreeSet<String> {
     let class_of = |n: &str| classes.iter().find(|c| c.name == n);
-    // Erbt/implementiert `sub` den Typ `sup` (Klasse oder Interface)?
+    // Does `sub` inherit/implement the type `sup` (class or interface)?
     let is_subtype = |sub: &str, sup: &str| -> bool {
         if sup == "java/lang/Object" {
-            return true; // implizite Wurzel aller Klassen
+            return true; // implicit root of all classes
         }
         let mut stack = vec![sub.to_string()];
         let mut seen = BTreeSet::new();
@@ -264,7 +264,7 @@ fn resolve_targets_ref(
         if !is_subtype(inst, class) {
             continue;
         }
-        // Methodenauflösung ab der konkreten Klasse aufwärts (JVMS 5.4.6).
+        // Method resolution from the concrete class upward (JVMS 5.4.6).
         let mut cur = inst.as_str();
         loop {
             let Some(ci) = class_of(cur) else { break };
@@ -281,13 +281,13 @@ fn resolve_targets_ref(
     targets
 }
 
-/// Phase 1 der Runtime-Elimination: Kann *irgendein* instanziierter Typ in
-/// einem Referenzzyklus liegen? Baut den Typ-Referenzgraphen (Kante C→S, wenn
-/// C ein Ref-Feld vom Typ T hat und S ein instanziierter Subtyp von T ist;
-/// Arrays leiten über ihr Element durch) und sucht einen gerichteten Zyklus.
-/// Ist er azyklisch, genügt reine RC — der Zyklen-Collector entfällt.
-/// Konservativ: unbekannte/breite Feldtypen (`Object`) erzeugen Kanten zu
-/// allen Subtypen (lieber einen Zyklus zu viel annehmen als einen zu wenig).
+/// Phase 1 of the runtime elimination: can *any* instantiated type lie in
+/// a reference cycle? Builds the type reference graph (edge C→S if
+/// C has a ref field of type T and S is an instantiated subtype of T;
+/// arrays pass through via their element) and searches for a directed cycle.
+/// If it is acyclic, pure RC suffices — the cycle collector is dropped.
+/// Conservative: unknown/broad field types (`Object`) create edges to
+/// all subtypes (better to assume one cycle too many than one too few).
 fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
     let class_of = |n: &str| classes.iter().find(|c| c.name == n);
     let is_subtype = |sub: &str, sup: &str| -> bool {
@@ -314,10 +314,10 @@ fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
     };
     let insts: Vec<&str> = instantiated.iter().map(|s| s.as_str()).collect();
     let n = insts.len();
-    // Adjazenz über instanziierte Klassen.
+    // Adjacency over instantiated classes.
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (ci, &c) in insts.iter().enumerate() {
-        // Ref-Feld-Ziele inkl. geerbter Felder einsammeln.
+        // Collect ref-field targets including inherited fields.
         let mut targets: Vec<String> = Vec::new();
         let mut cur = Some(c.to_string());
         let mut guard = 0;
@@ -345,15 +345,15 @@ fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
     !has_cycle(&adj)
 }
 
-/// Gerichtete Zyklen-Suche (weiß/grau/schwarz-DFS, iterativ).
+/// Directed cycle search (white/gray/black DFS, iterative).
 fn has_cycle(adj: &[Vec<usize>]) -> bool {
     let n = adj.len();
-    let mut color = vec![0u8; n]; // 0=weiß, 1=grau, 2=schwarz
+    let mut color = vec![0u8; n]; // 0=white, 1=gray, 2=black
     for start in 0..n {
         if color[start] != 0 {
             continue;
         }
-        // Stack aus (Knoten, nächster-Nachbar-Index).
+        // Stack of (node, next-neighbor-index).
         let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
         color[start] = 1;
         while let Some((u, i)) = stack.last().copied() {
@@ -361,7 +361,7 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
                 stack.last_mut().unwrap().1 += 1;
                 let v = adj[u][i];
                 match color[v] {
-                    1 => return true, // grauer Nachbar → Rückkante → Zyklus
+                    1 => return true, // gray neighbor → back edge → cycle
                     0 => {
                         color[v] = 1;
                         stack.push((v, 0));
@@ -377,9 +377,9 @@ fn has_cycle(adj: &[Vec<usize>]) -> bool {
     false
 }
 
-/// Wie `resolve_targets_ref`, aber (konkrete Klasse → Symbol)-Paare: für die
-/// bikonditionale Devirtualisierung, die pro konkreter Klasse einen
-/// Vtable-Zeiger-Vergleich emittiert. Deterministisch sortiert.
+/// Like `resolve_targets_ref`, but (concrete class → symbol) pairs: for the
+/// biconditional devirtualization, which emits one vtable-pointer comparison
+/// per concrete class. Deterministically sorted.
 fn resolve_target_pairs(
     classes: &[ClassInfo],
     instantiated: &BTreeSet<String>,

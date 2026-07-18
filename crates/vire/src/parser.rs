@@ -1,5 +1,5 @@
-//! Vire-Parser: `Vec<Token> → ast::Module`. Rekursiver Abstieg für Items/
-//! Statements, Pratt (Präzedenzklettern) für Ausdrücke. Siehe sprache/PARSER.md.
+//! Vire parser: `Vec<Token> → ast::Module`. Recursive descent for items/
+//! statements, Pratt (precedence climbing) for expressions. See language/PARSER.md.
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
@@ -16,7 +16,7 @@ impl Parser {
         Parser { toks, pos: 0, diags: Vec::new() }
     }
 
-    // --- Token-Primitive ---
+    // --- Token primitives ---
     fn peek(&self) -> &Tok {
         &self.toks[self.pos.min(self.toks.len() - 1)].tok
     }
@@ -52,13 +52,13 @@ impl Parser {
     fn err(&mut self, msg: &str) {
         self.diags.push(Diag::error(msg, self.span()));
     }
-    /// Newlines (weiche Terminatoren) überspringen.
+    /// Skip newlines (soft terminators).
     fn skip_nl(&mut self) {
         while matches!(self.peek(), Tok::Newline) {
             self.bump();
         }
     }
-    /// Anweisungsende: Newline oder `;` (mehrere ok).
+    /// Statement end: newline or `;` (several ok).
     fn stmt_end(&mut self) {
         while matches!(self.peek(), Tok::Newline | Tok::Semi) {
             self.bump();
@@ -85,12 +85,12 @@ impl Parser {
         }
     }
 
-    // --- Modul & Items ---
+    // --- Module & items ---
     pub fn parse_module(&mut self) -> Module {
         let mut items = Vec::new();
-        // Top-Level-Anweisungen (Skript-Stil) werden gesammelt und zu einem
-        // impliziten `fn main()` zusammengefasst — Python-artig, ohne Boilerplate,
-        // null Laufzeitkosten (reine Frontend-Zucker).
+        // Top-level statements (script style) are collected and combined into an
+        // implicit `fn main()` — Python-like, without boilerplate, zero runtime
+        // cost (pure frontend sugar).
         let mut top_stmts = Vec::new();
         self.stmt_end();
         while !matches!(self.peek(), Tok::Eof) {
@@ -119,7 +119,7 @@ impl Parser {
         Module { items }
     }
 
-    /// Beginnt hier ein Item (nicht eine Top-Level-Anweisung)?
+    /// Does an item start here (rather than a top-level statement)?
     fn at_item_start(&self) -> bool {
         matches!(
             self.peek(),
@@ -150,13 +150,13 @@ impl Parser {
                 self.bump();
                 let mut path = vec![self.ident()];
                 while self.eat(&Tok::Dot) {
-                    // selektiv: use a.{b, c} – hier vereinfacht bis Zeilenende lesen
+                    // selective: use a.{b, c} – simplified here, read to end of line
                     if matches!(self.peek(), Tok::LBrace) {
                         break;
                     }
                     path.push(self.ident());
                 }
-                // Rest der Zeile (z.B. {..} / as ..) für M1 überspringen
+                // skip the rest of the line (e.g. {..} / as ..) for M1
                 while !matches!(self.peek(), Tok::Newline | Tok::Semi | Tok::Eof) {
                     self.bump();
                 }
@@ -165,7 +165,7 @@ impl Parser {
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
             Tok::Ident(n) if n == "cxx" => Some(self.parse_cxx()),
             Tok::Kw(Kw::Macro) => {
-                // `macro name(p, …) = <expr>` — Ausdrucks-Makro.
+                // `macro name(p, …) = <expr>` — expression macro.
                 let sp = self.span();
                 self.bump();
                 let name = self.ident();
@@ -202,7 +202,7 @@ impl Parser {
             let mut ty = None;
             let mut bounds = Vec::new();
             if self.eat(&Tok::Colon) {
-                // entweder `T: Trait + Trait` oder `comptime N: Int`
+                // either `T: Trait + Trait` or `comptime N: Int`
                 if is_comptime {
                     ty = Some(self.parse_type());
                 } else {
@@ -227,7 +227,7 @@ impl Parser {
         self.expect(&Tok::LParen, "'('");
         self.skip_nl();
         while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
-            // `self` als Empfänger
+            // `self` as receiver
             if self.at_kw(Kw::SelfLower) {
                 self.bump();
                 ps.push(Param { name: "self".into(), ty: None, default: None });
@@ -252,10 +252,10 @@ impl Parser {
         let name = self.ident();
         let generics = self.parse_generics();
         let params = self.parse_params();
-        // Rückgabetyp: `-> T` ODER das kürzere `> T`. Nach `)` gibt es keinen
-        // Ausdruckskontext, in dem `>` ein Vergleich sein könnte → eindeutig.
-        // (Match-Arme/Lambdas KÖNNEN das nicht: dort kollidierte `>` mit dem
-        // Vergleichsoperator bzw. dem Guard — s. sprache/SYNTAX-VEREINFACHUNG.md.)
+        // Return type: `-> T` OR the shorter `> T`. After `)` there is no
+        // expression context in which `>` could be a comparison → unambiguous.
+        // (Match arms/lambdas CANNOT do this: there `>` would collide with the
+        // comparison operator or the guard — see language/SYNTAX-SIMPLIFICATION.md.)
         let ret = if self.eat(&Tok::Arrow) || self.eat(&Tok::Gt) { Some(self.parse_type()) } else { None };
         FnSig { name, generics, params, ret, span: sp }
     }
@@ -263,7 +263,7 @@ impl Parser {
     fn parse_fn(&mut self, is_pub: bool) -> FnDef {
         let sig = self.parse_fn_sig();
         let body = if self.eat(&Tok::Eq) {
-            // Ausdrucksfunktion: `= expr`
+            // expression function: `= expr`
             let e = self.parse_expr(0);
             let span = self.span();
             Some(Block { stmts: vec![], tail: Some(Box::new(e)), span })
@@ -291,16 +291,16 @@ impl Parser {
             } else {
                 let mname = self.ident();
                 if self.eat(&Tok::Colon) {
-                    // Feld: name: Type
+                    // field: name: Type
                     let ty = self.parse_type();
                     fields.push(Field { name: mname, ty });
                 } else if self.eat(&Tok::LParen) {
-                    // Variante mit Feldern: Name(a: T, b: T) oder Name(T)
+                    // variant with fields: Name(a: T, b: T) or Name(T)
                     let mut vf = Vec::new();
                     let mut positional = true;
                     self.skip_nl();
                     while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
-                        // `name: Type` (benannt) oder nur `Type` (positional)
+                        // `name: Type` (named) or just `Type` (positional)
                         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon) {
                             positional = false;
                             let fname = self.ident();
@@ -318,7 +318,7 @@ impl Parser {
                     self.expect(&Tok::RParen, "')'");
                     variants.push(Variant { name: mname, fields: vf, positional });
                 } else {
-                    // datenlose Variante
+                    // dataless variant
                     variants.push(Variant { name: mname, fields: vec![], positional: true });
                 }
             }
@@ -347,7 +347,7 @@ impl Parser {
     fn parse_impl(&mut self) -> ImplDef {
         let sp = self.span();
         self.expect(&Tok::Kw(Kw::Impl), "'impl'");
-        // `impl Trait for Type` oder `impl Type`
+        // `impl Trait for Type` or `impl Type`
         let first = self.parse_type();
         let (trait_name, for_type) = if self.eat_kw(Kw::For) {
             (Some(first.name), self.parse_type())
@@ -365,7 +365,7 @@ impl Parser {
         ImplDef { trait_name, for_type, methods, span: sp }
     }
 
-    /// `link "lib"` / `link "a" link "b"` — kontextuelle Link-Direktiven.
+    /// `link "lib"` / `link "a" link "b"` — contextual link directives.
     fn parse_links(&mut self) -> Vec<String> {
         let mut links = Vec::new();
         while matches!(self.peek(), Tok::Ident(n) if n == "link") {
@@ -380,7 +380,7 @@ impl Parser {
         links
     }
 
-    /// `native "c++" [link "lib"]* """ …code… """` — eingebetteter Fremdcode.
+    /// `native "c++" [link "lib"]* """ …code… """` — embedded foreign code.
     fn parse_native(&mut self) -> Item {
         let sp = self.span();
         self.expect(&Tok::Kw(Kw::Native), "'native'");
@@ -404,7 +404,7 @@ impl Parser {
         let sp = self.span();
         self.bump(); // `cxx`
         let links = self.parse_links();
-        // Optionale Präambel als Triple-String (Includes/Usings).
+        // Optional preamble as a triple string (includes/usings).
         let preamble = if let Tok::Str(s) = self.peek().clone() {
             self.bump();
             s
@@ -438,8 +438,8 @@ impl Parser {
             Tok::Str(s) => s,
             _ => "C".into(),
         };
-        // Optional: `header "datei.h"` → Signaturen später aus dem C-Header
-        // generieren (auto-bindgen), kein `{}`-Block.
+        // Optional: `header "datei.h"` → generate signatures later from the C header
+        // (auto-bindgen), no `{}` block.
         let mut header = None;
         if matches!(self.peek(), Tok::Ident(n) if n == "header") {
             self.bump();
@@ -489,7 +489,7 @@ impl Parser {
         Type { name, args, borrowed, span: sp }
     }
 
-    // --- Blöcke & Statements ---
+    // --- Blocks & statements ---
     fn parse_block(&mut self) -> Block {
         let sp = self.span();
         self.expect(&Tok::LBrace, "'{'");
@@ -499,7 +499,7 @@ impl Parser {
         while !self.at(&Tok::RBrace) && !matches!(self.peek(), Tok::Eof) {
             let s = self.parse_stmt();
             let had_end = matches!(self.peek(), Tok::Newline | Tok::Semi);
-            // Letzter Ausdruck ohne folgende Anweisung → tail (Blockwert)
+            // last expression with no following statement → tail (block value)
             if let Stmt::Expr(e) = &s {
                 self.stmt_end();
                 if self.at(&Tok::RBrace) {
@@ -547,7 +547,7 @@ impl Parser {
             Tok::Kw(Kw::For) => {
                 self.bump();
                 let pat = self.parse_pattern();
-                // `for i, x in …` → Tupelmuster
+                // `for i, x in …` → tuple pattern
                 let pat = if self.eat(&Tok::Comma) {
                     let mut ps = vec![pat, self.parse_pattern()];
                     while self.eat(&Tok::Comma) {
@@ -568,7 +568,7 @@ impl Parser {
                 let value = if self.eat(&Tok::Eq) { Some(self.parse_expr(0)) } else { None };
                 Stmt::Let { mutable: true, name, value, span: sp }
             }
-            // `name = expr` (Bindung) vs. Ausdruck: Lookahead auf `ident =`
+            // `name = expr` (binding) vs. expression: lookahead for `ident =`
             Tok::Ident(_) if matches!(self.peek_at(1), Tok::Eq) => {
                 let name = self.ident();
                 self.bump(); // =
@@ -577,7 +577,7 @@ impl Parser {
             }
             _ => {
                 let e = self.parse_expr(0);
-                // Zuweisung? `lhs [op]= rhs`
+                // assignment? `lhs [op]= rhs`
                 let op = match self.peek() {
                     Tok::Eq => Some(None),
                     Tok::PlusEq => Some(Some(BinOp::Add)),
@@ -597,13 +597,13 @@ impl Parser {
         }
     }
 
-    // --- Ausdrücke (Pratt) ---
+    // --- Expressions (Pratt) ---
     fn parse_expr(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
         loop {
-            // Postfix (höchste Bindung): . ( [ ? as
+            // Postfix (highest binding): . ( [ ? as
             lhs = self.parse_postfix(lhs);
-            // Bereich `a..b` / `a..=b` — niedrigste Bindung (bp 1), nicht-assoziativ.
+            // Range `a..b` / `a..=b` — lowest binding (bp 1), non-associative.
             if matches!(self.peek(), Tok::DotDot | Tok::DotDotEq) && min_bp <= 1 {
                 let sp = self.span();
                 let inclusive = matches!(self.peek(), Tok::DotDotEq);
@@ -627,7 +627,7 @@ impl Parser {
         lhs
     }
 
-    /// Aktueller Infix-Operator + linke Bindungsstärke.
+    /// Current infix operator + left binding power.
     fn infix_op(&self) -> Option<(BinOp, u8)> {
         Some(match self.peek() {
             Tok::Kw(Kw::Or) => (BinOp::Or, 1),
@@ -678,7 +678,7 @@ impl Parser {
                 let inner = if self.at(&Tok::LBrace) {
                     Expr::Block(self.parse_block())
                 } else {
-                    self.parse_expr(1) // ganzen folgenden Ausdruck falten
+                    self.parse_expr(1) // fold the entire following expression
                 };
                 Expr::Comptime { inner: Box::new(inner), span: sp }
             }
@@ -688,7 +688,7 @@ impl Parser {
 
     fn parse_postfix(&mut self, mut e: Expr) -> Expr {
         loop {
-            // Leading-dot-Chains über Newlines hinweg zulassen:
+            // Allow leading-dot chains across newlines:
             if matches!(self.peek(), Tok::Newline) {
                 let mut k = 0;
                 while matches!(self.peek_at(k), Tok::Newline) {
@@ -737,7 +737,7 @@ impl Parser {
         self.expect(&Tok::LParen, "'('");
         self.skip_nl();
         while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
-            // benanntes Argument `name: expr` → Name für M1 verworfen
+            // named argument `name: expr` → name discarded for M1
             if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon) {
                 self.ident();
                 self.bump();
@@ -803,7 +803,7 @@ impl Parser {
                 Expr::Capsule { inputs, body, span: sp }
             }
             Tok::At => {
-                // Compiler-Intrinsic @name(...) — als Call auf Ident "@name"
+                // compiler intrinsic @name(...) — as a call on ident "@name"
                 self.bump();
                 let name = format!("@{}", self.ident());
                 Expr::Ident(name, sp)
@@ -821,10 +821,10 @@ impl Parser {
             }
             Tok::LParen => self.parse_paren_or_lambda(),
             Tok::LBracket => {
-                // Listen-Literal
+                // list literal
                 self.bump();
                 self.skip_nl();
-                // Leere Liste `[]` bzw. leere Map `[:]`.
+                // empty list `[]` or empty map `[:]`.
                 if self.at(&Tok::RBracket) {
                     self.bump();
                     return Expr::List(Vec::new(), sp);
@@ -835,7 +835,7 @@ impl Parser {
                     return Expr::MapLit(Vec::new(), sp);
                 }
                 let first = self.parse_expr(0);
-                // Map-Literal `[k: v, …]`
+                // map literal `[k: v, …]`
                 if self.eat(&Tok::Colon) {
                     let v0 = self.parse_expr(0);
                     let mut pairs = vec![(first, v0)];
@@ -853,7 +853,7 @@ impl Parser {
                     self.expect(&Tok::RBracket, "']'");
                     return Expr::MapLit(pairs, sp);
                 }
-                // Comprehension `[elem for var in iter (if cond)?]`
+                // comprehension `[elem for var in iter (if cond)?]`
                 if self.at_kw(Kw::For) {
                     self.bump(); // for
                     let var = self.ident();
@@ -889,8 +889,8 @@ impl Parser {
 
     fn parse_paren_or_lambda(&mut self) -> Expr {
         let sp = self.span();
-        // `(a, b) -> e` Lambda vs. `(e)` Klammerung: bis zur passenden `)` scannen
-        // und prüfen, ob danach `->` kommt.
+        // `(a, b) -> e` lambda vs. `(e)` parenthesization: scan to the matching `)`
+        // and check whether `->` follows.
         let mut depth = 0;
         let mut k = 0;
         loop {
@@ -1012,7 +1012,7 @@ impl Parser {
             }
             Tok::Ident(name) => {
                 self.bump();
-                // Konstruktor mit Feldern? `Name(p, …)` oder Pfad `Type.Variant`
+                // constructor with fields? `Name(p, …)` or path `Type.Variant`
                 let mut full = name;
                 while self.eat(&Tok::Dot) {
                     full.push('.');
@@ -1041,7 +1041,7 @@ impl Parser {
                 Pattern::Wildcard(sp)
             }
         };
-        // Oder-Muster `A | B`
+        // or-pattern `A | B`
         if self.at(&Tok::Pipe) {
             let mut alts = vec![p];
             while self.eat(&Tok::Pipe) {
@@ -1054,8 +1054,8 @@ impl Parser {
     }
 }
 
-/// Bequemer Einstieg: Quelltext → (Modul, Diagnosen).
-/// Baut aus gesammelten Top-Level-Anweisungen ein implizites `fn main()`.
+/// Convenient entry point: source text → (module, diagnostics).
+/// Builds an implicit `fn main()` from the collected top-level statements.
 fn synth_main(stmts: Vec<Stmt>) -> Item {
     use crate::ast::*;
     use crate::diag::Span;
@@ -1070,7 +1070,7 @@ pub fn parse(src: &str) -> (Module, Vec<Diag>) {
     parse_with_syntax(src, crate::syntax::Syntax::default())
 }
 
-/// Wie `parse`, aber mit nutzerdefinierter Schlüsselwort-Schreibweise.
+/// Like `parse`, but with user-defined keyword spelling.
 pub fn parse_with_syntax(src: &str, syntax: crate::syntax::Syntax) -> (Module, Vec<Diag>) {
     let (toks, mut diags) = crate::lexer::Lexer::with_syntax(src, syntax).lex();
     let mut p = Parser::new(toks);

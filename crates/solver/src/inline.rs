@@ -1,18 +1,18 @@
-//! Inliner auf der Mittel-IR.
+//! Inliner on the mid-level IR.
 //!
-//! Läuft nach der Devirtualisierung, damit devirtualisierte Sites inlinebar
-//! werden — Inlining schaltet dann LLVM-seitig alles Weitere frei
-//! (DESIGN.md §4). Konservativ: nur direkte Calls, nur kleine, nicht
-//! selbstrekursive Ziele.
+//! Runs after devirtualization so that devirtualized sites become inlinable
+//! — inlining then unlocks everything else on the LLVM side
+//! (DESIGN.md §4). Conservative: only direct calls, only small, non-
+//! self-recursive targets.
 
 use std::collections::BTreeMap;
 
 use fastllvm_ir::*;
 
-/// Obergrenze an Statements, bis zu der eine Funktion inlinet wird.
+/// Upper bound on statements up to which a function is inlined.
 const SIZE_LIMIT: usize = 16;
-/// Obergrenze an Inline-Vorgängen pro Aufrufer (gegen Code-Explosion
-/// durch Ketten kleiner Funktionen).
+/// Upper bound on inlining operations per caller (against code explosion
+/// from chains of small functions).
 const PER_CALLER_LIMIT: usize = 64;
 
 pub fn inline_program(program: &mut Program) -> usize {
@@ -23,12 +23,12 @@ pub fn inline_program(program: &mut Program) -> usize {
                 if *func == f.name)
         })
     };
-    // Exception-Fluss im Callee ist inlinebar: jeder Aufruf-Site hat einen
-    // pending-Check danach (throw_after), sodass eine aus dem geinlinten
-    // Rumpf propagierende Exception im Fortsetzungsblock erkannt wird; ein
-    // interner try/catch-Handler ist ohnehin selbstständig.
+    // Exception flow in the callee is inlinable: every call site has a
+    // pending check after it (throw_after), so an exception propagating out
+    // of the inlined body is detected in the continuation block; an
+    // internal try/catch handler is self-contained anyway.
 
-    // Kandidaten kopieren, damit Aufrufer mutierbar bleiben.
+    // Copy candidates so callers stay mutable.
     let candidates: BTreeMap<String, Function> = program
         .functions
         .iter()
@@ -64,11 +64,11 @@ fn find_call_site(f: &Function, candidates: &BTreeMap<String, Function>) -> Opti
     None
 }
 
-/// Ersetzt den (ggf. bewachten) Call in Block `blk` an Index `idx` durch den
-/// Rumpf des Callees: Block wird am Call geteilt, Callee-Blöcke (mit
-/// umnummerierten Locals und Blöcken) angehängt, Returns auf den
-/// Fortsetzungsblock umgebogen. Für `CallGuarded` wird ein Null-Check des
-/// Receivers als Wächter vorangestellt (abfangbare NPE bleibt erhalten).
+/// Replaces the (possibly guarded) call in block `blk` at index `idx` with the
+/// callee's body: the block is split at the call, callee blocks (with
+/// renumbered locals and blocks) are appended, returns are redirected to the
+/// continuation block. For `CallGuarded`, a null check of the
+/// receiver is prepended as a guard (the catchable NPE is preserved).
 fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String, Function>) {
     let (dest, func, args, guarded) = match f.blocks[blk].statements[idx].clone() {
         Statement::Call { dest, func, args } => (dest, func, args, false),
@@ -79,18 +79,18 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
 
     let local_off = f.locals.len() as u32;
     f.locals.extend(callee.locals.iter().copied());
-    // Bei bewachtem Aufruf: zwei zusätzliche synthetische Blöcke (npe, arg)
-    // vor den Callee-Blöcken; sonst beginnen die Callee-Blöcke direkt.
+    // For a guarded call: two additional synthetic blocks (npe, arg)
+    // before the callee blocks; otherwise the callee blocks start directly.
     let extra = if guarded { 2u32 } else { 0 };
     let block_off = f.blocks.len() as u32;
     let callee_first = block_off + extra;
     let cont_block = Block(callee_first + callee.blocks.len() as u32);
 
     let tail: Vec<Statement> = f.blocks[blk].statements.split_off(idx + 1);
-    f.blocks[blk].statements.pop(); // der (bewachte) Call selbst
+    f.blocks[blk].statements.pop(); // the (guarded) call itself
 
     if guarded {
-        // Aufrufer-Block: Receiver == null? → npe-Block, sonst arg-Block.
+        // Caller block: receiver == null? → npe block, otherwise arg block.
         let cmp = f.locals.len() as u32;
         f.locals.push(Ty::I32);
         f.blocks[blk].statements.push(Statement::Assign(
@@ -105,12 +105,12 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
                 else_blk: Block(block_off + 1), // arg
             },
         );
-        // npe-Block.
+        // npe block.
         f.blocks.push(BasicBlock {
             statements: vec![Statement::Call { dest: None, func: "jrt_throw_npe".into(), args: vec![] }],
             terminator: Terminator::Goto(cont_block),
         });
-        // arg-Block: Argument-Zuweisungen, dann in den Callee.
+        // arg block: argument assignments, then into the callee.
         let arg_assigns = args
             .into_iter()
             .enumerate()
@@ -122,7 +122,7 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
         return;
     }
 
-    // Ungewachter Call: Argument-Zuweisungen direkt im Aufrufer-Block.
+    // Unguarded call: argument assignments directly in the caller block.
     for (k, arg) in args.into_iter().enumerate() {
         f.blocks[blk]
             .statements
@@ -133,8 +133,8 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
     f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
 }
 
-/// Hängt die (umnummerierten) Callee-Blöcke an; Returns werden zu Sprüngen
-/// in den Fortsetzungsblock (mit Zuweisung des Rückgabewerts an `dest`).
+/// Appends the (renumbered) callee blocks; returns become jumps
+/// to the continuation block (with assignment of the return value to `dest`).
 fn splice_callee(
     f: &mut Function,
     callee: &Function,

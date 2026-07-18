@@ -1,81 +1,81 @@
-# Benchmark-Suite: Vire vs Rust vs C++ (clang++)
+# Benchmark suite: Vire vs Rust vs C++ (clang++)
 
-`./run.sh` — baut jede Benchmark in allen drei Sprachen (`vire build`, `rustc -O
--C target-cpu=native`, `clang++ -O2 -march=native`), misst best-of-5 und prüft
-Output-Gleichheit. C++ = **clang++** (LLVM, wie Vire) für einen fairen Codegen-
-Vergleich (g++/GCC weicht separat ab, s. REKURSION-INLINING.md).
+`./run.sh` — builds each benchmark in all three languages (`vire build`, `rustc -O
+-C target-cpu=native`, `clang++ -O2 -march=native`), measures best-of-5, and checks
+output equality. C++ = **clang++** (LLVM, like Vire) for a fair codegen
+comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 
-## Ergebnisse (best-of-5, dieselbe Maschine)
+## Results (best-of-5, the same machine)
 | Benchmark | Vire | Rust | clang++ | Vire/clang |
 |---|---|---|---|---|
-| bitmanip (popcount) | 0,187 | 0,186 | 0,186 | **1,00×** |
-| matmul (256³ naiv) | 0,012 | 0,010 | 0,013 | **0,97×** |
-| nbody (2000, 20 Steps) | 0,073 | 0,072 | 0,076 | **0,95×** |
-| montecarlo (20M, LCG) | 0,039 | 0,039 | 0,040 | **0,98×** |
-| vcall (dyn Dispatch, 100M) | 0,244 | 0,116 | 0,273 | **0,89×** |
-| sort (quicksort 2M) | 0,170 | 0,122 | 0,111 | 1,52× |
-| binsearch (10M Lookups) | 0,561 | 0,481 | 0,455 | 1,23× |
+| bitmanip (popcount) | 0.187 | 0.186 | 0.186 | **1.00×** |
+| matmul (256³ naive) | 0.012 | 0.010 | 0.013 | **0.97×** |
+| nbody (2000, 20 steps) | 0.073 | 0.072 | 0.076 | **0.95×** |
+| montecarlo (20M, LCG) | 0.039 | 0.039 | 0.040 | **0.98×** |
+| vcall (dyn dispatch, 100M) | 0.244 | 0.116 | 0.273 | **0.89×** |
+| sort (quicksort 2M) | 0.170 | 0.122 | 0.111 | 1.52× |
+| binsearch (10M lookups) | 0.561 | 0.481 | 0.455 | 1.23× |
 
-## Deutung
-- **Compute (bitmanip/matmul/nbody/montecarlo): Vire = clang-Parität, teils schneller**
-  (matmul/nbody 0,95–0,97×). Beide über LLVM → dasselbe Codegen-Optimum.
-- **vcall = Trait-Objekte (dyn Dispatch): Vire 0,89× — SCHNELLER als C++ `virtual`.**
-  Vires Vtable-Dispatch (diese Session gebaut) ist so schnell wie C++, hier sogar
-  etwas schneller. Rusts `dyn` ist nochmals schneller (0,116) — Rust devirtualisiert
-  den monomorphen Aufruf im Benchmark teilweise.
-- **Array-index-lastig (sort/binsearch): Vire 1,2–1,5× langsamer.** Der Grund sind
-  **Bounds-Checks** auf jedem Array-Zugriff — der Solver (`elide_bounds`) entfernt
-  viele, aber nicht die daten-abhängigen (quicksort-Partition, Binärsuche-mid). Das
-  ist der klare, ehrliche Optimierungspunkt (Rust hat dasselbe Prinzip, elidiert
-  aber mehr; C++ hat gar keine Checks). Der nächste Perf-Hebel für Vire.
-- **DIFFs in der Tabelle** sind reine Float-Formatierung (Vire/C++ `%g` wissenschaftlich
-  vs Rusts volle Präzision) bzw. Summierungs-Rundung (nbody) — identische Werte.
+## Interpretation
+- **Compute (bitmanip/matmul/nbody/montecarlo): Vire = clang parity, partly faster**
+  (matmul/nbody 0.95–0.97×). Both via LLVM → the same codegen optimum.
+- **vcall = trait objects (dyn dispatch): Vire 0.89× — FASTER than C++ `virtual`.**
+  Vire's vtable dispatch (built this session) is as fast as C++, here even
+  somewhat faster. Rust's `dyn` is faster still (0.116) — Rust devirtualizes
+  the monomorphic call in the benchmark partly.
+- **Array-index-heavy (sort/binsearch): Vire 1.2–1.5× slower.** The reason is
+  **bounds checks** on every array access — the solver (`elide_bounds`) removes
+  many, but not the data-dependent ones (quicksort partition, binary-search mid). That
+  is the clear, honest optimization point (Rust has the same principle, but elides
+  more; C++ has no checks at all). The next perf lever for Vire.
+- **DIFFs in the table** are pure float formatting (Vire/C++ `%g` scientific
+  vs Rust's full precision) or summation rounding (nbody) — identical values.
 
-## Kategorie-Abdeckung (ehrlich)
-Von den ~80 Kategorien der Wunschliste laufen die **compute-, speicher-, daten-
-struktur-, algorithmen- und numerik-gebundenen** — die hier gemessenen decken
-Mikrobenchmarks (Arith/Bit/Rekursion/Virtual-Calls/Closures/Generics — s. auch
-`../vire-lang/`), Numerik (Matmul/N-Body/Monte-Carlo), Algorithmen (Sort/Suche) und
-Speicher (Arena/RC/Heap — s. RAM-REDUKTION.md, ESCAPE-ARENA.md) ab.
+## Category coverage (honest)
+Of the ~80 categories on the wishlist, the **compute-, memory-, data-structure-,
+algorithm-, and numerics-bound** ones run — the ones measured here cover
+microbenchmarks (arith/bit/recursion/virtual-calls/closures/generics — see also
+`../vire-lang/`), numerics (matmul/N-body/Monte-Carlo), algorithms (sort/search), and
+memory (arena/RC/heap — see RAM-REDUCTION.md, ESCAPE-ARENA.md).
 
-**NICHT abgedeckt (brauchen Libraries/Features, die Vire noch nicht hat):**
-- **Textverarbeitung** (Regex, JSON, XML, CSV, YAML, TOML, HTML, Markdown) — braucht
-  eine String-/Parser-Bibliothek.
-- **Kryptographie** (AES, SHA, BLAKE3, RSA, ECC, Argon2) — braucht Krypto-Lib
-  (oder Byte-Arrays + Bit-Ops; `ArrKind::Byte` fehlt noch).
-- **Parallelität** (Threadpool, Work-Stealing, Channels, Lock-Free, Parallel-Sort) —
-  Vire hat nur den Java-`--threads`-Pfad (pthreads), keine High-Level-Nebenläufigkeit.
-- **I/O** (Dateisystem, mmap, TCP/UDP/HTTP/WebSocket) — braucht IO-/Netzwerk-Bibliothek.
-- **Komplexe Datenstrukturen** (B-Bäume, AVL/RB, Prio-Queue) — mangels typisierter
-  Collections (`List[T]`) und Array-als-Parameter (s.u.) nur eingeschränkt.
+**NOT covered (need libraries/features that Vire does not yet have):**
+- **Text processing** (regex, JSON, XML, CSV, YAML, TOML, HTML, Markdown) — needs
+  a string/parser library.
+- **Cryptography** (AES, SHA, BLAKE3, RSA, ECC, Argon2) — needs a crypto lib
+  (or byte arrays + bit ops; `ArrKind::Byte` still missing).
+- **Parallelism** (thread pool, work stealing, channels, lock-free, parallel sort) —
+  Vire has only the Java `--threads` path (pthreads), no high-level concurrency.
+- **I/O** (filesystem, mmap, TCP/UDP/HTTP/WebSocket) — needs an IO/network library.
+- **Complex data structures** (B-trees, AVL/RB, priority queue) — for lack of typed
+  collections (`List[T]`) and array-as-parameter (see below) only limited.
 
-## Bekannte Vire-Limitationen, die die Benchmarks berührt haben
-- **Array als Funktionsparameter** (`fn f(a: Ref)` + `a[i]`) → „kein bekanntes Array":
-  Ref-Params tragen keine ArrKind. sort wurde deshalb iterativ-in-main geschrieben
-  (Array bleibt lokal). Eine `Array[T]`-Param-Annotation wäre der Fix.
-- **`else` muss auf derselben Zeile wie `}`** stehen (Newline-terminierte Syntax).
+## Known Vire limitations that the benchmarks touched on
+- **Array as a function parameter** (`fn f(a: Ref)` + `a[i]`) → "no known array":
+  ref params carry no ArrKind. sort was therefore written iteratively-in-main
+  (the array stays local). An `Array[T]` param annotation would be the fix.
+- **`else` must be on the same line as `}`** (newline-terminated syntax).
 
-## Bounds-Checks: Analyse + ehrliche Decke (Nachtrag)
-Gemessene Decke mit `FASTLLVM_NO_BOUNDS=1` (Messmodus, alle Checks aus, unsound):
+## Bounds checks: analysis + honest ceiling (addendum)
+Measured ceiling with `FASTLLVM_NO_BOUNDS=1` (measurement mode, all checks off, unsound):
 
-| Benchmark | Vire (Checks) | Vire (ohne Checks) | Rust | clang++ |
+| Benchmark | Vire (checks) | Vire (no checks) | Rust | clang++ |
 |---|---|---|---|---|
-| sort | 0,168 | **0,132** (−21%) | 0,122 | 0,110 |
-| binsearch | 0,559 | **0,480** (−14%) | 0,479 | 0,458 |
+| sort | 0.168 | **0.132** (−21%) | 0.122 | 0.110 |
+| binsearch | 0.559 | **0.480** (−14%) | 0.479 | 0.458 |
 
-**Zwei Erkenntnisse:**
-1. **Bounds-Checks kosten real** (−14 bis −21%). `elide_bounds` (GVN) entfernt viele,
-   aber NICHT die daten-abhängigen (`a[mid]` mit `mid=(lo+hi)/2`, quicksort-Partition):
-   der Beweis `mid < len` bräuchte den Loop-Invariant `hi ≤ len-1`, der keine
-   direkte Branch-Bedingung ist. Das ist der Elisions-Hebel Richtung **Rust-Parität**.
-2. **`unter clang` ist NICHT erreichbar** — und das ist keine Vire-Schwäche: selbst
-   mit ALLEN Checks aus bleibt Vire (0,132/0,480) über clang (0,110/0,458). **clang++
-   hat NULL Bounds-Checks + das LLVM-Codegen-Optimum → es IST die Decke für jede
-   LLVM-Sprache.** Rust (das ebenfalls Checks hat + LLVM nutzt) landet identisch bei
-   0,122/0,479 = ~1,05-1,10× clang. Vire kann clang bestenfalls ERREICHEN (Parität),
-   nicht unterbieten — es gibt keinen Vire-Vorteil, den clang++ nicht auch hat.
+**Two findings:**
+1. **Bounds checks cost real time** (−14 to −21%). `elide_bounds` (GVN) removes many,
+   but NOT the data-dependent ones (`a[mid]` with `mid=(lo+hi)/2`, quicksort partition):
+   the proof `mid < len` would need the loop invariant `hi ≤ len-1`, which is no
+   direct branch condition. That is the elision lever toward **Rust parity**.
+2. **"under clang" is NOT reachable** — and that is no Vire weakness: even
+   with ALL checks off, Vire (0.132/0.480) stays above clang (0.110/0.458). **clang++
+   has ZERO bounds checks + the LLVM codegen optimum → it IS the ceiling for every
+   LLVM language.** Rust (which likewise has checks + uses LLVM) lands identically at
+   0.122/0.479 = ~1.05-1.10× clang. Vire can at best REACH clang (parity),
+   not undercut it — there is no Vire advantage that clang++ does not also have.
 
-**Fazit:** der erreichbare + wertvolle Zielwert ist **Rust-Parität** (via
-Bounds-Elision der daten-abhängigen Indizes), nicht „unter clang". Der `div/rem`-Fix
-(inline `sdiv`/`srem` bei konstantem Divisor) ist umgesetzt (hilft -O0/nicht-LTO;
-unter -O2 -flto inlinet LTO `jrt_ldiv` ohnehin). `FASTLLVM_NO_BOUNDS=1` = Messflag.
+**Conclusion:** the reachable + valuable target value is **Rust parity** (via
+bounds elision of the data-dependent indices), not "under clang". The `div/rem` fix
+(inline `sdiv`/`srem` with a constant divisor) is implemented (helps -O0/non-LTO;
+under -O2 -flto LTO inlines `jrt_ldiv` anyway). `FASTLLVM_NO_BOUNDS=1` = a measurement flag.

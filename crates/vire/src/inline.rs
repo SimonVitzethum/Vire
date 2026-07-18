@@ -1,34 +1,34 @@
-//! Shallow Self-Recursive Inlining (AST→AST, VOR der Typinferenz).
+//! Shallow Self-Recursive Inlining (AST→AST, BEFORE type inference).
 //!
-//! Kleine, tail-förmige, selbst-rekursive Funktionen werden 1–2 Ebenen in sich
-//! selbst inline-expandiert: jeder Selbstaufruf `f(args)` im Rumpf wird durch den
-//! (param-substituierten, hygienisierten) Rumpf ersetzt. Der übrige Rekursions-
-//! Boden bleibt erhalten (Terminierung unverändert).
+//! Small, tail-shaped, self-recursive functions are inline-expanded 1–2 levels
+//! into themselves: each self-call `f(args)` in the body is replaced by the
+//! (parameter-substituted, hygienized) body. The remaining recursion
+//! base is preserved (termination unchanged).
 //!
-//! Zwei Effekte (siehe sprache/REKURSION-INLINING.md):
-//!  1. **Call-Overhead-Halbierung** — jeder inline-expandierte Frame berechnet
-//!     mehrere Ebenen ohne echten `call`. Gilt für JEDE Rekursion.
-//!  2. **Branching-Reduktion** — legt überlappende Teilaufrufe frei (fib(n-1) und
-//!     fib(n-2) rufen BEIDE fib(n-3)); LLVM-CSE mergt die identischen reinen Calls
-//!     → der Branching-Faktor sinkt. Das ist der große Gewinn (fib 0,08→0,005 s),
-//!     GRATIS, weil LLVM reine Funktionen als `readnone` führt.
+//! Two effects (see language/RECURSION-INLINING.md):
+//!  1. **Halving of call overhead** — each inline-expanded frame computes
+//!     several levels without a real `call`. Applies to EVERY recursion.
+//!  2. **Branching reduction** — exposes overlapping subcalls (fib(n-1) and
+//!     fib(n-2) BOTH call fib(n-3)); LLVM CSE merges the identical pure calls
+//!     → the branching factor drops. That is the big win (fib 0.08→0.005 s),
+//!     FOR FREE, because LLVM treats pure functions as `readnone`.
 //!
-//! Das ersetzt genau g++s flaches Rekursions-Inlining (das LLVM per Default NICHT
-//! macht) und übertrifft es via CSE.
+//! This replaces exactly g++'s flat recursion inlining (which LLVM does NOT do
+//! by default) and surpasses it via CSE.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::expand::{collect_binders_block, subst_block};
 
-/// Wie viele Ebenen selbst-inline. 2 = jeder Frame deckt 3 Rekursionsebenen ab
-/// (Rumpf ×(#Selbstaufrufe)^2 Größe — nur für KLEINE Funktionen, s. MAX_NODES).
+/// How many levels to self-inline. 2 = each frame covers 3 recursion levels
+/// (body ×(#self-calls)^2 in size — only for SMALL functions, see MAX_NODES).
 const DEPTH: u32 = 2;
-/// Größenobergrenze (AST-Knoten) einer Kandidaten-Funktion — gegen Code-Bloat.
+/// Upper size limit (AST nodes) of a candidate function — against code bloat.
 const MAX_NODES: usize = 48;
 
 pub fn inline_recursion(m: &mut Module) {
-    // Kandidaten: kleine, self-rekursive, tail-förmige (kein `return`) Funktionen.
+    // Candidates: small, self-recursive, tail-shaped (no `return`) functions.
     let mut cands: HashMap<String, (Vec<String>, Block)> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
@@ -56,7 +56,7 @@ pub fn inline_recursion(m: &mut Module) {
     }
 }
 
-// --- Kandidaten-Prüfung -----------------------------------------------------
+// --- Candidate check --------------------------------------------------------
 
 fn is_self_recursive(b: &Block, name: &str) -> bool {
     let mut found = false;
@@ -145,8 +145,8 @@ fn node_count_expr(e: &Expr) -> usize {
     n
 }
 
-/// „Rein genug", um als Argument dupliziert/direkt substituiert zu werden
-/// (keine Aufrufe/Seiteneffekte). Nur so bleibt der Selbstaufruf sicher inline-bar.
+/// "Pure enough" to be duplicated/directly substituted as an argument
+/// (no calls/side effects). Only this keeps the self-call safely inlineable.
 fn is_pure_arg(e: &Expr) -> bool {
     match e {
         Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Ident(..) | Expr::SelfExpr(..) => true,
@@ -157,7 +157,7 @@ fn is_pure_arg(e: &Expr) -> bool {
     }
 }
 
-// --- Inline-Ersetzung (eine Ebene) ------------------------------------------
+// --- Inline replacement (one level) -----------------------------------------
 
 fn inline_calls_block(b: &mut Block, name: &str, params: &[String], orig: &Block, counter: &mut u32) {
     for s in &mut b.stmts {
@@ -185,15 +185,15 @@ fn inline_calls_stmt(s: &mut Stmt, name: &str, params: &[String], orig: &Block, 
         _ => {}
     }
 }
-/// Kinder ZUERST (eine Ebene pro Durchlauf — den frisch eingesetzten Rumpf NICHT
-/// erneut betreten), dann ggf. diesen Selbstaufruf ersetzen.
+/// Children FIRST (one level per pass — do NOT re-enter the freshly inserted
+/// body), then replace this self-call if applicable.
 fn inline_calls_expr(e: &mut Expr, name: &str, params: &[String], orig: &Block, counter: &mut u32) {
     for_each_subexpr_mut(e, &mut |s| inline_calls_expr(s, name, params, orig, counter));
     for_each_subblock_mut(e, &mut |b| inline_calls_block(b, name, params, orig, counter));
     let repl = if let Expr::Call { callee, args, .. } = e {
         if matches!(callee.as_ref(), Expr::Ident(n, _) if n == name) && args.len() == params.len() && args.iter().all(is_pure_arg) {
-            // pmap: param → Argument-Ausdruck (direkt → LLVM sieht identische reine
-            // Subaufrufe und CSE-t sie). rename: Rumpf-lokale Binder gensym.
+            // pmap: param → argument expression (direct → LLVM sees identical pure
+            // subcalls and CSEs them). rename: gensym for body-local binders.
             let pmap: HashMap<String, Expr> = params.iter().cloned().zip(args.iter().cloned()).collect();
             let id = *counter;
             *counter += 1;
@@ -214,7 +214,7 @@ fn inline_calls_expr(e: &mut Expr, name: &str, params: &[String], orig: &Block, 
     }
 }
 
-// --- generische Kind-Traversierung ------------------------------------------
+// --- generic child traversal ------------------------------------------------
 
 fn for_each_subexpr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match e {

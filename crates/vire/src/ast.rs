@@ -1,5 +1,5 @@
-//! Vire-AST. Rein syntaktisch (kein Typwissen — das setzt später `infer`). Knoten
-//! tragen Spans für Diagnosen und Debug-Info.
+//! Vire AST. Purely syntactic (no type knowledge — that comes later via `infer`).
+//! Nodes carry spans for diagnostics and debug info.
 
 use crate::diag::Span;
 
@@ -16,23 +16,23 @@ pub enum Item {
     Impl(ImplDef),
     Const { name: String, value: Expr, span: Span },
     Use { path: Vec<String>, span: Span },
-    /// `extern "C" [header "h.h"] [link "lib"]* { fn … }` — Fremdfunktionen.
-    /// Mit `header`: die Signaturen werden zur Compilezeit aus dem C-Header
-    /// generiert (auto-bindgen), kein `{}`-Block nötig.
+    /// `extern "C" [header "h.h"] [link "lib"]* { fn … }` — foreign functions.
+    /// With `header`: the signatures are generated at compile time from the C header
+    /// (auto-bindgen), no `{}` block needed.
     Extern { abi: String, items: Vec<FnSig>, links: Vec<String>, header: Option<String>, span: Span },
-    /// `native "c++" [link "lib"]* """ …raw code… """` — eingebetteter Fremdcode,
-    /// der automatisch mitkompiliert und gelinkt wird (kein Extra-File/Flag).
+    /// `native "c++" [link "lib"]* """ …raw code… """` — embedded foreign code
+    /// that is automatically compiled and linked alongside (no extra file/flag).
     Native { abi: String, code: String, links: Vec<String>, span: Span },
-    /// `macro name(p, …) = <expr>` — hygienisches Ausdrucks-Makro. Vor der
-    /// Typinferenz per AST→AST-Expansion eingesetzt: Parameter werden durch die
-    /// Argument-Teilbäume ersetzt, makro-lokale Bindungen gensym-umbenannt
-    /// (Hygiene). Siehe `expand.rs`.
+    /// `macro name(p, …) = <expr>` — hygienic expression macro. Applied before
+    /// type inference via AST→AST expansion: parameters are replaced by the
+    /// argument subtrees, macro-local bindings are gensym-renamed
+    /// (hygiene). See `expand.rs`.
     Macro { name: String, params: Vec<String>, body: Expr, span: Span },
-    /// `cxx [link "lib"]* """preamble""" { fn sig = "c++ body" … }` — C++-Bridge-
-    /// Generator: für jede `fn` wird ein `extern "C"`-Trampolin generiert (mit
-    /// C++-Rumpf), der über den `native "c++"`-Pfad kompiliert/gelinkt wird; die
-    /// Signaturen werden als Vire-`extern` registriert. Erspart die
-    /// handgeschriebene Fassade. Siehe sprache/CPP-INTEROP.md.
+    /// `cxx [link "lib"]* """preamble""" { fn sig = "c++ body" … }` — C++ bridge
+    /// generator: for each `fn` an `extern "C"` trampoline is generated (with a
+    /// C++ body) that is compiled/linked via the `native "c++"` path; the
+    /// signatures are registered as Vire `extern`. Saves the
+    /// handwritten facade. See language/CPP-INTEROP.md.
     Cxx { links: Vec<String>, preamble: String, fns: Vec<(FnSig, String)>, span: Span },
 }
 
@@ -48,7 +48,7 @@ pub struct FnSig {
 #[derive(Debug, Clone)]
 pub struct FnDef {
     pub sig: FnSig,
-    /// `= expr` (Ausdrucksfunktion) oder `{ … }` (Block). None = nur Signatur.
+    /// `= expr` (expression function) or `{ … }` (block). None = signature only.
     pub body: Option<Block>,
     pub is_pub: bool,
 }
@@ -57,9 +57,9 @@ pub struct FnDef {
 pub struct GenericParam {
     pub name: String,
     pub is_comptime: bool,
-    /// Trait-Schranke(n), z.B. `T: Ord + Hash`.
+    /// Trait bound(s), e.g. `T: Ord + Hash`.
     pub bounds: Vec<String>,
-    /// Bei `comptime N: Int` der Typ.
+    /// The type in the case of `comptime N: Int`.
     pub ty: Option<Type>,
 }
 
@@ -89,9 +89,9 @@ pub struct Field {
 #[derive(Debug, Clone)]
 pub struct Variant {
     pub name: String,
-    /// Felder der Variante (leer bei datenloser Variante).
+    /// Fields of the variant (empty for a dataless variant).
     pub fields: Vec<Field>,
-    /// True, wenn positional (`Circle(radius: Float)` vs. nur Typen).
+    /// True if positional (`Circle(radius: Float)` vs. types only).
     pub positional: bool,
 }
 
@@ -115,7 +115,7 @@ pub struct ImplDef {
 pub struct Type {
     pub name: String,
     pub args: Vec<Type>,
-    /// `&T` geborgt.
+    /// `&T` borrowed.
     pub borrowed: bool,
     pub span: Span,
 }
@@ -123,7 +123,7 @@ pub struct Type {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    /// Letzter Ausdruck = Blockwert (falls kein terminierendes `;`).
+    /// Last expression = block value (if there is no terminating `;`).
     pub tail: Option<Box<Expr>>,
     pub span: Span,
 }
@@ -132,7 +132,7 @@ pub struct Block {
 pub enum Stmt {
     /// `[mut] name [= expr]`
     Let { mutable: bool, name: String, value: Option<Expr>, span: Span },
-    /// `lhs op= rhs` bzw. `lhs = rhs`
+    /// `lhs op= rhs` or `lhs = rhs`
     Assign { target: Expr, op: Option<BinOp>, value: Expr, span: Span },
     Expr(Expr),
     Return(Option<Expr>, Span),
@@ -156,17 +156,17 @@ pub enum Expr {
     Call { callee: Box<Expr>, args: Vec<Expr>, span: Span },
     Field { base: Box<Expr>, name: String, span: Span },
     Index { base: Box<Expr>, index: Box<Expr>, span: Span },
-    /// Konstruktor/Call mit Typargumenten oder Generics-Anwendung: hier als Call.
+    /// Constructor/call with type arguments or generics application: here as a call.
     If { cond: Box<Expr>, then: Block, elifs: Vec<(Expr, Block)>, els: Option<Block>, span: Span },
     Match { scrutinee: Box<Expr>, arms: Vec<(Pattern, Option<Expr>, Expr)>, span: Span },
     Block(Block),
     Lambda { params: Vec<String>, body: Box<Expr>, span: Span },
     List(Vec<Expr>, Span),
-    /// `[elem for var in iter (if cond)?]` — List-Comprehension.
+    /// `[elem for var in iter (if cond)?]` — list comprehension.
     Comprehension { elem: Box<Expr>, var: String, iter: Box<Expr>, cond: Option<Box<Expr>>, span: Span },
-    /// `[k: v, …]` / `[:]` — Map-Literal.
+    /// `[k: v, …]` / `[:]` — map literal.
     MapLit(Vec<(Expr, Expr)>, Span),
-    /// `expr?` — Fehler-Propagation.
+    /// `expr?` — error propagation.
     Try { inner: Box<Expr>, span: Span },
     /// `expr as Type`
     Cast { inner: Box<Expr>, ty: Type, span: Span },
@@ -174,10 +174,10 @@ pub enum Expr {
     Comptime { inner: Box<Expr>, span: Span },
     /// `a..b` (exklusiv) / `a..=b` (inklusiv)
     Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool, span: Span },
-    /// `capsule(a, b) { … }` — isolierter Arena-Scope: nur `inputs` rein, nur der
-    /// Blockwert raus (tief kopiert), Inneres RC-/Kollektor-frei (eigene Arena).
-    /// `&`-markierte Inputs sind geborgt/read-only (keine Kopie). Siehe
-    /// sprache/CAPSULE-BEWERTUNG.md.
+    /// `capsule(a, b) { … }` — isolated arena scope: only `inputs` in, only the
+    /// block value out (deep-copied), the interior RC-/collector-free (own arena).
+    /// `&`-marked inputs are borrowed/read-only (no copy). See
+    /// language/CAPSULE-EVALUATION.md.
     Capsule { inputs: Vec<(String, bool)>, body: Block, span: Span },
 }
 
@@ -188,7 +188,7 @@ pub enum Pattern {
     Int(i128, Span),
     Str(String, Span),
     Bool(bool, Span),
-    /// `Variant(p, p, …)` bzw. `Variant`
+    /// `Variant(p, p, …)` or `Variant`
     Ctor { name: String, args: Vec<Pattern>, span: Span },
     /// `(p, p, …)`
     Tuple(Vec<Pattern>, Span),

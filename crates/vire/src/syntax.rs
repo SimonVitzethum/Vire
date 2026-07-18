@@ -1,12 +1,12 @@
-//! Nutzer-konfigurierbare Oberflächen-Syntax: die Schlüsselwort-*Schreibweisen*
-//! sind austauschbar, ohne den Compiler zu ändern. Eine `vire.syntax`-Datei neben
-//! der Quelle (oder `--syntax DATEI`) bildet kanonische Schlüsselwörter auf eigene
-//! Schreibweisen ab — z.B. `fn = func`, `capsule = box`. Die Grammatik/Semantik
-//! bleibt unberührt: nur der Lexer schlägt Bezeichner gegen diese Tabelle nach.
+//! User-configurable surface syntax: the keyword *spellings* are
+//! interchangeable without changing the compiler. A `vire.syntax` file next to
+//! the source (or `--syntax FILE`) maps canonical keywords to custom
+//! spellings — e.g. `fn = func`, `capsule = box`. The grammar/semantics
+//! remain untouched: only the lexer looks up identifiers against this table.
 //!
-//! Format (eine Zuordnung pro Zeile, `#` = Kommentar):
+//! Format (one mapping per line, `#` = comment):
 //! ```text
-//! # kanonisch = neue_schreibweise
+//! # canonical = new_spelling
 //! fn      = func
 //! capsule = box
 //! ```
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::lexer::{Kw, KW_TABLE};
 
-/// Schreibweise → Schlüsselwort. Default = die kanonische Tabelle (Identität).
+/// Spelling → keyword. Default = the canonical table (identity).
 #[derive(Debug, Clone)]
 pub struct Syntax {
     map: HashMap<String, Kw>,
@@ -28,14 +28,14 @@ impl Default for Syntax {
 }
 
 impl Syntax {
-    /// Nachschlagen: ist dieser Bezeichner (unter aktueller Syntax) ein Schlüsselwort?
+    /// Lookup: is this identifier (under the current syntax) a keyword?
     pub fn keyword(&self, s: &str) -> Option<Kw> {
         self.map.get(s).copied()
     }
 
-    /// Ein Schlüsselwort umbenennen: die alte Schreibweise entfällt, die neue gilt.
-    /// Fehler, wenn die neue Schreibweise schon von einem ANDEREN Schlüsselwort
-    /// belegt ist (sonst würde die Grammatik mehrdeutig).
+    /// Rename a keyword: the old spelling is dropped, the new one takes effect.
+    /// Errors if the new spelling is already taken by a DIFFERENT keyword
+    /// (otherwise the grammar would become ambiguous).
     pub fn rename(&mut self, kw: Kw, spelling: &str) -> Result<(), String> {
         if let Some(other) = self.map.get(spelling) {
             if *other != kw {
@@ -46,13 +46,13 @@ impl Syntax {
                 ));
             }
         }
-        // alte Schreibweise(n) dieses Schlüsselworts entfernen
+        // remove the old spelling(s) of this keyword
         self.map.retain(|_, v| *v != kw);
         self.map.insert(spelling.to_string(), kw);
         Ok(())
     }
 
-    /// Eine `vire.syntax`-Konfiguration parsen und anwenden (auf Default-Basis).
+    /// Parse and apply a `vire.syntax` configuration (on top of the default).
     pub fn parse(text: &str) -> Result<Syntax, Vec<String>> {
         let mut syn = Syntax::default();
         let mut errs = Vec::new();

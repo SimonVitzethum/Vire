@@ -1,18 +1,18 @@
-//! Hygienische Ausdrucks-Makros: AST→AST-Expansion VOR der Typinferenz.
+//! Hygienic expression macros: AST→AST expansion BEFORE type inference.
 //!
-//! `macro name(p, …) = <expr>` wird an jeder Aufrufstelle `name(args)` durch den
-//! Rumpf ersetzt — Parameter werden durch die Argument-Teilbäume substituiert,
-//! makro-lokale Bindungen (`mut`/Lambda-Parameter/`for`-Variablen/Muster-Binder)
-//! werden pro Expansion gensym-umbenannt. Dadurch:
-//!   * kann eine makro-eingeführte Bindung KEINEN Bezeichner eines Arguments
-//!     einfangen (Hygiene nach unten), und
-//!   * behalten Argument-Ausdrücke ihre Bedeutung an der Aufrufstelle (Hygiene
-//!     nach oben — sie werden unverändert eingesetzt).
+//! `macro name(p, …) = <expr>` is replaced at every call site `name(args)` by the
+//! body — parameters are substituted with the argument subtrees, and
+//! macro-local bindings (`mut`/lambda parameters/`for` variables/pattern binders)
+//! are gensym-renamed per expansion. As a result:
+//!   * a macro-introduced binding can NEVER capture an identifier of an argument
+//!     (downward hygiene), and
+//!   * argument expressions retain their meaning at the call site (upward
+//!     hygiene — they are inserted unchanged).
 //!
-//! Bewusst begrenzt (ehrlich): ein makro-lokaler Name wird im ganzen Rumpf
-//! konsistent umbenannt (nicht per disjunktem Scope); Makros expandieren zu
-//! Ausdrücken (kein item-erzeugendes Makro); Rekursions-/Tiefenlimit gegen
-//! divergierende Makros.
+//! Deliberately limited (honestly): a macro-local name is renamed consistently
+//! throughout the whole body (not per disjoint scope); macros expand to
+//! expressions (no item-producing macro); recursion/depth limit guards against
+//! diverging macros.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,8 +27,8 @@ struct Expander {
     errs: Vec<String>,
 }
 
-/// Setzt alle Makros im Modul ein und entfernt die Makro-Definitionen. Fehler
-/// (Aritätskonflikt, Rekursionslimit) werden gesammelt zurückgegeben.
+/// Expands all macros in the module and removes the macro definitions. Errors
+/// (arity conflict, recursion limit) are collected and returned.
 pub fn expand_macros(m: &mut Module) -> Result<(), Vec<String>> {
     let mut macros: HashMap<String, (Vec<String>, Expr)> = HashMap::new();
     for it in &m.items {
@@ -112,9 +112,9 @@ impl Expander {
         }
     }
 
-    /// Kinder zuerst expandieren (Argumente makro-frei machen), dann diese Stelle:
-    /// ist sie ein Makro-Aufruf, durch den (hygienisierten) Rumpf ersetzen und das
-    /// Ergebnis erneut expandieren (verschachtelte/rumpf-interne Makros).
+    /// Expand children first (make arguments macro-free), then this site:
+    /// if it is a macro call, replace it with the (hygienized) body and expand
+    /// the result again (nested/body-internal macros).
     fn expr(&mut self, e: &mut Expr) {
         self.expr_children(e);
         let repl = if let Expr::Call { callee, args, span } = e {
@@ -215,8 +215,8 @@ impl Expander {
         }
     }
 
-    /// Rumpf klonen, makro-lokale Binder gensym-umbenennen, Parameter durch die
-    /// Argument-Teilbäume ersetzen.
+    /// Clone the body, gensym-rename macro-local binders, replace parameters with
+    /// the argument subtrees.
     fn instantiate(&mut self, params: &[String], args: &[Expr], body: &Expr, _span: crate::diag::Span) -> Expr {
         let mut b = body.clone();
         let id = self.counter;
@@ -224,7 +224,7 @@ impl Expander {
         let mut locals: HashSet<String> = HashSet::new();
         collect_binders_expr(&b, &mut locals);
         for p in params {
-            locals.remove(p); // Parameter werden substituiert, nicht umbenannt
+            locals.remove(p); // parameters are substituted, not renamed
         }
         let rename: HashMap<String, String> = locals.iter().map(|l| (l.clone(), format!("{l}$h{id}"))).collect();
         let pmap: HashMap<String, Expr> = params.iter().cloned().zip(args.iter().cloned()).collect();
@@ -233,7 +233,7 @@ impl Expander {
     }
 }
 
-// --- Binder-Sammlung (makro-lokale Namen) -----------------------------------
+// --- Binder collection (macro-local names) ----------------------------------
 
 pub(crate) fn collect_binders_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
@@ -348,10 +348,10 @@ fn collect_binders_pat(p: &Pattern, out: &mut HashSet<String>) {
     }
 }
 
-// --- Substitution: Parameter → Argument, lokale Binder → frische Namen -------
+// --- Substitution: parameter → argument, local binders → fresh names --------
 
 pub(crate) fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
-    // Ident: Parameter-Ersetzung (ganzer Knoten) hat Vorrang, sonst Umbenennung.
+    // Ident: parameter substitution (whole node) takes precedence, otherwise renaming.
     if let Expr::Ident(n, _) = e {
         if let Some(arg) = pmap.get(n) {
             *e = arg.clone();

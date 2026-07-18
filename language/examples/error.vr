@@ -1,0 +1,49 @@
+// Error handling in the Go spirit: errors are VALUES, explicit in the signature,
+// no exceptions. BUT without Go's `nil` — that would be `null` through the back door
+// (guiding principle 4). One consistent model: Result[T, E], typed.
+
+use std.io
+
+// Typed errors as a sum type — more than Go's bare `error` interface:
+type ConfigError {
+    NotFound(path: Str)
+    BadSyntax(path: Str, line: Int)
+    Empty(path: Str)
+}
+
+type Config { host: Str, port: Int }
+
+fn parse(path: Str, text: Str) -> Result[Config, ConfigError] {
+    if text.is_empty() { return Err(ConfigError.Empty(path)) }
+    mut host = ""
+    mut port = 0
+    for i, line in enumerate(text.lines()) {
+        parts = line.split("=")
+        if parts.len() != 2 { return Err(ConfigError.BadSyntax(path, i + 1)) }
+        match parts[0].trim() {
+            "host" -> host = parts[1].trim()
+            "port" -> port = parse_int(parts[1].trim())?   // ? propagates Err
+            _      -> {}                                     // unknown: ignore
+        }
+    }
+    Ok(Config(host, port))
+}
+
+fn load(path: Str) -> Result[Config, ConfigError] {
+    text = read_file(path).wrap("Config {path}")?           // context + propagation
+    parse(path, text)
+}
+
+fn main() -> Result[Unit, ConfigError] {
+    // Explicit, typed handling via match (= Go's "val, err" branching):
+    cfg = match load("app.cfg") {
+        Ok(c)                       -> c
+        Err(ConfigError.NotFound(p)) -> {
+            log.warn("missing, using default", path: p)
+            Config("localhost", 8080)
+        }
+        Err(e) -> return Err(e)                             // carries context + debug path
+    }
+    log.info("started", host: cfg.host, port: cfg.port)
+    Ok(())
+}

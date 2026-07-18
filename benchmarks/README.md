@@ -1,78 +1,78 @@
-# FastLLVM-Benchmarks
+# FastLLVM benchmarks
 
-Aussagekräftige Benchmarks über mehrere Bereiche, jeweils in **Java** (→ FastLLVM),
-**Rust** und **C++** (`g++ -O3 -march=native`), bit-gleiche Ausgaben. Runner:
-`./run.sh` (Umgebungsvariable `N` = Wiederholungen, bestes Ergebnis zählt).
+Meaningful benchmarks across several areas, each in **Java** (→ FastLLVM),
+**Rust**, and **C++** (`g++ -O3 -march=native`), bit-identical outputs. Runner:
+`./run.sh` (environment variable `N` = repetitions, the best result counts).
 
-FastLLVM baut mit `-march=native` (Closed-World-AOT auf der Zielmaschine).
+FastLLVM builds with `-march=native` (closed-world AOT on the target machine).
 
-## Bereiche
+## Areas
 
-| Benchmark | Bereich | Belastet |
+| Benchmark | Area | Stresses |
 |---|---|---|
-| **Arith** | reine Ganzzahl-Arithmetik | ALU-Durchsatz, Vektorisierung |
-| **Alloc** | Loop-lokale Objekte | Escape-Analyse, RC-Elision |
-| **Fib** | tiefe Rekursion | Call-Overhead |
-| **Sieve** | `boolean[]`, gezählte Schleifen | Bounds-Elision, Speicherbandbreite |
-| **Poly** | virtuelle Dispatches über Array | Devirt, Ref-Array-Zugriff |
-| **Matmul** | 512³ Matrixmultiplikation | FP-Durchsatz, Cache, affine Indizes |
-| **Mandel** | Mandelbrot 4000² | FP-Compute, vektorisierbar |
-| **Quick** | 20M-Element Quicksort | Verzweigung, In-Place-Array, Bounds |
-| **NBody** | 20M Schritte, statische Arrays | FP + `sqrt` + Feld-/Array-Zugriff |
-| **Trees** | binary-trees (Alloc/Dealloc) | RC + Zyklen-Collector-Durchsatz |
+| **Arith** | pure integer arithmetic | ALU throughput, vectorization |
+| **Alloc** | loop-local objects | escape analysis, RC elision |
+| **Fib** | deep recursion | call overhead |
+| **Sieve** | `boolean[]`, counted loops | bounds elision, memory bandwidth |
+| **Poly** | virtual dispatches over an array | devirt, ref-array access |
+| **Matmul** | 512³ matrix multiplication | FP throughput, cache, affine indices |
+| **Mandel** | Mandelbrot 4000² | FP compute, vectorizable |
+| **Quick** | 20M-element quicksort | branching, in-place array, bounds |
+| **NBody** | 20M steps, static arrays | FP + `sqrt` + field/array access |
+| **Trees** | binary-trees (alloc/dealloc) | RC + cycle-collector throughput |
 
-## Ergebnisse (Stand dieser Session, best of 3–7, vs Rust / vs C++)
+## Results (as of this session, best of 3–7, vs Rust / vs C++)
 
-| Benchmark | vs Rust | vs C++ | Anmerkung |
+| Benchmark | vs Rust | vs C++ | Note |
 |---|---|---|---|
-| Arith  | **0,42×** | **0,74×** | AVX2 schlägt beide |
-| Alloc  | **~0×**   | **0,86×** | Stack-Allok. + RC-frei |
-| Fib    | **0,85×** | 1,78× | schlägt Rust; C++ Rekursions-Codegen |
-| Sieve  | **~1,0×** | **1,05×** | Parität |
-| Poly   | **0,97×** | 2,61× | schlägt Rust; C++ konstant-faltet |
-| Mandel | **1,00×** | 1,06× | Parität |
-| Quick  | **1,03×** | **0,82×** | Parität Rust, schlägt C++ |
-| Matmul | 6,6×  | 9,0× | **offen** — affine Index-Bounds |
-| NBody  | 39×   | 40× | **offen** — interproz. Array-Länge |
-| Trees  | 3,2×  | 3,6× | **offen** — Zyklen-Collector auf Baum |
+| Arith  | **0.42×** | **0.74×** | AVX2 beats both |
+| Alloc  | **~0×**   | **0.86×** | stack alloc. + RC-free |
+| Fib    | **0.85×** | 1.78× | beats Rust; C++ recursion codegen |
+| Sieve  | **~1.0×** | **1.05×** | parity |
+| Poly   | **0.97×** | 2.61× | beats Rust; C++ constant-folds |
+| Mandel | **1.00×** | 1.06× | parity |
+| Quick  | **1.03×** | **0.82×** | parity Rust, beats C++ |
+| Matmul | 6.6×  | 9.0× | **open** — affine index bounds |
+| NBody  | 39×   | 40× | **open** — interproc. array length |
+| Trees  | 3.2×  | 3.6× | **open** — cycle collector on a tree |
 
-**7 von 10 auf/über Rust-Parität.** Drei offene Bereiche, alle mit klar
-benanntem, substanziellem Analyse-Bedarf:
+**7 of 10 at/above Rust parity.** Three open areas, all with a clearly
+named, substantial analysis need:
 
-### Matmul (6,6×) — affine Index-Bounds-Elision
-Der innere Zugriff `C[i*n+j]` hat einen **affinen Index** `i*n + j`. Die heutige
-GVN-Bounds-Elision beweist gezählte Schleifen (`arr[i]`, `i < len`) und
-And-Masken, aber nicht `i*n + j < n*n`. Nötig: eine flusssensitive **obere-
-Schranken-Analyse** (Intervall, nur Obergrenzen), die aus den Wächtern `i<n`,
-`j<n` und `len=n²` die Schranke `(n-1)·n + (n-1) < n²` herleitet und über
-`Mul`/`Add` propagiert. Erst dann sind die Zugriffe throw-frei → die
-pending-Prüfungen fallen weg → LLVM vektorisiert die FMA-Schleife (wie Rust/C++).
-Solange die Prüfung bleibt, blockiert der pending-Check die Vektorisierung.
+### Matmul (6.6×) — affine index-bounds elision
+The inner access `C[i*n+j]` has an **affine index** `i*n + j`. Today's
+GVN bounds elision proves counted loops (`arr[i]`, `i < len`) and
+and-masks, but not `i*n + j < n*n`. Needed: a flow-sensitive **upper-bound
+analysis** (interval, upper bounds only) that derives from the guards `i<n`,
+`j<n` and `len=n²` the bound `(n-1)·n + (n-1) < n²` and propagates over
+`Mul`/`Add`. Only then are the accesses throw-free → the
+pending checks drop out → LLVM vectorizes the FMA loop (like Rust/C++).
+As long as the check stays, the pending check blocks vectorization.
 
-### NBody (39×) — interprozedurale/statische Array-Länge
-Die Arrays sind **statische Felder**, in `main` erzeugt, in `advance()` benutzt.
-Zwei Teil-Fixes dieser Session griffen bereits:
-- **RC-auf-stabilen-Statics eliminiert** (72×→39×): ein statisches Feld, das eine
-  Funktion + Callees nicht schreibt, ist während ihrer Ausführung konstant →
-  `GetStatic` liefert eine stabile, von der Static-Wurzel gehaltene Referenz und
-  braucht kein retain/release (war zuvor 66 RC-Ops je `advance`).
-- **Inline-geprüfter Array-Zugriff**: Zugriffe sind jetzt sichtbare `load`/`store`
-  (hoistbar) statt opaker `jrt_daload`-Calls.
-Es bleibt: die **Länge** der statischen Arrays ist in `advance` unbekannt (kein
-`NewArray` dort) → Bounds nicht elidierbar → pending-Prüfungen bleiben. Nötig:
-statische Array-Längen whole-program verfolgen (`static T[] f = new T[k]` ⇒ Länge
-`k`) **plus** die Schleifenschranke `nb` als interprozedurale Konstante.
+### NBody (39×) — interprocedural/static array length
+The arrays are **static fields**, created in `main`, used in `advance()`.
+Two partial fixes this session already took effect:
+- **RC-on-stable-statics eliminated** (72×→39×): a static field that a
+  function + its callees do not write is constant during their execution →
+  `GetStatic` yields a stable reference held by the static root and
+  needs no retain/release (previously 66 RC ops per `advance`).
+- **Inline-checked array access**: accesses are now visible `load`/`store`
+  (hoistable) instead of opaque `jrt_daload` calls.
+What remains: the **length** of the static arrays is unknown in `advance` (no
+`NewArray` there) → bounds not elidable → the pending checks stay. Needed:
+track static array lengths whole-program (`static T[] f = new T[k]` ⇒ length
+`k`) **plus** the loop bound `nb` as an interprocedural constant.
 
-### Trees (3,2×) — Zyklen-Collector auf azyklischen Bäumen
-`Node` referenziert `Node` → der Typ-Referenzgraph ist zyklisch → die
-(konservative, typbasierte) Azyklizitäts-Analyse behält den Zyklen-Collector, der
-je decref Kandidaten puffert. Der Baum ist real azyklisch. Nötig: eine
-**Struktur-/Shape-Analyse** (oder Region/Ownership-Inferenz), die Baum-förmige
-Allokationsmuster als azyklisch beweist — dann entfällt der Collector (wie schon
-heute für typ-azyklische Programme) und die Allokation läuft RC-schlank.
+### Trees (3.2×) — cycle collector on acyclic trees
+`Node` references `Node` → the type-reference graph is cyclic → the
+(conservative, type-based) acyclicity analysis keeps the cycle collector, which
+buffers candidates per decref. The tree is really acyclic. Needed: a
+**structure/shape analysis** (or region/ownership inference) that proves tree-shaped
+allocation patterns acyclic — then the collector drops out (as it already does
+today for type-acyclic programs) and the allocation runs RC-lean.
 
-## Gemeinsamer Nenner der offenen Fälle
-Alle drei brauchen **stärkere statische Beweise** (affine Intervalle,
-interprozedurale Konstanten/Längen, Shape-Analyse), damit Sicherheits-Checks
-und RC-Buchhaltung entfallen. Die *Infrastruktur* dafür (GVN, Escape, Azyklizität,
-pending-Elision) steht; es sind gezielte Erweiterungen, keine Neubauten.
+## Common denominator of the open cases
+All three need **stronger static proofs** (affine intervals,
+interprocedural constants/lengths, shape analysis) so that safety checks
+and RC bookkeeping drop out. The *infrastructure* for this (GVN, escape, acyclicity,
+pending elision) is in place; these are targeted extensions, not new builds.

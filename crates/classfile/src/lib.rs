@@ -1,8 +1,8 @@
-//! Parser für Java-Classfiles (JVMS Kap. 4).
+//! Parser for Java class files (JVMS ch. 4).
 //!
-//! Bewusst minimal: Constant Pool vollständig (nötig für alle Referenzen),
-//! Methoden mit Code-Attribut, Bytecode-Decoder für die unterstützte
-//! Teilmenge. StackMapTable, Annotations etc. werden überlesen.
+//! Deliberately minimal: constant pool in full (needed for all references),
+//! methods with a Code attribute, bytecode decoder for the supported
+//! subset. StackMapTable, annotations, etc. are skipped over.
 
 mod opcode;
 pub use opcode::{decode_code, ArrTy, Cond, Instr};
@@ -36,8 +36,8 @@ impl std::error::Error for ParseError {}
 
 type Result<T> = std::result::Result<T, ParseError>;
 
-/// Ein Eintrag im Constant Pool. Long/Double belegen zwei Slots (JVMS 4.4.5);
-/// der zweite Slot wird als `Unusable` abgelegt, damit Indizes stimmen.
+/// An entry in the constant pool. Long/Double occupy two slots (JVMS 4.4.5);
+/// the second slot is stored as `Unusable` so that indices stay correct.
 #[derive(Debug, Clone)]
 pub enum Const {
     Utf8(String),
@@ -57,12 +57,12 @@ pub enum Const {
     Unusable,
 }
 
-/// Eintrag im BootstrapMethods-Attribut (JVMS 4.7.23).
+/// Entry in the BootstrapMethods attribute (JVMS 4.7.23).
 #[derive(Debug, Clone)]
 pub struct BootstrapMethod {
-    /// CP-Index einer MethodHandle-Konstante.
+    /// CP index of a MethodHandle constant.
     pub method_ref: u16,
-    /// CP-Indizes der statischen Bootstrap-Argumente.
+    /// CP indices of the static bootstrap arguments.
     pub args: Vec<u16>,
 }
 
@@ -71,7 +71,7 @@ pub struct Method {
     pub access_flags: u16,
     pub name: String,
     pub descriptor: String,
-    /// None bei abstract/native.
+    /// None for abstract/native.
     pub code: Option<Code>,
 }
 
@@ -81,9 +81,9 @@ impl Method {
     }
 }
 
-/// Eintrag der Exception-Table (JVMS 4.7.3): der Bereich [start_pc, end_pc)
-/// wird von handler_pc abgefangen, wenn der geworfene Typ zu catch_type passt
-/// (catch_type 0 = finally / fängt alles).
+/// Entry in the exception table (JVMS 4.7.3): the range [start_pc, end_pc)
+/// is caught by handler_pc if the thrown type matches catch_type
+/// (catch_type 0 = finally / catches everything).
 #[derive(Debug, Clone)]
 pub struct ExceptionEntry {
     pub start_pc: u16,
@@ -105,8 +105,8 @@ pub struct Field {
     pub access_flags: u16,
     pub name: String,
     pub descriptor: String,
-    /// CP-Index des ConstantValue-Attributs (statische finals mit
-    /// Compile-Zeit-Konstante), falls vorhanden.
+    /// CP index of the ConstantValue attribute (static finals with a
+    /// compile-time constant), if present.
     pub constant_value: Option<u16>,
 }
 
@@ -139,7 +139,7 @@ impl ClassFile {
         let _major = r.u16()?;
 
         let cp_count = r.u16()?;
-        // Index 0 ist per Spezifikation unbenutzt.
+        // Index 0 is unused per the specification.
         let mut constant_pool = vec![Const::Unusable];
         let mut i = 1;
         while i < cp_count {
@@ -163,7 +163,7 @@ impl ClassFile {
                 15 => Const::MethodHandle { reference_kind: r.u8()?, reference_index: r.u16()? },
                 16 => Const::MethodType { descriptor: r.u16()? },
                 18 => Const::InvokeDynamic { bootstrap_method_attr_index: r.u16()?, name_and_type: r.u16()? },
-                // Dynamic (condy)/Module/Package: überlesen.
+                // Dynamic (condy)/Module/Package: skipped over.
                 17 => { r.bytes(4)?; Const::Unusable }
                 19 | 20 => { r.bytes(2)?; Const::Unusable }
                 t => return Err(ParseError::UnsupportedConstTag(t)),
@@ -243,7 +243,7 @@ impl ClassFile {
                             catch_type: cr.u16()?,
                         });
                     }
-                    // Sub-Attribute (LineNumberTable, StackMapTable, …) ignorieren.
+                    // Ignore sub-attributes (LineNumberTable, StackMapTable, …).
                     code = Some(Code { max_stack, max_locals, bytecode, exceptions });
                 } else {
                     r.bytes(attr_len)?;
@@ -252,8 +252,8 @@ impl ClassFile {
             methods.push(Method { access_flags, name, descriptor, code });
         }
 
-        // Klassen-Attribute: BootstrapMethods sammeln (für invokedynamic),
-        // Rest überlesen.
+        // Class attributes: collect BootstrapMethods (for invokedynamic),
+        // skip over the rest.
         let mut bootstrap_methods = Vec::new();
         let attr_count = r.u16()?;
         for _ in 0..attr_count {
@@ -303,10 +303,10 @@ impl ClassFile {
         utf8_at(&self.constant_pool, idx)
     }
 
-    /// Löst einen invokedynamic-Callsite auf. Liefert (Name, Deskriptor,
-    /// Bootstrap-Methodenname, Bootstrap-Argument-CP-Indizes). Der
-    /// Bootstrap-Methodenname erlaubt dem Frontend, `makeConcatWithConstants`
-    /// zu erkennen und statisch aufzulösen (DESIGN.md §1.3).
+    /// Resolves an invokedynamic call site. Returns (name, descriptor,
+    /// bootstrap method name, bootstrap argument CP indices). The
+    /// bootstrap method name lets the frontend recognize `makeConcatWithConstants`
+    /// and resolve it statically (DESIGN.md §1.3).
     pub fn invoke_dynamic(&self, idx: u16) -> Result<(&str, &str, &str, &[u16])> {
         let (bsm_idx, nat) = match self.constant_pool.get(idx as usize) {
             Some(Const::InvokeDynamic { bootstrap_method_attr_index, name_and_type }) => {
@@ -322,7 +322,7 @@ impl ClassFile {
             .bootstrap_methods
             .get(bsm_idx as usize)
             .ok_or(ParseError::BadIndex(bsm_idx))?;
-        // Bootstrap-MethodHandle → referenzierte Methode → deren Name.
+        // Bootstrap MethodHandle → referenced method → its name.
         let bsm_name = match self.constant_pool.get(bsm.method_ref as usize) {
             Some(Const::MethodHandle { reference_index, .. }) => {
                 self.member_ref(*reference_index)?.1
@@ -337,8 +337,8 @@ impl ClassFile {
         ))
     }
 
-    /// Löst eine MethodHandle-Konstante zu (reference_kind, Klasse, Name,
-    /// Deskriptor) der referenzierten Methode auf.
+    /// Resolves a MethodHandle constant to (reference_kind, class, name,
+    /// descriptor) of the referenced method.
     pub fn method_handle(&self, idx: u16) -> Result<(u8, &str, &str, &str)> {
         let (kind, ref_idx) = match self.constant_pool.get(idx as usize) {
             Some(Const::MethodHandle { reference_kind, reference_index }) => {
@@ -350,7 +350,7 @@ impl ClassFile {
         Ok((kind, class, name, desc))
     }
 
-    /// Deskriptor einer MethodType-Konstante.
+    /// Descriptor of a MethodType constant.
     pub fn method_type(&self, idx: u16) -> Result<&str> {
         match self.constant_pool.get(idx as usize) {
             Some(Const::MethodType { descriptor }) => utf8_at(&self.constant_pool, *descriptor),
@@ -358,8 +358,8 @@ impl ClassFile {
         }
     }
 
-    /// Liefert einen String aus einer String- oder Utf8-Konstante
-    /// (Bootstrap-Argumente sind String-Konstanten).
+    /// Returns a string from a String or Utf8 constant
+    /// (bootstrap arguments are String constants).
     pub fn const_string(&self, idx: u16) -> Result<&str> {
         match self.constant_pool.get(idx as usize) {
             Some(Const::String { utf8 }) => utf8_at(&self.constant_pool, *utf8),
@@ -372,7 +372,7 @@ impl ClassFile {
         class_name_at(&self.constant_pool, idx)
     }
 
-    /// Löst einen Method-/Field-Ref zu (Klasse, Name, Deskriptor) auf.
+    /// Resolves a method/field ref to (class, name, descriptor).
     pub fn member_ref(&self, idx: u16) -> Result<(&str, &str, &str)> {
         let (class, nat) = match self.constant_pool.get(idx as usize) {
             Some(Const::MethodRef { class, name_and_type })
@@ -416,9 +416,9 @@ fn skip_attributes(r: &mut Reader) -> Result<()> {
     Ok(())
 }
 
-/// Modified UTF-8 (JVMS 4.4.7): kein 4-Byte-UTF-8, Supplementary Characters
-/// als CESU-8-Surrogatpaare, U+0000 als 0xC0 0x80. Für die aktuelle Teilmenge
-/// reicht die Dekodierung von 1–3-Byte-Sequenzen.
+/// Modified UTF-8 (JVMS 4.4.7): no 4-byte UTF-8, supplementary characters
+/// as CESU-8 surrogate pairs, U+0000 as 0xC0 0x80. For the current subset,
+/// decoding 1–3-byte sequences suffices.
 fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;

@@ -1,8 +1,0 @@
-// Python-Libs aus REINEM Vire — kein C-Code, nur diese Deklaration + Aufrufe.
-extern "C" {
-    fn vire_py_eval_f(code: Str, x: F64) -> F64
-    fn vire_py_eval_i(code: Str, x: Int) -> Int
-}
-print(vire_py_eval_f("__import__('math').sqrt(x)", 625.0))
-print(vire_py_eval_f("__import__('math').log(x, 2)", 1024.0))
-print(vire_py_eval_i("__import__('math').factorial(x)", 6))

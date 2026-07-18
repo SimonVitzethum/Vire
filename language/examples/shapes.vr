@@ -1,0 +1,47 @@
+// Sum types, traits, generics, pattern matching — the Rust domain,
+// but without lifetimes/borrow syntax. All inferred and monomorphized.
+
+type Shape {
+    Circle(radius: Float)
+    Rect(w: Float, h: Float)
+    Triangle(base: Float, height: Float)
+}
+
+fn area(s: Shape) -> Float {
+    match s {
+        Circle(r)      -> 3.14159265 * r * r
+        Rect(w, h)     -> w * h
+        Triangle(b, h) -> 0.5 * b * h
+    }
+}
+
+// Trait with a default method
+trait Describe {
+    fn name(self) -> Str
+    fn describe(self) = "{self.name()} with area {area(self)}"   // default
+}
+
+impl Describe for Shape {
+    fn name(self) = match self {
+        Circle(_)      -> "Circle"
+        Rect(_, _)     -> "Rectangle"
+        Triangle(_, _) -> "Triangle"
+    }
+}
+
+// Generic function with a trait bound — for ANY Describe type
+fn print_all[T: Describe](items: List[T]) {
+    for it in items {
+        print(it.describe())
+    }
+}
+
+fn total_area(shapes: List[Shape]) -> Float {
+    shapes.map(area).fold(0.0, (a, b) -> a + b)
+}
+
+fn main() {
+    shapes = [Circle(2.0), Rect(3.0, 4.0), Triangle(6.0, 1.0)]
+    print_all(shapes)
+    print("Total: {total_area(shapes)}")
+}

@@ -1,5 +1,5 @@
-//! Diagnosen mit Quell-Span (Byte-Range). Fehler nah an der Ursache melden ist
-//! Ergonomie-kritisch (BEWERTUNG §5).
+//! Diagnostics with source span (byte range). Reporting errors close to the
+//! cause is ergonomics-critical (BEWERTUNG §5).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span(pub usize, pub usize);
@@ -15,7 +15,7 @@ pub struct Diag {
     pub level: Level,
     pub msg: String,
     pub span: Span,
-    /// Optionaler Fix-Vorschlag (maschinenlesbar gedacht).
+    /// Optional fix suggestion (intended to be machine-readable).
     pub hint: Option<String>,
 }
 
@@ -27,7 +27,7 @@ impl Diag {
         self.hint = Some(hint.to_string());
         self
     }
-    /// Menschliche Ausgabe mit Zeile:Spalte, aus dem Quelltext berechnet.
+    /// Human-readable output with line:column, computed from the source text.
     pub fn render(&self, src: &str) -> String {
         let (line, col) = line_col(src, self.span.0);
         let lvl = match self.level {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reproduziert M0.1 (adversarialer Objektgraph, FastLLVM auto-RC vs Rust-Indizes).
-# Vollbericht: ../../sprache/M0-MESSUNG.md
+# Vollbericht: ../../language/M0-MEASUREMENT.md
 set -e
 fj="$(cd "$(dirname "$0")/../.." && pwd)/target/debug/fastjavac"
 javac -d . Graph.java

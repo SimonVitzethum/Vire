@@ -1,0 +1,29 @@
+// C interop — the universal library gateway. Direct extern declaration
+// or header binding. `unsafe` marks only the actual FFI line.
+
+// Direct declaration of individual C functions:
+extern "C" {
+    fn sqrt(x: F64) -> F64
+    fn clock() -> Int
+}
+
+// Whole library via generated bindings (C ABI):
+use c "sqlite3.h" as sql
+
+fn open_db(path: Str) -> Result[Ptr[sql.sqlite3], Str] {
+    unsafe {
+        mut handle: Ptr[sql.sqlite3] = null_ptr()
+        rc = sql.sqlite3_open(path.c_str(), &handle)
+        if rc == 0 { Ok(handle) } else { Err("could not open {path}") }
+    }
+}
+
+fn main() -> Result[Unit, Str] {
+    // C math directly, zero-cost:
+    print("sqrt(2) = {sqrt(2.0)}")
+
+    // Use a C library:
+    db = open_db("app.db")?
+    unsafe { sql.sqlite3_close(db) }
+    Ok(())
+}

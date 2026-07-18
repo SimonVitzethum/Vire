@@ -1,165 +1,205 @@
-# Vire — Fahrplan (Features 1–8 + Compiler-Pipeline)
+# Vire — Roadmap (features 1–8 + compiler pipeline)
 
-Aufgabenliste für die Umsetzung. Reihenfolge nach Abhängigkeit und Risiko.
-Design-Grundlage: [sprache/](sprache/). **Backend/Solver existieren**; neu ist das
-Front-End. Legende: `[ ]` offen · `[~]` teilweise · `[x]` fertig.
-
----
-
-## M0 — Risiko-Messung (Gate) — ✅ AUSGEFÜHRT, Urteil: **bedingtes Weiter**
-
-Vollständiger Bericht: **[sprache/M0-MESSUNG.md](sprache/M0-MESSUNG.md)**. Programme:
-[benchmarks/m0/](benchmarks/m0/). Gemessen über die **reale automatische Pipeline**
-(Solver macht die Inferenz — nicht Hand-Absenkung), Oracle↔Automatisch-Spread.
-
-- [x] **M0.1 Alias-Präzision.** Adversarialer PageRank-Objektgraph (geteilt/
-  entkommend/mutierend/zyklisch). Ergebnis: **>1000× langsamer** als Rust bei 100k
-  (Kollektor super-linear/Timeout), **4,4×** ohne Kollektor, **6,3×** atomare RC
-  (uncontended). Der Spread Oracle(=0 RC)↔Automatisch ist maximal → die Inferenz
-  gewinnt die Borrow-Fakten im geteilt/zyklischen Fall **nicht** zurück. „Rust-
-  Niveau ohne Annotationen" = **Slogan** auf dieser Teilmenge.
-- [x] **M0.2 Compile-Zeit.** Solver+Backend super-linear (~O(n^1,4)): 50k LOC =
-  1,8 s, extrapoliert ~5–7 s bei 100k — **ohne** inkrementelles Caching.
-- [~] **M0.1-Contention** (Rest): echte Multithread-Contention als separater Versuch
-  offen; 6,3× uncontended ist die Untergrenze.
-- [x] **M0.1b (die entscheidende Zusatzmessung):** RC von Objektmodell getrennt
-  (Kollektor aus, N=16k): mit RC 4,4×, **ohne RC 1,48×**, Rust 1×. → Die RC ist
-  **3,4× und elidierbar** (Loop ist topologie-stabil = beweisbar borgbar); der Solver
-  hat die Borgbarkeit **nicht bewiesen** (Vollständigkeitslücke, nicht §7-Wand). Decke
-  = **~1,5×** (Objektmodell), nicht 1×.
-
-**M0.3 Entscheidung — die Reparatur ist EINE, nicht zwei parallele:**
-- [ ] **(ii) Region-Borrow-Inferenz** (der Gate-Öffner): loop-stabile Container
-  (`nodes[]`, `n.out` — im Loop nicht umgesetzt) als borgbare Region beweisen →
-  Loop-retain/release streichen. **Das entschärft den Kollektor gratis mit** (ohne
-  Loop-Releases keine Zyklen-Kandidaten → kein O(n²)). Ziel: 108× → ~1,5×.
-  Soundness-heikel (0-live!): nur mit region-/dominanz-scopiertem „kein Store setzt
-  den geborgten Slot um"-Beweis. **Das ist das Ownership-Inferenz-Modul** — sorgfältig,
-  nicht schnell.
-- [x] **(i) Kollektor-Skalierung** — UMGESETZT (adaptive Schwelle 2×live → linear; 108×→~7×) + iterativer Drop/Collect (Soundness: N=200k Crash→läuft). Für dieses Muster danach **nicht mehr nötig**;
-  bleibt relevant für *echt* zyklische Programme. **Achtung Zielkonflikt:**
-  inkrementell/generationell = Write-Barriers je Mutation (re-inflationiert den Floor)
-  **+ mehr Runtime** → zieht gegen „~runtime-frei" (Feature 5) und Teil von Feature 3.
-- [x] **(iii) SOUNDNESS-Bug BEHOBEN:** iterativer Worklist-Release + iterative
-  Kollektor-Traversierungen (cwork/bwork/fwork). N=200k Crash → läuft, 0 live.
-- [ ] **(iv) Feld-/interproz. Bounds-Elision** für `out[k]` (Länge eines Feld-Arrays)
-  → schließt einen Teil der Rest-1,5× Richtung ~1,1×.
-- [ ] **(v) Overflow-Default + `+%`-Kultur** (Vektorisierung, M0-Bericht) und
-  **Analyse-Caching** (Compile-Zeit).
-- [ ] **(vi) M0.1c Contention:** echte Multithread-Contention messen (Feature-1-Zahl).
-
-**Kernrisiko rot bestätigt, Weg aber vermessen:** ~1,1–1,5× ist erreichbar, braucht
-aber das Ownership-Modul (ii). Front-End (P1+) bleibt bis (ii)+(iii) zurückgestellt.
+Task list for the implementation. Ordered by dependency and risk.
+Design basis: [language/](language/). Legend: `[ ]` open · `[~]` partial · `[x]` done.
 
 ---
 
-## Compiler-Pipeline (Front-End neu, Rest wiederverwendet)
+## Current state (2026-07)
 
-### P1 — Lexer + Parser → AST  → Plan: [sprache/PARSER.md](sprache/PARSER.md)
-- [ ] Lexer (Token-Kinds, Unicode-Idents, Zahlen/Strings/Interpolation, Kommentare).
-- [ ] Rekursiver-Abstieg-Parser + Pratt-Ausdrucksparser (Präzedenztabelle).
-- [ ] AST-Definitionen (`crates/vire_ast`).
-- [ ] Fehler-Recovery (Panic-Mode an `}`/`\n`; mehrere Fehler pro Lauf).
-- [ ] `vire fmt` (Roundtrip AST→Quelltext) als Parser-Fuzz-Absicherung.
+The **whole pipeline is functional**: lexer → parser → macro expansion → recursive
+inline → type inference → lowering to SSA IR → whole-program solver → LLVM backend →
+`clang -O2 -flto -march=native`. `vire build foo.vr -o foo` and `vire run foo.vr`
+produce and run native binaries today. Traits (vtable dispatch + devirtualization),
+arrays, structs/records, generics-by-inlining, and a set of example programs compile
+and run; the benchmark suite (sort, binsearch, vcall, matmul, nbody, montecarlo,
+bitmanip, pagerank) runs against Rust/clang/gcc.
 
-### P2 — Namensauflösung + Typinferenz + Monomorphisierung
-- [ ] Namens-/Modulauflösung (ein Modul = Datei, ein Paket = Verzeichnis).
-- [ ] **Bidirektionale HM-Inferenz** mit lokalen Ankern (Signaturen an Fn-/Modul-
-  grenzen halten Fehler nah — s. [BEWERTUNG.md](sprache/BEWERTUNG.md) §5).
-- [ ] Trait-Auflösung + Kohärenzregeln (das *echte* Risiko, nicht Vanilla-HM).
-- [ ] Monomorphisierung (dockt an den vorhandenen Inliner-Ansatz an).
-- [ ] **Gute Fehlermeldungen** (nahe Ursache, Fix-Vorschläge) — Ergonomie-kritisch.
+**Soundness floor:** the Java-bytecode path's **65 heap-balance regression tests
+(0 live objects at exit)** stay green after every change — the oracle for the RC/
+collector/elision work.
 
-### P3 — `comptime` + Makro-Expander (die „Präprozessor"-Ebene, Feature 4/2/3)
-- [ ] `comptime`-Auswerter (Interpreter über den AST/Typgraphen; Rekursionslimit).
-- [ ] `@typeinfo`/Reflection-API (Feature 3).
-- [ ] Hygienischer Makro-Expander (Feature 4).
-- [ ] `@if`/`@when` bedingte Compilierung (Feature 4).
+**Performance (vs clang++ 22, best-of-5, output-verified):** at or above Rust level
+on compute (montecarlo 0.96×, nbody/bitmanip ~1.0×) and **2.4× faster on virtual
+dispatch** (vcall 0.42×, via solver devirtualization). Array-heavy kernels still lag
+(sort 1.37×, binsearch 1.16×) — data-dependent bounds checks.
 
-### P4 — Absenkung AST → `crates/ir` **in SSA**
-- [ ] Lowering (Werttypen, Summentypen→getaggte Union, Closures, `match`→`switch`).
-- [ ] **Iterator-Mutation-Check** ([REFERENZ.md](sprache/REFERENZ.md) §9a) — lokale
-  Nicht-Mutations-Analyse; nicht beweisbar → Compilefehler.
-- [ ] SSA-Erzeugung (macht den GVN-gegen-Slot-Reuse-Kampf des Java-Pfads überflüssig).
-- [ ] Solver + Backend unverändert anhängen (Devirt/Escape/RC/Bounds/Backend).
+### What's still to do (priority order)
 
-### P5 — Stdlib + FFI
-- [ ] Kern-Stdlib (Str, List/Map/Set, Iteratoren, Option/Result) über libc.
-- [ ] `extern "C"` + `unsafe`-Grenze.
-- [ ] C-Header→Binding-Generator (Feature 5-Voraussetzung, Interop-Kern).
-
----
-
-## Features 1–8 (jeweils mit Andockpunkt + Kernaufgaben)
-
-### [1] Multithreading, safe by construction 🟢* *(leicht + Kanäle/Mutex genügt — bestätigt)*
-Andock: FastLLVM `--threads` (atomare RC, pthreads, Monitor) — **vorhanden**.
-- [ ] `Channel[T]`, `spawn`, `Mutex[T]`, `Atomic[T]` in der Stdlib.
-- [ ] `parallel_map`/`parallel_for` (Fork-Join).
-- [ ] **Send-Prüfung**: ein an `spawn` übergebener Wert muss gemoved/kopiert *oder*
-  ein Sync-Typ sein — sonst Compilefehler. *Konservativ* (dieselbe Analyse wie der
-  Iterator-Check §9a; im Zweifel Mutex/move verlangen). **Keine** Totalgarantie über
-  beliebige Alias-Graphen — bewusst (BEWERTUNG §7.1).
-- [ ] M0.1 klärt vorab die Atomic-Contention-Kosten.
-
-### [2] Template-Programmierung 🟢
-Andock: Monomorphisierung (P2) + `comptime` (P3).
-- [ ] Generics `[T: Trait]`, Mehrfachschranken.
-- [ ] Wert-Generics `[comptime N: Int]`, Fixarrays `[T; N]`.
-- [ ] Monomorphisierung + statische Trait-Auflösung → Direktaufrufe.
-
-### [3] Compile-Time-Reflection 🟢
-Andock: Whole-Program-Typgraph (P2) + `comptime` (P3).
-- [ ] `@typeinfo(T)` (Felder/Varianten/Methoden/Attribute, comptime-durchlaufbar).
-- [ ] `@derive(Json, Eq, Hash, Ord, …)` über Reflection.
-- [ ] `comptime for/if/assert`, `emit`. **Keine** Laufzeit-Reflection (AOT).
-
-### [4] Eigener optionaler Präprozessor 🟢 *(= comptime/@if/Makros, kein C-Text)*
-Andock: P3.
-- [ ] Hygienische Makros (`macro name(args) { … }`), **hygienisch + typsicher**:
-  - [ ] **typisierte Parameter** (`cond: expr`, `body: block`, `ident`, `pat`,
-    `type`, oder konkreter Typ) → Fehlverwendung = Compilefehler am Aufrufort.
-  - [ ] **volle Typprüfung nach Expansion** (kein ill-typisiertes Ergebnis möglich).
-  - [ ] Hygiene (keine Namens-Einfänge), Diagnose-Spans bis in die Expansion.
-- [ ] `@if`/`@when` (bedingte Compilierung, Plattform-Weichen) — ausdrucksbasiert, geprüft.
-- [ ] `const`/`comptime {}` (Compilezeit-Werte/Codegen), voll typgeprüft. Doku: kein `#define`.
-
-### [5] Build-Interop, Meson first-class 🟢🟡
-Andock: clang→Objekt (vorhanden).
-- [ ] Stabile Compiler-CLI (`--emit=obj|llvm|asm`, `-O`, `--deps` Ninja-`.d`).
-- [ ] Meson-Modul `vire` (`vire.executable/static_library`), C-ABI-`.o`/`.a`.
-- [ ] `vire build`-Wrapper delegiert an Meson; pkg-config-Deps → Binding-Generator.
-- [ ] **Entscheidung:** Meson *adoptieren* statt eigenem Build (spart ein Subsystem).
-
-### [6] Logger „in gut" 🟢
-Andock: Stdlib + `comptime` (compile-time Level-Filter) + Debug-Info (Ort).
-- [ ] Strukturierte Felder, Level, `with log.span(...)`.
-- [ ] **Compile-Zeit-Level-Filter**: deaktivierte Aufrufe = 0 Instruktionen (comptime-`if`).
-- [ ] Sinks (Konsole farbig / JSON / Datei), beim Build gewählt.
-
-### [7] Fehlerbehandlung à la Go 🟢* *(Go-Geist, aber `Result` statt `nil`)*
-Andock: Wert-Fehlermodell (Backend vorhanden), `?` als Absenkung.
-- [ ] `Result[T,E]`/`Option[T]` + `?`-Operator (früher Rücksprung).
-- [ ] `.wrap(msg)` (Kontext, Kette), typisierte Fehler + `match`.
-- [ ] **Kein `nil`, kein `(T, Error)`-Tupel** (verletzt kein-null). `panic` nur für
-  Programmierfehler.
-
-### [8] Debug-Symbole + Crash-Pfade 🟢
-Andock: LLVM-Debug-Metadaten (Backend-Ausbau), Panic-Modell.
-- [ ] Zeilennummern Front-End→IR durchreichen; `!DILocation`/`!DISubprogram` emittieren.
-- [ ] Debug-Runtime-Backtrace (`datei:zeile:funktion`) bei panic/Bounds/Null.
-- [ ] Release standardmäßig aus (0 Overhead), `--release --backtrace` opt-in.
-- [ ] freestanding: kompakte Symboltabelle statt libc-`backtrace`.
+1. **Relational bounds elision** (the largest measured gap). Elide the data-dependent
+   index check on `a[mid]` / quicksort partition: prove `mid = (lo+hi)/2 < len` from
+   `lo < len ∧ hi < len` via a saturating lt-domain (div-sum rule + `x−1 < x` axiom,
+   greatest-fixpoint on the loop invariant). Replaces today's guard-only lt-analysis
+   in [crates/solver/src/bounds.rs](crates/solver/src/bounds.rs). Caps at Rust parity
+   (no production compiler elides the non-affine binary-search check; Rust keeps it).
+2. **Region-borrow inference (M0.3 gate-opener)** — see M0 below; prove loop-stable
+   containers borrowable → drop loop retain/release → defuses the collector for free.
+3. **Front-end completeness** — `comptime` evaluator, full monomorphization, trait
+   coherence, error-recovery quality, `vire fmt` (P2/P3/P4 below).
+4. **Stdlib breadth + FFI polish** — `Str`, `List`/`Map`/`Set`, iterators,
+   `Option`/`Result`, the C-header binding generator (P5).
+5. **Features 1–8** — concurrency stdlib, generics surface, comptime reflection,
+   hygienic macros, Meson integration, logger, Go-style errors, debug/backtrace.
 
 ---
 
-## Querschnitts-Risiken (früh retiren — aus BEWERTUNG §7)
-- [ ] **Alias-Präzision** (Sicherheit *und* Tempo hängen daran) → M0.1.
-- [ ] **Compile-Zeit** Whole-Program+Mono+comptime → M0.2 + Analyse-Caching prüfen.
-- [ ] **Inferenz-Fehlerlokalität** → bidirektionale Anker + Fix-Vorschläge (P2).
-- [ ] **Overflow-Default**: geprüft auch in Release, Wrapping nur explizit ([REFERENZ.md](sprache/REFERENZ.md) §3.1).
+## M0 — risk measurement (gate) — ✅ EXECUTED, verdict: **conditional go**
 
-## Nicht-Ziele (bewusst)
-Laufzeit-`eval`/-Reflection · dynamisches Nachladen unbekannten Codes · C-Text-
-Präprozessor · Deadlock-Freiheits-Garantie · „alle" C++/Rust-Libs jenseits der
-C-ABI-Grenze.
+Full report: **[language/M0-MEASUREMENT.md](language/M0-MEASUREMENT.md)**. Programs:
+[benchmarks/m0/](benchmarks/m0/). Measured over the **real automatic pipeline** (the
+solver does the inference — not hand lowering), oracle↔automatic spread.
+
+- [x] **M0.1 alias precision.** Adversarial PageRank object graph (shared/escaping/
+  mutating/cyclic). Result: **>1000× slower** than Rust at 100k (collector
+  super-linear/timeout), **4.4×** without the collector, **6.3×** atomic RC
+  (uncontended). The oracle(=0 RC)↔automatic spread is maximal → the inference does
+  **not** recover the borrow facts in the shared/cyclic case. "Rust-level without
+  annotations" is a **slogan** on this subset.
+- [x] **M0.2 compile time.** Solver+backend super-linear (~O(n^1.4)): 50k LOC = 1.8 s,
+  extrapolated ~5–7 s at 100k — **without** incremental caching.
+- [~] **M0.1 contention** (rest): real multithread contention as a separate experiment
+  is open; 6.3× uncontended is the lower bound.
+- [x] **M0.1b (the decisive extra measurement):** RC separated from the object model
+  (collector off, N=16k): with RC 4.4×, **without RC 1.48×**, Rust 1×. → The RC is
+  **3.4× and elidable** (the loop is topology-stable = provably borrowable); the
+  solver did **not** prove the borrowability (completeness gap, not a §7 wall).
+  Ceiling = **~1.5×** (object model), not 1×.
+
+**M0.3 decision — the repair is ONE thing, not two parallel ones:**
+- [ ] **(ii) region-borrow inference** (the gate-opener): prove loop-stable containers
+  (`nodes[]`, `n.out` — not reassigned in the loop) borrowable as a region → drop the
+  loop retain/release. **This defuses the collector for free** (no loop releases → no
+  cycle candidates → no O(n²)). Goal: 108× → ~1.5×. Soundness-delicate (0 live!): only
+  with a region-/dominance-scoped "no store rebinds the borrowed slot" proof. **This
+  is the ownership-inference module** — careful, not quick.
+- [x] **(i) collector scaling** — DONE (adaptive threshold 2×live → linear; 108×→~7×)
+  + iterative drop/collect (soundness: N=200k crash→runs). Not needed further for this
+  pattern; stays relevant for *genuinely* cyclic programs. **Note the tension:**
+  incremental/generational = write barriers per mutation (re-inflates the floor) +
+  more runtime → pulls against "~runtime-free" (feature 5) and part of feature 3.
+- [x] **(iii) SOUNDNESS bug FIXED:** iterative worklist release + iterative collector
+  traversals (cwork/bwork/fwork). N=200k crash → runs, 0 live.
+- [ ] **(iv) field-/interprocedural bounds elision** for `out[k]` (length of a field
+  array) → closes part of the residual 1.5× toward ~1.1×.
+- [ ] **(v) overflow default + `+%` culture** (vectorization, M0 report) and
+  **analysis caching** (compile time).
+- [ ] **(vi) M0.1c contention:** measure real multithread contention (feature-1 number).
+
+**Core risk confirmed red, but the path is surveyed:** ~1.1–1.5× is reachable, but
+needs the ownership module (ii). Front-end (P1+) was deferred until (ii)+(iii); the
+rest of the pipeline is now built (see current state above).
+
+---
+
+## Compiler pipeline (front-end new, rest reused)
+
+### P1 — lexer + parser → AST → plan: [language/PARSER.md](language/PARSER.md)
+- [x] Lexer (token kinds, Unicode idents, numbers/strings/interpolation, comments).
+- [x] Recursive-descent parser + Pratt expression parser (precedence table).
+- [x] AST definitions.
+- [~] Error recovery (panic mode at `}`/`\n`; multiple errors per run) — basic.
+- [ ] `vire fmt` (roundtrip AST→source) as parser-fuzz insurance.
+
+### P2 — name resolution + type inference + monomorphization
+- [x] Name/module resolution (one module = file, one package = directory).
+- [x] **Bidirectional HM inference** with local anchors (signatures at fn/module
+  boundaries keep errors near — see [EVALUATION.md](language/EVALUATION.md) §5).
+- [~] Trait resolution + coherence rules (the *real* risk, not vanilla HM).
+- [~] Monomorphization (hooks into the existing inliner approach).
+- [~] **Good error messages** (near the cause, fix suggestions) — ergonomics-critical.
+
+### P3 — `comptime` + macro expander (the "preprocessor" layer, features 4/2/3)
+- [~] Macro expander (`crates/vire/src/expand.rs`).
+- [ ] `comptime` evaluator (interpreter over the AST/type graph; recursion limit).
+- [ ] `@typeinfo`/reflection API (feature 3).
+- [ ] Hygienic macros (feature 4).
+- [ ] `@if`/`@when` conditional compilation (feature 4).
+
+### P4 — lowering AST → `crates/ir` **in SSA**
+- [x] Lowering (value types, sum types→tagged union, closures, `match`→`switch`).
+- [~] **Iterator-mutation check** ([REFERENCE.md](language/REFERENCE.md) §9a) — local
+  non-mutation analysis; not provable → compile error.
+- [x] SSA generation (removes the Java path's GVN-vs-slot-reuse fight).
+- [x] Solver + backend attached unchanged (devirt/escape/RC/bounds/backend).
+
+### P5 — stdlib + FFI
+- [~] Core stdlib (Str, List/Map/Set, iterators, Option/Result) over libc.
+- [x] `extern "C"` + `unsafe` boundary.
+- [x] C-header→binding generator (feature-5 prerequisite, interop core).
+
+---
+
+## Features 1–8 (each with attachment point + core tasks)
+
+### [1] Multithreading, safe by construction 🟢* *(light + channels/mutex is enough — confirmed)*
+Attach: backend `--threads` (atomic RC, pthreads, monitor) — **present**.
+- [ ] `Channel[T]`, `spawn`, `Mutex[T]`, `Atomic[T]` in the stdlib.
+- [ ] `parallel_map`/`parallel_for` (fork-join).
+- [ ] **Send check**: a value passed to `spawn` must be moved/copied *or* a Sync type
+  — else compile error. *Conservative* (same analysis as the iterator check §9a; when
+  in doubt require mutex/move). **No** total guarantee over arbitrary alias graphs —
+  deliberate (EVALUATION §7.1).
+- [ ] M0.1 clarifies the atomic-contention cost up front.
+
+### [2] Template programming 🟢
+Attach: monomorphization (P2) + `comptime` (P3).
+- [ ] Generics `[T: Trait]`, multiple bounds.
+- [ ] Value generics `[comptime N: Int]`, fixed arrays `[T; N]`.
+- [ ] Monomorphization + static trait resolution → direct calls.
+
+### [3] Compile-time reflection 🟢
+Attach: whole-program type graph (P2) + `comptime` (P3).
+- [ ] `@typeinfo(T)` (fields/variants/methods/attributes, comptime-iterable).
+- [ ] `@derive(Json, Eq, Hash, Ord, …)` via reflection.
+- [ ] `comptime for/if/assert`, `emit`. **No** runtime reflection (AOT).
+
+### [4] Own optional preprocessor 🟢 *(= comptime/@if/macros, not C text)*
+Attach: P3.
+- [ ] Hygienic macros (`macro name(args) { … }`), **hygienic + type-safe**:
+  - [ ] **typed parameters** (`cond: expr`, `body: block`, `ident`, `pat`, `type`, or
+    a concrete type) → misuse = compile error at the call site.
+  - [ ] **full type checking after expansion** (no ill-typed result possible).
+  - [ ] hygiene (no name capture), diagnostic spans into the expansion.
+- [ ] `@if`/`@when` (conditional compilation, platform switches) — expression-based, checked.
+- [ ] `const`/`comptime {}` (compile-time values/codegen), fully type-checked. Docs: not `#define`.
+
+### [5] Build interop, Meson first-class 🟢🟡
+Attach: clang→object (present).
+- [ ] Stable compiler CLI (`--emit=obj|llvm|asm`, `-O`, `--deps` Ninja `.d`).
+- [ ] Meson module `vire` (`vire.executable/static_library`), C-ABI `.o`/`.a`.
+- [ ] `vire build` wrapper delegates to Meson; pkg-config deps → binding generator.
+- [ ] **Decision:** *adopt* Meson instead of an own build system (saves a subsystem).
+
+### [6] Logger "done right" 🟢
+Attach: stdlib + `comptime` (compile-time level filter) + debug info (location).
+- [ ] Structured fields, levels, `with log.span(...)`.
+- [ ] **Compile-time level filter**: disabled calls = 0 instructions (comptime `if`).
+- [ ] Sinks (colored console / JSON / file), chosen at build time.
+
+### [7] Go-style error handling 🟢* *(Go spirit, but `Result` instead of `nil`)*
+Attach: value error model (backend present), `?` as lowering.
+- [ ] `Result[T,E]`/`Option[T]` + `?` operator (early return).
+- [ ] `.wrap(msg)` (context, chain), typed errors + `match`.
+- [ ] **No `nil`, no `(T, Error)` tuple** (violates no-null). `panic` only for
+  programmer errors.
+
+### [8] Debug symbols + crash paths 🟢
+Attach: LLVM debug metadata (backend extension), panic model.
+- [ ] Thread line numbers front-end→IR; emit `!DILocation`/`!DISubprogram`.
+- [ ] Debug runtime backtrace (`file:line:function`) on panic/bounds/null.
+- [ ] Off by default in release (0 overhead), `--release --backtrace` opt-in.
+- [ ] freestanding: compact symbol table instead of libc `backtrace`.
+
+---
+
+## Cross-cutting risks (retire early — from EVALUATION §7)
+- [x] **Alias precision** (safety *and* speed depend on it) → M0.1 (measured; residual
+  addressed by region inference (ii)).
+- [~] **Compile time** whole-program+mono+comptime → M0.2 measured; analysis caching open.
+- [~] **Inference error locality** → bidirectional anchors + fix suggestions (P2).
+- [ ] **Overflow default**: checked also in release, wrapping only explicit
+  ([REFERENCE.md](language/REFERENCE.md) §3.1).
+
+## Non-goals (deliberate)
+Runtime `eval`/reflection · dynamic loading of unknown code · C-text preprocessor ·
+deadlock-freedom guarantee · "all" C++/Rust libraries beyond the C-ABI boundary.

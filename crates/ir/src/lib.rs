@@ -1,7 +1,7 @@
-//! Mittel-IR nach rustc-MIR-Vorbild (siehe DESIGN.md §2): Funktionen aus
-//! Basic Blocks, Locals statt Operandenstack, expliziter Terminator pro
-//! Block. Auf dieser IR laufen später Devirtualisierung, Escape-Analyse,
-//! Inlining und guarded speculation — vor der LLVM-Absenkung.
+//! Mid-level IR modeled on rustc's MIR (see DESIGN.md §2): functions of
+//! basic blocks, locals instead of an operand stack, an explicit terminator per
+//! block. Devirtualization, escape analysis, inlining, and guarded speculation
+//! later run on this IR — before the LLVM lowering.
 
 use std::fmt;
 
@@ -11,16 +11,16 @@ pub enum Ty {
     I64,
     F32,
     F64,
-    /// Referenztyp; vorerst opak (Zeiger). Für String-Literale genutzt.
+    /// Reference type; opaque for now (pointer). Used for string literals.
     Ref,
     Void,
 }
 
-/// Index eines Locals in `Function::locals`.
+/// Index of a local in `Function::locals`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Local(pub u32);
 
-/// Index eines Basic Blocks in `Function::blocks`.
+/// Index of a basic block in `Function::blocks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Block(pub u32);
 
@@ -31,11 +31,11 @@ pub enum Operand {
     ConstI64(i64),
     ConstF32(f32),
     ConstF64(f64),
-    /// Verweis auf ein String-Literal in `Program::strings`.
+    /// Reference to a string literal in `Program::strings`.
     ConstStr(u32),
-    /// Class-Objekt einer zur Compile-Zeit aufgelösten Klasse (Reflection,
-    /// DESIGN.md §1.3). Singleton pro Klasse → `==` ist Pointer-Gleichheit,
-    /// wie in Java.
+    /// Class object of a class resolved at compile time (reflection,
+    /// DESIGN.md §1.3). Singleton per class → `==` is pointer equality,
+    /// as in Java.
     ConstClass(String),
     ConstNull,
 }
@@ -45,7 +45,7 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    /// Java-Semantik: wirft bei Divisor 0; Absenkung fügt den Check ein.
+    /// Java semantics: throws on divisor 0; the lowering inserts the check.
     Div,
     Rem,
     Shl,
@@ -67,31 +67,31 @@ pub enum Rvalue {
     Use(Operand),
     Binary(BinOp, Operand, Operand),
     Neg(Operand),
-    /// Numerische Konvertierung; Quelltyp = Typ des Operanden, Zieltyp =
-    /// Typ des Ziel-Locals. Nur verlustfreie/definierte Fälle inline
-    /// (i2l/i2d/l2d/l2i); saturating d2i/d2l laufen über Runtime-Calls.
+    /// Numeric conversion; source type = type of the operand, target type =
+    /// type of the destination local. Only lossless/defined cases inline
+    /// (i2l/i2d/l2d/l2i); saturating d2i/d2l go through runtime calls.
     Convert(Operand),
 }
 
 #[derive(Debug, Clone)]
 pub enum Statement {
     Assign(Local, Rvalue),
-    /// Direkter Aufruf (statisch, devirtualisiert oder Runtime-Intrinsic).
+    /// Direct call (static, devirtualized, or runtime intrinsic).
     Call {
         dest: Option<Local>,
         func: String,
         args: Vec<Operand>,
     },
-    /// Devirtualisierter Instanzaufruf: wie `Call`, aber `args[0]` (der
-    /// Receiver) wird auf null geprüft → abfangbare NullPointerException.
+    /// Devirtualized instance call: like `Call`, but `args[0]` (the
+    /// receiver) is null-checked → catchable NullPointerException.
     CallGuarded {
         dest: Option<Local>,
         func: String,
         args: Vec<Operand>,
     },
-    /// Virtueller Aufruf über die Vtable; `args[0]` ist der Receiver.
-    /// `class` ist der statische Typ des Call-Sites; der Solver ersetzt
-    /// monomorphe Sites durch `Call` (CHA-Devirtualisierung).
+    /// Virtual call through the vtable; `args[0]` is the receiver.
+    /// `class` is the static type of the call site; the solver replaces
+    /// monomorphic sites with `Call` (CHA devirtualization).
     CallVirtual {
         dest: Option<Local>,
         class: String,
@@ -101,46 +101,46 @@ pub enum Statement {
         ret: Ty,
         args: Vec<Operand>,
     },
-    /// Polymorpher, aber kleiner Call-Site (2–3 instanziierte Zielklassen):
-    /// der Solver ersetzt den Vtable-Dispatch durch eine Typ-Wächter-Kaskade
-    /// aus Direkt-Aufrufen (guarded devirtualization / polymorphic inline
-    /// cache). `args[0]` ist der Receiver (auf null geprüft); `targets` sind
-    /// (konkrete Klasse, Symbol)-Paare, das letzte dient als else-Zweig.
+    /// Polymorphic but small call site (2–3 instantiated target classes):
+    /// the solver replaces the vtable dispatch with a type-guard cascade
+    /// of direct calls (guarded devirtualization / polymorphic inline
+    /// cache). `args[0]` is the receiver (null-checked); `targets` are
+    /// (concrete class, symbol) pairs, the last serving as the else branch.
     CallPoly {
         dest: Option<Local>,
         ret: Ty,
         args: Vec<Operand>,
         targets: Vec<(String, String)>,
     },
-    /// Objektallokation; Felder sind genullt (Java-Default), Header gesetzt.
+    /// Object allocation; fields are zeroed (Java default), header set.
     New { dest: Local, class: String },
-    /// Stack-Allokation: von der Escape-Analyse bewiesen, dass das Objekt
-    /// die Funktion nie verlässt (Ownership light, DESIGN.md §6a) —
-    /// Lebenszeit = Stack-Frame, wie ein Rust-Wert ohne Box.
+    /// Stack allocation: the escape analysis has proven that the object
+    /// never leaves the function (ownership light, DESIGN.md §6a) —
+    /// lifetime = stack frame, like a Rust value without a Box.
     StackNew { dest: Local, class: String },
     GetField { dest: Local, obj: Operand, class: String, field: String },
     PutField { obj: Operand, class: String, field: String, value: Operand },
     GetStatic { dest: Local, class: String, field: String },
     PutStatic { class: String, field: String, value: Operand },
-    /// `dest = (pending exception instanceof class) ? 1 : 0` — für die
-    /// Typ-Diskriminierung mehrerer catch-Blöcke.
+    /// `dest = (pending exception instanceof class) ? 1 : 0` — for
+    /// discriminating the types of multiple catch blocks.
     InstanceOfPending { dest: Local, class: String },
-    /// Laufzeit-checkcast auf eine modellierte Klasse: wirft
-    /// ClassCastException bei Mismatch, sonst passthrough.
+    /// Runtime checkcast to a modeled class: throws
+    /// ClassCastException on mismatch, otherwise passthrough.
     CheckCast { obj: Operand, class: String },
     /// `dest = (obj instanceof class) ? 1 : 0`.
     InstanceOf { dest: Local, obj: Operand, class: String },
-    /// Array-Allokation der Länge `len`.
+    /// Array allocation of length `len`.
     NewArray { dest: Local, kind: ArrKind, len: Operand },
     ArrayLen { dest: Local, arr: Operand },
-    /// `dest = arr[index]`; bounds-gecheckt sofern `checked`.
+    /// `dest = arr[index]`; bounds-checked if `checked`.
     ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },
-    /// `arr[index] = value`; bounds-gecheckt sofern `checked`.
+    /// `arr[index] = value`; bounds-checked if `checked`.
     ArrayStore { arr: Operand, index: Operand, value: Operand, kind: ArrKind, checked: bool },
 }
 
-/// Array-Elementart: Wertetyp (Stack) + Speicherbreite. Bool/Byte = 1 Byte,
-/// Char/Short = 2 (Wert int); Int/Float = 4; Long/Double/Ref = 8.
+/// Array element kind: value type (stack) + storage width. Bool/Byte = 1 byte,
+/// Char/Short = 2 (value int); Int/Float = 4; Long/Double/Ref = 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrKind {
     Bool,
@@ -155,7 +155,7 @@ pub enum ArrKind {
 }
 
 impl ArrKind {
-    /// Wertetyp auf dem Operandenstack.
+    /// Value type on the operand stack.
     pub fn value_ty(self) -> Ty {
         match self {
             ArrKind::Long => Ty::I64,
@@ -165,7 +165,7 @@ impl ArrKind {
             _ => Ty::I32,
         }
     }
-    /// Speicherbreite in Bytes.
+    /// Storage width in bytes.
     pub fn size(self) -> usize {
         match self {
             ArrKind::Bool | ArrKind::Byte => 1,
@@ -182,13 +182,13 @@ impl ArrKind {
 #[derive(Debug, Clone)]
 pub enum Terminator {
     Goto(Block),
-    /// if op != 0 → then_blk sonst else_blk (Vergleiche liefern 0/1).
+    /// if op != 0 → then_blk otherwise else_blk (comparisons yield 0/1).
     Branch {
         cond: Operand,
         then_blk: Block,
         else_blk: Block,
     },
-    /// Mehrweg-Verzweigung (tableswitch/lookupswitch) auf einen i32-Wert.
+    /// Multi-way branch (tableswitch/lookupswitch) on an i32 value.
     Switch {
         value: Operand,
         default: Block,
@@ -205,33 +205,33 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone)]
 pub struct Function {
-    /// Gemangelter, linkbarer Name (z. B. `J_Hello_main_...`).
+    /// Mangled, linkable name (e.g. `J_Hello_main_...`).
     pub name: String,
     pub params: Vec<Ty>,
     pub ret: Ty,
-    /// Locals[0..params.len()] sind die Parameter.
+    /// Locals[0..params.len()] are the parameters.
     pub locals: Vec<Ty>,
     pub blocks: Vec<BasicBlock>,
-    /// Instanzmethode: Local 0 ist `this` und beweisbar nicht-null (der Aufrufer
-    /// prüft den Receiver bzw. `this` stammt aus `new`). Erlaubt dem Backend, die
-    /// inline-Null-Prüfung bei `this`-Feldzugriffen wegzulassen.
+    /// Instance method: local 0 is `this` and provably non-null (the caller
+    /// checks the receiver, or `this` comes from `new`). Lets the backend omit
+    /// the inline null check on `this` field accesses.
     pub receiver_nonnull: bool,
 }
 
-// --- Klassenmodell (Closed World: alle Klassen sind zur Build-Zeit bekannt) ---
+// --- Class model (closed world: all classes are known at build time) ---
 
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub name: String,
     pub ty: Ty,
-    /// Für Ref-Felder: interner Name des referenzierten Typs (Element-Typ bei
-    /// Arrays), `java/lang/Object` wenn unbekannt/breit. `None` bei Primitiven
-    /// UND bei Primitiv-Arrays (`int[]` referenziert nichts → keine Zyklus-
-    /// Kante). Grundlage der Azyklizitäts-Analyse (Zyklen-Collector-Elimination).
+    /// For ref fields: internal name of the referenced type (element type for
+    /// arrays), `java/lang/Object` if unknown/wide. `None` for primitives
+    /// AND for primitive arrays (`int[]` references nothing → no cycle
+    /// edge). Basis of the acyclicity analysis (cycle collector elimination).
     pub ref_target: Option<String>,
 }
 
-/// Compile-Zeit-Initialwert eines statischen Feldes (ConstantValue).
+/// Compile-time initial value of a static field (ConstantValue).
 #[derive(Debug, Clone)]
 pub enum ConstInit {
     I32(i32),
@@ -252,14 +252,14 @@ pub struct MethodInfo {
     pub name: String,
     pub desc: String,
     pub is_static: bool,
-    /// false bei abstract (kein Code-Attribut).
+    /// false for abstract (no Code attribute).
     pub has_body: bool,
-    /// Gemangelter Funktionsname der Definition in dieser Klasse.
+    /// Mangled function name of the definition in this class.
     pub mangled: String,
 }
 
 impl MethodInfo {
-    /// Virtuell = nimmt am Dispatch teil (Instanzmethode, kein Konstruktor).
+    /// Virtual = participates in dispatch (instance method, not a constructor).
     pub fn is_virtual(&self) -> bool {
         !self.is_static && self.name != "<init>"
     }
@@ -267,18 +267,18 @@ impl MethodInfo {
 
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
-    /// Interner JVM-Name (z. B. `pkg/Foo`).
+    /// Internal JVM name (e.g. `pkg/Foo`).
     pub name: String,
-    /// None nur bei java/lang/Object (implizit, nicht registriert).
+    /// None only for java/lang/Object (implicit, not registered).
     pub super_name: Option<String>,
     pub is_interface: bool,
-    /// Direkt implementierte/erweiterte Interfaces (JVM-Namen).
+    /// Directly implemented/extended interfaces (JVM names).
     pub interfaces: Vec<String>,
-    /// Nur deklarierte Instanzfelder; Superklassen-Felder über die Kette.
+    /// Only declared instance fields; superclass fields via the chain.
     pub fields: Vec<FieldInfo>,
     pub static_fields: Vec<StaticFieldInfo>,
     pub methods: Vec<MethodInfo>,
-    /// Hat die Klasse einen statischen Initialisierer (<clinit>)?
+    /// Does the class have a static initializer (<clinit>)?
     pub has_clinit: bool,
 }
 
@@ -286,14 +286,14 @@ pub struct ClassInfo {
 pub struct Program {
     pub functions: Vec<Function>,
     pub classes: Vec<ClassInfo>,
-    /// String-Literal-Pool; `Operand::ConstStr` indiziert hierher.
+    /// String literal pool; `Operand::ConstStr` indexes into this.
     pub strings: Vec<String>,
-    /// Klassen mit Class-Objekt (durch Reflection berührt):
-    /// Klassenname → String-Index des gepunkteten Namens (für getName).
+    /// Classes with a Class object (touched by reflection):
+    /// class name → string index of the dotted name (for getName).
     pub class_objects: Vec<(String, u32)>,
-    /// Einstiegsklasse (interner Name, z.B. `com/x/App`), falls bekannt
-    /// (JAR-Manifest `Main-Class` oder `--main`). Nur deren `main` wird zu
-    /// `java_main`; ist es `None`, gilt jede `main`-Methode (Einzeldatei-Modus).
+    /// Entry class (internal name, e.g. `com/x/App`), if known
+    /// (JAR manifest `Main-Class` or `--main`). Only its `main` becomes
+    /// `java_main`; if `None`, any `main` method applies (single-file mode).
     pub main_class: Option<String>,
 }
 
@@ -306,8 +306,8 @@ impl Program {
         (self.strings.len() - 1) as u32
     }
 
-    /// Registriert das Class-Objekt einer Klasse und liefert den
-    /// String-Index ihres gepunkteten Namens.
+    /// Registers a class's Class object and returns the
+    /// string index of its dotted name.
     pub fn intern_class_object(&mut self, class: &str) -> u32 {
         if let Some((_, sid)) = self.class_objects.iter().find(|(c, _)| c == class) {
             return *sid;
@@ -322,8 +322,8 @@ impl Program {
         self.classes.iter().find(|c| c.name == name)
     }
 
-    /// Feld-Auflösung: läuft die Superklassen-Kette von `class` hoch bis zur
-    /// deklarierenden Klasse (JVMS 5.4.3.2). Liefert (Besitzerklasse, Typ).
+    /// Field resolution: walks the superclass chain from `class` up to the
+    /// declaring class (JVMS 5.4.3.2). Returns (owner class, type).
     pub fn resolve_field(&self, class: &str, field: &str) -> Option<(&str, Ty)> {
         let mut cur = self.class(class)?;
         loop {
@@ -334,8 +334,8 @@ impl Program {
         }
     }
 
-    /// Statisches Feld auflösen (Superklassen-Kette hoch). Liefert
-    /// (Besitzerklasse, Typ).
+    /// Resolve a static field (up the superclass chain). Returns
+    /// (owner class, type).
     pub fn resolve_static_field(&self, class: &str, field: &str) -> Option<(&str, Ty)> {
         let mut cur = self.class(class)?;
         loop {
@@ -346,8 +346,8 @@ impl Program {
         }
     }
 
-    /// Methoden-Auflösung: findet die Implementierung von `name`+`desc`
-    /// ab `class` aufwärts. Liefert die definierende ClassInfo + MethodInfo.
+    /// Method resolution: finds the implementation of `name`+`desc`
+    /// from `class` upward. Returns the defining ClassInfo + MethodInfo.
     pub fn resolve_method(&self, class: &str, name: &str, desc: &str) -> Option<(&ClassInfo, &MethodInfo)> {
         let mut cur = self.class(class)?;
         loop {
@@ -358,7 +358,7 @@ impl Program {
         }
     }
 
-    /// Ist `sub` gleich `sup` oder eine (transitive) Subklasse?
+    /// Is `sub` equal to `sup` or a (transitive) subclass?
     pub fn is_subclass(&self, sub: &str, sup: &str) -> bool {
         let mut cur = sub;
         loop {
@@ -372,8 +372,8 @@ impl Program {
         }
     }
 
-    /// Alle Interfaces, die `class` (transitiv über Super-Kette und
-    /// Interface-Vererbung) implementiert.
+    /// All interfaces that `class` implements (transitively via the super
+    /// chain and interface inheritance).
     pub fn all_interfaces(&self, class: &str) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         let mut stack = vec![class.to_string()];
@@ -391,18 +391,18 @@ impl Program {
         out
     }
 
-    /// Implementiert `class` das Interface `iface` (oder ist gleich)?
+    /// Does `class` implement the interface `iface` (or is it equal)?
     pub fn implements(&self, class: &str, iface: &str) -> bool {
         class == iface || self.all_interfaces(class).contains(iface)
     }
 }
 
-/// Macht aus einem JVM-Namen einen linkbaren Bezeichner.
+/// Turns a JVM name into a linkable identifier.
 pub fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
-/// Linker-Symbol einer Methode. Muss über alle Crates konsistent sein.
+/// Linker symbol of a method. Must be consistent across all crates.
 pub fn mangle(class: &str, name: &str, descriptor: &str) -> String {
     if name == "main" && descriptor == "([Ljava/lang/String;)V" {
         return "java_main".to_string();
@@ -410,12 +410,12 @@ pub fn mangle(class: &str, name: &str, descriptor: &str) -> String {
     format!("J_{}_{}_{}", sanitize(class), sanitize(name), sanitize(descriptor))
 }
 
-/// Symbol des statischen Initialisierers einer Klasse.
+/// Symbol of a class's static initializer.
 pub fn clinit_symbol(class: &str) -> String {
     mangle(class, "<clinit>", "()V")
 }
 
-// --- Textuelle Ausgabe für Debugging (`--emit-ir`) ---
+// --- Textual output for debugging (`--emit-ir`) ---
 
 impl fmt::Display for Program {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

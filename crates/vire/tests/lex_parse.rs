@@ -24,7 +24,7 @@ fn lex_numbers_and_ops() {
 
 #[test]
 fn newline_is_soft_terminator() {
-    // Newline nach `b` (endet Anweisung) → Terminator; nach `+` (Operator) nicht.
+    // Newline after `b` (ends statement) → terminator; after `+` (operator) it does not.
     let (toks, _) = lex("a + b\nc");
     let nl = toks.iter().filter(|t| t.tok == Tok::Newline).count();
     assert_eq!(nl, 1, "genau ein Terminator-Newline erwartet");
@@ -97,12 +97,12 @@ fn parse_match_and_for() {
 
 #[test]
 fn parse_method_chain_multiline() {
-    // Leading-dot-Chain über Zeilen hinweg
+    // Leading-dot chain across lines
     let src = "fn f(xs) = xs.map(g)\n  .filter(h)\n  .len()\n";
     let (m, diags) = vire::parse(src);
     assert!(diags.is_empty(), "{:?}", diags);
     let Item::Fn(f) = &m.items[0] else { panic!() };
-    // äußerster Ausdruck ist ein Call (.len())
+    // outermost expression is a Call (.len())
     assert!(matches!(f.body.as_ref().unwrap().tail.as_ref().unwrap().as_ref(), Expr::Call { .. }));
 }
 

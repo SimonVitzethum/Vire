@@ -1,0 +1,47 @@
+// Hygienic AND type-safe macros (AST-based, typed parameters, fully
+// type-checked after expansion) + comptime instead of the C preprocessor. No token soup:
+// incorrect use is a compile error AT THE CALL SITE.
+
+// Custom control construct. Parameter kinds: cond is an expression, body a block.
+macro unless(cond: expr, body: block) { if not (cond) { body } }
+
+// Block timing: `body` is inserted, `t0`/`r` are hygienic (do not collide
+// with names at the call site); the result type is inherited from `body` & checked.
+macro timed(label: expr, body: block) {
+    t0 = now()
+    r  = body
+    log.debug("{label}", ms: now() - t0)
+    r
+}
+
+// Retry with a fixed count — a macro, because it inserts the block multiple times.
+macro retry(times: expr, body: block) {
+    mut last = Err("never tried")
+    for _ in 0..times {
+        last = body
+        if last.is_ok() { break }
+    }
+    last
+}
+
+// unless(42) { ... }   // ERROR at the call: `cond: expr` must be Bool (type-checked)
+
+// Conditional compilation without #ifdef: comptime-if (the branch is not even
+// compiled when the condition is false).
+fn poll_backend() {
+    comptime if cfg.os == .linux { epoll_wait() } else { kqueue_wait() }
+}
+
+fn main() {
+    unless(ready()) { init() }
+
+    total = timed("sum") {
+        mut s = 0
+        for i in 0..1_000_000 { s = s + i }
+        s
+    }
+    print(total)
+
+    result = retry(3) { fetch("https://example.com") }
+    print(result)
+}

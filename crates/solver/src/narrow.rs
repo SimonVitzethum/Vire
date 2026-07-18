@@ -1,11 +1,11 @@
-//! Field-Auto-Narrowing über Wertebereichs-Analyse.
+//! Field auto-narrowing via value-range analysis.
 //!
-//! Ein `Int`(i64)-Feld, dessen sämtliche gespeicherte Werte BEWEISBAR in den
-//! i32-Bereich passen, wird auf i32 verengt (4 statt 8 Byte → RAM). Sound: bei
-//! jeder Unsicherheit ⊤ (nicht verengen); Widening garantiert Terminierung und
-//! über-approximiert wachsende Rekurrenzen (z.B. ein Akkumulator/Zähler → ⊤ →
-//! bleibt i64). Der Rewrite fügt an narrowten Feldzugriffen `Convert` ein
-//! (Read: i32→i64 sext; Write: i64→i32 trunc, verlustfrei da beweisbar passend).
+//! An `Int`(i64) field whose stored values ALL PROVABLY fit in the
+//! i32 range is narrowed to i32 (4 instead of 8 bytes → RAM). Sound: on
+//! any uncertainty ⊤ (do not narrow); widening guarantees termination and
+//! over-approximates growing recurrences (e.g. an accumulator/counter → ⊤ →
+//! stays i64). The rewrite inserts `Convert` at narrowed field accesses
+//! (read: i32→i64 sext; write: i64→i32 trunc, lossless since provably fitting).
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ const POS_INF: i64 = i64::MAX;
 struct Range {
     lo: i64,
     hi: i64,
-    bot: bool, // ⊥ (noch kein Wert)
+    bot: bool, // ⊥ (no value yet)
 }
 impl Range {
     fn bottom() -> Range {
@@ -33,7 +33,7 @@ impl Range {
     fn is_top(&self) -> bool {
         !self.bot && (self.lo == NEG_INF || self.hi == POS_INF)
     }
-    /// Plain join (Vereinigung, KEIN Widening): lo=min, hi=max.
+    /// Plain join (union, NO widening): lo=min, hi=max.
     fn join(&self, other: Range) -> Range {
         if other.bot {
             return *self;
@@ -43,9 +43,9 @@ impl Range {
         }
         Range { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi), bot: false }
     }
-    /// Widening von `self` (alt) nach `new`: jede Grenze, die sich vergrößert hat,
-    /// auf ±∞ setzen (Terminierung; sound). Nur nach anhaltendem Wachstum anwenden
-    /// (verzögert), sonst würde reine Propagation fälschlich zu ⊤ widen.
+    /// Widening from `self` (old) to `new`: set every bound that has grown
+    /// to ±∞ (termination; sound). Apply only after sustained growth
+    /// (delayed), otherwise pure propagation would wrongly widen to ⊤.
     fn widen_to(&self, new: Range) -> Range {
         if self.bot {
             return new;
@@ -100,7 +100,7 @@ fn mul(a: Range, b: Range) -> Range {
     let vs: Vec<i64> = prods.iter().map(|p| p.unwrap()).collect();
     Range { lo: *vs.iter().min().unwrap(), hi: *vs.iter().max().unwrap(), bot: false }
 }
-/// Division nur bei konstantem positivem Divisor präzise, sonst ⊤.
+/// Division precise only with a constant positive divisor, otherwise ⊤.
 fn div(a: Range, b: Range) -> Range {
     if a.bot || b.bot {
         return Range::bottom();
@@ -111,7 +111,7 @@ fn div(a: Range, b: Range) -> Range {
     let d = b.lo;
     Range { lo: a.lo / d, hi: a.hi / d, bot: false }
 }
-/// Rest bei konstantem Divisor: |Ergebnis| < |d|.
+/// Remainder with a constant divisor: |result| < |d|.
 fn rem(_a: Range, b: Range) -> Range {
     if b.bot || b.lo != b.hi || b.lo == 0 {
         return Range::top();
@@ -120,15 +120,15 @@ fn rem(_a: Range, b: Range) -> Range {
     Range { lo: -m, hi: m, bot: false }
 }
 
-/// Ist der Local-Typ ganzzahlig (verengbar relevant)?
+/// Is the local type an integer (relevant to narrowing)?
 fn is_int(ty: Ty) -> bool {
     matches!(ty, Ty::I32 | Ty::I64)
 }
 
-/// Verengt beweisbar-i32-passende `Int`-Felder auf i32 + schreibt die Zugriffe um.
-/// Rückgabe: Anzahl verengter Felder.
+/// Narrows provably-i32-fitting `Int` fields to i32 + rewrites the accesses.
+/// Return: number of narrowed fields.
 pub fn narrow_fields(program: &mut Program) -> usize {
-    // Fixpunkt: Feld-Ranges + Local-Ranges (nicht-fluss-sensitiv: Join aller Defs).
+    // Fixpoint: field ranges + local ranges (not flow-sensitive: join of all defs).
     let mut field_r: HashMap<(String, String), Range> = HashMap::new();
     let mut local_r: HashMap<(usize, u32), Range> = HashMap::new();
 
@@ -141,15 +141,15 @@ pub fn narrow_fields(program: &mut Program) -> usize {
         }
     };
 
-    // Verzögertes Widening: eine Grenze, die sich über MEHR als K Iterationen weiter
-    // vergrößert, ist eine echte Rekurrenz (Zähler/Akkumulator) → auf ±∞ widen.
-    // Reine Propagation (endliche Ketten) stabilisiert vorher → keine Widening,
-    // volle Präzision. K muss die längste azyklische Kette überdauern.
+    // Delayed widening: a bound that keeps growing over MORE than K iterations
+    // is a true recurrence (counter/accumulator) → widen to ±∞.
+    // Pure propagation (finite chains) stabilizes before that → no widening,
+    // full precision. K must outlast the longest acyclic chain.
     const K: u32 = 12;
     let mut local_age: HashMap<(usize, u32), u32> = HashMap::new();
     let mut field_age: HashMap<(String, String), u32> = HashMap::new();
     for _pass in 0..(K + 8) {
-        // Phase 1: neue Ranges via PLAIN JOIN, aus den ALTEN Maps gelesen (Jacobi).
+        // Phase 1: new ranges via PLAIN JOIN, read from the OLD maps (Jacobi).
         let mut nl: HashMap<(usize, u32), Range> = HashMap::new();
         let mut nf: HashMap<(String, String), Range> = HashMap::new();
         let mut jl = |key: (usize, u32), r: Range, nl: &mut HashMap<(usize, u32), Range>| {
@@ -181,11 +181,11 @@ pub fn narrow_fields(program: &mut Program) -> usize {
                             };
                             jl((fi, d.0), r, &mut nl);
                         }
-                        // KEIN Feld-Feedback: ein GetField liefert ⊤. Damit kann kein
-                        // Feld-Range (transitiv) von sich selbst abhängen → wachsende
-                        // Rekurrenzen (z.B. ein akkumulierendes Feld) werden ⊤ und NIE
-                        // fälschlich verengt. Sound; verengt weiter Konstanten/`i%256`
-                        // etc. (Werte, die NICHT aus dem Feld selbst stammen).
+                        // NO field feedback: a GetField yields ⊤. This way no
+                        // field range can (transitively) depend on itself → growing
+                        // recurrences (e.g. an accumulating field) become ⊤ and are NEVER
+                        // wrongly narrowed. Sound; still narrows constants/`i%256`
+                        // etc. (values that do NOT stem from the field itself).
                         Statement::GetField { dest, .. } if is_int(f.locals[dest.0 as usize]) => {
                             jl((fi, dest.0), Range::top(), &mut nl);
                         }
@@ -217,7 +217,7 @@ pub fn narrow_fields(program: &mut Program) -> usize {
                 }
             }
         }
-        // Phase 2: mit verzögertem Widening in die alten Maps mergen.
+        // Phase 2: merge into the old maps with delayed widening.
         let mut changed = false;
         for (key, new) in nl {
             let old = *local_r.get(&key).unwrap_or(&Range::bottom());
@@ -248,8 +248,8 @@ pub fn narrow_fields(program: &mut Program) -> usize {
         }
     }
 
-    // Verengbare Felder bestimmen: nur deklarierte I64-`Int`-Felder, deren Range
-    // beweisbar in i32 passt (und nicht ⊥ = wird tatsächlich geschrieben).
+    // Determine narrowable fields: only declared I64 `Int` fields whose range
+    // provably fits in i32 (and is not ⊥ = is actually written).
     let mut narrow: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for c in &program.classes {
         for fld in &c.fields {
@@ -266,7 +266,7 @@ pub fn narrow_fields(program: &mut Program) -> usize {
         return 0;
     }
 
-    // Feld-Typen auf i32 setzen.
+    // Set field types to i32.
     for c in &mut program.classes {
         for fld in &mut c.fields {
             if narrow.contains(&(c.name.clone(), fld.name.clone())) {
@@ -275,8 +275,8 @@ pub fn narrow_fields(program: &mut Program) -> usize {
         }
     }
 
-    // Zugriffe umschreiben: Read i32→i64 (sext via Convert in ein frisches i64-
-    // Local, dann Use), Write i64→i32 (trunc via Convert in ein frisches i32-Local).
+    // Rewrite accesses: read i32→i64 (sext via Convert into a fresh i64
+    // local, then Use), write i64→i32 (trunc via Convert into a fresh i32 local).
     for f in &mut program.functions {
         for bi in 0..f.blocks.len() {
             let mut out: Vec<Statement> = Vec::new();
@@ -284,7 +284,7 @@ pub fn narrow_fields(program: &mut Program) -> usize {
             for st in stmts {
                 match st {
                     Statement::GetField { dest, obj, class, field } if narrow.contains(&(class.clone(), field.clone())) => {
-                        // Feld ist jetzt i32 → in ein i32-Temp laden, dann sext ins dest.
+                        // Field is now i32 → load into an i32 temp, then sext into dest.
                         f.locals.push(Ty::I32);
                         let tmp = Local((f.locals.len() - 1) as u32);
                         out.push(Statement::GetField { dest: tmp, obj, class, field });
@@ -292,7 +292,7 @@ pub fn narrow_fields(program: &mut Program) -> usize {
                     }
                     Statement::PutField { obj, class, field, value } if narrow.contains(&(class.clone(), field.clone())) => {
                         match value {
-                            // Konstante passt beweisbar → direkt als i32.
+                            // Constant provably fits → directly as i32.
                             Operand::ConstI64(v) => {
                                 out.push(Statement::PutField { obj, class, field, value: Operand::ConstI32(v as i32) });
                             }

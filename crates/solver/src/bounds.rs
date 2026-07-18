@@ -1,28 +1,28 @@
-//! Bounds-Check-Elision via globales Value-Numbering (GVN).
+//! Bounds-check elision via global value numbering (GVN).
 //!
-//! Array-Zugriffe, deren Index beweisbar in `[0, arr.length)` liegt, werden auf
-//! `checked: false` gesetzt — das Backend emittiert sie dann inline ohne
-//! Bounds-/NPE-Prüfung (throw-frei → die pending-Prüfung fällt weg). Das ist
-//! der Weg, über den auch Rusts LLVM `arr[i]` in Schleifen von den Checks
-//! befreit; hier beweist es der Solver explizit unter Closed World.
+//! Array accesses whose index provably lies in `[0, arr.length)` are set to
+//! `checked: false` — the backend then emits them inline without a
+//! bounds/NPE check (throw-free → the pending check falls away). This is
+//! the same route by which Rust's LLVM frees `arr[i]` in loops from the
+//! checks; here the solver proves it explicitly under closed world.
 //!
-//! Warum GVN? Das Mittel-IR ist nicht in SSA: der javac-Stackverkehr recycelt
-//! Slots aggressiv, sodass Index, Schranke und Array am Schleifenwächter in
-//! *anderen* Locals liegen als am Zugriff — obwohl es dieselben Werte sind. Eine
-//! lokal-basierte Analyse verliert die Verbindung. GVN vergibt jedem *Wert* eine
-//! stabile Nummer (Sym): Kopien erben die Nummer, Merges erzeugen ein Phi-Sym.
-//! Damit ist „Index-Wert < Längen-Wert" slot-unabhängig entscheidbar.
+//! Why GVN? The mid-level IR is not in SSA: the javac stack traffic recycles
+//! slots aggressively, so index, bound, and array at the loop guard live in
+//! *different* locals than at the access — even though they are the same values. A
+//! local-based analysis loses the connection. GVN assigns each *value* a
+//! stable number (sym): copies inherit the number, merges create a phi sym.
+//! This makes "index value < length value" decidable independently of the slot.
 //!
-//! Drei Schritte:
-//! 1. GVN-Fixpunkt: `env[b]` = Local → Sym am Blockeingang (pessimistisch: eine
-//!    konkrete Nummer nur bei Übereinstimmung aller Preds, sonst Phi).
-//! 2. Nichtnegativität als globale Eigenschaft der Syms (größter Fixpunkt):
-//!    const≥0, Add(nn,≥0), Mul(nn,nn), Länge, Phi(alle-nn).
-//! 3. Flusssensitive Must-Analyse `lt` über Sym-Paare (Wert < Wert), erzeugt an
-//!    Branch-Kanten. Ein Zugriff `arr[i]` wird unchecked, wenn
-//!    `(sym(i), len_of[sym(arr)]) ∈ lt` und `sym(i)` nichtnegativ ist.
-//! Sound: `len` ist eine Array-Länge (< 2^31), also verhindert `i < len` den
-//! Überlauf — `nn` bedeutet an diesem Punkt tatsächlich `i >= 0`.
+//! Three steps:
+//! 1. GVN fixpoint: `env[b]` = local → sym at the block entry (pessimistic: a
+//!    concrete number only when all preds agree, otherwise phi).
+//! 2. Non-negativity as a global property of the syms (greatest fixpoint):
+//!    const≥0, Add(nn,≥0), Mul(nn,nn), length, Phi(all-nn).
+//! 3. Flow-sensitive must-analysis `lt` over sym pairs (value < value), created at
+//!    branch edges. An access `arr[i]` becomes unchecked when
+//!    `(sym(i), len_of[sym(arr)]) ∈ lt` and `sym(i)` is non-negative.
+//! Sound: `len` is an array length (< 2^31), so `i < len` prevents the
+//! overflow — at this point `nn` really does mean `i >= 0`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -36,28 +36,28 @@ pub fn elide_bounds(program: &mut Program) -> usize {
     total
 }
 
-/// Wertnummer-Ausdruck. Jede Variante ist über ihre Felder eindeutig, sodass
-/// der Interner strukturell gleiche Werte auf dieselbe Nummer abbildet.
+/// Value-number expression. Each variant is unique through its fields, so
+/// the interner maps structurally equal values to the same number.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum SymExpr {
     Const(i64),
     Param(u32),
-    /// Undurchsichtiger Wert, identifiziert durch seine Definitionsstelle.
+    /// Opaque value, identified by its definition site.
     Opaque(u32),
-    /// Phi an einem Blockeingang: (Block, Local).
+    /// Phi at a block entry: (block, local).
     Phi(u32, u32),
-    /// Array-Identität (NewArray), identifiziert durch die Definitionsstelle.
+    /// Array identity (NewArray), identified by the definition site.
     Array(u32),
-    /// Länge des Arrays mit Sym-Id.
+    /// Length of the array with sym id.
     Len(u32),
-    /// Sym-Id + Konstante (Induktionsschritt).
+    /// Sym id + constant (induction step).
     Add(u32, i64),
-    /// Summe zweier Syms (kanonisch: id1 <= id2) — nicht-konstanter Schritt
-    /// wie `j += i`.
+    /// Sum of two syms (canonical: id1 <= id2) — non-constant step
+    /// like `j += i`.
     Add2(u32, u32),
-    /// Produkt zweier Syms (kanonisch: id1 <= id2).
+    /// Product of two syms (canonical: id1 <= id2).
     Mul(u32, u32),
-    /// `x & m` mit Maske m ≥ 0 — Ergebnis liegt beweisbar in [0, m].
+    /// `x & m` with mask m ≥ 0 — the result provably lies in [0, m].
     And(u32, i64),
 }
 
@@ -79,12 +79,12 @@ impl Interner {
     }
 }
 
-/// Definitionsstelle → stabile u32 (Block, Statement-Index).
+/// Definition site → stable u32 (block, statement index).
 fn site(b: usize, si: usize) -> u32 {
     ((b as u32) << 16) | (si as u32 & 0xFFFF)
 }
 
-type Env = BTreeMap<u32, u32>; // Local → Sym-Id
+type Env = BTreeMap<u32, u32>; // local → sym id
 
 fn sym_of_operand(op: &Operand, env: &Env, it: &mut Interner) -> u32 {
     match op {
@@ -109,10 +109,10 @@ fn is_int(t: Ty) -> bool {
 fn sym_of_rvalue(rv: &Rvalue, env: &Env, it: &mut Interner, s: u32, dst: Ty, locals: &[Ty]) -> u32 {
     match rv {
         Rvalue::Use(op) => sym_of_operand(op, env, it),
-        // Ganzzahl-Konvertierung ist werttransparent (gleiches Sym), wenn Quelle
-        // und Ziel Ganzzahlen sind: `(int)j`/`(long)i` ändern den in `[0,len)`
-        // (len < 2^31) liegenden Wert nicht. Die spätere lt+nn-Prüfung stellt
-        // genau diesen Bereich sicher, sodass die Trunkierung verlustfrei ist.
+        // Integer conversion is value-transparent (same sym) when source
+        // and target are integers: `(int)j`/`(long)i` do not change a value
+        // lying in `[0,len)` (len < 2^31). The later lt+nn check guarantees
+        // exactly this range, so the truncation is lossless.
         Rvalue::Convert(Operand::Copy(l)) if is_int(dst) && is_int(*locals.get(l.0 as usize).unwrap_or(&Ty::Ref)) => {
             sym_of_operand(&Operand::Copy(*l), env, it)
         }
@@ -150,10 +150,10 @@ fn sym_of_rvalue(rv: &Rvalue, env: &Env, it: &mut Interner, s: u32, dst: Ty, loc
             }
             _ => it.intern(SymExpr::Opaque(s)),
         },
-        // Bitmaskierung `x & m` (m ≥ 0): Ergebnis in [0, m] — häufig als
-        // Index `arr[i & (len-1)]`/`sh[i & 1]` (Potenz-von-2-Ringpuffer). Die
-        // Maske kann inline-Konstante ODER ein Const-wertiges Local sein (javac
-        // lädt `iconst` in einen Slot); daher über die Sym-Nummer auflösen.
+        // Bit masking `x & m` (m ≥ 0): result in [0, m] — often as
+        // index `arr[i & (len-1)]`/`sh[i & 1]` (power-of-2 ring buffer). The
+        // mask can be an inline constant OR a const-valued local (javac
+        // loads `iconst` into a slot); therefore resolve it via the sym number.
         Rvalue::Binary(BinOp::And, a, b) => {
             let sa = sym_of_operand(a, env, it);
             let sb = sym_of_operand(b, env, it);
@@ -176,8 +176,8 @@ fn sym_of_rvalue(rv: &Rvalue, env: &Env, it: &mut Interner, s: u32, dst: Ty, loc
     }
 }
 
-/// Transfer eines Blocks: env am Eingang → env am Ausgang. Baut nebenbei
-/// `len_of` (Array-Sym → Längen-Sym) auf.
+/// Transfer of a block: env at entry → env at exit. Builds `len_of`
+/// (array sym → length sym) as a side effect.
 fn transfer_block(
     f: &Function,
     b: usize,
@@ -234,7 +234,7 @@ fn transfer_block(
     env
 }
 
-/// Prädezessoren je Block.
+/// Predecessors per block.
 fn predecessors(f: &Function) -> Vec<Vec<usize>> {
     let nb = f.blocks.len();
     let mut preds = vec![Vec::new(); nb];
@@ -259,11 +259,11 @@ fn succ_blocks(t: &Terminator) -> Vec<usize> {
     }
 }
 
-/// Merge (pessimistisch): konkrete Nummer nur, wenn alle Preds das Local führen
-/// und übereinstimmen; sonst Phi(b, local).
+/// Merge (pessimistic): concrete number only when all preds carry the local
+/// and agree; otherwise Phi(b, local).
 fn merge_in(f: &Function, b: usize, preds: &[usize], env_out: &[Env], it: &mut Interner) -> Env {
     if preds.is_empty() {
-        // Entry: Parameter vorbelegen.
+        // Entry: preload parameters.
         let mut env = Env::new();
         for i in 0..f.params.len() as u32 {
             let s = it.intern(SymExpr::Param(i));
@@ -271,14 +271,14 @@ fn merge_in(f: &Function, b: usize, preds: &[usize], env_out: &[Env], it: &mut I
         }
         return env;
     }
-    // Alle in irgendeinem Pred definierten Locals betrachten.
+    // Consider all locals defined in any pred.
     let mut locals: BTreeSet<u32> = BTreeSet::new();
     for &p in preds {
         locals.extend(env_out[p].keys().copied());
     }
     let mut env = Env::new();
     for l in locals {
-        // Konkret nur, wenn ALLE Preds das Local führen und sich einig sind.
+        // Concrete only when ALL preds carry the local and agree.
         let first = env_out[preds[0]].get(&l).copied();
         let agree = first.is_some()
             && preds.iter().all(|&p| env_out[p].get(&l).copied() == first);
@@ -300,7 +300,7 @@ fn run(f: &mut Function) -> usize {
     let locals = f.locals.clone();
     let mut it = Interner::default();
 
-    // --- Schritt 1: GVN-Fixpunkt (Gauss-Seidel, gedeckelt). ---
+    // --- Step 1: GVN fixpoint (Gauss-Seidel, capped). ---
     let mut env_out: Vec<Env> = vec![Env::new(); nb];
     let mut len_of: HashMap<u32, u32> = HashMap::new();
     let mut converged = false;
@@ -321,15 +321,15 @@ fn run(f: &mut Function) -> usize {
         }
     }
     if !converged {
-        return 0; // konservativ: unkonvergiert → keine Elision
+        return 0; // conservative: not converged → no elision
     }
-    // env_in je Block final rekonstruieren.
+    // Reconstruct env_in per block finally.
     let env_in: Vec<Env> = (0..nb).map(|b| merge_in(f, b, &preds[b], &env_out, &mut it)).collect();
 
-    // --- Schritt 2: Nichtnegativität (größter Fixpunkt über Syms). ---
-    // phi_inc: eingehende Syms je Phi-Sym (aus dem finalen env). Fehlt das Local
-    // in *irgendeinem* Pred, ist das Phi „incomplete" (ein undefinierter/anderer
-    // Eingang) → weder kollabierbar noch nn-beweisbar.
+    // --- Step 2: non-negativity (greatest fixpoint over syms). ---
+    // phi_inc: incoming syms per phi sym (from the final env). If the local is
+    // missing in *any* pred, the phi is "incomplete" (an undefined/other
+    // input) → neither collapsible nor nn-provable.
     let mut phi_inc: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut incomplete: BTreeSet<u32> = BTreeSet::new();
     for b in 0..nb {
@@ -348,14 +348,14 @@ fn run(f: &mut Function) -> usize {
             }
         }
     }
-    // Phi-Kollaps (optimistisch): ein Phi, dessen einziger Nicht-Selbst-Eingang
-    // ein Wert S ist, ist ≡ S (schleifeninvariant). Nötig, weil der pessimistische
-    // GVN invariante Werte, die um die Schleife fließen, sonst als Phi festhält.
+    // Phi collapse (optimistic): a phi whose only non-self input
+    // is a value S is ≡ S (loop-invariant). Necessary because the pessimistic
+    // GVN would otherwise hold invariant values flowing around the loop as a phi.
     let repr = compute_repr(&it, &phi_inc, &incomplete);
     let nn = compute_nonneg(&it, &phi_inc, &repr, &incomplete);
-    // Konstante obere Schranke je Sym: Const(c≥0) → c, And(_,m≥0) → m. Für
-    // Indizes ohne Schleifenwächter (`sh[i & 1]`): in-bounds gegen konstante
-    // Länge, wenn diese Schranke < Länge ist.
+    // Constant upper bound per sym: Const(c≥0) → c, And(_,m≥0) → m. For
+    // indices without a loop guard (`sh[i & 1]`): in-bounds against a constant
+    // length, if this bound < length.
     let ub_const: Vec<Option<i64>> = it
         .exprs
         .iter()
@@ -366,8 +366,8 @@ fn run(f: &mut Function) -> usize {
         })
         .collect();
 
-    // --- Schritt 3: flusssensitive lt-Analyse über Sym-Paare. ---
-    // Kanten-Fakten: (from_block, to_block) → strikte (x<y)-Paare.
+    // --- Step 3: flow-sensitive lt-analysis over sym pairs. ---
+    // Edge facts: (from_block, to_block) → strict (x<y) pairs.
     let mut edge_facts: HashMap<(usize, usize), BTreeSet<(u32, u32)>> = HashMap::new();
     let mut universe: BTreeSet<(u32, u32)> = BTreeSet::new();
     for b in 0..nb {
@@ -375,7 +375,7 @@ fn run(f: &mut Function) -> usize {
         else {
             continue;
         };
-        // Vergleichs-Definition des cond-Locals im selben Block finden (letzte).
+        // Find the comparison definition of the cond local in the same block (last).
         let Some((op, sa0, sb0)) = find_cmp(f, b, c.0, &env_in[b], &mut it) else {
             continue;
         };
@@ -393,9 +393,9 @@ fn run(f: &mut Function) -> usize {
         edge_facts.entry((b, e)).or_default().extend(else_pairs);
     }
 
-    // Must-Fixpunkt: in[entry]=∅, sonst ⊤=universe; in[b] = ∩_p (in[p] ∪ facts(p→b)).
+    // Must fixpoint: in[entry]=∅, otherwise ⊤=universe; in[b] = ∩_p (in[p] ∪ facts(p→b)).
     let mut lt_in: Vec<BTreeSet<(u32, u32)>> = vec![universe.clone(); nb];
-    // Entry ist der Block ohne Preds (üblich Block 0).
+    // Entry is the block without preds (usually block 0).
     for b in 0..nb {
         if preds[b].is_empty() {
             lt_in[b].clear();
@@ -430,19 +430,19 @@ fn run(f: &mut Function) -> usize {
         }
     }
 
-    // --- Zugriffe markieren. ---
+    // --- Mark accesses. ---
     let mut count = 0;
     for b in 0..nb {
         let lt = lt_in[b].clone();
-        // env am jeweiligen Statement mitführen.
+        // Carry env along at each statement.
         let mut env = env_in[b].clone();
         let mut dummy_len = len_of.clone();
         let stmts = &mut f.blocks[b].statements;
         for si in 0..stmts.len() {
             let elide = match &stmts[si] {
-                // Ref-Loads dürfen elidiert werden (reiner GEP); Ref-Stores nicht,
-                // da `jrt_?astore` die Kovarianz-Prüfung (ArrayStoreException)
-                // trägt, die der inline-Pfad nicht hätte.
+                // Ref loads may be elided (pure GEP); ref stores not,
+                // since `jrt_?astore` carries the covariance check (ArrayStoreException)
+                // that the inline path would not have.
                 Statement::ArrayLoad { arr, index, checked, .. } if *checked => {
                     provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &repr, &mut it)
                 }
@@ -460,20 +460,20 @@ fn run(f: &mut Function) -> usize {
                     _ => {}
                 }
             }
-            // env um dieses Statement fortschreiben (nur Sym-Definitionen).
+            // Advance env past this statement (only sym definitions).
             step_env(&f_stmt(stmts, si), b, si, &mut env, &mut it, &mut dummy_len, &locals);
         }
     }
     count
 }
 
-// Hilfsklon eines Statements zum Fortschreiben von env (Borrow-Umgehung).
+// Helper clone of a statement for advancing env (borrow workaround).
 fn f_stmt(stmts: &[Statement], si: usize) -> Statement {
     stmts[si].clone()
 }
 
-/// Schreibt env um ein einzelnes Statement fort (wie transfer_block, aber
-/// einzeln — für die Zugriffsmarkierung).
+/// Advances env past a single statement (like transfer_block, but
+/// individually — for the access marking).
 fn step_env(st: &Statement, b: usize, si: usize, env: &mut Env, it: &mut Interner, len_of: &mut HashMap<u32, u32>, locals: &[Ty]) {
     match st {
         Statement::Assign(d, rv) => {
@@ -536,11 +536,11 @@ fn provably_in_bounds(
     let Some(&lensym0) = len_of.get(&asym) else { return false };
     let lensym = canon(repr, lensym0);
     let isym = canon(repr, sym_of_operand(index, env, it));
-    // Pfad 1: Schleifenwächter-Fakt `i < len` + Nichtnegativität.
+    // Path 1: loop-guard fact `i < len` + non-negativity.
     if lt.contains(&(isym, lensym)) && nn.contains(&isym) {
         return true;
     }
-    // Pfad 2: konstante Länge L, Index mit konstanter Schranke u ∈ [0, L).
+    // Path 2: constant length L, index with constant bound u ∈ [0, L).
     if let SymExpr::Const(l) = it.exprs[lensym as usize] {
         if let Some(Some(u)) = ub_const.get(isym as usize) {
             return *u >= 0 && *u < l;
@@ -549,7 +549,7 @@ fn provably_in_bounds(
     false
 }
 
-/// Repräsentant eines Syms nach Phi-Kollaps (Pfadverfolgung, bounds-sicher).
+/// Representative of a sym after phi collapse (path following, bounds-safe).
 fn canon(repr: &[u32], mut s: u32) -> u32 {
     while (s as usize) < repr.len() && repr[s as usize] != s {
         s = repr[s as usize];
@@ -557,8 +557,8 @@ fn canon(repr: &[u32], mut s: u32) -> u32 {
     s
 }
 
-/// Phi-Kollaps: repr[p] = S, wenn alle Nicht-Selbst-Eingänge von p (nach
-/// Kanonisierung) derselbe Wert S sind. Fixpunkt.
+/// Phi collapse: repr[p] = S if all non-self inputs of p (after
+/// canonicalization) are the same value S. Fixpoint.
 fn compute_repr(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, incomplete: &BTreeSet<u32>) -> Vec<u32> {
     let n = it.exprs.len();
     let mut repr: Vec<u32> = (0..n as u32).collect();
@@ -570,7 +570,7 @@ fn compute_repr(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, incomplete: &BT
             }
             let ci = canon(&repr, i as u32);
             if ci != i as u32 {
-                continue; // schon kollabiert
+                continue; // already collapsed
             }
             let Some(inc) = phi_inc.get(&(i as u32)) else { continue };
             let mut distinct: BTreeSet<u32> = BTreeSet::new();
@@ -592,15 +592,15 @@ fn compute_repr(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, incomplete: &BT
     repr
 }
 
-/// Sucht im Block b die Vergleichs-Definition des cond-Locals und liefert
-/// (Vergleichsart, Sym des linken, Sym des rechten Operanden).
+/// Searches in block b for the comparison definition of the cond local and returns
+/// (comparison kind, sym of the left operand, sym of the right operand).
 fn find_cmp(f: &Function, b: usize, cond: u32, env_in: &Env, it: &mut Interner) -> Option<(BinOp, u32, u32)> {
-    // env bis zur Vergleichsdefinition mitführen; letzte passende Def nutzen.
+    // Carry env up to the comparison definition; use the last matching def.
     let mut env = env_in.clone();
     let mut result = None;
     let mut dummy_len = HashMap::new();
-    // Long-Vergleiche werden als `jrt_lcmp(x,y) <op> 0` gesenkt (lcmp liefert
-    // sign(x−y)). `sign(x−y) op 0 ⟺ x op y`, also lösen wir den lcmp-Aufruf auf.
+    // Long comparisons are lowered as `jrt_lcmp(x,y) <op> 0` (lcmp yields
+    // sign(x−y)). `sign(x−y) op 0 ⟺ x op y`, so we resolve the lcmp call.
     let mut lcmp: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
     for (si, st) in f.blocks[b].statements.iter().enumerate() {
         if let Statement::Call { dest: Some(d), func, args } = st {
@@ -612,7 +612,7 @@ fn find_cmp(f: &Function, b: usize, cond: u32, env_in: &Env, it: &mut Interner) 
         }
         if let Statement::Assign(d, Rvalue::Binary(op, a, c)) = st {
             if d.0 == cond && matches!(op, BinOp::CmpLt | BinOp::CmpGe | BinOp::CmpGt | BinOp::CmpLe) {
-                // `lcmp(x,y) <op> 0` → (op, x, y), sonst direkter Vergleich.
+                // `lcmp(x,y) <op> 0` → (op, x, y), otherwise a direct comparison.
                 let lc = match (a, c) {
                     (Operand::Copy(l), Operand::ConstI32(0)) => lcmp.get(&l.0).copied(),
                     _ => None,
@@ -629,24 +629,24 @@ fn find_cmp(f: &Function, b: usize, cond: u32, env_in: &Env, it: &mut Interner) 
     result
 }
 
-/// Strikte (x<y)-Fakten für die then- bzw. else-Kante eines `Branch{cond}`,
-/// wobei cond = Cmp(op, a, b), sa/sb die Syms. Branch nimmt then bei cond!=0.
+/// Strict (x<y) facts for the then- resp. else-edge of a `Branch{cond}`,
+/// where cond = Cmp(op, a, b), sa/sb the syms. Branch takes then when cond!=0.
 fn strict_facts(op: BinOp, sa: u32, sb: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
     match op {
-        // a<b: then ⟹ a<b; else ⟹ b<=a (nicht strikt → nichts).
+        // a<b: then ⟹ a<b; else ⟹ b<=a (not strict → nothing).
         BinOp::CmpLt => (vec![(sa, sb)], vec![]),
-        // a>b: then ⟹ b<a; else ⟹ a<=b (nichts).
+        // a>b: then ⟹ b<a; else ⟹ a<=b (nothing).
         BinOp::CmpGt => (vec![(sb, sa)], vec![]),
-        // a>=b: then ⟹ b<=a (nichts); else ⟹ a<b.
+        // a>=b: then ⟹ b<=a (nothing); else ⟹ a<b.
         BinOp::CmpGe => (vec![], vec![(sa, sb)]),
-        // a<=b: then ⟹ a<=b (nichts); else ⟹ b<a.
+        // a<=b: then ⟹ a<=b (nothing); else ⟹ b<a.
         BinOp::CmpLe => (vec![], vec![(sb, sa)]),
         _ => (vec![], vec![]),
     }
 }
 
-/// Nichtnegative Syms (größter Fixpunkt): const≥0, Add(nn,≥0), Mul(nn,nn),
-/// Länge, Phi(alle-Eingänge nn). Alles andere gilt als möglicherweise negativ.
+/// Non-negative syms (greatest fixpoint): const≥0, Add(nn,≥0), Mul(nn,nn),
+/// length, Phi(all-inputs nn). Everything else counts as possibly negative.
 fn compute_nonneg(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32], incomplete: &BTreeSet<u32>) -> BTreeSet<u32> {
     let n = it.exprs.len();
     let mut nn = vec![true; n];
@@ -679,6 +679,6 @@ fn compute_nonneg(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32],
             break;
         }
     }
-    // nn gilt auch für kollabierte Syms über ihren Repräsentanten.
+    // nn also holds for collapsed syms via their representative.
     (0..n as u32).filter(|&i| nn[canon(repr, i) as usize]).collect()
 }

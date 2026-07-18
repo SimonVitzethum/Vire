@@ -1,5 +1,5 @@
-//! Vire — Front-End (Lexer, Parser, AST). Absenkung nach `crates/ir` folgt
-//! (sprache/FRONTEND-PLAN.md). Backend/Solver bleiben unverändert.
+//! Vire — front-end (lexer, parser, AST). Lowering to `crates/ir` follows
+//! (language/FRONTEND-PLAN.md). Backend/solver remain unchanged.
 
 pub mod ast;
 pub mod diag;

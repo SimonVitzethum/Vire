@@ -1,74 +1,56 @@
-# SPEC CPU 2017 — ehrliche Einordnung + Plan
+# SPEC CPU 2017 — honest positioning + plan
 
-*Nutzerwunsch: „mach auch SPEC CPU 2017". Hier die ehrliche Lage, warum es nicht
-1:1 geht, und was stattdessen aussagekräftig ist.*
+*User request: "do SPEC CPU 2017 too". Here is the honest situation, why it does not
+work 1:1, and what is meaningful instead.*
 
-## Warum SPEC CPU 2017 nicht direkt auf Vire läuft
-1. **Proprietär/lizenziert.** SPEC CPU 2017 ist kein frei verfügbares Benchmark-Set
-   (Lizenz ~1000 $, nicht im Repo/Netz frei ladbar). Ich kann es hier nicht
-   beschaffen oder ausführen.
-2. **Die Workloads sind C/C++/Fortran, nicht Vire.** SPEC misst *Compiler auf
-   Standard-Programmen*: intrate = perlbench, gcc, mcf, omnetpp, xalancbmk, x264,
+## Why SPEC CPU 2017 does not run directly on Vire
+1. **Proprietary/licensed.** SPEC CPU 2017 is not a freely available benchmark set
+   (license ~$1000, not freely downloadable in the repo/net). I cannot procure
+   or run it here.
+2. **The workloads are C/C++/Fortran, not Vire.** SPEC measures *compilers on
+   standard programs*: intrate = perlbench, gcc, mcf, omnetpp, xalancbmk, x264,
    deepsjeng, leela, exchange2, xz; fprate = bwaves, cactuBSSN, namd, parest, povray,
-   lbm, wrf, blender, cam4, imagick, nab, fotonik3d, roms. **Das sind zehntausende
-   Zeilen realer C/C++/Fortran** — keine Vire-Programme. „SPEC auf Vire laufen lassen"
-   gibt es nicht, weil die SPEC-Programme nicht in Vire geschrieben sind.
-3. **Vires Backend IST clang/LLVM.** Auf den C/C++-SPEC-Workloads wäre „Vire-Leistung"
-   = clang-Leistung — Vire trägt dort nichts bei, es ist nicht diese Sprachen. Ein
-   ehrlicher SPEC-Vergleich würde nur clang vs gcc vs icc messen, nicht Vire.
+   lbm, wrf, blender, cam4, imagick, nab, fotonik3d, roms. **These are tens of thousands
+   of lines of real C/C++/Fortran** — not Vire programs. "Run SPEC on Vire"
+   does not exist, because the SPEC programs are not written in Vire.
+3. **Vire's backend IS clang/LLVM.** On the C/C++ SPEC workloads, "Vire performance"
+   = clang performance — Vire contributes nothing there, it is not those languages. An
+   honest SPEC comparison would only measure clang vs gcc vs icc, not Vire.
 
-## Was stattdessen aussagekräftig ist
-Zwei ehrliche Wege, SPEC-*repräsentativ* zu messen, ohne SPEC zu behaupten:
+## What is meaningful instead
+Two honest ways to measure SPEC-*representatively* without claiming SPEC:
 
-**(a) SPEC-repräsentative Kernels nach Vire portieren** und gegen Rust/C++ messen —
-je ein Vertreter der SPEC-Charakteristika:
-- **519.lbm-Stil** (Lattice-Boltzmann, Float-Stencil über großes Gitter) →
-  Compute+Array-bound. Vire kann das mit `farray(n)` (typisierte Float-Arrays).
-  Erwartung nach den Messungen: **Parität** (compute+array = schon Parität, nsieve/
+**(a) Port SPEC-representative kernels to Vire** and measure against Rust/C++ —
+one representative per SPEC characteristic:
+- **519.lbm style** (Lattice-Boltzmann, float stencil over a large grid) →
+  compute+array-bound. Vire can do this with `farray(n)` (typed float arrays).
+  Expectation per the measurements: **parity** (compute+array = already parity, nsieve/
   mandelbrot).
-- **505.mcf-Stil** (Netzwerk-Simplex, Zeiger-Jagd über Graphknoten, int-lastig) →
-  Objekt-/Pointer-bound. Vire trifft hier die **RC-Steuer** (~2× RC-only, wie
-  pagerank/binary-trees). Der ehrliche Gap-Fall.
-- **557.xz-Stil** (Kompression, Byte-Arrays + Bit-Manipulation) → braucht **Byte-
-  Arrays** (heute nur i64-`array()`; ArrKind::Byte im Builtin fehlt) → derzeit
-  nicht sauber portierbar.
+- **505.mcf style** (network simplex, pointer chasing over graph nodes, int-heavy) →
+  object/pointer-bound. Vire hits the **RC tax** here (~2× RC-only, like
+  pagerank/binary-trees). The honest gap case.
+- **557.xz style** (compression, byte arrays + bit manipulation) → needs **byte
+  arrays** (today only i64 `array()`; ArrKind::Byte missing in the builtin) → currently
+  not cleanly portable.
 
-**(b) Die schon laufenden CLBG-Benchmarks als Proxy** (`vire-lang/`): sie decken
-dieselben Achsen ab — Compute (mandelbrot, arith), Rekursion (fib), Array (nsieve),
-Objekt-Allokation/GC (binary-trees). Ergebnis: **Compute/Array/Rekursion = C++/Rust-
-Parität, Objekt-Allokation = ~2,7× (RC-Steuer)**. Das ist genau die Aussage, die ein
-SPEC-Lauf für eine Sprache dieser Bauart liefern würde.
+**(b) The already-running CLBG benchmarks as a proxy** (`vire-lang/`): they cover
+the same axes — compute (mandelbrot, arith), recursion (fib), array (nsieve),
+object allocation/GC (binary-trees). Result: **compute/array/recursion = C++/Rust
+parity, object allocation = ~2.7× (RC tax)**. That is exactly the statement that a
+SPEC run for a language of this construction would deliver.
 
-## Plan (wenn SPEC-repräsentativ gewünscht)
-1. **lbm-Stil-Stencil** nach Vire (`farray`, nested loops) + Rust/C++ → erwartete
-   Parität bestätigen (fp-rate-Charakteristik).
-2. **mcf-Stil-Graph** (Knoten-Objekte, Kanten-Traversal) + Rust/C++ → die RC-Steuer
-   quantifizieren (int-rate-Charakteristik, der ehrliche Gap).
-3. **Byte-Arrays** (`ArrKind::Byte` im `array()`-Builtin) nachrüsten → dann xz-Stil
-   (Kompression) portierbar.
-Nicht: die echte SPEC-Suite behaupten. Das wäre unehrlich — sie ist weder verfügbar
-noch in Vire geschrieben.
+## Plan (if SPEC-representative is wanted)
+1. **lbm-style stencil** to Vire (`farray`, nested loops) + Rust/C++ → confirm the
+   expected parity (fp-rate characteristic).
+2. **mcf-style graph** (node objects, edge traversal) + Rust/C++ → quantify the RC tax
+   (int-rate characteristic, the honest gap).
+3. **Byte arrays** (`ArrKind::Byte` in the `array()` builtin) added → then xz style
+   (compression) portable.
+Not: claiming the real SPEC suite. That would be dishonest — it is neither available
+nor written in Vire.
 
-## Kurzfassung
-**SPEC CPU 2017 ist proprietär und in C/C++/Fortran — nicht direkt auf Vire
-lauffähig, und wo doch, würde es clang messen, nicht Vire.** Die aussagekräftige
-Alternative sind SPEC-repräsentative Kernel-Ports + die CLBG-Suite, und die sagen
-dasselbe wie der Rest dieses Projekts: **Compute-Parität, RC-Steuer auf Objekten.**
-EOF
-echo "SPEC-Doku geschrieben"; cd /home/simon/Schreibtisch/FastLLVM; git add -A && git commit -q -m "$(cat <<'MSG'
-SPEC CPU 2017: honest positioning + representative-port plan
-
-Document why SPEC CPU 2017 can't run on Vire directly: it's proprietary/licensed
-(not freely available), its workloads are large C/C++/Fortran programs (not Vire),
-and where they are C/C++ Vire's backend IS clang so it would measure clang, not
-Vire. The meaningful alternatives: (a) port SPEC-representative kernels -- lbm-style
-float stencil (expect parity, per nsieve/mandelbrot), mcf-style pointer-chasing
-graph (hits the RC tax ~2x, per pagerank/binary-trees), xz-style needs byte arrays
-(pending ArrKind::Byte); (b) the already-running CLBG suite as a proxy covering the
-same axes, which says compute/array/recursion = C++/Rust parity, object allocation
-= ~2.7x (RC tax). Not claiming the real SPEC suite -- it's neither available nor
-written in Vire. See benchmarks/SPEC-CPU2017.md.
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-MSG
-)" >/dev/null && echo committed
+## In short
+**SPEC CPU 2017 is proprietary and in C/C++/Fortran — not directly runnable on Vire,
+and where it is, it would measure clang, not Vire.** The meaningful
+alternative is SPEC-representative kernel ports + the CLBG suite, and they say
+the same as the rest of this project: **compute parity, RC tax on objects.**

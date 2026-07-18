@@ -1,0 +1,41 @@
+// capsule — isolated arena scope for hot/risky things (CAPSULE-EVALUATION.md).
+// PURE form: `()` inputs are DEEP-copied INTO the arena, only the block value comes out
+// (also deep-copied). No `&`, no move — only the deep copy makes the input
+// region-local and guarantees isolation + fault containment. The inside runs in
+// its own virtual RAM (arena) → NO RC, NO cycle collector, en-bloc free.
+// The win comes exactly when a lot of work funnels into a SMALL block value.
+
+type Node {
+    rank: Float
+    out: List[Node]          // may contain cycles — irrelevant in the capsule (arena)
+}
+
+fn pagerank(n: Int, iters: Int) -> Float {
+    // The whole shared/cyclic/mutating graph lives in the arena:
+    // exactly the M0 case, here RC-free and without a collector.
+    capsule(n, iters) {
+        mut nodes = build_graph(n)       // nodes → arena, no retain/release
+        for _ in 0..iters {
+            for node in nodes {
+                mut acc = 0.0
+                for nb in node.out { acc = acc + nb.rank }
+                node.rank = 0.15 / n + 0.85 * acc
+            }
+        }
+        mut sum = 0.0
+        for node in nodes { sum = sum + node.rank }
+        sum                               // block value → copied into the outer heap
+    }
+    // Arena freed en bloc here; only `sum` (a single Float) survives.
+}
+
+// Risky input in isolation: a bug in the parser only hits the arena.
+// `data` is deep-copied into the arena (no `&`) — the blast radius of a bug in the
+// parser is therefore the arena, nothing outside. Sweet spot: large input, small doc.
+fn parse_untrusted(data: List[Byte]) -> Result[Doc, Error] {
+    capsule(data) {                       // deep copy in → true isolation
+        tokenize(data).then(build_doc)    // all arena-local, blast radius = arena
+    }
+}
+// Note: the copy-free variant `capsule(&data)` breaks isolation/containment and
+// is open research (see CAPSULE-EVALUATION.md "Open research questions").

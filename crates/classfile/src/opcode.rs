@@ -1,10 +1,10 @@
-//! Decoder für die unterstützte Bytecode-Teilmenge (JVMS Kap. 6):
-//! int-Arithmetik, Kontrollfluss, statische Aufrufe, getstatic/invokevirtual
-//! (für das println-Intrinsic), String-/int-Konstanten.
+//! Decoder for the supported bytecode subset (JVMS ch. 6):
+//! int arithmetic, control flow, static calls, getstatic/invokevirtual
+//! (for the println intrinsic), string/int constants.
 
 use crate::ParseError;
 
-/// Vergleichsbedingung für Branch-Instruktionen.
+/// Comparison condition for branch instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cond {
     Eq,
@@ -15,8 +15,8 @@ pub enum Cond {
     Le,
 }
 
-/// Array-Elementtyp. Der Stack-/Wertetyp ist bei Bool/Byte/Char/Short int,
-/// die Speicherbreite aber 1/2 Byte (schmale Arrays, Rust-Speicherprofil).
+/// Array element type. The stack/value type is int for Bool/Byte/Char/Short,
+/// but the storage width is 1/2 byte (narrow arrays, Rust memory profile).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrTy {
     Bool,
@@ -30,8 +30,8 @@ pub enum ArrTy {
     Ref,
 }
 
-/// Eine dekodierte Instruktion. `pc`-Angaben in Branch-Zielen sind absolute
-/// Bytecode-Offsets (bereits aus den relativen Offsets berechnet).
+/// A decoded instruction. `pc` values in branch targets are absolute
+/// bytecode offsets (already computed from the relative offsets).
 #[derive(Debug, Clone)]
 pub enum Instr {
     Nop,
@@ -39,7 +39,7 @@ pub enum Instr {
     LConst(i64),
     FConst(f32),
     DConst(f64),
-    /// ldc2_w: long/double aus dem Constant Pool.
+    /// ldc2_w: long/double from the constant pool.
     Ldc2W(u16),
     LdcString(u16),
     LdcInt(i32),
@@ -111,13 +111,13 @@ pub enum Instr {
     Pop2,
     Dup,
     Dup2,
-    /// if_icmp<cond>: vergleicht zwei Stack-Werte.
+    /// if_icmp<cond>: compares two stack values.
     IfICmp(Cond, usize),
-    /// if<cond>: vergleicht einen Stack-Wert mit 0.
+    /// if<cond>: compares a stack value with 0.
     IfZero(Cond, usize),
     Goto(usize),
-    /// tableswitch/lookupswitch: (default-Ziel, [(Schlüssel, Ziel)]) mit
-    /// absoluten Bytecode-Offsets.
+    /// tableswitch/lookupswitch: (default target, [(key, target)]) with
+    /// absolute bytecode offsets.
     Switch(usize, Vec<(i32, usize)>),
     IReturn,
     LReturn,
@@ -137,19 +137,19 @@ pub enum Instr {
     New(u16),
     CheckCast(u16),
     InstanceOf(u16),
-    /// newarray mit primitivem Elementtyp. byte/boolean/char/short werden als
-    /// Int-Array (4 Byte) geführt — javac trunkiert die Werte vor dem Store
-    /// (i2b/i2c/i2s), daher wertkorrekt.
+    /// newarray with primitive element type. byte/boolean/char/short are kept as
+    /// an int array (4 bytes) — javac truncates the values before the store
+    /// (i2b/i2c/i2s), so it is value-correct.
     NewArrayPrim(ArrTy),
-    /// anewarray: Array von Referenzen (Klassenindex, hier ignoriert).
+    /// anewarray: array of references (class index, ignored here).
     NewArrayRef(u16),
     ArrayLength,
     AThrow,
-    /// monitorenter/monitorexit — poppt objectref, ruft die Runtime-Sperre
-    /// (echt unter --threads, sonst No-Op).
+    /// monitorenter/monitorexit — pops objectref, calls the runtime lock
+    /// (real under --threads, otherwise a no-op).
     MonitorEnter,
     MonitorExit,
-    /// Array-Load/Store mit Elementtyp (byte/char/short → Int).
+    /// Array load/store with element type (byte/char/short → int).
     ArrLoad(ArrTy),
     ArrStore(ArrTy),
     AConstNull,
@@ -159,9 +159,9 @@ pub enum Instr {
     IfACmp(Cond, usize),
 }
 
-/// Dekodiert das Code-Array einer Methode zu `(pc, Instr)`-Paaren.
-/// `ldc`-Auflösung braucht den Constant Pool, deshalb der Callback:
-/// er liefert für einen CP-Index `Some(int)` bzw. `None` für String.
+/// Decodes a method's code array into `(pc, Instr)` pairs.
+/// `ldc` resolution needs the constant pool, hence the callback:
+/// it returns `Some(int)` for a CP index, or `None` for a string.
 pub fn decode_code(
     code: &[u8],
     resolve_ldc: impl Fn(u16) -> Option<i32>,
@@ -232,7 +232,7 @@ pub fn decode_code(
             0x47..=0x4A => (Instr::DStore(op as u16 - 0x47), 1),
             0x3A => (Instr::AStore(u8_at(pc + 1)? as u16), 2),
             0x4B..=0x4E => (Instr::AStore(op as u16 - 0x4B), 1),
-            // Array-Load (baload deckt byte UND boolean ab).
+            // Array load (baload covers byte AND boolean).
             0x2E => (Instr::ArrLoad(ArrTy::Int), 1),
             0x2F => (Instr::ArrLoad(ArrTy::Long), 1),
             0x30 => (Instr::ArrLoad(ArrTy::Float), 1),
@@ -241,7 +241,7 @@ pub fn decode_code(
             0x33 => (Instr::ArrLoad(ArrTy::Byte), 1),
             0x34 => (Instr::ArrLoad(ArrTy::Char), 1),
             0x35 => (Instr::ArrLoad(ArrTy::Short), 1),
-            // Array-Store.
+            // Array store.
             0x4F => (Instr::ArrStore(ArrTy::Int), 1),
             0x50 => (Instr::ArrStore(ArrTy::Long), 1),
             0x51 => (Instr::ArrStore(ArrTy::Float), 1),
@@ -308,8 +308,8 @@ pub fn decode_code(
             0x97 => (Instr::DCmpL, 1),
             0x98 => (Instr::DCmpG, 1),
             0x84 => (Instr::IInc(u8_at(pc + 1)? as u16, u8_at(pc + 2)? as i8 as i32), 3),
-            // `wide`: verbreitert den Index (und bei iinc die Konstante) auf 16 Bit.
-            // Format: 0xc4 <op> <index:u16> [<const:i16> nur bei iinc].
+            // `wide`: widens the index (and, for iinc, the constant) to 16 bits.
+            // Format: 0xc4 <op> <index:u16> [<const:i16> only for iinc].
             0xc4 => {
                 let sub = u8_at(pc + 1)?;
                 let idx = u16_at(pc + 2)?;
@@ -343,8 +343,8 @@ pub fn decode_code(
             0xA5 => (Instr::IfACmp(Cond::Eq, branch(pc + 1)?), 3),
             0xA6 => (Instr::IfACmp(Cond::Ne, branch(pc + 1)?), 3),
             0xA7 => (Instr::Goto(branch(pc + 1)?), 3),
-            // tableswitch: Padding auf 4-Byte-Grenze, dann default/low/high
-            // und (high-low+1) Offsets (alle relativ zum Opcode-Start).
+            // tableswitch: padding to a 4-byte boundary, then default/low/high
+            // and (high-low+1) offsets (all relative to the opcode start).
             0xAA => {
                 let base = pc + 1 + ((4 - ((pc + 1) % 4)) % 4);
                 let u32_at = |i: usize| -> Result<u32, ParseError> {
@@ -361,7 +361,7 @@ pub fn decode_code(
                 }
                 (Instr::Switch(default, cases), base + 12 + count * 4 - pc)
             }
-            // lookupswitch: Padding, dann default/npairs und npairs (key, offset).
+            // lookupswitch: padding, then default/npairs and npairs (key, offset).
             0xAB => {
                 let base = pc + 1 + ((4 - ((pc + 1) % 4)) % 4);
                 let u32_at = |i: usize| -> Result<u32, ParseError> {
@@ -390,13 +390,13 @@ pub fn decode_code(
             0xB6 => (Instr::InvokeVirtual(u16_at(pc + 1)?), 3),
             0xB7 => (Instr::InvokeSpecial(u16_at(pc + 1)?), 3),
             0xB8 => (Instr::InvokeStatic(u16_at(pc + 1)?), 3),
-            // invokeinterface: index (u2), count (u1), 0 (u1) — 5 Bytes.
+            // invokeinterface: index (u2), count (u1), 0 (u1) — 5 bytes.
             0xB9 => (Instr::InvokeInterface(u16_at(pc + 1)?), 5),
             0xBA => (Instr::InvokeDynamic(u16_at(pc + 1)?), 5),
             0xBB => (Instr::New(u16_at(pc + 1)?), 3),
             0xBC => {
-                // newarray: atype → Elementtyp. bool/byte/char/short/int → Int
-                // (4-Byte, wertkorrekt), long/float/double typisiert.
+                // newarray: atype → element type. bool/byte/char/short/int → int
+                // (4-byte, value-correct), long/float/double typed.
                 let elem = match u8_at(pc + 1)? {
                     4 => ArrTy::Bool,
                     5 => ArrTy::Char,

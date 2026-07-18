@@ -1,13 +1,14 @@
 # Vire
 
-**Vire** ist eine Programmiersprache: *so leicht wie Python, so schnell wie C/Rust,
-speichersicher — ohne Lifetimes, ohne Ownership-Syntax, ohne manuelle
-Speicherverwaltung.* Sie kompiliert **AOT** zu nativen Binaries über einen
-Whole-Program-Solver und ein LLVM-Backend und kommt (für den beweisbaren Großteil)
-**ohne Runtime** aus.
+**Vire** is a programming language: *as light as Python, as fast as C/Rust,
+memory-safe — without lifetimes, without ownership syntax, without manual memory
+management.* It compiles **AOT** to native binaries through a whole-program solver
+and an LLVM backend, and runs (for the provable majority) **without a runtime**.
 
-> Name von lateinisch *vīrēs* („Kräfte, Stärke") — leicht, aber mächtig.
-> Dateiendung `.vr`. Arbeitsstand: Sprache spezifiziert, Backend gebaut & gemessen.
+> Name from the Latin *vīrēs* ("forces, strength") — light, yet powerful.
+> File extension `.vr`. Current state: language specified; front-end, solver and
+> backend built, compiling `.vr` to native binaries and benchmarked against
+> Rust/C++/gcc.
 
 ```vire
 fn word_counts(text: Str) -> Map[Str, Int] {
@@ -19,75 +20,88 @@ fn word_counts(text: Str) -> Map[Str, Int] {
 }
 ```
 
-Liest wie Python — kompiliert zu einer speichersicheren, RC-eliminierten nativen
-Binary.
+Reads like Python — compiles to a memory-safe, RC-eliminated native binary.
 
-## Idee in einem Absatz
+## The idea in one paragraph
 
-Speichersicherheit gibt es klassisch nur mit einer von drei Kröten: Garbage
-Collector (Runtime/Pausen), Ownership+Lifetimes (Rusts Annotationslast) oder
-Referenzzählung (kleine Runtime). Vire löst das **pro Programmstelle**: ein
-Whole-Program-Solver **beweist** Ownership, wo möglich (→ 0 Runtime, wie Rust), und
-fällt auf schlanke RC zurück, wo nötig. Der Programmierer schreibt **null**
-Speicher-Annotationen. Typen sind vollständig **inferiert** (Python-Ergonomie ohne
-Pythons Dynamikkosten). Das ist machbar, weil Vire **Closed-World** ist (alle
-Quellen zur Compilezeit) und auf einem Backend aufsetzt, das genau diese Beweise
-schon liefert.
+Classically, memory safety comes with one of three costs: a garbage collector
+(runtime/pauses), ownership + lifetimes (Rust's annotation burden), or reference
+counting (a small runtime). Vire resolves this **per program site**: a whole-program
+solver **proves** ownership where possible (→ zero runtime, like Rust), and falls
+back to lean RC where necessary. The programmer writes **zero** memory annotations.
+Types are fully **inferred** (Python ergonomics without Python's dynamic cost). This
+is feasible because Vire is **closed-world** (all sources available at compile time)
+and sits on a backend that already delivers exactly these proofs.
 
-## Status & Architektur
+## Status & architecture
 
-Vire = **neues Front-End** auf einem **bereits gebauten, gemessenen Backend**:
+Vire is a **front-end** on a **built, measured backend**. The whole pipeline is
+functional: `vire build foo.vr -o foo` and `vire run foo.vr` produce and execute
+native binaries today.
 
-| Schicht | Status |
+| Layer | Status |
 |---|---|
-| **Vire-Front-End** (`crates/vire`) — Lexer, Parser, AST | **im Aufbau** (Lexer + Parser lauffähig, `vire parse` dumpt AST; `sieb.vr`/`formen.vr` parsen sauber) |
-| Vire-Front-End — Resolve, Typinferenz, `comptime`, Makros → SSA-IR | spezifiziert ([sprache/FRONTEND-PLAN.md](sprache/FRONTEND-PLAN.md)), folgt |
-| **Mittel-IR** (`crates/ir`) | gebaut |
-| **Whole-Program-Solver** (Devirt, Inlining, Escape/RC-Elision, Bounds-/Null-Check-Elision, Azyklizität) | gebaut |
-| **LLVM-Backend** (textuelles IR + clang, `-march=native`, LTO; hosted/freestanding/threads) | gebaut |
+| **Vire front-end** (`crates/vire`) — lexer, parser, macro expansion, recursive inline, type inference, lowering to SSA IR | **built & working** — compiles `.vr` end-to-end to native code |
+| **Mid-level IR** (`crates/ir`) | built |
+| **Whole-program solver** (`crates/solver`) — devirtualization, inlining, escape/RC elision, bounds/null-check elision, field auto-narrowing, region inference | built |
+| **LLVM backend** (`crates/backend`) — textual IR + clang `-O2 -flto -march=native`; TBAA, `!invariant.load`, branch weights, cold error paths; hosted/freestanding/threads | built |
+| **Runtime** (`crates/driver`) — RC + Bacon–Rajan cycle collector, slab allocator, packed 16-byte header | built |
 
-Das Backend wurde über einen **Java-Bytecode-Front-End-Prototyp** entwickelt und
-gegen Rust **und** C++ gebenchmarkt (siehe [DESIGN.md](DESIGN.md) §9,
-[benchmarks/](benchmarks/)): 7 von 10 Benchmarks auf/über Rust-Niveau,
-Arithmetik/Allokation auch unter C++. Damit ist der teure, riskante Teil (Codegen,
-Speichermodell, Sicherheits-Check-Elision) **belegt** — Vire erbt ihn direkt. Der
-Java-Weg war das Beweismittel; das eigene, in SSA absenkende Front-End räumt dessen
-Reibung weg (siehe [sprache/BEWERTUNG.md](sprache/BEWERTUNG.md) §3).
+The backend was developed and hardened via a **Java-bytecode front-end prototype**
+(the `fastjavac` path), whose **65 heap-balance regression tests (0 live objects at
+exit)** are the soundness oracle — the floor every optimization must keep green. See
+[DESIGN.md](DESIGN.md) and [benchmarks/](benchmarks/).
 
-## Dokumente
+## Benchmarks (snapshot)
 
-- **[sprache/BEWERTUNG.md](sprache/BEWERTUNG.md)** — Machbarkeit ehrlich: die drei
-  Spannungen (keine Runtime / alle Libs / Python-leicht) und **§7 Restrisiken**
-  (Alias-Präzision, Compile-Zeit) — die zwei Zahlen, die vor dem Bau zu messen sind.
-- **[sprache/SPRACHE.md](sprache/SPRACHE.md)** — Syntax-Tour (Schnelleinstieg).
-- **[sprache/REFERENZ.md](sprache/REFERENZ.md)** — vollständige Syntax-/Feature-
-  Referenz (inkl. §9a Iterator-Mutation-Regel).
-- **[sprache/FEATURES-BEWERTUNG.md](sprache/FEATURES-BEWERTUNG.md)** — Bewertung der
-  acht gewünschten Features (Multithreading, Templates, comptime-Reflection,
-  eigener Präprozessor, Meson, Logger, Go-Error-Handling, Debug-Crash-Pfade).
-- **[TODO.md](TODO.md)** — Fahrplan: Features 1–8 + Compiler-Pipeline, **M0 =
-  Risiko-Messung zuerst**.
-- **[sprache/PARSER.md](sprache/PARSER.md)** — Parser-/Front-End-Bauplan (Lexer,
-  Grammatik, Pratt-Ausdrücke, Fehler-Recovery).
-- **[sprache/beispiele/](sprache/beispiele/)** — lauffähig gedachte Programme über
-  alle Bereiche und Features.
-- **[DESIGN.md](DESIGN.md)** — Architektur des Backends (Solver, Speichermodell,
-  Benchmarks). Beschreibt den heutigen Java-Bytecode-Pfad = das Beweismittel/die
-  Bootstrap-Basis.
-- **[benchmarks/](benchmarks/)** — Benchmark-Suite (Java/Rust/C++), Runner, Analyse.
+Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, g++
+16, rustc 1.97, all `-O2 -flto -march=native`):
 
-## Kernideen der Sprache (Kurzform)
+| Benchmark | Vire vs clang++ | Notes |
+|---|---|---|
+| montecarlo | **0.96×** (Vire faster) | compute-bound, Vire wins |
+| nbody / bitmanip | ~1.00× | at parity |
+| **vcall** | **0.42×** (2.4× faster) | solver devirtualization; matches Rust, near g++ |
+| matmul | ~1.0× | gcc/rustc auto-vectorizer leads (LLVM codegen limit) |
+| sort | 1.37× | array bounds checks (data-dependent index) |
+| binsearch | 1.16× | array bounds check + cache-miss-bound |
 
-- **Inferenz statt Annotation** — Typen stehen nirgends, sind aber alle bekannt.
-- **Kein `null`** — `Option[T]`; keine Exceptions — Fehler sind Werte (Go-Geist) mit
-  `?`-Propagation.
-- **`type`** für Produkt- und Summentypen (Werttypen, kein Objekt-Header),
-  **Traits** + monomorphisierte **Generics**.
-- **`comptime`** — Code, der im Compiler läuft: Reflection, Ableitungen, bedingte
-  Compilierung — zero-cost, kein Runtime-Metadaten-Ballast.
-- **Unsichtbarer Speicher** — Stack/Heap/RC entscheidet der Solver; `&` optional.
-- **Nebenläufigkeit sicher by construction** — Kanäle (CSP) + `Mutex`/`Atomic`, der
-  Solver lehnt geteilten nackten mutablen Zustand ab.
-- **C nativ** — `extern "C"`/Header-Bindings; C++/Rust über C-ABI. Meson first-class.
+Vire is at or above Rust level on compute and on virtual dispatch; the remaining
+gaps are array-heavy kernels whose data-dependent bounds checks need a relational
+analysis to elide (see [TODO.md](TODO.md) and [benchmarks/suite/](benchmarks/suite/)).
 
-Der Name/Details sind provisorisch und leicht änderbar; das Design ist der Kern.
+## Documents
+
+- **[TODO.md](TODO.md)** — roadmap and remaining work (M0 risk gate, front-end
+  pipeline, features 1–8, performance).
+- **[DESIGN.md](DESIGN.md)** — backend architecture (solver, memory model,
+  benchmarks). Describes the Java-bytecode path = the proof/bootstrap base.
+- **[language/EVALUATION.md](language/EVALUATION.md)** — honest feasibility: the three
+  tensions (no runtime / all libraries / Python-light) and §7 residual risks
+  (alias precision, compile time).
+- **[language/LANGUAGE.md](language/LANGUAGE.md)** — syntax tour (quick start).
+- **[language/REFERENCE.md](language/REFERENCE.md)** — full syntax/feature reference.
+- **[language/FEATURES-EVALUATION.md](language/FEATURES-EVALUATION.md)** — assessment of
+  the eight requested features (multithreading, templates, comptime reflection, own
+  preprocessor, Meson, logger, Go-style error handling, debug crash paths).
+- **[language/PARSER.md](language/PARSER.md)** — parser/front-end build plan.
+- **[language/examples/](language/examples/)** — example programs across areas and
+  features.
+- **[benchmarks/](benchmarks/)** — benchmark suite (Java/Rust/C++), runner, analysis.
+
+## Core language ideas (in brief)
+
+- **Inference over annotation** — types appear nowhere yet are all known.
+- **No `null`** — `Option[T]`; no exceptions — errors are values (Go spirit) with
+  `?` propagation.
+- **`type`** for product and sum types (value types, no object header), **traits** +
+  monomorphized **generics**.
+- **`comptime`** — code that runs in the compiler: reflection, derivations,
+  conditional compilation — zero-cost, no runtime metadata ballast.
+- **Invisible memory** — stack/heap/RC decided by the solver; `&` optional.
+- **Concurrency safe by construction** — channels (CSP) + `Mutex`/`Atomic`; the
+  solver rejects shared bare mutable state.
+- **C native** — `extern "C"`/header bindings; C++/Rust via the C ABI. Meson
+  first-class.
+
+The name and details are provisional and easy to change; the design is the core.
