@@ -88,8 +88,35 @@ manuelles `!prof` + `alwaysinline` auf den heißen Schleifen gegenüber -O2? Ist
 Gewinn <5%, lohnt der Optimizer nicht (LLVM -O2 -march=native holt schon fast alles);
 ist er >20%, lohnt er. Erst die Zahl, dann das Quartal — dieselbe Gate-Disziplin wie
 beim Frontend.
-EOF
-echo "AOT-Plan geschrieben"
+
+## GEBAUT + GEMESSEN: Schritt 1 (`!prof`-Branch-Weights aus Schleifentiefe)
+Der billigste/wirkungsvollste Plan-Schritt ist umgesetzt: `loop_branch_bias` in
+`crates/backend/src/lib.rs` schätzt statisch (reduzibler CFG: Kante `u→v` mit
+`v≤u` = Rückwärtskante → Schleifen-Header `v`, Körper `[v,u]`), welcher Zweig
+einer bedingten Verzweigung in der Schleife bleibt, und setzt `!prof
+branch_weights` (100:3) am Schleifen-Ausgangs-Branch. Läuft in BEIDEN Backends
+(Java + Vire). Test: `crates/backend/tests/branch_weights.rs`. Abschaltbar per
+`FASTLLVM_NO_PROF=1` (A/B).
+
+**Messung der Decke (Gate-Disziplin):** branch-lastiger Workload (200M Iterationen,
+`if i%7 / elif i%13 / else`), 3 Läufe je Variante:
+- mit `!prof`:  0,215 / 0,215 / 0,220 s
+- ohne `!prof`: 0,216 / 0,212 / 0,220 s
+
+→ **kein messbarer Unterschied (~0%).** Bestätigt die Vorhersage (<5%): LLVM
+`-O2 -march=native` ordnet diese Branches schon optimal an; die statischen Weights
+stimmen mit LLVMs eigener Schleifen-Heuristik überein und addieren nichts. Der
+Wert läge nur dort, wo LLVM falsch rät (seltene Fehler-/Kalt-Pfade) — und selbst
+da klein.
+
+**Konsequenz (ehrlich, Gate-getreu):** Schritt 1 ist korrekt + kostenlos
+implementiert, aber die gemessene Decke rechtfertigt die schwereren Schritte 2–4
+(volle `hotness.rs`, partielle Evaluation, Superblöcke) NICHT — der Plan selbst
+sagt „<5% → lohnt nicht". Der reale Hebel bleibt der RC-/Objekt-Pfad
+(Region-Inferenz), nicht AOT-Branch-Tricks. Schritte 2–4 bleiben geplant, aber
+ungebaut, bis ein gemessener Fall sie rechtfertigt (z.B. branch-lastiger Code mit
+klaren Kalt-Pfaden, den LLVM falsch schätzt — oder der optionale PGO-Pfad).
+
 ## Untersuchung: lohnen sich die vier Techniken? (messungsgetrieben)
 *Frage: Aufrufgraph analysieren / Zweig-Wahrscheinlichkeiten / spezialisierte
 Versionen für häufige Typkombinationen / mehrere Varianten + Laufzeit-Auswahl.*

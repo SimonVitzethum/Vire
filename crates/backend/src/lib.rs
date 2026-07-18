@@ -242,6 +242,11 @@ struct Ctx<'a> {
     static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Interprozedurale Instanzfeld-Schreibmengen (+ opak-Flag) für Region-Inferenz.
     field_writes: BTreeMap<String, (BTreeSet<(String, String)>, bool)>,
+    /// AOT-Hotpath: Metadaten-IDs der zwei geteilten `branch_weights`-Knoten
+    /// (then-heiß, else-heiß). Aus statischer Schleifen-Schätzung an `!prof`
+    /// gesetzt — LLVM ordnet/optimiert dann heiße Pfade selbst.
+    bw_then: usize,
+    bw_else: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -399,7 +404,12 @@ pub fn emit(program: &Program) -> String {
     }
     let static_writes = static_write_effects(program);
     let field_writes = instance_field_writes(program);
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes };
+    // AOT-Hotpath: Metadaten-IDs für die zwei geteilten branch_weights-Knoten,
+    // oberhalb der TBAA-IDs (max TBAA-ID = 2*len bei len Feldern, sonst 0).
+    let bw_base = if tbaa.is_empty() { 0 } else { 2 * tbaa.len() + 1 };
+    let bw_then = bw_base;
+    let bw_else = bw_base + 1;
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, bw_then, bw_else };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -750,8 +760,65 @@ pub fn emit(program: &Program) -> String {
             writeln!(w, "!{tag} = !{{!{tynode}, !{tynode}, i64 0}}").unwrap();
         }
     }
+    // AOT-Hotpath: die zwei geteilten branch_weights-Knoten (100:3 / 3:100).
+    if ctx.tbaa.is_empty() {
+        writeln!(w).unwrap();
+    }
+    writeln!(w, "!{} = !{{!\"branch_weights\", i32 100, i32 3}}", ctx.bw_then).unwrap();
+    writeln!(w, "!{} = !{{!\"branch_weights\", i32 3, i32 100}}", ctx.bw_else).unwrap();
 
     out
+}
+
+/// AOT-Hotpath: statische Schleifen-Schätzung. Für jede bedingte Verzweigung
+/// wird geschätzt, welcher Zweig in einer Schleife bleibt (heiß). Reduzibler
+/// CFG aus unserer Absenkung: eine Kante `u → v` mit `v ≤ u` ist eine
+/// Rückwärtskante (Schleifen-Header `v`, Latch `u`); Blöcke in `[v, u]` sind im
+/// Schleifenkörper. Ein Branch, dessen einer Ziel-Block im Körper liegt und der
+/// andere nicht (Schleifen-Ausgang), gewichtet den Körper-Zweig heiß.
+/// Rückgabe: Block-Index → true (then heiß) / false (else heiß).
+fn loop_branch_bias(f: &Function) -> std::collections::HashMap<usize, bool> {
+    let succ = |bb: &BasicBlock| -> Vec<usize> {
+        match &bb.terminator {
+            Terminator::Goto(b) => vec![b.0 as usize],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+            Terminator::Switch { default, cases, .. } => {
+                let mut v: Vec<usize> = cases.iter().map(|(_, b)| b.0 as usize).collect();
+                v.push(default.0 as usize);
+                v
+            }
+            Terminator::Return(_) => vec![],
+        }
+    };
+    // Schleifen-Spannen: Header v → größter Latch-Index u (Rückwärtskante u→v).
+    let mut span_max: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (u, bb) in f.blocks.iter().enumerate() {
+        for v in succ(bb) {
+            if v <= u {
+                let e = span_max.entry(v).or_insert(u);
+                if u > *e {
+                    *e = u;
+                }
+            }
+        }
+    }
+    let inloop = |t: usize| span_max.iter().any(|(&h, &l)| h <= t && t <= l);
+    let mut bias = std::collections::HashMap::new();
+    for (b, bb) in f.blocks.iter().enumerate() {
+        if let Terminator::Branch { then_blk, else_blk, .. } = &bb.terminator {
+            let (t, el) = (then_blk.0 as usize, else_blk.0 as usize);
+            match (inloop(t), inloop(el)) {
+                (true, false) => {
+                    bias.insert(b, true);
+                }
+                (false, true) => {
+                    bias.insert(b, false);
+                }
+                _ => {}
+            }
+        }
+    }
+    bias
 }
 
 /// Ruft die <clinit> von `class` auf, aber erst die der Superklasse
@@ -1385,6 +1452,14 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn };
+    // AOT-Hotpath: statische Schleifen-Schätzung → welcher Branch-Zweig bleibt
+    // in der Schleife (heiß). Setzt `!prof`-Weights, LLVM optimiert den Rest.
+    // `FASTLLVM_NO_PROF` schaltet die Weights ab (für A/B-Messung der Decke).
+    let bw_bias = if std::env::var_os("FASTLLVM_NO_PROF").is_some() {
+        std::collections::HashMap::new()
+    } else {
+        loop_branch_bias(f)
+    };
 
     for (bi, bb) in f.blocks.iter().enumerate() {
         writeln!(w, "bb{bi}:").unwrap();
@@ -1397,7 +1472,14 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
                 let c = e.operand(w, cond);
                 let b = e.fresh();
                 writeln!(w, "  {b} = icmp ne i32 {c}, 0").unwrap();
-                writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}", then_blk.0, else_blk.0).unwrap();
+                // `!prof`-Branch-Weights aus der Schleifen-Schätzung: der in der
+                // Schleife bleibende Zweig ist heiß.
+                let prof = match bw_bias.get(&bi) {
+                    Some(true) => format!(", !prof !{}", ctx.bw_then),
+                    Some(false) => format!(", !prof !{}", ctx.bw_else),
+                    None => String::new(),
+                };
+                writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}{prof}", then_blk.0, else_blk.0).unwrap();
             }
             Terminator::Switch { value, default, cases } => {
                 let v = e.operand(w, value);
