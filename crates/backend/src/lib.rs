@@ -1027,6 +1027,32 @@ fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>, static_writes: &BTreeSet
             b[l] = true;
         }
     }
+    // Region-Inferenz-Inkrement (Traversal-Cursor): ein `GetField`-Load eines
+    // Feldes, das diese Funktion NIRGENDS schreibt, von einer stabilen (geborgten)
+    // Basis, ist selbst ein Borrow — das Feld hält den Wert am Leben. Das elidiert
+    // die heißen `cur = cur.next`-retain/release (M0.1c/T14). SOUND nur, wenn keine
+    // Nutzerfunktion gerufen wird, die das Feld ändern könnte: Runtime-Intrinsics
+    // (jrt_*) fassen keine Nutzerfelder an, also ist die Funktions-lokale
+    // PutField-Prüfung dann vollständig. Bei User-Calls konservativ aus.
+    let has_user_calls = f.blocks.iter().flat_map(|bb| &bb.statements).any(|st| match st {
+        Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => !func.starts_with("jrt_"),
+        Statement::CallVirtual { .. } | Statement::CallPoly { .. } => true,
+        _ => false,
+    });
+    let written_fields: BTreeSet<(&str, &str)> = f
+        .blocks
+        .iter()
+        .flat_map(|bb| &bb.statements)
+        .filter_map(|st| match st {
+            Statement::PutField { class, field, .. } => Some((class.as_str(), field.as_str())),
+            _ => None,
+        })
+        .collect();
+    let field_borrow_ok = |obj: &Operand, class: &str, field: &str, b: &[bool]| -> bool {
+        !has_user_calls
+            && !written_fields.contains(&(class, field))
+            && matches!(obj, Operand::Copy(s) if borrowed.contains(&s.0) || b[s.0 as usize])
+    };
     loop {
         let mut changed = false;
         for bb in &f.blocks {
@@ -1049,9 +1075,15 @@ fn borrow_slots(f: &Function, borrowed: &BTreeSet<u32>, static_writes: &BTreeSet
                         let stable = !static_writes.contains(&(class.clone(), field.clone()));
                         (Some(dest.0), stable)
                     }
+                    // Traversal-Cursor: Load eines nie geschriebenen Feldes von
+                    // stabiler Basis → Borrow (siehe field_borrow_ok oben).
+                    Statement::GetField { dest, obj, class, field }
+                        if f.locals[dest.0 as usize] == Ty::Ref =>
+                    {
+                        (Some(dest.0), field_borrow_ok(obj, class, field, &b))
+                    }
                     Statement::New { dest, .. }
                     | Statement::StackNew { dest, .. }
-                    | Statement::GetField { dest, .. }
                     | Statement::NewArray { dest, .. }
                     | Statement::ArrayLoad { dest, .. }
                         if f.locals[dest.0 as usize] == Ty::Ref =>
