@@ -106,6 +106,26 @@ fn capsule_stub_senkt_rumpf_transparent_ab() {
 }
 
 #[test]
+fn capsule_objekt_eingabe_ist_fehler() {
+    // Der gefährliche Fall (aliasierte Ref-Eingabe) muss ein HARTER Fehler sein,
+    // kein stiller Stub — sonst verspräche capsule Containment ohne es zu liefern.
+    let (m, _) = parse("type P {\n x: Int\n}\nfn f(p: P) -> Int {\n capsule(p) {\n p.x\n }\n}\n");
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("capsule") && e.contains("Objekt-Eingabe")));
+}
+
+#[test]
+fn null_senkt_zu_constnull() {
+    // `null` (Mess-Bootstrap) → ConstNull; erlaubt verkettete/zyklische Graphen.
+    let src = "type N {\n next: N\n v: Int\n}\nfn main() {\n mut a = N(null, 1)\n print(a.v)\n}\n";
+    let p = lower(src);
+    let has_null = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::PutField { value: fastllvm_ir::Operand::ConstNull, .. })
+    });
+    assert!(has_null, "null muss als ConstNull ins next-Feld");
+}
+
+#[test]
 fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());

@@ -1,0 +1,26 @@
+type Node {
+    next: Node
+    v: Int
+}
+fn make_ring(n: Int) -> Int {
+    mut head = Node(null, 0)
+    mut prev = head
+    mut i = 1
+    while i < n {
+        mut node = Node(null, i)
+        prev.next = node
+        prev = node
+        i = i + 1
+    }
+    prev.next = head
+    prev.v
+}
+fn main() {
+    mut r = 0
+    mut k = 0
+    while k < KOUNT {
+        r = r + make_ring(500)
+        k = k + 1
+    }
+    print(r)
+}

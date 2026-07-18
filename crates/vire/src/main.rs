@@ -78,6 +78,10 @@ fn build_or_run(args: &[String]) {
     let mut out: Option<PathBuf> = None;
     let mut emit_ir = false;
     let mut emit_llvm = false;
+    // -O0: clang-Optimierung/LTO aus. Für ehrliche RC-/Heap-MESSUNGEN — sonst
+    // eliminiert `-O2 -flto` tote Allokations-/Release-Paare (die Objekte werden
+    // wegoptimiert, die Laufzeitzähler bleiben 0). Der Solver läuft immer.
+    let mut opt0 = false;
     let mut path: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -91,6 +95,7 @@ fn build_or_run(args: &[String]) {
             },
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
+            "-O0" => opt0 = true,
             other => path = Some(other.to_string()),
         }
     }
@@ -171,8 +176,16 @@ fn build_or_run(args: &[String]) {
         exit(1);
     }
     let mut cmd = Command::new("clang");
-    cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
-    cmd.args(["-ffunction-sections", "-fdata-sections", "-flto", "-Wl,--gc-sections", "-march=native"]);
+    if opt0 {
+        // Messmodus: keine Optimierung, kein LTO → Allokationen bleiben stehen.
+        // Section-GC bleibt (strippt nur ungenutzte ganze Funktionen wie den
+        // Threads-Pfad, nicht die Allok-Calls in genutzten Funktionen).
+        cmd.arg("-O0").arg(&ll_path).arg(&rt_path);
+        cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
+    } else {
+        cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
+        cmd.args(["-ffunction-sections", "-fdata-sections", "-flto", "-Wl,--gc-sections", "-march=native"]);
+    }
     if acyclic {
         cmd.arg("-DFASTLLVM_NO_CYCLES");
     }

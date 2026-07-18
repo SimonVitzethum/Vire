@@ -1,0 +1,23 @@
+type Node {
+    next: Node
+    v: Int
+}
+// Baut eine Liste dynamischer Länge n (jeder Knoten zeigt auf den vorigen →
+// loop-carried Alias über die Rückkante → NICHT stack-allokierbar → Heap).
+// Summiert dabei; gibt Skalar zurück, die Liste stirbt am Funktionsende → RC
+// muss sie freigeben (azyklisch → Kaskaden-Release, kein Kollektor).
+fn build_and_sum(n: Int) -> Int {
+    mut head = null
+    mut i = 0
+    mut s = 0
+    while i < n {
+        head = Node(head, i)
+        s = s + head.v
+        i = i + 1
+    }
+    s
+}
+fn main() {
+    print(build_and_sum(1000))
+    print(build_and_sum(100000))
+}

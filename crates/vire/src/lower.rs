@@ -259,6 +259,11 @@ impl<'a> FnLower<'a> {
                             Some(v) => self.lower_expr(v),
                             None => (Operand::ConstI64(0), Ty::I64),
                         };
+                        // Objekt-Klasse bei Neuzuweisung aktualisieren (Traversal
+                        // `cur = cur.next` muss cur weiter als Node kennen).
+                        if let Some(c) = self.class_of_operand(&op) {
+                            self.local_class.insert(l.0, c);
+                        }
                         self.emit(Statement::Assign(l, Rvalue::Use(op)));
                         return;
                     }
@@ -279,6 +284,11 @@ impl<'a> FnLower<'a> {
                 Expr::Ident(name, _) => {
                     if let Some((l, _ty)) = self.lookup(name) {
                         let (rhs, _) = self.lower_expr(value);
+                        if op.is_none() {
+                            if let Some(c) = self.class_of_operand(&rhs) {
+                                self.local_class.insert(l.0, c);
+                            }
+                        }
                         let rv = match op {
                             None => Rvalue::Use(rhs),
                             Some(o) => Rvalue::Binary(map_op(*o), Operand::Copy(l), rhs),
@@ -440,6 +450,13 @@ impl<'a> FnLower<'a> {
                 let id = self.intern(s);
                 (Operand::ConstStr(id), Ty::Ref)
             }
+            // `null` — MESS-BOOTSTRAP (nicht die endgültige Sprache; die hat kein
+            // null, sondern Option). Nur nötig, um verkettete/zyklische Graphen
+            // zu konstruieren und damit ZUM ERSTEN MAL den RC-/Kollektor-Pfad auf
+            // Vire-IR zu betreten (M0.1b-auf-Vire). Wird durch Option[T] ersetzt.
+            Expr::Ident(name, _) if name == "null" && self.lookup(name).is_none() => {
+                (Operand::ConstNull, Ty::Ref)
+            }
             Expr::Ident(name, _) => match self.lookup(name) {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
@@ -500,14 +517,37 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Block(b) => self.lower_block_val(b),
-            // capsule: M2-AUSFÜHRUNGS-STUB — der Rumpf wird transparent inline
-            // abgesenkt (Eingaben sind bereits im Scope sichtbar, Blockwert raus).
-            // Die REINE Semantik (eigene Arena, Deep-Copy-in/-out, Isolation +
-            // Fault-Containment; CAPSULE-BEWERTUNG.md) ist NOCH NICHT umgesetzt:
-            // hier gibt es keine Arena und keine Kopie → für wert-rein/wert-raus
-            // (Skalar-Ergebnis) beobachtungsgleich, aber OHNE die Isolations-/
-            // Perf-Garantien. Arena-Runtime + Copy-Maschinerie = eigener Meilenstein.
-            Expr::Capsule { body, .. } => self.lower_block_val(body),
+            // capsule: bis die Arena-Runtime + Deep-Copy stehen, sind NUR
+            // Skalar-Eingaben und Skalar-Ergebnisse erlaubt — das ist die
+            // beweisbar isolierte Teilmenge (Werte können nicht aliasieren, kein
+            // Objekt kann in die Arena zeigen). Objekt-Eingaben/-Ergebnisse sind
+            // HARTE FEHLER, kein stiller Stub: sonst verspräche `capsule`
+            // Containment für genau den Fall (aliasierte Ref-Eingabe / Objekt
+            // raus), in dem es NICHTS liefert. Die Isolationsgarantie der reinen
+            // Form ist noch nicht implementiert; für Skalar-rein/-raus wird der
+            // Rumpf transparent abgesenkt (beobachtungsgleich, aber noch ohne
+            // Arena/Perf — siehe CAPSULE-BEWERTUNG.md, Meilenstein capsule-Arena).
+            Expr::Capsule { inputs, body, .. } => {
+                for (nm, _borrowed) in inputs {
+                    if let Some((_, Ty::Ref)) = self.lookup(nm) {
+                        self.errs.push(format!(
+                            "capsule: Objekt-Eingabe `{nm}` noch nicht erlaubt — die Isolation \
+                             braucht Deep-Copy-in (noch nicht implementiert). Bis dahin nur \
+                             Skalar-Eingaben (Int/Float/Bool), sonst wäre die Containment-Garantie \
+                             eine Lüge."
+                        ));
+                    }
+                }
+                let (val, ty) = self.lower_block_val(body);
+                if ty == Ty::Ref {
+                    self.errs.push(
+                        "capsule: Objekt-Ergebnis noch nicht erlaubt — das braucht Deep-Copy-out \
+                         (sonst dangling in die freigegebene Arena). Bis dahin nur Skalar-Ergebnis."
+                            .into(),
+                    );
+                }
+                (val, ty)
+            }
             Expr::Range { .. } => {
                 self.errs.push("Range nur als for-Iterator (M2)".into());
                 (Operand::ConstI64(0), Ty::I64)

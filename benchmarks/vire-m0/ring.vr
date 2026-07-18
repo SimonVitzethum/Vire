@@ -1,0 +1,29 @@
+type Node {
+    next: Node
+    v: Int
+}
+// Baut eine Kette und schließt sie zum RING (prev.next = head) → echter Zyklus
+// mit externem Refcount 0 am Funktionsende → RC allein LECKT ihn → nur der
+// Zyklen-Kollektor kann ihn zurückholen. Genau der M0-Risikopfad, auf Vire-IR.
+fn make_ring(n: Int) -> Int {
+    mut head = Node(null, 0)
+    mut prev = head
+    mut i = 1
+    while i < n {
+        mut node = Node(null, i)
+        prev.next = node
+        prev = node
+        i = i + 1
+    }
+    prev.next = head
+    head.v + prev.v
+}
+fn main() {
+    mut r = 0
+    mut k = 0
+    while k < 50 {
+        r = r + make_ring(2000)
+        k = k + 1
+    }
+    print(r)
+}
