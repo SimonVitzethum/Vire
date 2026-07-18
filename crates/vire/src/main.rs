@@ -343,6 +343,9 @@ fn build_or_run(args: &[String]) {
     let _ = fastllvm_solver::elide_pending_checks(&mut program);
     s.inlined_calls = fastllvm_solver::inline_program(&mut program);
     s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
+    // Field-Auto-Narrowing (Wertebereichs-Analyse): `Int`-Felder, deren Werte
+    // beweisbar in i32 passen, auf 4 Byte verengen (RAM). Sound (Widening).
+    let _narrowed = fastllvm_solver::narrow_fields(&mut program);
     let acyclic = s.acyclic;
 
     if emit_ir {

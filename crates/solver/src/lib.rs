@@ -14,12 +14,14 @@ mod escape;
 mod inline;
 mod longcmp;
 mod pending;
+mod narrow;
 mod refcopy;
 pub use bounds::elide_bounds;
 pub use escape::stack_allocate;
 pub use inline::inline_program;
 pub use longcmp::fuse_long_compares;
 pub use pending::elide_pending_checks;
+pub use narrow::narrow_fields;
 pub use refcopy::elide_redundant_ref_copies;
 
 use std::collections::{BTreeMap, BTreeSet};
