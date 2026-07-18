@@ -247,6 +247,10 @@ struct Ctx<'a> {
     /// gesetzt — LLVM ordnet/optimiert dann heiße Pfade selbst.
     bw_then: usize,
     bw_else: usize,
+    /// Metadaten-Knoten für `!invariant.load` (leerer Knoten). Markiert Loads
+    /// beweisbar unveränderlicher Speicherstellen (Array-Länge, Vtable-Zeiger) —
+    /// LLVM darf sie aus Schleifen hoisten und CSEn (wie Rusts Slice-Länge).
+    md_inv: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -409,7 +413,8 @@ pub fn emit(program: &Program) -> String {
     let bw_base = if tbaa.is_empty() { 0 } else { 2 * tbaa.len() + 1 };
     let bw_then = bw_base;
     let bw_else = bw_base + 1;
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, bw_then, bw_else };
+    let md_inv = bw_base + 2;
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, bw_then, bw_else, md_inv };
 
     writeln!(w, "; erzeugt von fastllvm (naive Absenkung, siehe DESIGN.md)").unwrap();
 
@@ -667,9 +672,14 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w).unwrap();
 
+    // Fehler-/Ausnahme-Helfer sind kalt: als `cold` markiert ordnet LLVM ihre
+    // Aufrufe aus dem heißen Pfad heraus (bessere Block-Layout, Branch-Vorhersage
+    // wie Rusts `#[cold]` panic). Kein `noreturn` — Vires Pending-Modell kehrt zurück.
+    const COLD: &[&str] = &["jrt_throw_npe", "jrt_throw_bounds", "jrt_throw", "jrt_check_uncaught"];
     for (name, sig) in RUNTIME_DECLS {
         let (ret, params) = sig.split_once(' ').unwrap();
-        writeln!(w, "declare {ret} @{name}{params}").unwrap();
+        let attr = if COLD.contains(name) { " cold" } else { "" };
+        writeln!(w, "declare {ret} @{name}{params}{attr}").unwrap();
     }
 
     // Aufgerufene, aber nicht definierte Funktionen deklarieren.
@@ -705,7 +715,7 @@ pub fn emit(program: &Program) -> String {
     if let Some(slot) = ctx.vtable_index("java/lang/Runnable", "run", "()V") {
         writeln!(w, "define void @jrt_invoke_runnable(ptr %r) {{").unwrap();
         writeln!(w, "  %vtp = getelementptr ptr, ptr %r, i64 {VTABLE_WORD}").unwrap();
-        writeln!(w, "  %vt = load ptr, ptr %vtp").unwrap();
+        writeln!(w, "  %vt = load ptr, ptr %vtp, !invariant.load !{}", ctx.md_inv).unwrap();
         writeln!(w, "  %sp = getelementptr ptr, ptr %vt, i64 {slot}").unwrap();
         writeln!(w, "  %fn = load ptr, ptr %sp").unwrap();
         writeln!(w, "  call void %fn(ptr %r)").unwrap();
@@ -766,6 +776,7 @@ pub fn emit(program: &Program) -> String {
     }
     writeln!(w, "!{} = !{{!\"branch_weights\", i32 100, i32 3}}", ctx.bw_then).unwrap();
     writeln!(w, "!{} = !{{!\"branch_weights\", i32 3, i32 100}}", ctx.bw_else).unwrap();
+    writeln!(w, "!{} = !{{}}", ctx.md_inv).unwrap();
 
     out
 }
@@ -945,6 +956,9 @@ struct FnEmitter<'a> {
     /// Beweisbar nicht-null Locals — die inline-Null-Prüfung bei Feldzugriffen
     /// entfällt.
     nn: BTreeSet<u32>,
+    /// Metadaten-ID für `!invariant.load` (unveränderliche Loads: Array-Länge,
+    /// Vtable). Erlaubt LLVM Hoisting/CSE über Schleifen hinweg.
+    md_inv: usize,
 }
 
 impl FnEmitter<'_> {
@@ -1455,7 +1469,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn, md_inv: ctx.md_inv };
     // AOT-Hotpath: statische Schleifen-Schätzung → welcher Branch-Zweig bleibt
     // in der Schleife (heiß). Setzt `!prof`-Weights, LLVM optimiert den Rest.
     // `FASTLLVM_NO_PROF` schaltet die Weights ab (für A/B-Messung der Decke).
@@ -1649,7 +1663,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
-            writeln!(w, "  {vt} = load ptr, ptr {vtp}").unwrap();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !invariant.load !{}", e.md_inv).unwrap();
             let slotp = e.fresh();
             writeln!(w, "  {slotp} = getelementptr ptr, ptr {vt}, i64 {slot}").unwrap();
             let fnp = e.fresh();
@@ -1690,7 +1704,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
-            writeln!(w, "  {vt} = load ptr, ptr {vtp}").unwrap();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !invariant.load !{}", e.md_inv).unwrap();
             // Kaskade: pro Klasse ein Vtable-Vergleich → Direkt-Call; das
             // letzte Ziel ist der else-Zweig (Closed World: Receiver ist
             // garantiert eine der instanziierten Zielklassen).
@@ -2019,7 +2033,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
@@ -2081,7 +2095,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
