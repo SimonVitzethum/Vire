@@ -36,3 +36,18 @@ fn unknown_keyword_is_rejected() {
     let err = Syntax::parse("funktion = f\n").unwrap_err();
     assert!(err.iter().any(|e| e.contains("unbekannt")));
 }
+
+#[test]
+fn top_level_statements_become_main() {
+    // Skript-Stil: Top-Level-Anweisungen → implizites fn main().
+    let (m, diags) = parse_with_syntax("mut s = 0\nfor i in 0..3 { s = s + i }\nprint(s)\n", Syntax::default());
+    assert!(diags.is_empty(), "{diags:?}");
+    let has_main = m.items.iter().any(|it| matches!(it, Item::Fn(f) if f.sig.name == "main"));
+    assert!(has_main, "Top-Level-Anweisungen müssen ein main erzeugen");
+}
+
+#[test]
+fn top_level_and_explicit_main_conflict() {
+    let (_, diags) = parse_with_syntax("print(1)\nfn main() { print(2) }\n", Syntax::default());
+    assert!(!diags.is_empty(), "beides zugleich muss ein Fehler sein");
+}

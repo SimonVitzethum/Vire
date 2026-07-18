@@ -627,16 +627,21 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(obj), Ty::Ref);
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
-        // Intrinsic `print`
+        // Intrinsic `print` — mehrargumentig: jedes Argument in eigener Zeile.
         if name == "print" {
-            let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstI64(0), Ty::I64));
-            let func = match ty {
-                Ty::F64 | Ty::F32 => "jrt_println_double",
-                Ty::Ref => "jrt_println_str",
-                _ => "jrt_println_long",
-            };
-            let arg = if matches!(ty, Ty::F64 | Ty::F32 | Ty::Ref) { op } else { to_i64(op) };
-            self.emit(Statement::Call { dest: None, func: func.to_string(), args: vec![arg] });
+            if lowered.is_empty() {
+                let empty = self.intern("");
+                self.emit(Statement::Call { dest: None, func: "jrt_println_str".into(), args: vec![Operand::ConstStr(empty)] });
+            }
+            for (op, ty) in lowered {
+                let func = match ty {
+                    Ty::F64 | Ty::F32 => "jrt_println_double",
+                    Ty::Ref => "jrt_println_str",
+                    _ => "jrt_println_long",
+                };
+                let arg = if matches!(ty, Ty::F64 | Ty::F32 | Ty::Ref) { op } else { to_i64(op) };
+                self.emit(Statement::Call { dest: None, func: func.to_string(), args: vec![arg] });
+            }
             return (Operand::ConstI64(0), Ty::Void);
         }
         // Aufruf einer eigenen Funktion

@@ -88,17 +88,45 @@ impl Parser {
     // --- Modul & Items ---
     pub fn parse_module(&mut self) -> Module {
         let mut items = Vec::new();
+        // Top-Level-Anweisungen (Skript-Stil) werden gesammelt und zu einem
+        // impliziten `fn main()` zusammengefasst — Python-artig, ohne Boilerplate,
+        // null Laufzeitkosten (reine Frontend-Zucker).
+        let mut top_stmts = Vec::new();
         self.stmt_end();
         while !matches!(self.peek(), Tok::Eof) {
-            if let Some(it) = self.parse_item() {
-                items.push(it);
+            if self.at_item_start() {
+                if let Some(it) = self.parse_item() {
+                    items.push(it);
+                } else {
+                    self.bump();
+                }
             } else {
-                // Recovery: bis zum nächsten Item-Start / Zeilenende
-                self.bump();
+                top_stmts.push(self.parse_stmt());
             }
             self.stmt_end();
         }
+        if !top_stmts.is_empty() {
+            let has_main = items.iter().any(|it| matches!(it, Item::Fn(f) if f.sig.name == "main"));
+            if has_main {
+                self.diags.push(crate::diag::Diag::error(
+                    "Top-Level-Anweisungen UND `fn main` zugleich sind nicht erlaubt — eins von beiden",
+                    crate::diag::Span(0, 0),
+                ));
+            } else {
+                items.push(synth_main(top_stmts));
+            }
+        }
         Module { items }
+    }
+
+    /// Beginnt hier ein Item (nicht eine Top-Level-Anweisung)?
+    fn at_item_start(&self) -> bool {
+        matches!(
+            self.peek(),
+            Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
+                | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
+                | Tok::Kw(Kw::Macro)
+        )
     }
 
     fn parse_item(&mut self) -> Option<Item> {
@@ -886,6 +914,17 @@ impl Parser {
 }
 
 /// Bequemer Einstieg: Quelltext → (Modul, Diagnosen).
+/// Baut aus gesammelten Top-Level-Anweisungen ein implizites `fn main()`.
+fn synth_main(stmts: Vec<Stmt>) -> Item {
+    use crate::ast::*;
+    use crate::diag::Span;
+    Item::Fn(FnDef {
+        sig: FnSig { name: "main".into(), generics: vec![], params: vec![], ret: None, span: Span(0, 0) },
+        body: Some(Block { stmts, tail: None, span: Span(0, 0) }),
+        is_pub: false,
+    })
+}
+
 pub fn parse(src: &str) -> (Module, Vec<Diag>) {
     parse_with_syntax(src, crate::syntax::Syntax::default())
 }
