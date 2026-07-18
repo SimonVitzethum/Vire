@@ -6,6 +6,22 @@ use fastllvm_ir::Ty;
 use vire::{expand_macros, infer_module, inline_recursion, lower_module, parse};
 
 #[test]
+fn field_packing_i32_mit_mischarithmetik() {
+    // `I32`-Felder packen auf 4 Byte (RAM), UND gemischte i32/i64-Arithmetik
+    // (gepacktes Feld + i64-Local) wird jetzt korrekt vorzeichen-erweitert
+    // (vorher: Backend-Typfehler `i32 aber i64 erwartet`).
+    let p = lower("type T { small: I32  big: Int }\nfn main() {\n mut t = T(5, 1000000000000)\n print(t.big + t.small)\n}\n");
+    // Feld `small` ist i32 im Struct (gepackt).
+    let t = p.classes.iter().find(|c| c.name == "T").expect("T");
+    let small = t.fields.iter().find(|f| f.name == "small").expect("small");
+    assert_eq!(small.ty, Ty::I32, "I32-Feld muss als i32 gepackt sein");
+    // main enthält einen Convert (i32→i64 sext) für die Mischarithmetik.
+    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let has_convert = main.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Convert(_))));
+    assert!(has_convert, "gemischte i32/i64-Arithmetik muss das i32-Feld auf i64 erweitern");
+}
+
+#[test]
 fn trait_objekte_dynamischer_dispatch() {
     // `fn f(s: Shape)` + `s.area()` → dynamischer Dispatch (CallVirtual über die
     // Vtable), weil der konkrete Typ erst zur Laufzeit feststeht. Der Trait wird

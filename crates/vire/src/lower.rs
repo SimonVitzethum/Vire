@@ -899,6 +899,17 @@ impl<'a> FnLower<'a> {
         Operand::Copy(l64)
     }
 
+    /// i32-Operand vorzeichen-erweitert auf i64 (für gemischte Int-Arithmetik mit
+    /// gepackten `I32`-Feldern). Konstanten direkt, sonst ein `Convert` (sext).
+    fn widen_i32(&mut self, op: Operand) -> Operand {
+        if let Operand::ConstI32(v) = op {
+            return Operand::ConstI64(v as i64);
+        }
+        let d = self.new_local(Ty::I64);
+        self.emit(Statement::Assign(d, Rvalue::Convert(op)));
+        Operand::Copy(d)
+    }
+
     fn lower_block(&mut self, b: &Block2) {
         let _ = self.lower_block_val(b); // Void-Kontext: Tail-Wert verworfen
     }
@@ -1485,8 +1496,8 @@ impl<'a> FnLower<'a> {
                 }
             }
             Expr::Binary { op, lhs, rhs, .. } => {
-                let (l, lt) = self.lower_expr(lhs);
-                let (r, rt) = self.lower_expr(rhs);
+                let (mut l, mut lt) = self.lower_expr(lhs);
+                let (mut r, mut rt) = self.lower_expr(rhs);
                 // String-Verkettung: `+` mit mindestens einer Ref-Seite → Concat,
                 // Zahlen werden automatisch zu Strings (`"n=" + n`).
                 if matches!(op, BinOp::Add) && (lt == Ty::Ref || rt == Ty::Ref) {
@@ -1496,6 +1507,18 @@ impl<'a> FnLower<'a> {
                     self.emit(Statement::Call { dest: Some(d), func: "jrt_str_concat".into(), args: vec![ls, rs] });
                     return (Operand::Copy(d), Ty::Ref);
                 }
+                // Ganzzahl-Breiten angleichen: mischt der Ausdruck ein schmales i32
+                // (z.B. ein gepacktes `I32`-Feld) mit i64, wird das i32 vorzeichen-
+                // erweitert. Sonst emittierte das Backend `add i64 %a, %i32` (Typfehler).
+                // Macht opt-in `I32`-Field-Packing voll nutzbar (RAM-Ersparnis).
+                if lt == Ty::I32 && rt == Ty::I64 {
+                    l = self.widen_i32(l);
+                    lt = Ty::I64;
+                } else if rt == Ty::I32 && lt == Ty::I64 {
+                    r = self.widen_i32(r);
+                    rt = Ty::I64;
+                }
+                let _ = rt;
                 let is_cmp = matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
