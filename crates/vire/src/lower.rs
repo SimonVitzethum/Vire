@@ -12,6 +12,19 @@ use crate::ast::*;
 /// Feldlayout eines Nutzertyps: (Feldname, IR-Typ, Ref-Ziel-Klasse).
 type Layout = Vec<(String, Ty, Option<String>)>;
 
+/// Alle Methoden (Type-inline + `impl`-Blöcke) als (Klassenname, Methode).
+fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
+    let mut out = Vec::new();
+    for it in &m.items {
+        match it {
+            Item::Type(t) => out.extend(t.methods.iter().map(|meth| (t.name.clone(), meth))),
+            Item::Impl(im) => out.extend(im.methods.iter().map(|meth| (im.for_type.name.clone(), meth))),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Aufruf-Signatur einer Funktion: Parametertypen, Rückgabetyp, Rückgabe-Klasse
 /// (bei Objekt-Rückgabe der Klassenname — für Feldzugriff auf das Ergebnis).
 struct Sig {
@@ -81,14 +94,33 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             }
         }
     }
+    // Methoden (Type-inline + impl-Blöcke) → Symbol `Class.method`, self = Ref.
+    let methods = collect_methods(m);
+    for (class, meth) in &methods {
+        let ps = meth
+            .sig
+            .params
+            .iter()
+            .map(|p| if p.name == "self" { Ty::Ref } else { ty_of(p.ty.as_ref()) })
+            .collect();
+        let sym = format!("{class}.{}", meth.sig.name);
+        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of(meth.sig.ret.as_ref()) });
+    }
     for it in &m.items {
         if let Item::Fn(f) = it {
-            match lower_fn(f, &sigs, &types, &mut prog.strings) {
+            match lower_fn(f, &sigs, &types, &mut prog.strings, None, None) {
                 Ok(func) => prog.functions.push(func),
                 Err(mut e) => errs.append(&mut e),
             }
         }
-        // trait/impl/const/use/extern: M2+ — hier noch übersprungen
+        // trait/const/use: M2+ — hier noch übersprungen
+    }
+    for (class, meth) in &methods {
+        let sym = format!("{class}.{}", meth.sig.name);
+        match lower_fn(meth, &sigs, &types, &mut prog.strings, Some(class), Some(&sym)) {
+            Ok(func) => prog.functions.push(func),
+            Err(mut e) => errs.append(&mut e),
+        }
     }
     if errs.is_empty() {
         Ok(prog)
@@ -474,6 +506,14 @@ impl<'a> FnLower<'a> {
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
+            // `self` = der als Parameter gebundene Empfänger.
+            Expr::SelfExpr(_) => match self.lookup("self") {
+                Some((l, ty)) => (Operand::Copy(l), ty),
+                None => {
+                    self.errs.push("`self` außerhalb einer Methode".into());
+                    (Operand::ConstI64(0), Ty::I64)
+                }
+            },
             Expr::Unary { op, rhs, .. } => {
                 let (r, rt) = self.lower_expr(rhs);
                 match op {
@@ -596,6 +636,37 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr]) -> (Operand, Ty) {
+        // Methodenaufruf `obj.method(args)` → direkter Aufruf `Class.method(obj, args)`
+        // (monomorph, kein virtueller Dispatch — Vire-Typen sind (noch) flach).
+        if let Expr::Field { base, name, .. } = callee {
+            let (obj, _) = self.lower_expr(base);
+            let class = match self.class_of_operand(&obj) {
+                Some(c) => c,
+                None => {
+                    self.errs.push(format!("Methodenaufruf `.{name}()`: Typ des Empfängers unbekannt (annotieren)"));
+                    return (Operand::ConstI64(0), Ty::I64);
+                }
+            };
+            let sym = format!("{class}.{name}");
+            let mut arg_ops = vec![obj];
+            for a in args {
+                arg_ops.push(self.lower_expr(a).0);
+            }
+            let (ret, ret_class) = self.sigs.get(&sym).map(|s| (s.ret, s.ret_class.clone())).unwrap_or_else(|| {
+                self.errs.push(format!("`{class}` hat keine Methode `{name}`"));
+                (Ty::I64, None)
+            });
+            if ret == Ty::Void {
+                self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
+                return (Operand::ConstI64(0), Ty::Void);
+            }
+            let d = self.new_local(ret);
+            if let Some(c) = ret_class {
+                self.local_class.insert(d.0, c);
+            }
+            self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
+            return (Operand::Copy(d), ret);
+        }
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
             _ => {
@@ -711,9 +782,15 @@ fn lower_fn(
     sigs: &HashMap<String, Sig>,
     types: &HashMap<String, Layout>,
     strings: &mut Vec<String>,
+    recv_class: Option<&str>,
+    sym: Option<&str>,
 ) -> Result<Function, Vec<String>> {
     let ret = guess_ret_ty(f);
-    let name = if f.sig.name == "main" { "java_main".to_string() } else { f.sig.name.clone() };
+    let name = match sym {
+        Some(s) => s.to_string(),
+        None if f.sig.name == "main" => "java_main".to_string(),
+        None => f.sig.name.clone(),
+    };
     let mut fl = FnLower {
         locals: Vec::new(),
         blocks: Vec::new(),
@@ -731,11 +808,15 @@ fn lower_fn(
     // Parameter → Locals 0..n
     let mut param_tys = Vec::new();
     for p in &f.sig.params {
-        let t = ty_of(p.ty.as_ref());
+        // `self`-Empfänger: Ref auf die Methoden-Klasse.
+        let (t, cls) = if p.name == "self" {
+            (Ty::Ref, recv_class.map(|c| c.to_string()))
+        } else {
+            (ty_of(p.ty.as_ref()), class_of(p.ty.as_ref()))
+        };
         param_tys.push(t);
         let l = fl.new_local(t);
-        // Objekt-Parameter: Klasse aus dem Annotat für Feldzugriffe merken.
-        if let Some(c) = class_of(p.ty.as_ref()) {
+        if let Some(c) = cls {
             fl.local_class.insert(l.0, c);
         }
         fl.bind(&p.name, l, t);

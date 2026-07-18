@@ -169,3 +169,17 @@ fn break_ausserhalb_schleife_ist_fehler() {
     let (m, _) = parse("fn main() {\n break\n}\n");
     assert!(lower_module(&m).is_err());
 }
+
+#[test]
+fn methoden_und_impl_bloecke() {
+    let src = "type P {\n x: Int\n y: Int\n}\nimpl P {\n fn sum(self) -> Int { self.x + self.y }\n}\nfn main() {\n mut p = P(3, 4)\n print(p.sum())\n}\n";
+    let p = lower(src);
+    // Methode als Funktion `P.sum` mit self-Ref-Parameter registriert + abgesenkt.
+    let m = p.functions.iter().find(|f| f.name == "P.sum").expect("P.sum");
+    assert_eq!(m.params.first().copied(), Some(Ty::Ref)); // self
+    // Aufrufstelle emittiert Call(P.sum, [p]).
+    let calls = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "P.sum")
+    });
+    assert!(calls, "Methodenaufruf muss Call(P.sum) emittieren");
+}
