@@ -5,7 +5,7 @@
  * no_std/seL4-Variante ersetzt stdio/malloc durch die dortigen Primitive.
  *
  * Objekt-Speicherlayout (vom Backend erzeugt):
- *   { int64_t refcount; int64_t rcflags; void *vtable; <felder…> }
+ *   { int64_t refcount(packed: flags+count); void *vtable; <felder…> }
  * refcount < 0 ⇒ "immortal" (Stack-Objekte, String-/Class-Literale):
  * retain/release sind No-Ops, es wird nie freigegeben, der Collector
  * fasst sie nie an. rcflags trägt Farbe + Buffered-Bit für den
@@ -207,7 +207,6 @@ void *jrt_dyn_string_vt = NULL;
  * Literale sind immortal (refcount -1), konkatenierte Strings nicht. */
 typedef struct {
     int64_t refcount;
-    int64_t rcflags;
     void *vtable;
     int64_t len;
     uint8_t bytes[];
@@ -223,7 +222,7 @@ void jrt_print_str(const JStr *s) {
  * RC-getrackt (leckt am Ende) — bewusst einfach; typisierte/generische
  * Collections folgen mit generischen Typen. */
 typedef struct {
-    int64_t refcount, rcflags; /* jrt-Header: immortal (-1) → RC/Collector No-Op */
+    int64_t refcount; /* jrt-Header: immortal (-1) → RC/Collector No-Op */
     void *vtable;
     int64_t len, cap;
     int64_t *data;
@@ -231,7 +230,6 @@ typedef struct {
 VList *vire_list_new(void) {
     VList *l = (VList *)malloc(sizeof(VList));
     l->refcount = -1;
-    l->rcflags = 0;
     l->vtable = 0;
     l->len = 0;
     l->cap = 8;
@@ -252,7 +250,7 @@ int64_t vire_list_pop(VList *l) { return l->len > 0 ? l->data[--l->len] : 0; }
 
 /* --- Map (Int→Int, offene Adressierung) und Set (Int) ---------------------- */
 typedef struct {
-    int64_t refcount, rcflags; /* jrt-Header: immortal */
+    int64_t refcount; /* jrt-Header: immortal */
     void *vtable;
     int64_t cap, len;
     int64_t *keys, *vals;
@@ -261,7 +259,6 @@ typedef struct {
 static VMap *vmap_new_cap(int64_t cap) {
     VMap *m = (VMap *)malloc(sizeof(VMap));
     m->refcount = -1;
-    m->rcflags = 0;
     m->vtable = 0;
     m->cap = cap;
     m->len = 0;
@@ -488,12 +485,12 @@ void *jrt_long_vt = NULL;
 void *jrt_boolean_vt = NULL;
 
 typedef struct {
-    int64_t refcount, rcflags;
+    int64_t refcount;
     void *vtable;
     int32_t value;
 } JInteger;
 typedef struct {
-    int64_t refcount, rcflags;
+    int64_t refcount;
     void *vtable;
     int64_t value;
 } JLong;
@@ -555,7 +552,7 @@ void *jrt_boolean_tostring(void *o) {
 void *jrt_double_vt = NULL;
 void *jrt_character_vt = NULL;
 typedef struct {
-    int64_t refcount, rcflags;
+    int64_t refcount;
     void *vtable;
     double value;
 } JDouble;
@@ -601,7 +598,7 @@ void *jrt_character_tostring(void *o) {
 
 void *jrt_float_vt = NULL;
 typedef struct {
-    int64_t refcount, rcflags;
+    int64_t refcount;
     void *vtable;
     float value;
 } JFloat;
@@ -702,7 +699,7 @@ void (*jrt_sb_vtable[3])(void) = {
     (void (*)(void))0, /* kein Type-Descriptor */
 };
 typedef struct {
-    int64_t refcount, rcflags;
+    int64_t refcount;
     void *vtable;
     uint8_t *buf;
     int64_t len, cap;
@@ -777,10 +774,10 @@ int32_t jrt_sb_length(void *p) { return (int32_t)((JSB *)p)->len; }
 void jrt_retain(void *p);
 void jrt_release(void *p);
 JStr *jrt_str_format(const JStr *fmt, void *argsp) {
-    /* Object[]-Layout: { rc, rcflags, vtable, length, elems… }; length bei
-     * Offset 24, Elemente ab 40 (JArray ist weiter unten definiert). */
-    int64_t nargs = argsp ? *(int64_t *)((char *)argsp + 24) : 0;
-    void **elems = argsp ? (void **)((char *)argsp + 40) : NULL;
+    /* Object[]-Layout (packed header 16 B): { rc, vtable, length, elem_size,
+     * elems… }; length bei Offset 16, Elemente ab 32. */
+    int64_t nargs = argsp ? *(int64_t *)((char *)argsp + 16) : 0;
+    void **elems = argsp ? (void **)((char *)argsp + 32) : NULL;
     JSB *sb = (JSB *)jrt_sb_new();
     int ai = 0;
     for (int64_t i = 0; i < fmt->len; i++) {
@@ -858,20 +855,27 @@ void jrt_sb_init_str(void *p, const JStr *s) {
 
 /* --- Referenzzählung + Zyklen-Collector ------------------------------ */
 
+/* PACKED-HEADER (16 B statt 24): `refcount` trägt Zähler UND Collector-Flags in
+ * EINEM Wort — Bits 0-1 Farbe, Bit 2 buffered, Bits 3-62 Referenzzähler, Bit 63
+ * (rc<0) = immortal (unverändert der Schnelltest). Spart 8 B/Objekt (Node 48→40 B,
+ * trifft die 40-B-malloc-Größenklasse exakt). retain/release verschieben den
+ * Zähler um RC_SHIFT; die Farb-Masken lassen die Zähler-Bits stehen. */
 typedef struct {
-    int64_t refcount;
-    int64_t rcflags; /* Bits 0-1: Farbe; Bit 2: buffered */
-    void *vtable;    /* [0]=drop(obj), [1]=trace(obj, visit) */
+    int64_t refcount; /* gepackt: Flags Bits 0-2, Zähler Bits 3+, immortal <0 */
+    void *vtable;     /* [0]=drop(obj), [1]=trace(obj, visit) */
 } JObjHeader;
 
 /* Farben nach Bacon-Rajan. */
 enum { COL_BLACK = 0, COL_GRAY = 1, COL_WHITE = 2, COL_PURPLE = 3 };
 
-#define COLOR(h)        ((int)((h)->rcflags & 3))
-#define SET_COLOR(h, c) ((h)->rcflags = ((h)->rcflags & ~(int64_t)3) | (c))
-#define BUFFERED(h)     (((h)->rcflags >> 2) & 1)
+#define RC_SHIFT 3            /* untere 3 Bits = Flags */
+#define RC_ONE   ((int64_t)8) /* eine Referenz = 1 << RC_SHIFT */
+#define RC_COUNT(h)     ((h)->refcount >> RC_SHIFT)          /* Zählerwert (rc>=0) */
+#define COLOR(h)        ((int)((h)->refcount & 3))
+#define SET_COLOR(h, c) ((h)->refcount = ((h)->refcount & ~(int64_t)3) | (c))
+#define BUFFERED(h)     (((h)->refcount >> 2) & 1)
 #define SET_BUFFERED(h, b) \
-    ((h)->rcflags = ((h)->rcflags & ~(int64_t)4) | ((int64_t)(b) << 2))
+    ((h)->refcount = ((h)->refcount & ~(int64_t)4) | ((int64_t)(b) << 2))
 
 typedef void (*trace_fn)(void *, void (*)(void *));
 
@@ -1057,7 +1061,6 @@ void *jrt_alloc(int64_t size) {
     if (arena_top) {
         void *ap = arena_alloc((size_t)size);
         ((JObjHeader *)ap)->refcount = -1;
-        ((JObjHeader *)ap)->rcflags = 0;
         return ap;
     }
 #endif
@@ -1080,13 +1083,12 @@ void *jrt_alloc(int64_t size) {
         }
         if (rc_elide_pct > 0 && (int)(rc_elide_counter++ % 100) < rc_elide_pct) {
             ((JObjHeader *)p)->refcount = -1; /* immortal → retain/release No-Op */
-            ((JObjHeader *)p)->rcflags = 0;
             return p; /* nicht in live_objects gezählt (leckt bewusst) */
         }
     }
 #endif
     CNT_INC(live_objects);
-    ((JObjHeader *)p)->refcount = 1; /* der Erzeuger hält die erste Referenz */
+    ((JObjHeader *)p)->refcount = RC_ONE; /* der Erzeuger hält die erste Referenz */
     return p;
 }
 
@@ -1106,13 +1108,13 @@ void jrt_retain(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (__atomic_load_n(&h->refcount, __ATOMIC_RELAXED) < 0) return; /* immortal */
-    __atomic_add_fetch(&h->refcount, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&h->refcount, RC_ONE, __ATOMIC_RELAXED);
 }
 void jrt_release(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (__atomic_load_n(&h->refcount, __ATOMIC_RELAXED) < 0) return; /* immortal */
-    if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+    if ((__atomic_sub_fetch(&h->refcount, RC_ONE, __ATOMIC_ACQ_REL) >> RC_SHIFT) == 0) {
         run_drop(h);
         free_obj(h);
     }
@@ -1124,13 +1126,14 @@ void jrt_retain(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (h->refcount < 0) return; /* immortal */
-    h->refcount++;
+    h->refcount += RC_ONE;
 }
 void jrt_release(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (h->refcount < 0) return; /* immortal */
-    if (--h->refcount == 0) {
+    h->refcount -= RC_ONE;
+    if (RC_COUNT(h) == 0) {
         if (draining) { drop_enq(h); return; }   /* in Kaskade: nur einreihen */
         draining = 1;
         drop_enq(h);
@@ -1147,7 +1150,7 @@ void jrt_retain(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (h->refcount < 0) return; /* immortal */
-    h->refcount++;
+    h->refcount += RC_ONE;
     SET_COLOR(h, COL_BLACK);
 }
 
@@ -1155,7 +1158,8 @@ void jrt_release(void *p) {
     if (!p) return;
     JObjHeader *h = (JObjHeader *)p;
     if (h->refcount < 0) return; /* immortal */
-    if (--h->refcount == 0) {
+    h->refcount -= RC_ONE;
+    if (RC_COUNT(h) == 0) {
         /* Release: Kinder dekrementieren (drop), dann ggf. freigeben.
          * Iterativ (Drop-Puffer) statt rekursiv — s. drop_enq (Soundness).
          * Ein noch gepuffertes Objekt bleibt liegen — der Collector holt
@@ -1209,15 +1213,15 @@ static void *thread_tramp(void *runnable) {
 }
 void jrt_thread_start(void *thread) {
     if (!thread) return;
-    void *runnable = *(void **)((char *)thread + 24);
+    void *runnable = *(void **)((char *)thread + 16);
     jrt_retain(runnable); /* überlebt bis der Thread endet */
     pthread_t tid;
     pthread_create(&tid, NULL, thread_tramp, runnable);
-    *(int64_t *)((char *)thread + 32) = (int64_t)tid;
+    *(int64_t *)((char *)thread + 24) = (int64_t)tid;
 }
 void jrt_thread_join(void *thread) {
     if (!thread) return;
-    pthread_t tid = (pthread_t) * (int64_t *)((char *)thread + 32);
+    pthread_t tid = (pthread_t) * (int64_t *)((char *)thread + 24);
     if (tid) pthread_join(tid, NULL);
 }
 #else
@@ -1226,7 +1230,7 @@ void jrt_monitor_exit(void *o) { (void)o; }
 void jrt_thread_start(void *thread) {
     if (!thread) return;
     /* Ohne Threads: synchroner Lauf — ein gültiger sequentieller Schedule. */
-    jrt_invoke_runnable(*(void **)((char *)thread + 24));
+    jrt_invoke_runnable(*(void **)((char *)thread + 16));
 }
 void jrt_thread_join(void *thread) { (void)thread; }
 #endif
@@ -1256,7 +1260,7 @@ static void wl_push(JObjHeader ***buf, size_t *len, size_t *cap, JObjHeader *h) 
 static void visit_mark_gray(void *p) {
     JObjHeader *h = (JObjHeader *)p;
     if (!h || h->refcount < 0) return;
-    h->refcount--;                       /* Trial-Deletion je Kante */
+    h->refcount -= RC_ONE;                    /* Trial-Deletion je Kante */
     wl_push(&cwork, &cwl, &cwc, h);
 }
 static void mark_gray(JObjHeader *root) {
@@ -1274,7 +1278,7 @@ static void mark_gray(JObjHeader *root) {
 static void visit_scan_black(void *p) {
     JObjHeader *h = (JObjHeader *)p;
     if (!h || h->refcount < 0) return;
-    h->refcount++;
+    h->refcount += RC_ONE;
     wl_push(&bwork, &bwl, &bwc, h);
 }
 static void scan_black(JObjHeader *root) {
@@ -1299,7 +1303,7 @@ static void scan(JObjHeader *root) {
     while (cwl) {
         JObjHeader *h = cwork[--cwl];
         if (COLOR(h) != COL_GRAY) continue;
-        if (h->refcount > 0) {
+        if (RC_COUNT(h) > 0) {
             scan_black(h);               /* nutzt bwork, läuft voll leer */
         } else {
             SET_COLOR(h, COL_WHITE);
@@ -1332,12 +1336,12 @@ static void jrt_collect_cycles(void) {
     size_t kept = 0;
     for (size_t i = 0; i < roots_len; i++) {
         JObjHeader *h = roots[i];
-        if (COLOR(h) == COL_PURPLE && h->refcount > 0) {
+        if (COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) {
             mark_gray(h);
             roots[kept++] = h;
         } else {
             SET_BUFFERED(h, 0);
-            if (COLOR(h) == COL_BLACK && h->refcount == 0) free_obj(h);
+            if (COLOR(h) == COL_BLACK && RC_COUNT(h) == 0) free_obj(h);
         }
     }
     roots_len = kept;
@@ -1424,7 +1428,7 @@ void *jrt_throwable_message(void *obj) {
     }
     void **vt = (void **)((JObjHeader *)obj)->vtable;
     if (!vt || vt[2] == NULL) return NULL; /* Sentinel ohne Message-Feld */
-    void *msg = *(void **)((char *)obj + 24);
+    void *msg = *(void **)((char *)obj + 16);
     jrt_retain(msg);
     return msg;
 }
@@ -1466,18 +1470,18 @@ void *jrt_class_getname(void *jc) {
         jrt_throw_npe();
         return NULL;
     }
-    return *(void **)((char *)jc + 24);
+    return *(void **)((char *)jc + 16);
 }
 void *jrt_class_getsimplename(void *jc) {
     if (!jc) {
         jrt_throw_npe();
         return NULL;
     }
-    return *(void **)((char *)jc + 32);
+    return *(void **)((char *)jc + 24);
 }
 
 /* Record-equals: der Aufrufer hat instanceof(other, RecordClass) bereits in
- * `inst` (0 bei null/falschem Typ). Bei passendem Typ Feldbereich (ab Offset 24)
+ * `inst` (0 bei null/falschem Typ). Bei passendem Typ Feldbereich (ab Offset 16, packed header)
  * per memcmp vergleichen. Ref-Felder werden dabei per Identität verglichen
  * (dokumentierte Grenze); primitive Records sind exakt. */
 static int jrt_memcmp(const void *a, const void *b, int64_t n) {
@@ -1489,7 +1493,7 @@ static int jrt_memcmp(const void *a, const void *b, int64_t n) {
 int32_t jrt_record_memeq(void *a, void *b, int32_t inst, int64_t field_bytes) {
     if (!inst) return 0;
     if (a == b) return 1;
-    return jrt_memcmp((char *)a + 24, (char *)b + 24, field_bytes) == 0;
+    return jrt_memcmp((char *)a + 16, (char *)b + 16, field_bytes) == 0;
 }
 
 int32_t jrt_instanceof(void *obj, void *target_td) {
@@ -1554,7 +1558,6 @@ void jrt_check_uncaught(void) {
  * clone ohne statischen Typ); Elemente folgen direkt (ab Offset 40). */
 typedef struct {
     int64_t refcount;
-    int64_t rcflags;
     void *vtable;
     int64_t length;
     int64_t elem_size;
@@ -1577,7 +1580,7 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     }
     CNT_INC(live_objects);
     JArray *a = (JArray *)p;
-    a->refcount = 1;
+    a->refcount = RC_ONE;
     a->vtable = vtable;
     a->length = count;
     a->elem_size = elem_size;
@@ -1743,7 +1746,7 @@ void *jrt_enum_valueof(void *values, void *name) {
     for (int64_t i = 0; i < a->length; i++) {
         void *e = elems[i];
         if (!e) continue;
-        JStr *ename = *(JStr **)((char *)e + 24);
+        JStr *ename = *(JStr **)((char *)e + 16);
         if (jrt_str_equals(ename, (const JStr *)name)) {
             found = e;
             break;

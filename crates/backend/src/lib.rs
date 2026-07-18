@@ -213,9 +213,9 @@ fn array_vtable(kind: ArrKind) -> &'static str {
 ///   Slot 1: rcflags (i64) — Farbe/Buffered-Bit für den Zyklen-Collector
 ///   Slot 2: vtable (ptr)
 /// Instanzfelder beginnen daher bei GEP-Index 3.
-const HEADER_SLOTS: usize = 3;
+const HEADER_SLOTS: usize = 2;
 /// Word-Offset des Vtable-Zeigers im Header (für ptr-getelementptr).
-const VTABLE_WORD: usize = 2;
+const VTABLE_WORD: usize = 1;
 /// Vtable-Slot 0 = Drop, Slot 1 = Trace (Zyklen-Collector), Slot 2 =
 /// Type-Descriptor (instanceof); Interface-/virtuelle Methoden ab Slot 3.
 const VTABLE_METHOD_OFFSET: usize = 3;
@@ -428,7 +428,7 @@ pub fn emit(program: &Program) -> String {
         let bytes = s.as_bytes();
         writeln!(
             w,
-            "@jstr.{i} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} {{ i64 -1, i64 0, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
+            "@jstr.{i} = private unnamed_addr constant {{ i64, ptr, i64, [{n} x i8] }} {{ i64 -1, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
             n = bytes.len(),
             esc = escape_ll(bytes),
         )
@@ -447,8 +447,8 @@ pub fn emit(program: &Program) -> String {
         emit_jstr_const(w, &format!("jclasssimple.{s}"), simple.as_bytes());
         writeln!(
             w,
-            "@jclass.{s} = internal unnamed_addr constant {{ i64, i64, ptr, ptr, ptr }} \
-             {{ i64 -1, i64 0, ptr null, ptr @jclassname.{s}, ptr @jclasssimple.{s} }}",
+            "@jclass.{s} = internal unnamed_addr constant {{ i64, ptr, ptr, ptr }} \
+             {{ i64 -1, ptr null, ptr @jclassname.{s}, ptr @jclasssimple.{s} }}",
         )
         .unwrap();
     }
@@ -456,16 +456,16 @@ pub fn emit(program: &Program) -> String {
 
     // Struct-Typen: { i64 refcount, i64 rcflags, ptr vtable, felder… }.
     for c in &program.classes {
-        let mut parts = vec!["i64".to_string(), "i64".to_string(), "ptr".to_string()];
+        let mut parts = vec!["i64".to_string(), "ptr".to_string()];
         parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
     // Array-Typen (Header + i64 Länge + flexibles Elementfeld) und ihre
     // Vtables. int[] hat keine Ref-Elemente → No-Op-Drop/Trace; ref[]
     // released/besucht seine Elemente über Runtime-Helfer.
-    // Header: refcount, rcflags, vtable, length, elem_size (dann Elemente).
-    writeln!(w, "%arr.int = type {{ i64, i64, ptr, i64, i64, [0 x i32] }}").unwrap();
-    writeln!(w, "%arr.ref = type {{ i64, i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
+    // Header (packed 16 B): refcount, vtable, length, elem_size (dann Elemente).
+    writeln!(w, "%arr.int = type {{ i64, ptr, i64, i64, [0 x i32] }}").unwrap();
+    writeln!(w, "%arr.ref = type {{ i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
     // Arrays haben keinen Type-Descriptor (Slot 2 = null → instanceof false).
     writeln!(w, "@vt.array.int = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
     writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
@@ -1941,7 +1941,7 @@ fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: 
     let off = e.fresh();
     writeln!(w, "  {off} = mul i64 {i64v}, {}", k.size()).unwrap();
     let base = e.fresh();
-    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
@@ -1967,7 +1967,7 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
     let off = e.fresh();
     writeln!(w, "  {off} = mul i64 {i64v}, {}", k.size()).unwrap();
     let base = e.fresh();
-    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     // Wert auf die Speicherbreite kürzen (byte/char/short).
@@ -2007,7 +2007,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     writeln!(w, "  br label %{cont}").unwrap();
     writeln!(w, "{ck}:").unwrap();
     let lenp = e.fresh();
-    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 24").unwrap();
+    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
     writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
     let idx = e.fresh();
@@ -2022,7 +2022,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     let off = e.fresh();
     writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
     let base = e.fresh();
-    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
@@ -2066,7 +2066,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     writeln!(w, "  br label %{cont}").unwrap();
     writeln!(w, "{ck}:").unwrap();
     let lenp = e.fresh();
-    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 24").unwrap();
+    writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
     writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
     let idx = e.fresh();
@@ -2081,7 +2081,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let off = e.fresh();
     writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
     let base = e.fresh();
-    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 40").unwrap();
+    writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let sv = match k {
@@ -2244,8 +2244,8 @@ fn emit_jstr_const(w: &mut String, sym: &str, bytes: &[u8]) {
     let n = bytes.len();
     writeln!(
         w,
-        "@{sym} = private unnamed_addr constant {{ i64, i64, ptr, i64, [{n} x i8] }} \
-         {{ i64 -1, i64 0, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
+        "@{sym} = private unnamed_addr constant {{ i64, ptr, i64, [{n} x i8] }} \
+         {{ i64 -1, ptr @vt.java_lang_String, i64 {n}, [{n} x i8] c\"{esc}\" }}",
         esc = escape_ll(bytes),
     )
     .unwrap();
