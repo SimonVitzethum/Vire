@@ -90,3 +90,66 @@ ist er >20%, lohnt er. Erst die Zahl, dann das Quartal — dieselbe Gate-Diszipl
 beim Frontend.
 EOF
 echo "AOT-Plan geschrieben"
+## Untersuchung: lohnen sich die vier Techniken? (messungsgetrieben)
+*Frage: Aufrufgraph analysieren / Zweig-Wahrscheinlichkeiten / spezialisierte
+Versionen für häufige Typkombinationen / mehrere Varianten + Laufzeit-Auswahl.*
+
+**Der entscheidende Kontext zuerst:** die Benchmarks (`benchmarks/vire-lang/`) zeigen
+compute-gebundenen Code schon bei **C++/Rust-Parität** (arith 1,02×, fib 0,91×,
+mandelbrot 0,99×, nsieve 1,02× Rust). Der EINZIGE gemessene Gap ist der RC-/Objekt-
+Pfad (binary-trees 2,65×). **Keine der vier Techniken adressiert Speicherverwaltung** —
+sie zielen auf Compute/Dispatch, der schon optimal ist. Das rahmt jede Antwort: der
+Spielraum auf dem Compute-Pfad ist klein, der Hebel für den echten Gap ist Region-
+Inferenz, nicht AOT-Hotpath-Tricks. Mit dieser Erdung:
+
+1. **Ganzen Aufrufgraphen analysieren — JA, lohnt sich, ist schon da.** Devirt/Pruning/
+   Inliner/`static_writes`/interproz. Region-Inferenz laufen alle über den Call-Graph.
+   Kosten niedrig (Closed World = vollständiger Graph vorhanden). Kein neuer großer
+   Aufwand, eher die Basis, auf der der Rest sitzt. **Verdikt: bereits eingelöst.**
+
+2. **Zweig-Wahrscheinlichkeiten — LOHNT SICH BEDINGT, billige Version zuerst.** LLVM
+   `-O2` schätzt Branches schon gut (deshalb die Parität). Statische `!prof`-Weights
+   aus Schleifentiefe helfen v.a. dort, wo LLVM falsch rät: Fehler-/Kaltzweige
+   (`?`/Err, null-checks). Erwarteter Gewinn auf compute-Code **<5%** (er ist schon
+   optimal), messbar mehr nur bei branch-lastigem Code mit klaren Kalt-Pfaden.
+   **Kosten klein** (Loop-Tiefe→`!prof`, LLVM macht den Rest). **Verdikt: der billige
+   erste Schritt, aber Decke vorher messen — auf Parität-Code ist wenig zu holen.**
+
+3. **Spezialisierte Versionen für Typkombinationen — TEILS SCHON DA (Monomorphisierung).**
+   Für Generics macht Vire genau das (pro Typargument eine Instanz). Der Zusatz wäre
+   **Wert-Spezialisierung / partielle Evaluation**: heiße Funktion mit konstantem
+   Argument → gefaltete Kopie. Lohnt sich NUR, wenn heiße Funktionen konstante Args
+   bekommen (Config-Flags, feste Größen) — in den Benchmarks selten. **Verdikt:
+   Typ-Spezialisierung erledigt; Wert-Spezialisierung situativ, erst bei gemessenem
+   Fall bauen, nicht spekulativ (Code-Bloat).**
+
+4. **Mehrere Varianten + Laufzeit-Auswahl — AM WENIGSTEN wert im Closed-World-AOT.**
+   Das ist der JIT-artigste Vorschlag und genau der, den AOT am wenigsten braucht:
+   Wenn der Typ statisch bekannt ist (Closed World + Monomorphisierung + CHA-Devirt),
+   ruft man die richtige Variante **direkt** — keine Laufzeit-Auswahl, kein Dispatch-
+   Overhead, kein Bloat. Laufzeit-Auswahl hilft nur an **genuin polymorphen** Sites
+   (megamorph, 3+ Typen) — und die behandelt der Solver SCHON via `CallPoly`
+   (guarded devirtualization / polymorphic inline cache = ein paar Varianten + Typ-
+   Wächter-Kaskade). Der Rest wäre Code-Bloat (N Varianten × M Funktionen, Icache-
+   Druck) für Fälle, die die geschlossene Welt statisch auflöst. **Einzige echte
+   Nische:** Wert-basierte Varianten, deren Wert erst zur Laufzeit stabil wird (z.B.
+   ein Modus-Flag) — dort könnte 2-Varianten + Auswahl lohnen, aber das ist ein
+   schmaler Fall, kein allgemeiner Pass. **Verdikt: nein als generelle Strategie;
+   die nützliche 90% (polymorphe Sites) ist über `CallPoly` schon abgedeckt.**
+
+## Gesamturteil der Untersuchung
+Priorität nach Aufwand/Wirkung, geerdet an den Messungen:
+- **#1 (Call-Graph):** erledigt, Fundament.
+- **#2 (Branch-Weights):** billig, kleiner Gewinn (Parität-Code) → als Erstes, aber
+  Decke messen; wahrscheinlich <5%.
+- **#3 (Typ-Spezialisierung):** für Generics erledigt; Wert-Spezialisierung nur bei
+  gemessenem Bedarf.
+- **#4 (Laufzeit-Varianten):** überwiegend redundant zu statischer Mono+Devirt im
+  Closed World; die polymorphe Nische ist via `CallPoly` schon da. **Nicht bauen.**
+
+**Kernbefund:** Diese vier optimieren einen Pfad, der bereits auf C++/Rust-Niveau
+ist — der Ertrag ist marginal. Der einzige gemessene Gap (RC/Objekte, ~2,7×) liegt
+**orthogonal** dazu; ihn schließt interprozedurale Region-Inferenz (v2 hat pagerank
+schon 2,0×→1,55× gebracht), nicht Hotpath-Spezialisierung. Ehrliche Empfehlung:
+`!prof`-Weights als billiges Experiment, sonst die AOT-Hotpath-Maschinerie
+ZURÜCKSTELLEN und die Region-Inferenz fertigbauen — dort sitzt die gemessene Zahl.
