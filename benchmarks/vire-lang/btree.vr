@@ -1,0 +1,16 @@
+type Tree { l: Tree r: Tree }
+fn make(d: Int) -> Tree {
+    if d == 0 { Tree(null, null) } else { Tree(make(d - 1), make(d - 1)) }
+}
+fn check(t: Tree, d: Int) -> Int {
+    if d == 0 { 1 } else { 1 + check(t.l, d - 1) + check(t.r, d - 1) }
+}
+fn main() {
+    mut sum = 0
+    mut n = 0
+    while n < 60 {
+        sum = sum + check(make(16), 16)
+        n = n + 1
+    }
+    print(sum)
+}

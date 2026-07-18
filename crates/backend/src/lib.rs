@@ -1407,6 +1407,8 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                         (Ty::I64, Ty::I32) => "trunc",
                         (Ty::F32, Ty::F64) => "fpext",
                         (Ty::F64, Ty::F32) => "fptrunc",
+                        // Gleitkomma → Ganzzahl (Trunkierung).
+                        (Ty::F64, Ty::I64) | (Ty::F64, Ty::I32) | (Ty::F32, Ty::I64) | (Ty::F32, Ty::I32) => "fptosi",
                         _ => panic!("unerwartete Konvertierung {from:?} -> {to:?}"),
                     };
                     writeln!(w, "  {t} = {inst} {} {v} to {}", llty(from), llty(to)).unwrap();

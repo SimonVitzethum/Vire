@@ -1,0 +1,27 @@
+fn main() {
+    mut n = 2000
+    mut count = 0
+    mut py = 0
+    while py < n {
+        mut px = 0
+        while px < n {
+            mut cr = (px as Float) * 3.0 / (n as Float) - 2.0
+            mut ci = (py as Float) * 2.0 / (n as Float) - 1.0
+            mut zr = 0.0
+            mut zi = 0.0
+            mut i = 0
+            mut esc = 0
+            while i < 50 {
+                mut zr2 = zr * zr - zi * zi + cr
+                zi = 2.0 * zr * zi + ci
+                zr = zr2
+                if zr * zr + zi * zi > 4.0 { esc = 1
+                    i = 50 } else { i = i + 1 }
+            }
+            count = count + 1 - esc
+            px = px + 1
+        }
+        py = py + 1
+    }
+    print(count)
+}

@@ -347,6 +347,11 @@ impl<'a> Ctx<'a> {
                 t
             }
             Expr::Block(b) => self.infer_block(b, false),
+            // `x as T` → Zieltyp (Argument frei, es wird konvertiert).
+            Expr::Cast { inner, ty, .. } => {
+                self.infer_expr(inner);
+                ann_ty(Some(ty)).unwrap_or(T::I64)
+            }
             // Comprehension: Variable frisch binden (Element-Typ der Inferenz ohne
             // Array-Typ unbekannt), elem/cond inferieren. Ergebnis = frisch (Array).
             Expr::Comprehension { var, iter, elem, cond, .. } => {

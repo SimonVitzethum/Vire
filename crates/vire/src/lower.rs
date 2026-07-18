@@ -949,6 +949,17 @@ impl<'a> FnLower<'a> {
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
             // `comptime <expr>` → Compilezeit-Faltung konstanter Ausdrücke.
+            // `x as T` — numerische Konvertierung (int↔float, Breiten).
+            Expr::Cast { inner, ty, .. } => {
+                let (op, from) = self.lower_expr(inner);
+                let to = ty_of(Some(ty));
+                if from == to {
+                    return (op, to);
+                }
+                let d = self.new_local(to);
+                self.emit(Statement::Assign(d, Rvalue::Convert(op)));
+                (Operand::Copy(d), to)
+            }
             Expr::Comptime { inner, .. } => match const_eval(inner) {
                 Some(CVal::Int(v)) => (Operand::ConstI64(v), Ty::I64),
                 Some(CVal::Float(v)) => (Operand::ConstF64(v), Ty::F64),
