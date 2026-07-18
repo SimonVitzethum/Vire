@@ -1801,7 +1801,12 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let tb = ctx.tbaa_suffix(&owner, field);
             if ty == Ty::Ref {
                 // Feld übernimmt eine owning-Referenz: retain neu, release alt.
-                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                // `retain(null)` ist ein beweisbarer No-Op (Konstante null) →
+                // weglassen (spart einen Call je `x.f = null` / Feld-Init auf null;
+                // hilft allokationslastigem Code wie `Tree(null, null)`).
+                if !matches!(value, Operand::ConstNull) {
+                    writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                }
                 let old = e.fresh();
                 writeln!(w, "  {old} = load ptr, ptr {p}{tb}").unwrap();
                 writeln!(w, "  store ptr {v}, ptr {p}{tb}").unwrap();
@@ -1825,7 +1830,9 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("statisches Feld {class}.{field} fehlt"));
             let v = e.operand(w, value);
             if ty == Ty::Ref {
-                writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                if !matches!(value, Operand::ConstNull) {
+                    writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
+                }
                 let old = e.fresh();
                 writeln!(w, "  {old} = load ptr, ptr {g}").unwrap();
                 writeln!(w, "  store ptr {v}, ptr {g}").unwrap();
@@ -2117,7 +2124,8 @@ fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_
     }
     let old = e.fresh();
     writeln!(w, "  {old} = load ptr, ptr %l{}", dest.0).unwrap();
-    if retain_new {
+    // `retain(null)` ist ein No-Op → weglassen (Konstante null rendert als "null").
+    if retain_new && val != "null" {
         writeln!(w, "  call void @jrt_retain(ptr {val})").unwrap();
     }
     writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
