@@ -54,7 +54,7 @@ fn type_conflict_is_reported_not_swallowed() {
     let (mut m, diags) = parse("fn bad(x) {\n mut a = x + 1\n mut b = x + 2.0\n a\n}\n");
     assert!(diags.is_empty());
     let conflicts = infer_module(&mut m);
-    assert!(!conflicts.is_empty(), "Typkonflikt Int/Float muss gemeldet werden");
+    assert!(!conflicts.is_empty(), "Int/Float type conflict must be reported");
 }
 
 #[test]

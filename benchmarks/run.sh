@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Benchmark-Runner: FastLLVM vs Rust vs C++ (g++ -O3 -march=native), best of N.
-# Kompiliert jede Sprache, prüft Ausgabe-Gleichheit, misst, druckt Tabelle.
+# Benchmark runner: FastLLVM vs Rust vs C++ (g++ -O3 -march=native), best of N.
+# Compiles each language, checks output equality, measures, prints table.
 set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 fj="$root/target/debug/fastjavac"
@@ -13,7 +13,7 @@ best() { local m=999 d; for _ in $(seq 1 "$N"); do
   done; echo "$m"; }
 ratio() { echo "scale=2; $1 / $2" | bc; }
 
-# name Main   (Main = Java-Klasse; Kleinbuchstabe = rs/cpp basename)
+# name Main   (Main = Java class; lowercase = rs/cpp basename)
 run() {
   local name="$1" Main="$2" low; low=$(echo "$name" | tr 'A-Z' 'a-z')
   # Java → FastLLVM
@@ -23,10 +23,10 @@ run() {
   # Rust, C++
   rustc -O "$low.rs" -o "$work/${low}_rs" 2>/dev/null || echo "$name: rustc FAIL"
   g++ -O3 -march=native "$low.cpp" -o "$work/${low}_cpp" 2>/dev/null || echo "$name: g++ FAIL"
-  # Korrektheit
+  # Correctness
   local of or oc; of=$("$work/${low}_fl"); or=$("$work/${low}_rs" 2>/dev/null); oc=$("$work/${low}_cpp" 2>/dev/null)
   local mark=""; [ "$of" = "$or" ] && [ "$of" = "$oc" ] || mark=" ⚠MISMATCH($of|$or|$oc)"
-  # Zeiten
+  # Times
   local f r c; f=$(best "$work/${low}_fl"); r=$(best "$work/${low}_rs"); c=$(best "$work/${low}_cpp")
   printf "%-10s %9ss %9ss %9ss   %6sx %6sx%s\n" "$name" "$f" "$r" "$c" "$(ratio "$f" "$r")" "$(ratio "$f" "$c")" "$mark"
 }

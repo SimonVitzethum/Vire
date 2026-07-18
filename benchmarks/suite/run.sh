@@ -1,5 +1,5 @@
 #!/bin/sh
-# Baut+misst jede Benchmark in Vire/Rust/C++(clang), best-of-5, prüft Output-Gleichheit.
+# Builds+measures each benchmark in Vire/Rust/C++(clang), best-of-5, checks output equality.
 cd "$(dirname "$0")"
 VIRE=../../target/release/vire
 [ -x "$VIRE" ] || { cargo build --release -q --manifest-path ../../Cargo.toml -p vire; }

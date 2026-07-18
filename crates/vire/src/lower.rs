@@ -1183,7 +1183,7 @@ impl<'a> FnLower<'a> {
                         };
                         self.emit(Statement::Assign(l, rv));
                     } else {
-                        self.errs.push(format!("unbekannte Variable: {name}"));
+                        self.errs.push(format!("unknown variable: {name}"));
                     }
                 }
                 // Field mutation `p.x = v` resp. `p.x op= v` → (Get)+Binary+PutField.
@@ -1192,14 +1192,14 @@ impl<'a> FnLower<'a> {
                     let class = match self.class_of_operand(&obj) {
                         Some(c) => c,
                         None => {
-                            self.errs.push(format!("Feldzuweisung `.{name}`: Typ des Objekts unbekannt (annotieren)"));
+                            self.errs.push(format!("field assignment `.{name}`: type of the object unknown (annotate it)"));
                             return;
                         }
                     };
                     let fty = match self.layout_of(&class).and_then(|l| l.into_iter().find(|(n, ..)| n == name)) {
                         Some((_, ty, _)) => ty,
                         None => {
-                            self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
+                            self.errs.push(format!("`{class}` has no field `{name}`"));
                             return;
                         }
                     };
@@ -1231,11 +1231,11 @@ impl<'a> FnLower<'a> {
                         let idx32 = self.to_i32(idx);
                         self.emit(Statement::ArrayStore { arr, index: idx32, value: v, kind, checked: true });
                     } else {
-                        self.errs.push("Index-Zuweisung: kein Array/Liste".into());
+                        self.errs.push("index assignment: not an array/list".into());
                     }
                 }
                 _ => {
-                    self.errs.push("Zuweisungsziel M2: nur Variablen und Felder".into());
+                    self.errs.push("assignment target M2: only variables and fields".into());
                 }
             },
             Stmt::Expr(e) => {
@@ -1263,7 +1263,7 @@ impl<'a> FnLower<'a> {
                         let nb = self.new_block();
                         self.cur = nb.0 as usize;
                     }
-                    None => self.errs.push("`break` außerhalb einer Schleife".into()),
+                    None => self.errs.push("`break` outside a loop".into()),
                 }
             }
             Stmt::Continue(_) => {
@@ -1274,7 +1274,7 @@ impl<'a> FnLower<'a> {
                         let nb = self.new_block();
                         self.cur = nb.0 as usize;
                     }
-                    None => self.errs.push("`continue` außerhalb einer Schleife".into()),
+                    None => self.errs.push("`continue` outside a loop".into()),
                 }
             }
             Stmt::While { cond, body, .. } => {
@@ -1317,7 +1317,7 @@ impl<'a> FnLower<'a> {
                     Pattern::Bind(n, _) => n.clone(),
                     Pattern::Wildcard(_) => "_".into(),
                     _ => {
-                        self.errs.push("for-Muster: nur `for x in …`".into());
+                        self.errs.push("for pattern: only `for x in …`".into());
                         return;
                     }
                 };
@@ -1361,7 +1361,7 @@ impl<'a> FnLower<'a> {
                     let kind = match self.arr_of_operand(&arr) {
                         Some(k) => k,
                         None => {
-                            self.errs.push("for-Iterator: Range `a..b` oder eine Liste".into());
+                            self.errs.push("for iterator: range `a..b` or a list".into());
                             return;
                         }
                     };
@@ -1459,7 +1459,7 @@ impl<'a> FnLower<'a> {
             Expr::Ident(name, _) => match self.lookup(name) {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
-                    self.errs.push(format!("unbekannte Variable: {name}"));
+                    self.errs.push(format!("unknown variable: {name}"));
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
@@ -1467,7 +1467,7 @@ impl<'a> FnLower<'a> {
             Expr::SelfExpr(_) => match self.lookup("self") {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
-                    self.errs.push("`self` außerhalb einer Methode".into());
+                    self.errs.push("`self` outside a method".into());
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
@@ -1533,14 +1533,14 @@ impl<'a> FnLower<'a> {
                 let class = match self.class_of_operand(&obj) {
                     Some(c) => c,
                     None => {
-                        self.errs.push(format!("Feldzugriff `.{name}`: Typ des Objekts unbekannt (annotieren)"));
+                        self.errs.push(format!("field access `.{name}`: type of the object unknown (annotate it)"));
                         return (Operand::ConstI64(0), Ty::I64);
                     }
                 };
                 let (fty, rtarget) = match self.layout_of(&class).and_then(|l| l.into_iter().find(|(n, ..)| n == name)) {
                     Some((_, ty, rt)) => (ty, rt.clone()),
                     None => {
-                        self.errs.push(format!("`{class}` hat kein Feld `{name}`"));
+                        self.errs.push(format!("`{class}` has no field `{name}`"));
                         return (Operand::ConstI64(0), Ty::I64);
                     }
                 };
@@ -1571,7 +1571,7 @@ impl<'a> FnLower<'a> {
                 Some(CVal::Float(v)) => (Operand::ConstF64(v), Ty::F64),
                 Some(CVal::Bool(b)) => (Operand::ConstI32(if b { 1 } else { 0 }), Ty::I32),
                 None => {
-                    self.errs.push("comptime: Ausdruck ist nicht konstant-faltbar (nur Literale/Arithmetik/Vergleiche)".into());
+                    self.errs.push("comptime: expression is not constant-foldable (only literals/arithmetic/comparisons)".into());
                     (Operand::ConstI64(0), Ty::I64)
                 }
             },
@@ -1639,7 +1639,7 @@ impl<'a> FnLower<'a> {
                 let kind = match self.arr_of_operand(&arr) {
                     Some(k) => k,
                     None => {
-                        self.errs.push("Index `[]`: kein bekanntes Array (annotieren)".into());
+                        self.errs.push("index `[]`: unknown array (annotate it)".into());
                         return (Operand::ConstI64(0), Ty::I64);
                     }
                 };
@@ -1662,10 +1662,10 @@ impl<'a> FnLower<'a> {
                 for (nm, _borrowed) in inputs {
                     if let Some((_, Ty::Ref)) = self.lookup(nm) {
                         self.errs.push(format!(
-                            "capsule: Objekt-Eingabe `{nm}` noch nicht erlaubt — die Isolation \
-                             braucht Deep-Copy-in (noch nicht implementiert). Bis dahin nur \
-                             Skalar-Eingaben (Int/Float/Bool), sonst wäre die Containment-Garantie \
-                             eine Lüge."
+                            "capsule: object input `{nm}` not yet allowed — the isolation \
+                             needs deep-copy-in (not yet implemented). Until then only \
+                             scalar inputs (Int/Float/Bool), otherwise the containment guarantee \
+                             would be a lie."
                         ));
                     }
                 }
@@ -1673,7 +1673,7 @@ impl<'a> FnLower<'a> {
                 // forbid it. break/continue: the loop targets are saved and
                 // cleared during the body (inner loops set their own).
                 if body_has_return(body) {
-                    self.errs.push("capsule: `return` im Rumpf nicht erlaubt (würde die Arena lecken) — nutze den Blockwert".into());
+                    self.errs.push("capsule: `return` in the body not allowed (would leak the arena) — use the block value".into());
                 }
                 self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
                 let saved_loops = std::mem::take(&mut self.loops);
@@ -1682,8 +1682,8 @@ impl<'a> FnLower<'a> {
                 self.loops = saved_loops;
                 if ty == Ty::Ref {
                     self.errs.push(
-                        "capsule: Objekt-Ergebnis noch nicht erlaubt — das braucht Deep-Copy-out \
-                         (sonst dangling in die freigegebene Arena). Bis dahin nur Skalar-Ergebnis."
+                        "capsule: object result not yet allowed — that needs deep-copy-out \
+                         (otherwise dangling into the freed arena). Until then only a scalar result."
                             .into(),
                     );
                 }
@@ -1709,11 +1709,11 @@ impl<'a> FnLower<'a> {
                 }
             }
             Expr::Range { .. } => {
-                self.errs.push("Range nur als for-Iterator (M2)".into());
+                self.errs.push("range only as a for iterator (M2)".into());
                 (Operand::ConstI64(0), Ty::I64)
             }
             other => {
-                self.errs.push(format!("Ausdruck M2 noch nicht abgesenkt: {}", expr_kind(other)));
+                self.errs.push(format!("expression M2 not yet lowered: {}", expr_kind(other)));
                 (Operand::ConstI64(0), Ty::I64)
             }
         }
@@ -1740,7 +1740,7 @@ impl<'a> FnLower<'a> {
                         "get" => ("vire_list_get", Ty::I64),
                         "set" => ("vire_list_set", Ty::Void),
                         _ => {
-                            self.errs.push(format!("List hat keine Methode `{name}`"));
+                            self.errs.push(format!("List has no method `{name}`"));
                             return (Operand::ConstI64(0), Ty::I64);
                         }
                     };
@@ -1762,7 +1762,7 @@ impl<'a> FnLower<'a> {
                         "has" => ("vire_map_has", Ty::I32),
                         "len" => ("vire_map_len", Ty::I64),
                         _ => {
-                            self.errs.push(format!("Map hat keine Methode `{name}`"));
+                            self.errs.push(format!("Map has no method `{name}`"));
                             return (Operand::ConstI64(0), Ty::I64);
                         }
                     };
@@ -1780,7 +1780,7 @@ impl<'a> FnLower<'a> {
             let class = match self.class_of_operand(&obj) {
                 Some(c) => c,
                 None => {
-                    self.errs.push(format!("Methodenaufruf `.{name}()`: Typ des Empfängers unbekannt (annotieren)"));
+                    self.errs.push(format!("method call `.{name}()`: type of the receiver unknown (annotate it)"));
                     return (Operand::ConstI64(0), Ty::I64);
                 }
             };
@@ -1807,7 +1807,7 @@ impl<'a> FnLower<'a> {
                 arg_ops.push(self.lower_expr(a).0);
             }
             let (ret, ret_class) = self.sigs.get(&sym).map(|s| (s.ret, s.ret_class.clone())).unwrap_or_else(|| {
-                self.errs.push(format!("`{class}` hat keine Methode `{name}`"));
+                self.errs.push(format!("`{class}` has no method `{name}`"));
                 (Ty::I64, None)
             });
             if ret == Ty::Void {
@@ -1824,7 +1824,7 @@ impl<'a> FnLower<'a> {
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
             _ => {
-                self.errs.push("Aufruf-Ziel M2: nur benannte Funktionen".into());
+                self.errs.push("call target M2: only named functions".into());
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
@@ -1876,7 +1876,7 @@ impl<'a> FnLower<'a> {
             self.local_class.insert(obj.0, mangled.clone());
             self.emit(Statement::New { dest: obj, class: mangled.clone() });
             if lowered.len() != layout.len() {
-                self.errs.push(format!("{name}: {} Felder erwartet, {} übergeben", layout.len(), lowered.len()));
+                self.errs.push(format!("{name}: expected {} fields, {} given", layout.len(), lowered.len()));
             }
             for ((fname, fty, _), (mut v, _)) in layout.iter().zip(lowered) {
                 if *fty == Ty::I64 {
@@ -1893,7 +1893,7 @@ impl<'a> FnLower<'a> {
             self.local_class.insert(obj.0, name.clone());
             self.emit(Statement::New { dest: obj, class: name.clone() });
             if args.len() != layout.len() {
-                self.errs.push(format!("{name}: {} Felder erwartet, {} übergeben", layout.len(), args.len()));
+                self.errs.push(format!("{name}: expected {} fields, {} given", layout.len(), args.len()));
             }
             for ((fname, fty, _), arg) in layout.iter().zip(args) {
                 let (mut v, _) = self.lower_expr(arg);
@@ -2071,12 +2071,12 @@ impl<'a> FnLower<'a> {
         let body = fdef.body.as_ref().unwrap();
         if self.inlining.iter().any(|n| n == name) {
             self.errs
-                .push(format!("Higher-Order: rekursives Inlining von `{name}` nicht unterstützt (Lambda ist kein speicherbarer Funktionszeiger)"));
+                .push(format!("higher-order: recursive inlining of `{name}` not supported (a lambda is not a storable function pointer)"));
             return (Operand::ConstI64(0), Ty::I64);
         }
         if body_has_return(body) {
             self.errs.push(format!(
-                "Higher-Order: `{name}` benutzt `return` — inline-Expansion braucht einen ausdrucksförmigen Rumpf (Tail-Wert statt `return`)"
+                "higher-order: `{name}` uses `return` — inline expansion needs an expression-shaped body (tail value instead of `return`)"
             ));
             return (Operand::ConstI64(0), Ty::I64);
         }
@@ -2116,7 +2116,7 @@ impl<'a> FnLower<'a> {
         let src_kind = match self.arr_of_operand(&src) {
             Some(k) => k,
             None => {
-                self.errs.push("Comprehension: Quelle ist keine Liste".into());
+                self.errs.push("comprehension: source is not a list".into());
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
@@ -2207,7 +2207,7 @@ impl<'a> FnLower<'a> {
         self.emit(Statement::New { dest: obj, class: sum.clone() });
         self.emit(Statement::PutField { obj: Operand::Copy(obj), class: sum.clone(), field: "__tag".into(), value: Operand::ConstI64(tag) });
         if args.len() != vfields.len() {
-            self.errs.push(format!("Variante `{vname}`: {} Felder erwartet, {} übergeben", vfields.len(), args.len()));
+            self.errs.push(format!("variant `{vname}`: expected {} fields, {} given", vfields.len(), args.len()));
         }
         for ((fname, fty, _), arg) in vfields.iter().zip(args) {
             let (mut v, _) = self.lower_expr(arg);
@@ -2340,7 +2340,7 @@ impl<'a> FnLower<'a> {
                 let (sum, vtag, vfields) = match inst.or_else(|| self.variants.get(name).cloned()) {
                     Some(v) => v,
                     None => {
-                        self.errs.push(format!("unbekannte Variante `{name}` im match"));
+                        self.errs.push(format!("unknown variant `{name}` in match"));
                         return;
                     }
                 };
@@ -2372,7 +2372,7 @@ impl<'a> FnLower<'a> {
                 self.term(cur, Terminator::Goto(fail));
                 self.cur = matched.0 as usize;
             }
-            _ => self.errs.push("match-Muster: Tupel/String-Muster noch nicht abgesenkt".into()),
+            _ => self.errs.push("match pattern: tuple/string patterns not yet lowered".into()),
         }
     }
 
@@ -2428,10 +2428,10 @@ impl<'a> FnLower<'a> {
             }
             let missing: Vec<&str> = all.iter().filter(|(_, t)| !covered.contains(t)).map(|(n, _)| n.as_str()).collect();
             if !missing.is_empty() {
-                self.errs.push(format!("nicht-erschöpfendes `match`: fehlt {} (oder `_`-Zweig)", missing.join(", ")));
+                self.errs.push(format!("non-exhaustive `match`: missing {} (or `_` arm)", missing.join(", ")));
             }
         } else {
-            self.errs.push("`match` über Skalar/Literal braucht einen `_`-Zweig (nicht-erschöpfend)".into());
+            self.errs.push("`match` over scalar/literal needs a `_` arm (non-exhaustive)".into());
         }
     }
 
@@ -2793,10 +2793,10 @@ fn to_i64(op: Operand) -> Operand {
 fn expr_kind(e: &Expr) -> &'static str {
     match e {
         Expr::Str(..) => "Str", Expr::Char(..) => "Char", Expr::SelfExpr(..) => "self",
-        Expr::Field { .. } => "Feldzugriff", Expr::Index { .. } => "Index",
+        Expr::Field { .. } => "field access", Expr::Index { .. } => "Index",
         Expr::Match { .. } => "match", Expr::Lambda { .. } => "Lambda",
-        Expr::List(..) => "Liste", Expr::Try { .. } => "?", Expr::Cast { .. } => "as",
+        Expr::List(..) => "list", Expr::Try { .. } => "?", Expr::Cast { .. } => "as",
         Expr::Comptime { .. } => "comptime", Expr::Capsule { .. } => "capsule",
-        _ => "Ausdruck",
+        _ => "expression",
     }
 }

@@ -27,7 +27,7 @@ fn newline_is_soft_terminator() {
     // Newline after `b` (ends statement) → terminator; after `+` (operator) it does not.
     let (toks, _) = lex("a + b\nc");
     let nl = toks.iter().filter(|t| t.tok == Tok::Newline).count();
-    assert_eq!(nl, 1, "genau ein Terminator-Newline erwartet");
+    assert_eq!(nl, 1, "expected exactly one terminator newline");
     let (toks2, _) = lex("a +\nb");
     assert_eq!(toks2.iter().filter(|t| t.tok == Tok::Newline).count(), 0);
 }
@@ -54,7 +54,7 @@ fn parse_expr_fn() {
             assert_eq!(f.sig.params.len(), 2);
             assert!(f.body.is_some());
         }
-        _ => panic!("erwartete Fn"),
+        _ => panic!("expected Fn"),
     }
 }
 
@@ -70,7 +70,7 @@ fn parse_precedence() {
             assert!(matches!(op, vire::ast::BinOp::Add));
             assert!(matches!(rhs.as_ref(), Expr::Binary { op: vire::ast::BinOp::Mul, .. }));
         }
-        e => panic!("erwartete Binary Add, fand {e:?}"),
+        e => panic!("expected Binary Add, found {e:?}"),
     }
 }
 
@@ -79,7 +79,7 @@ fn parse_type_sum() {
     let src = "type Shape {\n Circle(radius: Float)\n Rect(w: Float, h: Float)\n Empty\n}\n";
     let (m, diags) = vire::parse(src);
     assert!(diags.is_empty(), "{:?}", diags);
-    let Item::Type(t) = &m.items[0] else { panic!("erwartete Type") };
+    let Item::Type(t) = &m.items[0] else { panic!("expected Type") };
     assert_eq!(t.name, "Shape");
     assert_eq!(t.variants.len(), 3);
     assert_eq!(t.variants[0].name, "Circle");

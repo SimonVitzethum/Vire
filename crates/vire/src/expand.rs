@@ -121,7 +121,7 @@ impl Expander {
             if let Expr::Ident(n, _) = callee.as_ref() {
                 if let Some((params, body)) = self.macros.get(n).cloned() {
                     if params.len() != args.len() {
-                        self.errs.push(format!("Makro `{n}`: {} Parameter erwartet, {} übergeben", params.len(), args.len()));
+                        self.errs.push(format!("Macro `{n}`: expected {} parameters, {} given", params.len(), args.len()));
                         None
                     } else {
                         Some(self.instantiate(&params, args, &body, *span))
@@ -141,7 +141,7 @@ impl Expander {
                 self.expr(&mut new_e);
                 self.depth -= 1;
             } else {
-                self.errs.push("Makro-Expansion: Rekursionslimit erreicht (divergierendes Makro?)".into());
+                self.errs.push("Macro expansion: recursion limit reached (diverging macro?)".into());
             }
             *e = new_e;
         }

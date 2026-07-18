@@ -170,7 +170,7 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
     let mut msgs: Vec<String> = u
         .conflicts
         .iter()
-        .map(|(a, b)| format!("Typkonflikt: {} vs {} (Inferenz)", ty_name(*a), ty_name(*b)))
+        .map(|(a, b)| format!("type conflict: {} vs {} (inference)", ty_name(*a), ty_name(*b)))
         .collect();
     msgs.sort();
     msgs.dedup();
@@ -182,7 +182,7 @@ fn ty_name(t: T) -> &'static str {
         T::I64 => "Int",
         T::F64 => "Float",
         T::I32 => "I32/Bool",
-        T::Ref => "Objekt/Ref",
+        T::Ref => "object/ref",
         T::Void => "Unit",
         T::Var(_) => "?",
     }

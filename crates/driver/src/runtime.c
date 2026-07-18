@@ -1090,9 +1090,9 @@ static void jrt_shutdown(void) {
         char b[24];
         plat_puts("[heap] ");
         plat_write(b, (size_t)fmt_i64(b, total_allocated));
-        plat_puts(" alloziert, ");
+        plat_puts(" allocated, ");
         plat_write(b, (size_t)fmt_i64(b, live_objects));
-        plat_puts(" noch live (Zyklen-Leak)\n");
+        plat_puts(" still live (cycle leak)\n");
     }
 #endif
 }
@@ -1676,7 +1676,7 @@ void jrt_check_uncaught(void) {
         if (td && td->cname) {
             plat_uncaught(td->cname);
         } else {
-            plat_puts("Exception in thread \"main\" (unbehandelte Exception)\n");
+            plat_puts("Exception in thread \"main\" (unhandled exception)\n");
         }
     }
     plat_abort();

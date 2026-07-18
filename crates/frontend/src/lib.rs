@@ -38,7 +38,7 @@ impl std::fmt::Display for FrontendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrontendError::Parse(e) => write!(f, "{e}"),
-            FrontendError::Unsupported(s) => write!(f, "nicht unterstützt: {s}"),
+            FrontendError::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
 }
@@ -66,7 +66,7 @@ fn ref_target_of(desc: &str) -> Option<String> {
 pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
     let field_ty_of = |desc: &str| -> Result<Ty> {
         let mut chars = desc.chars().peekable();
-        let c = chars.next().ok_or_else(|| FrontendError::Unsupported("leerer Felddeskriptor".into()))?;
+        let c = chars.next().ok_or_else(|| FrontendError::Unsupported("empty field descriptor".into()))?;
         field_ty(c, &mut chars, desc)
     };
 
@@ -83,7 +83,7 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
                     Some(Const::Double(v)) => ConstInit::F64(*v),
                     Some(Const::Float(v)) => ConstInit::F64(*v as f64),
                     Some(Const::String { utf8 }) => ConstInit::Str(program.intern_string(cf.utf8(*utf8)?)),
-                    _ => return Err(FrontendError::Unsupported(format!("ConstantValue von {}.{}", cf.this_class, f.name))),
+                    _ => return Err(FrontendError::Unsupported(format!("ConstantValue of {}.{}", cf.this_class, f.name))),
                 }),
                 None => None,
             };
@@ -445,7 +445,7 @@ fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
     let inner = desc
         .strip_prefix('(')
         .and_then(|s| s.split_once(')'))
-        .ok_or_else(|| FrontendError::Unsupported(format!("Deskriptor {desc}")))?;
+        .ok_or_else(|| FrontendError::Unsupported(format!("descriptor {desc}")))?;
     let (params_s, ret_s) = inner;
     let mut params = Vec::new();
     let mut chars = params_s.chars().peekable();
@@ -456,7 +456,7 @@ fn parse_descriptor(desc: &str) -> Result<(Vec<Ty>, Ty)> {
     let ret = match rc.next() {
         Some('V') => Ty::Void,
         Some(c) => field_ty(c, &mut rc.peekable(), desc)?,
-        None => return Err(FrontendError::Unsupported(format!("Deskriptor {desc}"))),
+        None => return Err(FrontendError::Unsupported(format!("descriptor {desc}"))),
     };
     Ok((params, ret))
 }
@@ -620,7 +620,7 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
                 });
             }
             8 => {
-                let obj = raw.expect("Konstruktor-Referenz muss ein Objekt liefern");
+                let obj = raw.expect("constructor reference must yield an object");
                 stmts.push(Statement::New { dest: obj, class: info.impl_class.clone() });
                 let mut ctor_args = vec![Operand::Copy(obj)];
                 ctor_args.extend(impl_args);
@@ -759,7 +759,7 @@ fn descriptor_params(desc: &str) -> Result<Vec<String>> {
     let inner = desc
         .strip_prefix('(')
         .and_then(|s| s.split_once(')'))
-        .ok_or_else(|| FrontendError::Unsupported(format!("Deskriptor {desc}")))?
+        .ok_or_else(|| FrontendError::Unsupported(format!("descriptor {desc}")))?
         .0;
     let mut out = Vec::new();
     let mut chars = inner.chars().peekable();
@@ -775,7 +775,7 @@ fn descriptor_params(desc: &str) -> Result<Vec<String>> {
                 }
             }
             '[' => {
-                return Err(FrontendError::Unsupported(format!("Array-Argument in {desc}")));
+                return Err(FrontendError::Unsupported(format!("array argument in {desc}")));
             }
             _ => {}
         }
@@ -801,14 +801,14 @@ fn field_ty(
                     return Ok(Ty::Ref);
                 }
             }
-            Err(FrontendError::Unsupported(format!("Deskriptor {desc}")))
+            Err(FrontendError::Unsupported(format!("descriptor {desc}")))
         }
         '[' => {
             // Consume the array descriptor; element type irrelevant, value is Ref.
-            let n = rest.next().ok_or_else(|| FrontendError::Unsupported(format!("Deskriptor {desc}")))?;
+            let n = rest.next().ok_or_else(|| FrontendError::Unsupported(format!("descriptor {desc}")))?;
             field_ty(n, rest, desc).map(|_| Ty::Ref)
         }
-        _ => Err(FrontendError::Unsupported(format!("Typ {c} in {desc}"))),
+        _ => Err(FrontendError::Unsupported(format!("type {c} in {desc}"))),
     }
 }
 
@@ -1129,7 +1129,7 @@ fn lower_method(
                 Some(prev) => {
                     if *prev != stack {
                         return Err(FrontendError::Unsupported(format!(
-                            "inkonsistenter Stack am Join bb{} in {}.{}",
+                            "inconsistent stack at join bb{} in {}.{}",
                             succ.0, cf.this_class, m.name
                         )));
                     }
@@ -1235,7 +1235,7 @@ fn lower_block(
     macro_rules! pop {
         () => {{
             let ty = stack.pop().ok_or_else(|| {
-                FrontendError::Unsupported("Stack-Unterlauf (Bytecode außerhalb der Teilmenge?)".into())
+                FrontendError::Unsupported("stack underflow (bytecode outside the subset?)".into())
             })?;
             ml.stack_slot(stack.len(), ty)
         }};
@@ -1251,7 +1251,7 @@ fn lower_block(
             // Must never happen: it would mean the leader computation did not
             // recognize a terminator opcode as a block end.
             return Err(FrontendError::Unsupported(format!(
-                "interner Fehler: Instruktion nach Terminator bei pc={pc}"
+                "internal error: instruction after terminator at pc={pc}"
             )));
         }
         match instr {
@@ -1273,7 +1273,7 @@ fn lower_block(
                         let class = ml.cf.class_name(*idx)?.to_string();
                         if program.class(&class).is_none() {
                             return Err(FrontendError::Unsupported(format!(
-                                "{class}.class (Klasse nicht im Closed-World-Input)"
+                                "{class}.class (class not in the closed-world input)"
                             )));
                         }
                         program.intern_class_object(&class);
@@ -1554,7 +1554,7 @@ fn lower_block(
                 // Category 2 (long/double) occupies one stack entry; two
                 // category-1 values occupy two.
                 let top = *stack.last().ok_or_else(|| {
-                    FrontendError::Unsupported("pop2 auf leerem Stack".into())
+                    FrontendError::Unsupported("pop2 on empty stack".into())
                 })?;
                 pop!();
                 if top != Ty::I64 && top != Ty::F64 {
@@ -1563,14 +1563,14 @@ fn lower_block(
             }
             Instr::Dup => {
                 let ty = *stack.last().ok_or_else(|| {
-                    FrontendError::Unsupported("dup auf leerem Stack".into())
+                    FrontendError::Unsupported("dup on empty stack".into())
                 })?;
                 let src = ml.stack_slot(stack.len() - 1, ty);
                 push!(ty, Rvalue::Use(Operand::Copy(src)));
             }
             Instr::Dup2 => {
                 let top = *stack.last().ok_or_else(|| {
-                    FrontendError::Unsupported("dup2 auf leerem Stack".into())
+                    FrontendError::Unsupported("dup2 on empty stack".into())
                 })?;
                 if top == Ty::I64 || top == Ty::F64 {
                     let src = ml.stack_slot(stack.len() - 1, top);
@@ -1617,7 +1617,7 @@ fn lower_block(
                 // fallthrough block directly after it.
                 let then_blk = block_of_pc[target];
                 let else_blk = fallthrough.ok_or_else(|| {
-                    FrontendError::Unsupported(format!("Branch ohne Folgeblock bei pc={pc}"))
+                    FrontendError::Unsupported(format!("branch without successor block at pc={pc}"))
                 })?;
                 succs.push((then_blk, stack.clone()));
                 succs.push((else_blk, stack.clone()));
@@ -1722,7 +1722,7 @@ fn lower_block(
                     continue;
                 }
                 if program.class(&class).is_none() {
-                    return Err(FrontendError::Unsupported(format!("new {class} (Klasse nicht im Closed-World-Input)")));
+                    return Err(FrontendError::Unsupported(format!("new {class} (class not in the closed-world input)")));
                 }
                 let ty = Ty::Ref;
                 let l = ml.stack_slot(stack.len(), ty);
@@ -2113,7 +2113,7 @@ fn lower_block(
                                 .map(|(_, mi)| mi.mangled.clone())
                                 .ok_or_else(|| {
                                     FrontendError::Unsupported(format!(
-                                        "{target}.newInstance(): kein parameterloser Konstruktor"
+                                        "{target}.newInstance(): no parameterless constructor"
                                     ))
                                 })?;
                             let l = ml.stack_slot(stack.len(), Ty::Ref);
@@ -2127,7 +2127,7 @@ fn lower_block(
                         }
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "Class.{name}{desc} (Reflection-Teilmenge: forName, getName, newInstance)"
+                                "Class.{name}{desc} (reflection subset: forName, getName, newInstance)"
                             )));
                         }
                     }
@@ -2181,7 +2181,7 @@ fn lower_block(
                             let d = ddesc.rsplit_once(')').unwrap().1;
                             d.trim_start_matches('L').trim_end_matches(';').to_string()
                         }
-                        _ => return Err(FrontendError::Unsupported("Lambda ohne Interface-Rückgabe".into())),
+                        _ => return Err(FrontendError::Unsupported("lambda without interface return type".into())),
                     };
                     let sam_desc = ml.cf.method_type(bsm_args[0])?.to_string();
                     let (kind, impl_class, impl_name, impl_desc) = ml.cf.method_handle(bsm_args[1])?;
@@ -2235,7 +2235,7 @@ fn lower_block(
                     let rec_class = descriptor_params(ddesc)?
                         .first()
                         .and_then(|p| p.strip_prefix('L').map(|s| s.trim_end_matches(';').to_string()))
-                        .ok_or_else(|| FrontendError::Unsupported("Record-Empfängertyp".into()))?;
+                        .ok_or_else(|| FrontendError::Unsupported("record receiver type".into()))?;
                     let names = ml.cf.const_string(bsm_args[1])?;
                     let field_names: Vec<String> = if names.is_empty() {
                         Vec::new()
@@ -2330,7 +2330,7 @@ fn lower_block(
                         .map(|&i| ml.cf.class_name(i).map(str::to_string))
                         .collect::<std::result::Result<_, _>>()
                         .map_err(|_| FrontendError::Unsupported(
-                            "typeSwitch mit nicht-Klassen-Label (guarded/constant pattern)".into(),
+                            "typeSwitch with non-class label (guarded/constant pattern)".into(),
                         ))?;
                     let n = labels.len() as i32;
                     let _restart = pop!(); // restart index (0 for simple patterns)
@@ -2376,7 +2376,7 @@ fn lower_block(
 
                 if dname != "makeConcatWithConstants" && dname != "makeConcat" {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokedynamic {dname} (unterstützt: String-Konkatenation, Lambda, Record, Pattern-Switch)"
+                        "invokedynamic {dname} (supported: string concatenation, lambda, record, pattern switch)"
                     )));
                 }
                 let with_constants = dname == "makeConcatWithConstants";
@@ -2428,7 +2428,7 @@ fn lower_block(
                         }
                         _ => {
                             return Err(FrontendError::Unsupported(format!(
-                                "Konkatenation von Argument-Typ {pd}"
+                                "concatenation of argument type {pd}"
                             )))
                         }
                     };
@@ -2483,7 +2483,7 @@ fn lower_block(
                 // (class metadata in the header) in a later stage.
                 let target = ml.cf.class_name(*idx)?.to_string();
                 let top_ty = *stack.last().ok_or_else(|| {
-                    FrontendError::Unsupported("checkcast auf leerem Stack".into())
+                    FrontendError::Unsupported("checkcast on empty stack".into())
                 })?;
                 let top = ml.stack_slot(stack.len() - 1, top_ty);
                 let provable = match origin_of(&stmts, top) {
@@ -2507,7 +2507,7 @@ fn lower_block(
                 let (class, name, desc) = (class.to_string(), name.to_string(), desc.to_string());
                 if program.class(&class).is_none() {
                     return Err(FrontendError::Unsupported(format!(
-                        "invokeinterface {class}.{name}{desc} (Interface nicht im Input)"
+                        "invokeinterface {class}.{name}{desc} (interface not in the input)"
                     )));
                 }
                 let (ptys, rty) = parse_descriptor(&desc)?;
@@ -2556,8 +2556,8 @@ fn lower_block(
                         Origin::Op(Operand::ConstStr(s)) => *s,
                         _ => {
                             return Err(FrontendError::Unsupported(
-                                "Class.forName mit nicht-konstantem Argument (Closed World: \
-                                 Reflection muss statisch auflösbar sein)"
+                                "Class.forName with non-constant argument (closed world: \
+                                 reflection must be statically resolvable)"
                                     .into(),
                             ))
                         }
@@ -2566,7 +2566,7 @@ fn lower_block(
                     let target = dotted.replace('.', "/");
                     if program.class(&target).is_none() {
                         return Err(FrontendError::Unsupported(format!(
-                            "Class.forName(\"{dotted}\"): Klasse nicht im Closed-World-Input"
+                            "Class.forName(\"{dotted}\"): class not in the closed-world input"
                         )));
                     }
                     program.intern_class_object(&target);
@@ -2587,7 +2587,7 @@ fn lower_block(
                         _ => match ml.class_const.get(&cls_arg).cloned() {
                             Some(c) => c,
                             None => return Err(FrontendError::Unsupported(
-                                "Enum.valueOf mit nicht statisch bekanntem Class-Objekt".into(),
+                                "Enum.valueOf with a Class object not known statically".into(),
                             )),
                         },
                     };
@@ -2769,7 +2769,7 @@ fn lower_block(
         if let Some(throw_pc) = throw_after {
             let target = exc_target_of_pc[&throw_pc];
             let cont = fallthrough.ok_or_else(|| {
-                FrontendError::Unsupported(format!("werfender Aufruf ohne Folgeblock bei pc={throw_pc}"))
+                FrontendError::Unsupported(format!("throwing call without successor block at pc={throw_pc}"))
             })?;
             let c = ml.fresh(Ty::I32);
             stmts.push(Statement::Call {

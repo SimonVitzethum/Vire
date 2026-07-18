@@ -40,7 +40,7 @@ impl Syntax {
         if let Some(other) = self.map.get(spelling) {
             if *other != kw {
                 return Err(format!(
-                    "Schreibweise `{spelling}` ist schon `{}` — kann nicht auch `{}` sein",
+                    "spelling `{spelling}` is already `{}` — cannot also be `{}`",
                     other.canonical(),
                     kw.canonical()
                 ));
@@ -62,20 +62,20 @@ impl Syntax {
                 continue;
             }
             let Some((lhs, rhs)) = line.split_once('=') else {
-                errs.push(format!("Zeile {}: erwarte `kanonisch = schreibweise`", i + 1));
+                errs.push(format!("line {}: expected `canonical = spelling`", i + 1));
                 continue;
             };
             let (canon, spelling) = (lhs.trim(), rhs.trim());
             let Some(kw) = KW_TABLE.iter().find(|(sp, _)| *sp == canon).map(|(_, k)| *k) else {
-                errs.push(format!("Zeile {}: unbekanntes Schlüsselwort `{canon}`", i + 1));
+                errs.push(format!("line {}: unknown keyword `{canon}`", i + 1));
                 continue;
             };
             if !is_ident(spelling) {
-                errs.push(format!("Zeile {}: `{spelling}` ist kein gültiger Bezeichner", i + 1));
+                errs.push(format!("line {}: `{spelling}` is not a valid identifier", i + 1));
                 continue;
             }
             if let Err(e) = syn.rename(kw, spelling) {
-                errs.push(format!("Zeile {}: {e}", i + 1));
+                errs.push(format!("line {}: {e}", i + 1));
             }
         }
         if errs.is_empty() {

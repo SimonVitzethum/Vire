@@ -46,7 +46,7 @@ impl Parser {
     }
     fn expect(&mut self, t: &Tok, what: &str) {
         if !self.eat(t) {
-            self.err(&format!("erwartete {what}, fand {:?}", self.peek()));
+            self.err(&format!("expected {what}, found {:?}", self.peek()));
         }
     }
     fn err(&mut self, msg: &str) {
@@ -68,7 +68,7 @@ impl Parser {
         match self.bump() {
             Tok::Ident(s) => s,
             other => {
-                self.diags.push(Diag::error(&format!("erwartete Bezeichner, fand {other:?}"), self.span()));
+                self.diags.push(Diag::error(&format!("expected identifier, found {other:?}"), self.span()));
                 "_".into()
             }
         }
@@ -109,7 +109,7 @@ impl Parser {
             let has_main = items.iter().any(|it| matches!(it, Item::Fn(f) if f.sig.name == "main"));
             if has_main {
                 self.diags.push(crate::diag::Diag::error(
-                    "Top-Level-Anweisungen UND `fn main` zugleich sind nicht erlaubt — eins von beiden",
+                    "top-level statements AND `fn main` at once are not allowed — pick one",
                     crate::diag::Span(0, 0),
                 ));
             } else {
@@ -184,7 +184,7 @@ impl Parser {
                 Some(Item::Macro { name, params, body, span: sp })
             }
             _ => {
-                self.err("erwartete ein Item (fn/type/trait/impl/const/use/extern)");
+                self.err("expected an item (fn/type/trait/impl/const/use/extern)");
                 None
             }
         }
@@ -374,7 +374,7 @@ impl Parser {
                 self.bump();
                 links.push(s);
             } else {
-                self.err("nach `link` wird ein Bibliotheksname erwartet (String)");
+                self.err("expected a library name after `link` (string)");
             }
         }
         links
@@ -392,7 +392,7 @@ impl Parser {
         let code = match self.bump() {
             Tok::Str(s) => s,
             _ => {
-                self.err("native: erwarte den Code als \"\"\"…\"\"\"-String");
+                self.err("native: expected the code as a \"\"\"…\"\"\" string");
                 String::new()
             }
         };
@@ -416,11 +416,11 @@ impl Parser {
         let mut fns = Vec::new();
         while self.at_kw(Kw::Fn) {
             let sig = self.parse_fn_sig();
-            self.expect(&Tok::Eq, "'=' (C++-Rumpf des Trampolins)");
+            self.expect(&Tok::Eq, "'=' (C++ body of the trampoline)");
             let body = match self.bump() {
                 Tok::Str(s) => s,
                 _ => {
-                    self.err("cxx: nach `=` wird der C++-Rumpf als String erwartet");
+                    self.err("cxx: expected the C++ body as a string after `=`");
                     String::new()
                 }
             };
@@ -447,7 +447,7 @@ impl Parser {
                 self.bump();
                 header = Some(h);
             } else {
-                self.err("nach `header` wird ein Dateiname erwartet (String)");
+                self.err("expected a file name after `header` (string)");
             }
         }
         let links = self.parse_links();
@@ -880,7 +880,7 @@ impl Parser {
             }
             Tok::LBrace => Expr::Block(self.parse_block()),
             other => {
-                self.err(&format!("unerwartet in Ausdruck: {other:?}"));
+                self.err(&format!("unexpected in expression: {other:?}"));
                 self.bump();
                 Expr::Int(0, sp)
             }
@@ -1036,7 +1036,7 @@ impl Parser {
                 }
             }
             other => {
-                self.err(&format!("unerwartet in Muster: {other:?}"));
+                self.err(&format!("unexpected in pattern: {other:?}"));
                 self.bump();
                 Pattern::Wildcard(sp)
             }

@@ -26,11 +26,11 @@ fn main() {
         match a.as_str() {
             "-o" => match args.next() {
                 Some(p) => out = Some(PathBuf::from(p)),
-                None => die("-o braucht ein Argument"),
+                None => die("-o requires an argument"),
             },
             "--main" => match args.next() {
                 Some(c) => main_override = Some(c.replace('.', "/")),
-                None => die("--main braucht einen Klassennamen"),
+                None => die("--main requires a class name"),
             },
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
@@ -39,14 +39,14 @@ fn main() {
             "--freestanding" => freestanding = true,
             "--threads" => threads = true,
             "-h" | "--help" => {
-                println!("Aufruf: fastjavac [-o BIN] [--main KLASSE] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] (KLASSE.class | LIB.jar) ...");
+                println!("Usage: fastjavac [-o BIN] [--main CLASS] [--emit-ir] [--emit-llvm] [--stats] [--no-solver] [--freestanding] (CLASS.class | LIB.jar) ...");
                 return;
             }
             _ => raw_inputs.push(PathBuf::from(a)),
         }
     }
     if raw_inputs.is_empty() {
-        die("keine Eingabedateien (erwartet .class oder .jar)");
+        die("no input files (expected .class or .jar)");
     }
 
     // Unpack JARs (closed-world collection): each .class file becomes an input,
@@ -71,7 +71,7 @@ fn main() {
         }
     }
     if inputs.is_empty() {
-        die("keine .class-Dateien gefunden (leeres JAR?)");
+        die("no .class files found (empty JAR?)");
     }
     let main_class = main_override.or(manifest_main);
 
@@ -143,7 +143,7 @@ fn main() {
                 s.poly_devirtualized,
                 s.inlined_calls,
                 s.stack_allocated,
-                if s.acyclic { "entfällt (azyklisch)" } else { "nötig" },
+                if s.acyclic { "omitted (acyclic)" } else { "required" },
             );
         }
     }
@@ -217,7 +217,7 @@ fn main() {
             let _ = std::fs::remove_dir_all(&build_dir);
         }
         Ok(s) => die(&format!("clang schlug fehl ({s}); Zwischendateien in {}", build_dir.display())),
-        Err(e) => die(&format!("clang nicht ausführbar: {e}")),
+        Err(e) => die(&format!("clang not runnable: {e}")),
     }
 }
 
@@ -254,7 +254,7 @@ fn unpack_jar(jar: &std::path::Path, root: &std::path::Path) -> std::io::Result<
     if !ok {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
-            "Entpacken fehlgeschlagen (weder `unzip` noch `jar` verfügbar)",
+            "unpacking failed (neither `unzip` nor `jar` available)",
         ));
     }
     // Collect .class files recursively.

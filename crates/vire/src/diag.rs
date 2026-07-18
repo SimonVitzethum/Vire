@@ -31,12 +31,12 @@ impl Diag {
     pub fn render(&self, src: &str) -> String {
         let (line, col) = line_col(src, self.span.0);
         let lvl = match self.level {
-            Level::Error => "Fehler",
-            Level::Warning => "Warnung",
+            Level::Error => "Error",
+            Level::Warning => "Warning",
         };
         let mut s = format!("{lvl} {line}:{col}: {}", self.msg);
         if let Some(h) = &self.hint {
-            s.push_str(&format!("\n  Hinweis: {h}"));
+            s.push_str(&format!("\n  Hint: {h}"));
         }
         s
     }

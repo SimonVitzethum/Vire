@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/vire",       # Vire-Front-End (Lexer/Parser/AST → SSA-IR); im Aufbau
-    "crates/ir",         # geteilte Mittel-IR (Absenkziel)
-    "crates/solver",     # geteilt: Devirt/Escape/RC/Bounds
-    "crates/backend",    # geteilt: LLVM-Emission
-    # --- Bootstrap (Java→IR): Backend-Soundness-Wächter + M0-Messbasis,
-    #     wird nach FRONTEND-PLAN §„Java-Ablöse-Kriterien" entfernt ---
+    "crates/vire",       # Vire front-end (lexer/parser/AST → SSA IR)
+    "crates/ir",         # shared mid-level IR (lowering target)
+    "crates/solver",     # shared: devirt/escape/RC/bounds
+    "crates/backend",    # shared: LLVM emission
+    # --- Bootstrap (Java→IR): backend soundness oracle + M0 measurement base,
+    #     removed per FRONTEND-PLAN §"Java retirement criteria" ---
     "crates/classfile",
     "crates/frontend",
     "crates/driver",

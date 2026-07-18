@@ -211,7 +211,7 @@ impl<'a> Lexer<'a> {
             return match i128::from_str_radix(&digits, base) {
                 Ok(v) => Tok::Int(v),
                 Err(_) => {
-                    self.diags.push(Diag::error("ungültige Zahl", Span(start, self.pos)));
+                    self.diags.push(Diag::error("invalid number", Span(start, self.pos)));
                     Tok::Int(0)
                 }
             };
@@ -273,7 +273,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.pos += 1;
             }
-            self.diags.push(Diag::error("nicht geschlossener \"\"\"-String", Span(open, self.pos)));
+            self.diags.push(Diag::error("unterminated \"\"\"-string", Span(open, self.pos)));
             return Tok::Str(std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string());
         }
         let start = self.pos;
@@ -299,7 +299,7 @@ impl<'a> Lexer<'a> {
         if self.peek() == b'"' {
             self.pos += 1;
         } else {
-            self.diags.push(Diag::error("nicht geschlossener String", Span(start, self.pos)));
+            self.diags.push(Diag::error("unterminated string", Span(start, self.pos)));
         }
         Tok::Str(s)
     }
@@ -319,7 +319,7 @@ impl<'a> Lexer<'a> {
         if self.peek() == b'\'' {
             self.pos += 1;
         } else {
-            self.diags.push(Diag::error("nicht geschlossenes Char-Literal", Span(start, self.pos)));
+            self.diags.push(Diag::error("unterminated char literal", Span(start, self.pos)));
         }
         Tok::Char(ch)
     }
@@ -387,7 +387,7 @@ impl<'a> Lexer<'a> {
             }
             b'!' => {
                 two!(b'=', Tok::Ne);
-                self.diags.push(Diag::error("unerwartetes '!' (nutze `not`)", Span(self.pos - 1, self.pos)));
+                self.diags.push(Diag::error("unexpected '!' (use `not`)", Span(self.pos - 1, self.pos)));
                 Tok::Ne
             }
             b'<' => {
@@ -404,7 +404,7 @@ impl<'a> Lexer<'a> {
             b'|' => Tok::Pipe,
             other => {
                 self.diags.push(Diag::error(
-                    &format!("unerwartetes Zeichen '{}'", other as char),
+                    &format!("unexpected character '{}'", other as char),
                     Span(self.pos - 1, self.pos),
                 ));
                 // treat as whitespace: the next call continues
