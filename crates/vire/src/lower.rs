@@ -12,6 +12,9 @@ use crate::ast::*;
 /// Feldlayout eines Nutzertyps: (Feldname, IR-Typ, Ref-Ziel-Klasse).
 type Layout = Vec<(String, Ty, Option<String>)>;
 
+/// Variante eines Summentyps: (Summentyp-Name, Tag, Felder als (geflachter Name, Typ, Ref-Klasse)).
+type VariantInfo = (String, i64, Vec<(String, Ty, Option<String>)>);
+
 /// Alle Methoden (Type-inline + `impl`-Blöcke) als (Klassenname, Methode).
 fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
     let mut out = Vec::new();
@@ -37,42 +40,57 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     let mut prog = Program::default();
     let mut errs = Vec::new();
 
-    // Produkttypen (Felder, keine Varianten) → Klassen + Layout-Tabelle.
-    // Summentypen (Varianten) folgen später (getaggte Union).
+    // Produkttypen → Klassen. Summentypen → EINE getaggte Klasse: Feld `__tag`
+    // (I64) + alle Variantenfelder geflacht (`Variant_field`). Match dispatcht
+    // über `__tag`. (Platz = Summe aller Varianten; einfach, passt zum flachen
+    // Klassenmodell. Kompaktere Union folgt später.)
     let mut types: HashMap<String, Layout> = HashMap::new();
-    for it in &m.items {
-        if let Item::Type(t) = it {
-            if !t.variants.is_empty() {
-                errs.push(format!("Summentyp `{}` (Varianten) noch nicht abgesenkt", t.name));
-                continue;
-            }
-            let layout: Layout = t
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), ty_of(Some(&f.ty)), class_of(Some(&f.ty))))
-                .collect();
-            types.insert(t.name.clone(), layout);
-        }
-    }
-    // ClassInfo je Produkttyp registrieren (super = Object, keine Methoden).
+    let mut variants: HashMap<String, VariantInfo> = HashMap::new();
     for it in &m.items {
         if let Item::Type(t) = it {
             if t.variants.is_empty() {
-                let fields = types[&t.name]
+                let layout: Layout = t
+                    .fields
                     .iter()
-                    .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+                    .map(|f| (f.name.clone(), ty_of(Some(&f.ty)), class_of(Some(&f.ty))))
                     .collect();
-                prog.classes.push(fastllvm_ir::ClassInfo {
-                    name: t.name.clone(),
-                    super_name: Some("java/lang/Object".to_string()),
-                    is_interface: false,
-                    interfaces: vec![],
-                    fields,
-                    static_fields: vec![],
-                    methods: vec![],
-                    has_clinit: false,
-                });
+                types.insert(t.name.clone(), layout);
+            } else {
+                let mut layout: Layout = vec![("__tag".into(), Ty::I64, None)];
+                for (tag, v) in t.variants.iter().enumerate() {
+                    let vfields: Vec<(String, Ty, Option<String>)> = v
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| {
+                            let fname = if f.name.is_empty() { format!("{}_{i}", v.name) } else { format!("{}_{}", v.name, f.name) };
+                            (fname, ty_of(Some(&f.ty)), class_of(Some(&f.ty)))
+                        })
+                        .collect();
+                    layout.extend(vfields.iter().cloned());
+                    variants.insert(v.name.clone(), (t.name.clone(), tag as i64, vfields));
+                }
+                types.insert(t.name.clone(), layout);
             }
+        }
+    }
+    // ClassInfo je Nutzertyp (Produkt UND Summe) registrieren (super = Object).
+    for it in &m.items {
+        if let Item::Type(t) = it {
+            let fields = types[&t.name]
+                .iter()
+                .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+                .collect();
+            prog.classes.push(fastllvm_ir::ClassInfo {
+                name: t.name.clone(),
+                super_name: Some("java/lang/Object".to_string()),
+                is_interface: false,
+                interfaces: vec![],
+                fields,
+                static_fields: vec![],
+                methods: vec![],
+                has_clinit: false,
+            });
         }
     }
 
@@ -108,7 +126,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for it in &m.items {
         if let Item::Fn(f) = it {
-            match lower_fn(f, &sigs, &types, &mut prog.strings, None, None) {
+            match lower_fn(f, &sigs, &types, &variants, &mut prog.strings, None, None) {
                 Ok(func) => prog.functions.push(func),
                 Err(mut e) => errs.append(&mut e),
             }
@@ -117,7 +135,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &mut prog.strings, Some(class), Some(&sym)) {
+        match lower_fn(meth, &sigs, &types, &variants, &mut prog.strings, Some(class), Some(&sym)) {
             Ok(func) => prog.functions.push(func),
             Err(mut e) => errs.append(&mut e),
         }
@@ -220,6 +238,8 @@ struct FnLower<'a> {
     sigs: &'a HashMap<String, Sig>,
     /// Nutzertyp-Layouts (Name → Felder) für New/GetField.
     types: &'a HashMap<String, Layout>,
+    /// Varianten-Registry (Variantenname → Info) für Konstruktion + Match.
+    variants: &'a HashMap<String, VariantInfo>,
     /// Klasse eines Ref-Locals (Objekt-Local-Index → Klassenname) für Feldzugriff.
     local_class: HashMap<u32, String>,
     /// Gemeinsamer String-Literal-Pool (Program::strings); `intern` gibt Indizes.
@@ -499,6 +519,10 @@ impl<'a> FnLower<'a> {
             Expr::Ident(name, _) if name == "null" && self.lookup(name).is_none() => {
                 (Operand::ConstNull, Ty::Ref)
             }
+            // Nullary-Variante als Ausdruck: `Empty` → getaggte Instanz.
+            Expr::Ident(name, _) if self.variants.contains_key(name) && self.lookup(name).is_none() => {
+                self.build_variant(name, &[])
+            }
             Expr::Ident(name, _) => match self.lookup(name) {
                 Some((l, ty)) => (Operand::Copy(l), ty),
                 None => {
@@ -566,6 +590,7 @@ impl<'a> FnLower<'a> {
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
+            Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
             Expr::Block(b) => self.lower_block_val(b),
             // capsule (reine Form, Skalar-rein/-raus): der Rumpf läuft in einer
             // eigenen Arena. `jrt_arena_push` vor dem Rumpf routet alle Heap-
@@ -674,6 +699,10 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
+        // Varianten-Konstruktor eines Summentyps: `Circle(2.0)` → getaggte Instanz.
+        if self.variants.contains_key(&name) {
+            return self.build_variant(&name, args);
+        }
         // Konstruktor eines Nutzertyps: `Point(x, y)` → New + PutField je Feld
         // (Feldreihenfolge = Deklarationsreihenfolge).
         if let Some(layout) = self.types.get(&name).cloned() {
@@ -731,6 +760,120 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Getaggte Variante bauen: `New Sum`, `__tag = t`, Felder aus den Argumenten.
+    fn build_variant(&mut self, vname: &str, args: &[Expr]) -> (Operand, Ty) {
+        let (sum, tag, vfields) = self.variants.get(vname).cloned().unwrap();
+        let obj = self.new_local(Ty::Ref);
+        self.local_class.insert(obj.0, sum.clone());
+        self.emit(Statement::New { dest: obj, class: sum.clone() });
+        self.emit(Statement::PutField { obj: Operand::Copy(obj), class: sum.clone(), field: "__tag".into(), value: Operand::ConstI64(tag) });
+        if args.len() != vfields.len() {
+            self.errs.push(format!("Variante `{vname}`: {} Felder erwartet, {} übergeben", vfields.len(), args.len()));
+        }
+        for ((fname, fty, _), arg) in vfields.iter().zip(args) {
+            let (mut v, _) = self.lower_expr(arg);
+            if *fty == Ty::I64 {
+                v = to_i64(v);
+            }
+            self.emit(Statement::PutField { obj: Operand::Copy(obj), class: sum.clone(), field: fname.clone(), value: v });
+        }
+        (Operand::Copy(obj), Ty::Ref)
+    }
+
+    /// `match s { Variant(binds) -> body … _ -> body }` → Dispatch über `__tag`,
+    /// Feld-Extraktion je Arm, Phi-Ersatz über ein Ergebnis-Local (wie lower_if).
+    fn lower_match(&mut self, scrut: &Expr, arms: &[(Pattern, Option<Expr>, Expr)]) -> (Operand, Ty) {
+        let (obj, _) = self.lower_expr(scrut);
+        let class = match self.class_of_operand(&obj) {
+            Some(c) => c,
+            None => {
+                self.errs.push("match: Typ des Ausdrucks unbekannt (Summentyp annotieren)".into());
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        let tag = self.new_local(Ty::I64);
+        self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: class.clone(), field: "__tag".into() });
+        let merge = self.new_block();
+        let mut ends: Vec<(usize, Operand, Ty)> = Vec::new();
+        for (pat, guard, body) in arms {
+            if guard.is_some() {
+                self.errs.push("match-Guard (`if`) noch nicht abgesenkt".into());
+            }
+            match pat {
+                Pattern::Ctor { name, args, .. } => {
+                    let (_, vtag, vfields) = match self.variants.get(name) {
+                        Some(v) => v.clone(),
+                        None => {
+                            self.errs.push(format!("unbekannte Variante `{name}` im match"));
+                            continue;
+                        }
+                    };
+                    let cond = self.new_local(Ty::I32);
+                    self.emit(Statement::Assign(cond, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(vtag))));
+                    let armb = self.new_block();
+                    let nextb = self.new_block();
+                    let cur = self.cur;
+                    self.term(cur, Terminator::Branch { cond: Operand::Copy(cond), then_blk: armb, else_blk: nextb });
+                    self.cur = armb.0 as usize;
+                    self.scopes.push(HashMap::new());
+                    for (j, argpat) in args.iter().enumerate() {
+                        if let Pattern::Bind(bn, _) = argpat {
+                            if let Some((fname, fty, rt)) = vfields.get(j) {
+                                let d = self.new_local(*fty);
+                                if let Some(rc) = rt {
+                                    self.local_class.insert(d.0, rc.clone());
+                                }
+                                self.emit(Statement::GetField { dest: d, obj: obj.clone(), class: class.clone(), field: fname.clone() });
+                                self.bind(bn, d, *fty);
+                            }
+                        }
+                    }
+                    let (v, t) = self.lower_expr(body);
+                    self.scopes.pop();
+                    ends.push((self.cur, v, t));
+                    self.cur = nextb.0 as usize;
+                }
+                Pattern::Wildcard(_) | Pattern::Bind(..) => {
+                    self.scopes.push(HashMap::new());
+                    if let Pattern::Bind(bn, _) = pat {
+                        if let Operand::Copy(l) = obj {
+                            self.bind(bn, l, Ty::Ref);
+                            self.local_class.insert(l.0, class.clone());
+                        }
+                    }
+                    let (v, t) = self.lower_expr(body);
+                    self.scopes.pop();
+                    ends.push((self.cur, v, t));
+                    let dead = self.new_block();
+                    self.cur = dead.0 as usize;
+                }
+                _ => self.errs.push("match-Muster M2: nur Varianten, `_` und Bindungen".into()),
+            }
+        }
+        let rty = ends.iter().map(|(_, _, t)| *t).find(|t| *t != Ty::Void).unwrap_or(Ty::Void);
+        if rty != Ty::Void {
+            let res = self.new_local(rty);
+            for (end, v, _) in &ends {
+                self.blocks[*end].statements.push(Statement::Assign(res, Rvalue::Use(v.clone())));
+                self.blocks[*end].terminator = Terminator::Goto(merge);
+            }
+            // Fallthrough (nicht-erschöpfend): Default-Wert.
+            let cur = self.cur;
+            self.blocks[cur].statements.push(Statement::Assign(res, Rvalue::Use(zero_of(rty))));
+            self.term(cur, Terminator::Goto(merge));
+            self.cur = merge.0 as usize;
+            (Operand::Copy(res), rty)
+        } else {
+            for (end, _, _) in &ends {
+                self.blocks[*end].terminator = Terminator::Goto(merge);
+            }
+            let cur = self.cur;
+            self.term(cur, Terminator::Goto(merge));
+            self.cur = merge.0 as usize;
+            (Operand::ConstI64(0), Ty::Void)
+        }
+    }
+
     fn lower_if(&mut self, cond: &Expr, then: &Block2, elifs: &[(Expr, Block2)], els: &Option<Block2>) -> (Operand, Ty) {
         let (c, _) = self.lower_expr(cond);
         let thenb = self.new_block();
@@ -781,6 +924,7 @@ fn lower_fn(
     f: &FnDef,
     sigs: &HashMap<String, Sig>,
     types: &HashMap<String, Layout>,
+    variants: &HashMap<String, VariantInfo>,
     strings: &mut Vec<String>,
     recv_class: Option<&str>,
     sym: Option<&str>,
@@ -798,6 +942,7 @@ fn lower_fn(
         scopes: vec![HashMap::new()],
         sigs,
         types,
+        variants,
         local_class: HashMap::new(),
         strings,
         errs: Vec::new(),

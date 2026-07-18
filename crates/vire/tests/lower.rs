@@ -183,3 +183,17 @@ fn methoden_und_impl_bloecke() {
     });
     assert!(calls, "Methodenaufruf muss Call(P.sum) emittieren");
 }
+
+#[test]
+fn summentyp_und_match() {
+    let src = "type Sh {\n Circle(r: Int)\n Rect(w: Int, h: Int)\n Empty\n}\nfn area(s: Sh) -> Int {\n match s {\n Circle(r) -> r * r\n Rect(w, h) -> w * h\n Empty -> 0\n }\n}\nfn main() {\n print(area(Circle(3)))\n}\n";
+    let p = lower(src);
+    // Getaggte Klasse Sh mit __tag als erstem Feld.
+    let c = p.classes.iter().find(|c| c.name == "Sh").expect("Sh");
+    assert_eq!(c.fields[0].name, "__tag");
+    // Konstruktion setzt __tag; match liest __tag (GetField __tag).
+    let reads_tag = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "__tag")
+    });
+    assert!(reads_tag, "match muss __tag lesen");
+}
