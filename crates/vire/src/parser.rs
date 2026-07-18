@@ -622,7 +622,7 @@ impl Parser {
                 let inner = if self.at(&Tok::LBrace) {
                     Expr::Block(self.parse_block())
                 } else {
-                    self.parse_expr(9)
+                    self.parse_expr(1) // ganzen folgenden Ausdruck falten
                 };
                 Expr::Comptime { inner: Box::new(inner), span: sp }
             }

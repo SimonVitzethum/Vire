@@ -275,3 +275,12 @@ fn lambda_inline_mit_capture() {
         .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Mul, ..))));
     assert!(has_mul, "Lambda-Rumpf muss inline expandiert werden");
 }
+
+#[test]
+fn comptime_faltet_konstanten() {
+    // `comptime 2 + 3 * 4` → ConstI64(14), keine Laufzeit-Arithmetik.
+    let p = lower("fn main() {\n print(comptime 2 + 3 * 4)\n}\n");
+    let has_arith = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(..))));
+    assert!(!has_arith, "comptime muss zur Compilezeit falten (keine Binary-Ops)");
+}

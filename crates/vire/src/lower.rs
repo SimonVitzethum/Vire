@@ -939,6 +939,16 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
+            // `comptime <expr>` → Compilezeit-Faltung konstanter Ausdrücke.
+            Expr::Comptime { inner, .. } => match const_eval(inner) {
+                Some(CVal::Int(v)) => (Operand::ConstI64(v), Ty::I64),
+                Some(CVal::Float(v)) => (Operand::ConstF64(v), Ty::F64),
+                Some(CVal::Bool(b)) => (Operand::ConstI32(if b { 1 } else { 0 }), Ty::I32),
+                None => {
+                    self.errs.push("comptime: Ausdruck ist nicht konstant-faltbar (nur Literale/Arithmetik/Vergleiche)".into());
+                    (Operand::ConstI64(0), Ty::I64)
+                }
+            },
             // `e?` — Fehler-Propagation für Result: Ok(v) → v; Err(_) → return e.
             // (Desugart zu match; die umgebende Funktion muss Result zurückgeben.)
             Expr::Try { inner, .. } => {
@@ -1752,6 +1762,73 @@ fn stmt_has_return(s: &Stmt) -> bool {
         Stmt::While { body, .. } | Stmt::For { body, .. } => body_has_return(body),
         _ => false,
     }
+}
+
+/// Compilezeit-Konstantenwert (für `comptime`).
+enum CVal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// Faltet einen konstanten Ausdruck zur Compilezeit. `None` = nicht konstant.
+fn const_eval(e: &Expr) -> Option<CVal> {
+    Some(match e {
+        Expr::Int(v, _) => CVal::Int(*v as i64),
+        Expr::Float(v, _) => CVal::Float(*v),
+        Expr::Bool(b, _) => CVal::Bool(*b),
+        Expr::Comptime { inner, .. } => return const_eval(inner),
+        Expr::Unary { op, rhs, .. } => match (op, const_eval(rhs)?) {
+            (UnOp::Neg, CVal::Int(v)) => CVal::Int(-v),
+            (UnOp::Neg, CVal::Float(v)) => CVal::Float(-v),
+            (UnOp::Not, CVal::Bool(b)) => CVal::Bool(!b),
+            _ => return None,
+        },
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let (l, r) = (const_eval(lhs)?, const_eval(rhs)?);
+            match (l, r) {
+                (CVal::Int(a), CVal::Int(b)) => match op {
+                    BinOp::Add | BinOp::AddWrap => CVal::Int(a.wrapping_add(b)),
+                    BinOp::Sub | BinOp::SubWrap => CVal::Int(a.wrapping_sub(b)),
+                    BinOp::Mul | BinOp::MulWrap => CVal::Int(a.wrapping_mul(b)),
+                    BinOp::Div if b != 0 => CVal::Int(a / b),
+                    BinOp::Rem if b != 0 => CVal::Int(a % b),
+                    BinOp::Eq => CVal::Bool(a == b),
+                    BinOp::Ne => CVal::Bool(a != b),
+                    BinOp::Lt => CVal::Bool(a < b),
+                    BinOp::Le => CVal::Bool(a <= b),
+                    BinOp::Gt => CVal::Bool(a > b),
+                    BinOp::Ge => CVal::Bool(a >= b),
+                    BinOp::BitAnd => CVal::Int(a & b),
+                    BinOp::BitOr => CVal::Int(a | b),
+                    BinOp::BitXor => CVal::Int(a ^ b),
+                    BinOp::Shl => CVal::Int(a << b),
+                    BinOp::Shr => CVal::Int(a >> b),
+                    _ => return None,
+                },
+                (CVal::Float(a), CVal::Float(b)) => match op {
+                    BinOp::Add => CVal::Float(a + b),
+                    BinOp::Sub => CVal::Float(a - b),
+                    BinOp::Mul => CVal::Float(a * b),
+                    BinOp::Div => CVal::Float(a / b),
+                    BinOp::Lt => CVal::Bool(a < b),
+                    BinOp::Le => CVal::Bool(a <= b),
+                    BinOp::Gt => CVal::Bool(a > b),
+                    BinOp::Ge => CVal::Bool(a >= b),
+                    _ => return None,
+                },
+                (CVal::Bool(a), CVal::Bool(b)) => match op {
+                    BinOp::And => CVal::Bool(a && b),
+                    BinOp::Or => CVal::Bool(a || b),
+                    BinOp::Eq => CVal::Bool(a == b),
+                    BinOp::Ne => CVal::Bool(a != b),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// Muster, das immer passt (deckt seinen Slot vollständig ab).
