@@ -136,3 +136,18 @@ Collections/Arena/generics/C++-Bridge geprüft. **Gesamt-RAM-Reduktion diese Ses
 pagerank 24,4 → 18,1 MB = −26%** (Header-Pack + Slab). Der zyklische Rest-Gap zu
 Rust ist der Bacon-Rajan-Collector (Mark/Scan-Buffer über den großen Zyklus) +
 der inhärente 16-B-RC-Header; acyklische/array-Fälle sind bei/unter Rust-Niveau.
+
+## GEBAUT: Field-Packing (opt-in `I32`, jetzt voll nutzbar)
+`I32`/`Bool`-Felder packten schon auf 4 Byte im Struct, waren aber NICHT nutzbar:
+ein gepacktes `I32`-Feld in i64-Arithmetik (`t.big + t.small`) ergab einen Backend-
+Typfehler. Fix: die Binary-Senkung erweitert das schmalere i32 vorzeichen-korrekt auf
+i64 (`widen_i32`), sodass gemischte Int-Breiten typkorrekt sind. Damit ist
+**nutzergesteuertes Field-Packing voll nutzbar** (`I32` deklarieren, wo Werte passen).
+
+**Gemessen** (1M verkettete Records, lebende Menge): `Rec{prev, 4× Int}`=56 B →
+`Rec{prev, 4× I32}`=40 B, **RAM 65,8 → 49,8 MB = −24%**, identischer Output.
+**Alignment-Hinweis:** lohnt nur bei MEHREREN schmalen Feldern (ein einzelnes i32
+nach Zeigern wird auf 8 gepaddet → kein Gewinn; pagerank-Node profitiert nicht,
+multi-Int-Structs ~24%). **Offen (Subsystem):** Auto-Narrowing (`Int`→i32
+inferieren, wenn Werte beweisbar passen) braucht eine Wertebereichs-Analyse
+(Whole-Program-Intervall-Fixpunkt über die Feld-Stores) — eigener fokussierter Schritt.
