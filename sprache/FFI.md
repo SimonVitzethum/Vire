@@ -138,3 +138,20 @@ print(geo_hypot(3.0, 4.0))     // 5.0 — keine Signatur getippt
 | Eingebetteter C/C++/Python-Shim | `native "abi" """…"""` (auto-kompiliert/gelinkt) |
 | Python-Lib nutzen | `py_import("mod")` aus reinem Vire — kein extern, kein cstr, kein C |
 | String an C übergeben | Vire-Str direkt (bei `header`/Deklaration `Ptr`), oder `cstr(s)` |
+
+## Sicherheit: `Ptr` und Python-Objekte sind UNSAFE (bewusst)
+Vire ist per Konstruktion speichersicher — **außer an der FFI-Grenze**. Das gilt
+scharf für:
+- **`Ptr`** (opaker Roh-Zeiger): der RC/Kollektor kennt ihn NICHT. Ein `Ptr` ist
+  ein nackter C-Zeiger; Lebenszeit/Gültigkeit liegen beim Nutzer.
+- **Python-Objekte** (`py_import`/`py_getattr`/`py_call_*` liefern `Ptr`): sie
+  tragen einen **CPython-Refcount**, den Vire NICHT verwaltet. Ein `py_getattr`-
+  Ergebnis, das in einer Vire-Variable landet und aus dem Scope fällt, wird
+  **nicht** `Py_DECREF`'t → es **leckt** (und ein manuelles frühes DECREF wäre
+  use-after-free auf der Python-Seite).
+
+Das ist erwartbares unsafe-FFI-Territorium — dieselbe Grenze, an der jede
+speichersichere Sprache (Rust `unsafe`, …) endet. Behandle `Ptr`/Python-Handles
+wie C-Zeiger: kurzlebig, klar besessen, nicht über Scopes hinweg gehortet. Ein
+sicherer, RC-integrierter `Py[T]`-Wrapper-Typ (mit Drop → `Py_DECREF`) ist die
+saubere Lösung und noch offen.
