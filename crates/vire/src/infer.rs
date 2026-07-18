@@ -291,6 +291,14 @@ impl<'a> Ctx<'a> {
             Expr::Binary { op, lhs, rhs, .. } => {
                 let l = self.infer_expr(lhs);
                 let r = self.infer_expr(rhs);
+                // `+` mit einer Ref/String-Seite = String-Verkettung → NICHT
+                // unifizieren (Zahlen werden zur Laufzeit zu Strings), Ergebnis Ref.
+                if matches!(op, BinOp::Add) {
+                    let (rl, rr) = (self.u.resolve(l), self.u.resolve(r));
+                    if rl == T::Ref || rr == T::Ref {
+                        return T::Ref;
+                    }
+                }
                 self.u.unify(l, r);
                 if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
                     T::I32

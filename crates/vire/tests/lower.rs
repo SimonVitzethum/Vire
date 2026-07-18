@@ -224,3 +224,12 @@ fn match_verschachtelt_bindet_korrekt() {
     let p = lower(src); // kompiliert = erschöpfend + verschachtelt akzeptiert
     assert!(p.functions.iter().any(|f| f.name == "f"));
 }
+
+#[test]
+fn string_concat_und_auto_konvert() {
+    let p = lower("fn main() {\n mut n = 42\n print(\"n=\" + n)\n}\n");
+    let calls: Vec<&str> = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
+        .filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
+    assert!(calls.contains(&"jrt_str_concat"), "String-+ muss jrt_str_concat rufen");
+    assert!(calls.contains(&"jrt_long_to_str"), "Int im +-String muss konvertiert werden");
+}

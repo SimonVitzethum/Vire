@@ -340,6 +340,22 @@ impl<'a> FnLower<'a> {
             }
         }
     }
+    /// Operand → String (Ref). Ref bleibt; Skalare über jrt_*_to_str.
+    fn to_str(&mut self, op: Operand, ty: Ty) -> Operand {
+        if ty == Ty::Ref {
+            return op;
+        }
+        let func = match ty {
+            Ty::F64 => "jrt_double_to_str",
+            Ty::F32 => "jrt_float_to_str",
+            Ty::I32 => "jrt_int_to_str",
+            _ => "jrt_long_to_str",
+        };
+        let arg = if ty == Ty::I64 { op } else if matches!(ty, Ty::F64 | Ty::F32 | Ty::I32) { op } else { to_i64(op) };
+        let d = self.new_local(Ty::Ref);
+        self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![arg] });
+        Operand::Copy(d)
+    }
     /// ArrayLen (i32) → i64-Operand für Vire (Ints sind i64).
     fn array_len_i64(&mut self, arr: Operand) -> Operand {
         let li32 = self.new_local(Ty::I32);
@@ -656,7 +672,16 @@ impl<'a> FnLower<'a> {
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.lower_expr(lhs);
-                let (r, _rt) = self.lower_expr(rhs);
+                let (r, rt) = self.lower_expr(rhs);
+                // String-Verkettung: `+` mit mindestens einer Ref-Seite → Concat,
+                // Zahlen werden automatisch zu Strings (`"n=" + n`).
+                if matches!(op, BinOp::Add) && (lt == Ty::Ref || rt == Ty::Ref) {
+                    let ls = self.to_str(l, lt);
+                    let rs = self.to_str(r, rt);
+                    let d = self.new_local(Ty::Ref);
+                    self.emit(Statement::Call { dest: Some(d), func: "jrt_str_concat".into(), args: vec![ls, rs] });
+                    return (Operand::Copy(d), Ty::Ref);
+                }
                 let is_cmp = matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
@@ -868,6 +893,11 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(obj), Ty::Ref);
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // Builtin `str(x)` → Text-Repräsentation (Ref).
+        if name == "str" {
+            let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            return (self.to_str(op, ty), Ty::Ref);
+        }
         // FFI-Builtin `cstr(s)` → NUL-terminierter char* (als Ptr/i64).
         if name == "cstr" {
             let arg = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstNull);
