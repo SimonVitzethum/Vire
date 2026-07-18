@@ -130,6 +130,12 @@ fn build_or_run(args: &[String]) {
     let mut opt0 = false;
     let mut force_no_cycles = false;
     let mut force_no_rc = false;
+    // PGO (Profile-Guided Optimization): der ehrliche Zusatz zum statischen AOT für
+    // datenabhängige Hotness, die die Schätzung nicht sieht. `--pgo-gen` baut eine
+    // instrumentierte Binary (schreibt beim Lauf ein Profil), `--pgo-use DIR` baut
+    // mit dem gesammelten Profil. Zwei-Phasen: gen → repräsentativer Lauf → use.
+    let mut pgo_gen = false;
+    let mut pgo_use: Option<String> = None;
     // FFI: zusätzliche Bibliotheken (`-l NAME`) und Objekte/Quellen (`--obj FILE`,
     // .c/.cpp/.o/.a) zum Linken — für C/C++/Python-Interop.
     let mut link_libs: Vec<String> = Vec::new();
@@ -159,6 +165,14 @@ fn build_or_run(args: &[String]) {
                 force_no_rc = true;
                 force_no_cycles = true;
             }
+            "--pgo-gen" => pgo_gen = true,
+            "--pgo-use" => match it.next() {
+                Some(d) => pgo_use = Some(d.clone()),
+                None => {
+                    eprintln!("--pgo-use braucht ein Profil-Verzeichnis");
+                    exit(2);
+                }
+            },
             "-l" => match it.next() {
                 Some(l) => link_libs.push(l.clone()),
                 None => {
@@ -392,6 +406,16 @@ fn build_or_run(args: &[String]) {
     } else {
         cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
         cmd.args(["-ffunction-sections", "-fdata-sections", "-flto", "-Wl,--gc-sections", "-march=native"]);
+        // PGO: Instrumentierung (gen) bzw. Profil-Nutzung (use). LTO bleibt an —
+        // clang kombiniert `-fprofile-use` mit `-flto` (die heißen Pfade werden
+        // aggressiver inline/entrollt/angeordnet).
+        if pgo_gen {
+            cmd.arg("-fprofile-generate");
+        } else if let Some(dir) = &pgo_use {
+            cmd.arg(format!("-fprofile-use={dir}"));
+            // fehlt eine Site im Profil, ist das kein Fehler (nur uninstr. Codegen).
+            cmd.arg("-Wno-profile-instr-unprofiled").arg("-Wno-profile-instr-out-of-date");
+        }
     }
     if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");

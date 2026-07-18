@@ -1281,7 +1281,12 @@ void jrt_release(void *p) {
  * run() ruft die generierte Trampoline @jrt_invoke_runnable auf. Unter
  * --threads echte pthreads + rekursiver globaler Monitor; sonst läuft
  * start() synchron (gültiger sequentieller Schedule), Monitore sind No-Ops. */
-void jrt_invoke_runnable(void *runnable); /* vom generierten Code definiert */
+/* Vom generierten Code definiert (starkes Symbol), WENN Threads/Runnable benutzt
+ * werden. Sonst greift dieses schwache No-Op-Default: normalerweise entfernt
+ * `--gc-sections` den einzigen Aufrufer (jrt_thread_start), aber unter
+ * `-fprofile-generate`/PGO überlebt er → die schwache Definition befriedigt den
+ * Linker (aufgerufen wird sie nie ohne echten Thread-Start). */
+__attribute__((weak)) void jrt_invoke_runnable(void *runnable) { (void)runnable; }
 
 #ifdef FASTLLVM_THREADS
 #include <pthread.h>
