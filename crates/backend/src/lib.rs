@@ -2182,7 +2182,12 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
             BinOp::Rem => "frem",
             _ => panic!("Bit-/Shift-Operation auf Gleitkomma"),
         };
-        writeln!(w, "  {t} = {inst} {} {a}, {b}", llty(aty)).unwrap();
+        // `contract`: erlaubt LLVM, `a*b+c` zu einer FMA zu fusionieren (mit
+        // -march=native → echte FMA-Instruktion). Die sicherste fast-math-Stufe —
+        // nur Kontraktion (meist HÖHERE Präzision), KEINE Reassoziation/NaN-
+        // Annahmen. Entspricht clangs Default (`-ffp-contract=on`); schließt den
+        // gemessenen ~12%-Gap zu clang auf float-lastigem Code (mandelbrot).
+        writeln!(w, "  {t} = {inst} contract {} {a}, {b}", llty(aty)).unwrap();
         return t;
     }
 
