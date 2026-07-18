@@ -136,6 +136,13 @@ fn build_or_run(args: &[String]) {
     // mit dem gesammelten Profil. Zwei-Phasen: gen → repräsentativer Lauf → use.
     let mut pgo_gen = false;
     let mut pgo_use: Option<String> = None;
+    // Cross-Compile: `--target <triple>` reicht clang `-target` durch (das emittierte
+    // IR ist triple-agnostisch → portabel). Linux/BSD/macOS = POSIX-Runtime direkt;
+    // Windows braucht die Runtime-Shims (aligned_alloc/pthread, s. runtime.c).
+    let mut target: Option<String> = None;
+    // Skalierung große Programme: ThinLTO statt Full-LTO (parallel, viel weniger
+    // Speicher/Zeit bei Millionen Zeilen — Full-LTO ist der Whole-Program-Flaschenhals).
+    let mut thin_lto = false;
     // FFI: zusätzliche Bibliotheken (`-l NAME`) und Objekte/Quellen (`--obj FILE`,
     // .c/.cpp/.o/.a) zum Linken — für C/C++/Python-Interop.
     let mut link_libs: Vec<String> = Vec::new();
@@ -165,6 +172,14 @@ fn build_or_run(args: &[String]) {
                 force_no_rc = true;
                 force_no_cycles = true;
             }
+            "--target" => match it.next() {
+                Some(t) => target = Some(t.clone()),
+                None => {
+                    eprintln!("--target braucht ein Triple (z.B. x86_64-pc-windows-gnu)");
+                    exit(2);
+                }
+            },
+            "--thin-lto" => thin_lto = true,
             "--pgo-gen" => pgo_gen = true,
             "--pgo-use" => match it.next() {
                 Some(d) => pgo_use = Some(d.clone()),
@@ -405,7 +420,19 @@ fn build_or_run(args: &[String]) {
         cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
     } else {
         cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
-        cmd.args(["-ffunction-sections", "-fdata-sections", "-flto", "-Wl,--gc-sections", "-march=native"]);
+        cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
+        // ThinLTO (parallel, speicherarm) für Riesen-Programme; sonst Full-LTO.
+        cmd.arg(if thin_lto { "-flto=thin" } else { "-flto" });
+        // `-march=native` nur ohne Cross-Compile (sonst passt die Host-CPU nicht
+        // zum Zieltriple). Beim Cross-Compile das Triple durchreichen.
+        match &target {
+            Some(t) => {
+                cmd.arg("-target").arg(t);
+            }
+            None => {
+                cmd.arg("-march=native");
+            }
+        }
         // PGO: Instrumentierung (gen) bzw. Profil-Nutzung (use). LTO bleibt an —
         // clang kombiniert `-fprofile-use` mit `-flto` (die heißen Pfade werden
         // aggressiver inline/entrollt/angeordnet).

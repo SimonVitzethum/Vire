@@ -193,6 +193,14 @@ static int fmt_spec_f(char *buf, const char *spec, double v) {
  * Slab-Basen (sicher — kein Fehlalarm gegen calloc'te Große/Arrays). Freigegebene
  * Zellen wandern in die Klassen-Freiliste (intrusiv). Große Objekte → plat_alloc. */
 #ifndef FASTLLVM_FREESTANDING
+/* Portabler ausgerichteter Allokator: Linux/BSD/macOS = C11 aligned_alloc,
+ * Windows = _aligned_malloc. So läuft der Slab auf allen Ziel-OS. */
+#ifdef _WIN32
+#include <malloc.h>
+static void *plat_aligned(size_t align, size_t size) { return _aligned_malloc(size, align); }
+#else
+static void *plat_aligned(size_t align, size_t size) { return aligned_alloc(align, size); }
+#endif
 #define SLAB_SIZE (256u * 1024u)
 #define SLAB_MASK (~(uintptr_t)(SLAB_SIZE - 1))
 #define SLAB_HDR 16u
@@ -252,7 +260,7 @@ static void *slab_alloc(size_t n) {
         return p;
     }
     if (!slab_cur[c] || slab_off[c] + cell > SLAB_SIZE) {
-        char *s = (char *)aligned_alloc(SLAB_SIZE, SLAB_SIZE);
+        char *s = (char *)plat_aligned(SLAB_SIZE, SLAB_SIZE);
         if (!s) return plat_alloc(n);
         ((Slab *)s)->next = (Slab *)slab_cur[c];
         ((Slab *)s)->cell = (int64_t)cell;
