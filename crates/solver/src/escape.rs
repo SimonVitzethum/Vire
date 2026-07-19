@@ -27,6 +27,15 @@ const STACK_ARR_CAP: i64 = 1024;
 /// class, never in `ref_field_classes` (primitive arrays hold no heap refs).
 const STACK_ARR_CLASS: &str = "$stackarr";
 
+/// How a non-escaping primitive array is placed once proven local.
+enum ArrSite {
+    /// Small compile-time length → call-stack `alloca` (LLVM can eliminate it).
+    Stack(ArrKind, i64),
+    /// Larger/dynamic, not in a loop → a function-scoped region (bump, freed at
+    /// return). Carries the runtime length operand.
+    Region(ArrKind, Operand),
+}
+
 /// Compile-time-constant array length, if the operand is a constant.
 fn const_len(op: &Operand) -> Option<i64> {
     match op {
@@ -179,7 +188,7 @@ fn run_function(
     // time. Only primitive (non-ref) arrays are eligible — a ref array could hold
     // heap references whose drop must run, which stack promotion would skip.
     let mut news: Vec<(usize, usize, Local, String)> = Vec::new();
-    let mut arr_meta: Vec<Option<(ArrKind, i64)>> = Vec::new();
+    let mut arr_meta: Vec<Option<ArrSite>> = Vec::new();
     for (bi, bb) in f.blocks.iter().enumerate() {
         for (si, st) in bb.statements.iter().enumerate() {
             match st {
@@ -188,11 +197,20 @@ fn run_function(
                     arr_meta.push(None);
                 }
                 Statement::NewArray { dest, kind, len } if !kind.is_ref() => {
-                    if let Some(n) = const_len(len) {
-                        if n > 0 && n <= STACK_ARR_CAP {
-                            news.push((bi, si, *dest, STACK_ARR_CLASS.to_string()));
-                            arr_meta.push(Some((*kind, n)));
-                        }
+                    // A small constant → call-stack alloca. A larger constant or a
+                    // runtime length that is NOT inside a loop → a function-scoped
+                    // region (freed at return). In-loop non-constant arrays are left
+                    // to the loop arena / heap (a function region would grow per
+                    // iteration).
+                    let site = match const_len(len) {
+                        Some(n) if n > 0 && n <= STACK_ARR_CAP => Some(ArrSite::Stack(*kind, n)),
+                        Some(n) if n > 0 && !cyclic[bi] => Some(ArrSite::Region(*kind, len.clone())),
+                        None if !cyclic[bi] => Some(ArrSite::Region(*kind, len.clone())),
+                        _ => None,
+                    };
+                    if let Some(s) = site {
+                        news.push((bi, si, *dest, STACK_ARR_CLASS.to_string()));
+                        arr_meta.push(Some(s));
                     }
                 }
                 _ => {}
@@ -350,10 +368,16 @@ fn run_function(
             continue;
         }
         let st = &mut f.blocks[*bi].statements[*si];
-        match arr_meta[idx] {
-            Some((kind, len)) => {
+        match &arr_meta[idx] {
+            Some(ArrSite::Stack(kind, len)) => {
+                let (kind, len) = (*kind, *len);
                 let Statement::NewArray { dest, .. } = *st else { unreachable!() };
                 *st = Statement::StackNewArray { dest, kind, len };
+            }
+            Some(ArrSite::Region(kind, len)) => {
+                let (kind, len) = (*kind, len.clone());
+                let Statement::NewArray { dest, .. } = *st else { unreachable!() };
+                *st = Statement::RegionNewArray { dest, kind, len };
             }
             None => {
                 let Statement::New { dest, class } = st.clone() else { unreachable!() };
@@ -487,6 +511,10 @@ fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
             *dest
         }
         Statement::New { dest, .. } | Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } => Some(*dest),
+        Statement::RegionNewArray { dest, len, .. } => {
+            u(len);
+            Some(*dest)
+        }
         Statement::GetField { dest, obj, .. } => {
             u(obj);
             Some(*dest)

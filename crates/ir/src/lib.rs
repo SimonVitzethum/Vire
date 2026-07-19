@@ -137,6 +137,12 @@ pub enum Statement {
     /// an entry-block `alloca [len x elem]` with an immortal header — no heap
     /// allocation, freed with the frame. Same idea as `StackNew` for objects.
     StackNewArray { dest: Local, kind: ArrKind, len: i64 },
+    /// Region array allocation: a non-escaping primitive array that is dynamic or
+    /// too large for the call stack, and NOT inside a loop. It is bump-allocated
+    /// (immortal) in a per-function region (`jrt_region_array`); the backend
+    /// brackets the function with `jrt_region_enter`/`_leave`, freeing it en bloc
+    /// at return. Cheaper than the RC heap for hot scratch-buffer functions.
+    RegionNewArray { dest: Local, kind: ArrKind, len: Operand },
     ArrayLen { dest: Local, arr: Operand },
     /// `dest = arr[index]`; bounds-checked if `checked`.
     ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },

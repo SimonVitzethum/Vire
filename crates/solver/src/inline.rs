@@ -227,7 +227,7 @@ fn remap_statement(st: &mut Statement, off: u32) {
             remap_operand(obj, off);
             remap_operand(value, off);
         }
-        Statement::NewArray { dest, len, .. } => {
+        Statement::NewArray { dest, len, .. } | Statement::RegionNewArray { dest, len, .. } => {
             remap_local(dest, off);
             remap_operand(len, off);
         }

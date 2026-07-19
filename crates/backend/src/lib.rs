@@ -184,6 +184,9 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_atomic_new", "ptr (i64)"),
     ("jrt_atomic_add", "i64 (ptr, i64)"),
     ("jrt_atomic_get", "i64 (ptr)"),
+    ("jrt_region_enter", "void ()"),
+    ("jrt_region_leave", "void ()"),
+    ("jrt_region_array", "ptr (i64, i64, ptr)"),
     ("jrt_mutex_new", "ptr (i64)"),
     ("jrt_mutex_lock", "void (ptr)"),
     ("jrt_mutex_unlock", "void (ptr)"),
@@ -955,6 +958,8 @@ struct FnEmitter<'a> {
     sn: u32,
     /// Running index of the StackNewArray slots (%sna<k>), reserved likewise.
     sna: u32,
+    /// This function allocates a region array → bracket it with region_enter/leave.
+    region: bool,
     /// Borrowed ref-parameter slots (never reassigned): RC elision — no
     /// entry retain, no cleanup release. The caller holds the reference for
     /// the call's duration (arguments are borrowed); copies into other locals
@@ -1000,8 +1005,9 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
             for st in &bb.statements {
                 let (def, immortal): (Option<u32>, bool) = match st {
                     Statement::StackNew { dest, .. } => (Some(dest.0), true),
-                    // Stack array: immortal (refcount -1), RC-free like StackNew.
-                    Statement::StackNewArray { dest, .. } => (Some(dest.0), true),
+                    // Stack/region array: immortal (refcount -1), RC-free — the stack
+                    // frame resp. jrt_region_leave reclaims it.
+                    Statement::StackNewArray { dest, .. } | Statement::RegionNewArray { dest, .. } => (Some(dest.0), true),
                     Statement::Assign(d, Rvalue::Use(op)) => {
                         let ip = match op {
                             Operand::ConstNull | Operand::ConstStr(_) | Operand::ConstClass(_) => true,
@@ -1493,6 +1499,16 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
             }
         }
     }
+    // Open the per-function region if this function allocates any region array;
+    // jrt_region_leave is emitted before every return (emit_cleanup).
+    let has_region = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.statements)
+        .any(|st| matches!(st, Statement::RegionNewArray { .. }));
+    if has_region {
+        writeln!(w, "  call void @jrt_region_enter()").unwrap();
+    }
     writeln!(w, "  br label %bb0").unwrap();
 
     let imm = immortal_only_locals(f);
@@ -1502,7 +1518,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, imm, borrow, nn, md_inv: ctx.md_inv };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, nn, md_inv: ctx.md_inv };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -1569,6 +1585,12 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
 /// only together (both-or-neither), so a stack container holds exclusively
 /// immortal contents — nothing that could leak.
 fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
+    // Close the per-function region (frees its bump allocations en bloc). Before
+    // the ref releases below, but order is irrelevant — region arrays are immortal
+    // (never released), and no released ref points into the region (non-escaping).
+    if e.region {
+        writeln!(w, "  call void @jrt_region_leave()").unwrap();
+    }
     for (i, ty) in e.f.locals.iter().enumerate() {
         // Borrowed parameters (never retained) and immortal-only slots (only no-op
         // values) need no cleanup release.
@@ -1814,6 +1836,22 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let ep = e.fresh();
             writeln!(w, "  {ep} = getelementptr i8, ptr {t}, i64 24").unwrap();
             writeln!(w, "  store i64 {}, ptr {ep}", kind.size()).unwrap();
+            store_dest(w, e, *dest, &t, false);
+        }
+        Statement::RegionNewArray { dest, kind, len } => {
+            // Bump-allocate an immortal array in the per-function region (bracketed
+            // by jrt_region_enter/_leave). The runtime zeroes + sets the header.
+            let nraw = e.operand(w, len);
+            let n64 = e.fresh();
+            writeln!(w, "  {n64} = sext i32 {nraw} to i64").unwrap();
+            let t = e.fresh();
+            writeln!(
+                w,
+                "  {t} = call ptr @jrt_region_array(i64 {n64}, i64 {}, ptr {})",
+                kind.size(),
+                array_vtable(*kind),
+            )
+            .unwrap();
             store_dest(w, e, *dest, &t, false);
         }
         Statement::GetField { dest, obj, class, field } => {

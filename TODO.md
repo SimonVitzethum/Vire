@@ -48,12 +48,17 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   concurrent `spawn` workers each own an independent region stack — no shared
   global `arena_top` to race on (was a documented threads limit). tests/
   vire_threads.sh `per_thread_arena` (8 workers, deterministic ×20).
-- [ ] Remaining array cases: constant arrays only stack-promote to the call stack
-  when ≤ 1024; non-escaping dynamic/large arrays **not** inside a promotable loop
-  (e.g. allocated once in a straight-line function) still go to the heap — a
-  function-scoped region would catch them, lower value (one alloc per call). Ref-
-  element arrays stay heap (element drops). **pagerank/ring** is the collector
-  case (persistent shared cycle), orthogonal to the allocator.
+- [x] **Function-scoped region** for non-escaping dynamic/large arrays not in a
+  loop (allocated once in a straight-line function): bump-allocated in a per-thread
+  region (`jrt_region_array`), the function bracketed with `jrt_region_enter/leave`,
+  freed en bloc at return. Reuses the object escape analysis (a returned/stored
+  array stays heap). Modest win — region ≈ glibc tcache for tiny arrays, ahead for
+  medium/large (both memset-bound); the point is avoiding malloc/free+RC. Sound:
+  Java 65/65, benchmark outputs unchanged, tests/vire_heap.sh (region_scratch +
+  escape-return guard). `FASTLLVM_NO_REGION` routes to the heap (A/B knob).
+- [ ] Remaining: ref-element arrays stay heap (element drops); in-loop non-const
+  arrays rely on the loop arena / heap (a function region would grow per
+  iteration). **pagerank/ring** is the collector case, orthogonal to the allocator.
 - [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
   field array) — closes part of the residual toward ~1.1×.
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and

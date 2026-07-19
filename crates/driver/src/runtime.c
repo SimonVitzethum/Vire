@@ -1915,6 +1915,111 @@ typedef struct {
     int64_t elem_size;
 } JArray;
 
+/* --- Function-scoped region (a second stack) ---------------------------------
+ * For a non-escaping array that is dynamic or too large for the call stack AND
+ * not inside a loop: the compiler brackets the function with jrt_region_enter/
+ * _leave and allocates the array with jrt_region_array — an immortal bump
+ * allocation in a per-thread region, freed en bloc when the function returns.
+ * No per-call malloc/free (the backing buffer persists; leave just rewinds the
+ * offset), so it beats the RC heap for hot functions with scratch arrays.
+ *
+ * The region is a single large, lazily-committed virtual buffer per thread
+ * (POSIX mmap MAP_NORESERVE — pages cost nothing until touched), so a marker is
+ * one offset and any size is handled without chunk bookkeeping. Thread-local →
+ * one region stack per thread (scales to multiple stacks, like the arena).
+ * Hosted only. Overflowing the reserve is treated as OOM. */
+#if !defined(FASTLLVM_FREESTANDING)
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#define REGION_MMAP 1
+#endif
+#ifdef FASTLLVM_THREADS
+#define REGION_TLS _Thread_local
+#else
+#define REGION_TLS
+#endif
+#define REGION_RESERVE ((size_t)1 << 32) /* 4 GiB virtual per thread (lazy) */
+static REGION_TLS char *r_base = NULL;
+static REGION_TLS size_t r_used = 0;
+static REGION_TLS size_t *r_marks = NULL;
+static REGION_TLS int r_depth = 0, r_mcap = 0;
+
+static void region_init(void) {
+#ifdef REGION_MMAP
+    r_base = (char *)mmap(NULL, REGION_RESERVE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (r_base == MAP_FAILED) r_base = NULL;
+#else
+    /* Non-POSIX fallback: a fixed committed buffer (heavier, secondary target). */
+    r_base = (char *)malloc(REGION_RESERVE >> 6); /* 64 MiB */
+#endif
+}
+void jrt_region_enter(void) {
+    if (r_depth == r_mcap) {
+        r_mcap = r_mcap ? r_mcap * 2 : 64;
+        r_marks = (size_t *)realloc(r_marks, (size_t)r_mcap * sizeof(size_t));
+    }
+    r_marks[r_depth++] = r_used;
+}
+void jrt_region_leave(void) {
+    if (r_depth > 0) r_used = r_marks[--r_depth];
+}
+void *jrt_region_array(int64_t count, int64_t elem_size, void *vtable) {
+    if (count < 0) {
+        plat_puts("Exception in thread \"main\" java.lang.NegativeArraySizeException\n");
+        plat_abort();
+    }
+    /* Measurement knob: FASTLLVM_NO_REGION routes region arrays to the heap
+     * instead (immortal → matches the compiler's treatment; leaks, so for timing
+     * comparisons only). */
+    static int region_off = -1;
+    if (region_off < 0) {
+        const char *e = getenv("FASTLLVM_NO_REGION");
+        region_off = e ? 1 : 0;
+    }
+    if (region_off) {
+        JArray *h = (JArray *)plat_alloc((size_t)32 + (size_t)count * (size_t)elem_size);
+        h->refcount = -1;
+        h->vtable = vtable;
+        h->length = count;
+        h->elem_size = elem_size;
+        return h;
+    }
+    size_t size = (size_t)32 + (size_t)count * (size_t)elem_size;
+    size = (size + 15u) & ~(size_t)15u;
+    if (!r_base) region_init();
+    size_t cap = REGION_RESERVE;
+#ifndef REGION_MMAP
+    cap = REGION_RESERVE >> 6;
+#endif
+    if (!r_base || r_used + size > cap) {
+        plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
+        plat_abort();
+    }
+    JArray *a = (JArray *)(r_base + r_used);
+    r_used += size;
+    memset(a, 0, size); /* array default values */
+    a->refcount = -1;   /* immortal → RC/collector no-op; freed by region_leave */
+    a->vtable = vtable;
+    a->length = count;
+    a->elem_size = elem_size;
+    return a;
+}
+#else
+/* Freestanding: no OS region; allocate an immortal array (RC-safe, matches the
+ * compiler's immortal treatment) and leak it — freestanding is short-lived/rare. */
+void jrt_region_enter(void) {}
+void jrt_region_leave(void) {}
+void *jrt_region_array(int64_t count, int64_t elem_size, void *vtable) {
+    JArray *a = (JArray *)plat_alloc((size_t)32 + (size_t)count * (size_t)elem_size);
+    a->refcount = -1;
+    a->vtable = vtable;
+    a->length = count;
+    a->elem_size = elem_size;
+    return a;
+}
+#endif
+
 void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
     if (count < 0) {
         plat_puts("Exception in thread \"main\" java.lang.NegativeArraySizeException\n");

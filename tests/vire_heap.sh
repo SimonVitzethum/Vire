@@ -88,6 +88,34 @@ fn make(k: Int) -> array { mut a = array(4)  a[0] = k  a }
 fn main() { mut x = make(42)  print(42) }
 EOF
 
+# --- function-scoped region: a non-escaping DYNAMIC array, not in a loop, is
+#     bump-allocated in the per-function region and freed at return. The function
+#     is called in a hot loop; must compute correctly and stay 0-live. ---
+case_ region_scratch 8000112000000 <<'EOF'
+fn score(seed: Int, m: Int) -> Int {
+    mut buf = array(m)
+    mut i = 0
+    while i < m { buf[i] = seed + i  i = i + 1 }
+    mut s = 0
+    mut j = 0
+    while j < m { s = s + buf[j]  j = j + 1 }
+    s
+}
+fn main() {
+    mut total = 0
+    mut k = 0
+    while k < 1000000 { total = total + score(k, 16)  k = k + 1 }
+    print(total)
+}
+EOF
+
+# --- ESCAPE guard for region arrays: a returned dynamic array must stay on the
+#     heap (region promotion there would be a use-after-return). ---
+case_ region_escape_return 55 <<'EOF'
+fn make(m: Int) -> array { mut a = array(m)  a[0] = 55  a }
+fn main() { mut x = make(4)  print(55) }
+EOF
+
 # --- while-loop arena still balanced (regression for the pre-existing path) ---
 case_ while_arena 500000500000 <<'EOF'
 fn work(n: Int) -> Int {
