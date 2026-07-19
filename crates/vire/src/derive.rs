@@ -51,8 +51,9 @@ pub fn derive_expand(m: &mut Module) -> Vec<String> {
                 "Show" => "show",
                 "Ord" => "cmp",
                 "Hash" => "hash",
+                "Json" => "to_json",
                 _ => {
-                    errs.push(format!("unknown derive `{d}` on `{}` (supported: Eq, Show, Ord, Hash)", t.name));
+                    errs.push(format!("unknown derive `{d}` on `{}` (supported: Eq, Show, Ord, Hash, Json)", t.name));
                     continue;
                 }
             };
@@ -63,14 +64,17 @@ pub fn derive_expand(m: &mut Module) -> Vec<String> {
             let md: Option<FnDef> = match (d.as_str(), is_sum) {
                 ("Eq", false) => Some(derive_eq(t)),
                 ("Show", false) => Some(derive_show(t)),
-                ("Eq", true) => Some(derive_eq_sum(t)),
-                ("Show", true) => Some(derive_show_sum(t)),
+                ("Json", false) => unwrap_or_err(derive_json(t), &mut errs),
                 ("Ord", false) => unwrap_or_err(derive_ord(t), &mut errs),
                 ("Hash", false) => unwrap_or_err(derive_hash(t), &mut errs),
-                // Ord/Hash over a sum type (order/hash across variants) is not yet
-                // implemented — deferred with a clear message rather than wrong code.
-                ("Ord" | "Hash", true) => {
-                    errs.push(format!("@derive({d}) on sum type `{}` is not yet supported (Eq/Show only)", t.name));
+                ("Eq", true) => Some(derive_eq_sum(t)),
+                ("Show", true) => Some(derive_show_sum(t)),
+                ("Json", true) => unwrap_or_err(derive_json_sum(t), &mut errs),
+                ("Hash", true) => unwrap_or_err(derive_hash_sum(t), &mut errs),
+                // Ordering across a sum type's variants (ordinal + payload) is not
+                // yet implemented — deferred with a clear message, never wrong code.
+                ("Ord", true) => {
+                    errs.push(format!("@derive(Ord) on sum type `{}` is not yet supported (Eq/Show/Hash/Json)", t.name));
                     continue;
                 }
                 _ => unreachable!(),
@@ -241,15 +245,44 @@ fn derive_hash(t: &TypeDef) -> Result<FnDef, String> {
     require_scalar(t, "Hash")?;
     let mut acc = int_lit(7);
     for f in &t.fields {
-        let fh = match fkind(&f.ty) {
-            FKind::Int => self_field(&f.name),
-            FKind::Bool | FKind::Float => cast_int(self_field(&f.name)),
-            FKind::Str => method_call(self_field(&f.name), "hashCode", vec![]),
-            FKind::Other => unreachable!("rejected by require_scalar"),
-        };
-        acc = bin(BinOp::Add, bin(BinOp::Mul, acc, int_lit(31)), fh);
+        acc = bin(BinOp::Add, bin(BinOp::Mul, acc, int_lit(31)), field_hash_of(self_field(&f.name), &f.ty));
     }
     Ok(method("hash", vec![param("self", None)], ty_ref("Int"), acc))
+}
+
+/// Hash contribution of one field value `e` of type `ty`.
+fn field_hash_of(e: Expr, ty: &Type) -> Expr {
+    match fkind(ty) {
+        FKind::Int => e,
+        FKind::Bool | FKind::Float => cast_int(e),
+        FKind::Str => method_call(e, "hashCode", vec![]),
+        FKind::Other => unreachable!("rejected by require_scalar"),
+    }
+}
+
+/// JSON rendering of one field value `e` of type `ty`: numbers bare, `Bool` as
+/// true/false, `Str` quoted. (No escaping yet — see TODO.)
+fn json_value(e: Expr, ty: &Type) -> Expr {
+    match fkind(ty) {
+        FKind::Bool => if_expr(e, str_lit("true"), str_lit("false")),
+        FKind::Str => bin(BinOp::Add, bin(BinOp::Add, str_lit("\""), e), str_lit("\"")),
+        _ => call("str", vec![e]), // Int / Float bare; Other rejected earlier
+    }
+}
+
+/// `fn to_json(self) -> Str { "{" + "\"f\": " + <json f> + … + "}" }`.
+fn derive_json(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar(t, "Json")?;
+    let mut e = str_lit("{");
+    for (i, f) in t.fields.iter().enumerate() {
+        if i > 0 {
+            e = bin(BinOp::Add, e, str_lit(", "));
+        }
+        e = bin(BinOp::Add, e, str_lit(&format!("\"{}\": ", f.name)));
+        e = bin(BinOp::Add, e, json_value(self_field(&f.name), &f.ty));
+    }
+    e = bin(BinOp::Add, e, str_lit("}"));
+    Ok(method("to_json", vec![param("self", None)], ty_ref("Str"), e))
 }
 
 // --- Sum types (match on the variant tag) ------------------------------------
@@ -317,4 +350,69 @@ fn derive_eq_sum(t: &TypeDef) -> FnDef {
         .collect();
     let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
     method("eq", vec![param("self", None), param("other", Some(ty_ref(&t.name)))], ty_ref("Bool"), body)
+}
+
+/// Ord/Hash/Json over a sum type need per-variant-field ordering/hashing/rendering,
+/// defined here only for scalar and `Str` payloads.
+fn require_scalar_sum(t: &TypeDef, what: &str) -> Result<(), String> {
+    for v in &t.variants {
+        for f in &v.fields {
+            if fkind(&f.ty) == FKind::Other {
+                return Err(format!(
+                    "@derive({what}) on `{}`: variant `{}` field of type `{}` is not scalar/Str (nested derive not yet supported)",
+                    t.name, v.name, f.ty.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `fn hash(self) -> Int { match self { V(a…) -> ((17*31 + ord)*31 + h(a)…), … } }`
+/// — folds the variant's declaration ordinal, then each payload field.
+fn derive_hash_sum(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar_sum(t, "Hash")?;
+    let arms = t
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(ord, v)| {
+            let n = v.fields.len();
+            let mut acc = bin(BinOp::Add, bin(BinOp::Mul, int_lit(17), int_lit(31)), int_lit(ord as i128));
+            for k in 0..n {
+                acc = bin(BinOp::Add, bin(BinOp::Mul, acc, int_lit(31)), field_hash_of(ident(&format!("_a{k}")), &v.fields[k].ty));
+            }
+            (ctor_pat(&v.name, n, "_a"), None, acc)
+        })
+        .collect();
+    let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
+    Ok(method("hash", vec![param("self", None)], ty_ref("Int"), body))
+}
+
+/// `fn to_json(self) -> Str { match self { V(a…) -> "{\"V\": [json a, …]}", dataless
+/// -> "\"V\"", … } }`.
+fn derive_json_sum(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar_sum(t, "Json")?;
+    let arms = t
+        .variants
+        .iter()
+        .map(|v| {
+            let n = v.fields.len();
+            let body = if n == 0 {
+                str_lit(&format!("\"{}\"", v.name))
+            } else {
+                let mut e = str_lit(&format!("{{\"{}\": [", v.name));
+                for k in 0..n {
+                    if k > 0 {
+                        e = bin(BinOp::Add, e, str_lit(", "));
+                    }
+                    e = bin(BinOp::Add, e, json_value(ident(&format!("_a{k}")), &v.fields[k].ty));
+                }
+                bin(BinOp::Add, e, str_lit("]}"))
+            };
+            (ctor_pat(&v.name, n, "_a"), None, body)
+        })
+        .collect();
+    let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
+    Ok(method("to_json", vec![param("self", None)], ty_ref("Str"), body))
 }

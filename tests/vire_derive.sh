@@ -131,9 +131,49 @@ Nothing
 0
 1" "$work/sum.vr"
 
+# Json on a product type (numbers bare, Bool true/false, Str quoted).
+cat > "$work/json.vr" <<'EOF'
+@derive(Json)
+type User {
+    name: Str
+    age: Int
+    active: Bool
+}
+fn main() {
+    mut u = User("Ann", 30, true)
+    print(u.to_json())
+}
+EOF
+check "Json (product)" '{"name": "Ann", "age": 30, "active": true}' "$work/json.vr"
+
+# Json + Hash on a sum type (dataless + payload variants).
+cat > "$work/jsum.vr" <<'EOF'
+@derive(Json, Hash)
+type Shape {
+    Circle(Float)
+    Rect(w: Float, h: Float)
+    Nothing
+}
+fn main() {
+    mut c = Circle(2.0)
+    mut d = Circle(2.0)
+    mut r = Rect(3.0, 4.0)
+    print(c.to_json())              // {"Circle": [2]}
+    print(r.to_json())              // {"Rect": [3, 4]}
+    print(Nothing.to_json())        // "Nothing"
+    print(c.hash() == d.hash())     // 1
+    print(c.hash() == r.hash())     // 0
+}
+EOF
+check "Json + Hash (sum type)" '{"Circle": [2]}
+{"Rect": [3, 4]}
+"Nothing"
+1
+0' "$work/jsum.vr"
+
 # Errors: genuinely unknown derive, Ord on a sum type, generic type, nested field.
-printf '@derive(Json)\ntype T { x: Int }\nfn main(){print(1)}\n' > "$work/unk.vr"
-errck "unknown derive rejected" "unknown derive .Json." "$work/unk.vr"
+printf '@derive(Serialize)\ntype T { x: Int }\nfn main(){print(1)}\n' > "$work/unk.vr"
+errck "unknown derive rejected" "unknown derive .Serialize." "$work/unk.vr"
 
 printf '@derive(Ord)\ntype S { A(Int)\n B(Int) }\nfn main(){print(1)}\n' > "$work/sumord.vr"
 errck "Ord on sum type rejected" "sum type" "$work/sumord.vr"
