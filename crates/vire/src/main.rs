@@ -81,13 +81,25 @@ fn main() {
     }
 }
 
-/// Locate the CSolver `solver` binary for on-by-default verification: an explicit
-/// override first, then `$CSOLVER`, then `solver` on `PATH`, then a sibling CSolver
-/// build next to this repo. Returns None if none is runnable.
+/// Locate the CSolver `solver` binary for on-by-default verification. The verifier is
+/// vendored in this repo (crates/csolver), so it builds into this workspace's target
+/// dir right next to `vire` — that in-repo build is preferred. Order: explicit override
+/// → the `solver` sibling of this executable → `$CSOLVER` → `solver` on `PATH`.
 fn resolve_solver(override_path: Option<&str>) -> Option<String> {
     let runnable = |p: &str| Command::new(p).arg("--help").output().map(|o| o.status.code().is_some()).unwrap_or(false);
     if let Some(p) = override_path {
         return runnable(p).then(|| p.to_string());
+    }
+    // The in-repo build: `solver` next to this `vire` executable (same target dir).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sib = dir.join("solver");
+            if let Some(s) = sib.to_str() {
+                if sib.exists() && runnable(s) {
+                    return Some(s.to_string());
+                }
+            }
+        }
     }
     if let Ok(p) = std::env::var("CSOLVER") {
         if runnable(&p) {
@@ -96,15 +108,6 @@ fn resolve_solver(override_path: Option<&str>) -> Option<String> {
     }
     if runnable("solver") {
         return Some("solver".to_string());
-    }
-    for cand in [
-        "../CSolver/target/release/solver",
-        "../../CSolver/target/release/solver",
-        concat!(env!("HOME"), "/Schreibtisch/CSolver/target/release/solver"),
-    ] {
-        if std::path::Path::new(cand).exists() && runnable(cand) {
-            return Some(cand.to_string());
-        }
     }
     None
 }

@@ -1,0 +1,98 @@
+# Provenance capability lattice (general — extend per subsystem in your own files).
+#
+# A provenance label records WHERE a region's backing pages came from; `grants` lists the
+# capabilities that origin legitimately confers. An unlabelled region grants EVERYTHING
+# (the sound default), so this is purely opt-in — naming no labels changes nothing.
+#
+#   foreign  — a page inserted from an untrusted/foreign source (e.g. a page-cache page
+#              spliced into a socket). Readable, but NOT a legitimate kernel WRITE target.
+#   kernel   — an ordinary kernel-owned buffer: read + write.
+prov foreign grants=read
+prov kernel  grants=read,write
+#   iomem    — a device-register mapping from the `ioremap` family. Read + write; its extent
+#              is the device's, known only at the mapping site, so bounds through it are a
+#              trust assumption (`--assume-valid-mmio`), not a proof.
+prov iomem   grants=read,write
+
+# CVE-2026-31431 "Copy Fail" source: splice()/sendpage inserts a caller-supplied page
+# (arg1) into the socket's scatterlist with no write-permission check. Label it `foreign`.
+[af_alg_sendpage]
+label arg1 foreign
+
+# Provenance PROPAGATION through scatterlists (general — a container absorbs an element's
+# provenance, so a foreign page taints the whole list). `sg_set_page(sg, page, ...)` puts a
+# page into a scatterlist entry; `sg_chain(prv, ..., sgl)` links one list into another.
+[sg_set_page]
+propagate arg0 from arg1
+
+[sg_chain]
+propagate arg0 from arg2
+
+# The AEAD in-place chain that weaponizes the foreign page:
+#   crypto_aead_copy_sgl(tfm, src, dst, len)   copies src's scatterlist into dst → dst
+#                                              absorbs src's provenance.
+#   aead_request_set_crypt(req, src, dst, len, iv)   the request's crypto WRITES dst, so the
+#                                              request's write-target provenance is dst's.
+#   crypto_aead_{encrypt,decrypt}(req)         performs the write → the request's destination
+#                                              must grant `write`. A foreign page that reached
+#                                              it (via the propagations above) is refused.
+# crypto_aead_copy_sgl(null_tfm, src, dst, len) copies the associated data (AAD) from the
+# TX scatterlist (arg1) into the request's RX scatterlist (arg2) using the NULL cipher. In
+# the VULNERABLE build this dst is the socket's RX sgl, which may hold a `foreign`
+# (read-only, spliced-in) page — so the copy WRITES a page it may not own: CVE-2026-31431.
+# Require the destination to grant `write`; a `foreign` dst provably lacks it → refused.
+# The patched build copies the AAD out-of-place into a fresh writable buffer (not the RX
+# sgl), whose dst is not `foreign`, so this never fires there — no false FAIL.
+[crypto_aead_copy_sgl]
+propagate arg2 from arg1
+require arg2 write
+
+[aead_request_set_crypt]
+propagate arg0 from arg2
+# In-place reuse (src == dst) writing a foreign page is the precise Copy-Fail signature; a
+# distinct out-of-place dst (the patched path) does not fire.
+require-if-alias arg1 arg2 write
+
+# The AEAD op sink. ONLY the in-place check fires (never a plain `require arg0 write`, which
+# would false-FAIL the patched out-of-place path once the RX sgl is labelled foreign below).
+# Inlined form (real optimized kernel): aead_request_set_crypt is `static inline`, so there is
+# no call — `req->src`/`req->dst` are set by field stores. Read them back from the request (arg0)
+# at offsets 64 (src) and 72 (dst) in `struct aead_request` and apply the in-place-alias check:
+# an in-place op (src==dst) writing a foreign page is refused; distinct dst (patched) is not.
+[crypto_aead_encrypt crypto_aead_decrypt]
+require-if-alias-fields arg0 64 72 write
+
+# af_alg_get_rsgl builds the receive scatterlist into the request (arg3 = areq). Those RX pages
+# are the recvmsg output — user pages, or (the Copy-Fail vector) page-cache pages spliced in — so
+# they are a potentially-read-only WRITE target: label areq `foreign`. The in-place gate above then
+# fires ONLY when the op reuses this RX sgl as both src and dst (the vulnerable in-place path),
+# never on the safe out-of-place copy — so labelling is sound.
+[af_alg_get_rsgl]
+label arg3 foreign
+
+# CVE-2026-31431 whole-object seed: the AEAD recvmsg worker's socket (arg0) may hold a page
+# spliced in by af_alg_sendpage in a PRIOR syscall, so seed it `foreign` at entry. Only the
+# in-place sink (require-if-alias, above) then fires, so this never false-FAILs the safe
+# out-of-place (patched) path. This is the cross-syscall step that closes the chain on real IR.
+[_aead_recvmsg aead_recvmsg]
+seed arg0 foreign
+
+# NOTE (diagnosis refined 2026-07-11, on vulnerable v6.12 `crypto/algif_aead.ll`):
+# the `foreign` label now DOES reach the AEAD request at the sink — the cross-syscall
+# `seed arg0 foreign` + taint-on-read propagate it to `crypto_aead_{en,de}crypt`'s arg0
+# (verified: the request object carries the label). What still does not connect is the
+# **in-place aliasing** of `req->src` (off 64) and `req->dst` (off 72): they are read back
+# as two DISTINCT opaque values, so the `require-if-alias-fields` gate cannot see `src==dst`
+# and (soundly) does not fire.
+#
+# Root cause: an intervening opaque call between the request setup and the crypto op
+# (`af_alg_get_rsgl` and the request-build helpers) HAVOCs the analyzer's store-forwarding,
+# so the same-SSA-value stores to src/dst are forgotten by the time the op reads them. The
+# enforcement + this contract chain are complete and proven on a faithful synthetic
+# reproduction *and* on an opaque (heap) request with no intervening havoc; forcing the gate
+# to fire once the aliasing is unknown would be UNSOUND (the intervening call may legitimately
+# set an out-of-place dst → a false FAIL on the patched path). Closing it on real optimized IR
+# therefore needs PRECISE INTERPROCEDURAL EFFECT SUMMARIES for the request-build helpers (that
+# they do not clobber `req->src`/`req->dst`), so store-forwarding survives the call — a general,
+# contract-expressible feature, not a copy-fail special case. See
+# `Kerneltests/scanrun/logs/copyfail-detection-design.md`.

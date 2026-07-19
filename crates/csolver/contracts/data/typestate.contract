@@ -1,0 +1,68 @@
+# Generalised typestate / protocol tracker (use-after-scope B, missing-check E, order G5).
+#
+# A named resource (keyed by its pointer base or scalar identity) moves through a finite set
+# of states via `typestate-set` transitions; `typestate-require[-not]` obligations flag a use
+# in a forbidden state. All contract-driven — new protocols are new contract lines, not code.
+# A bug-finding-only check; a violation is refuted only when the resource is *definitely* in
+# the forbidden state on the path (states are meet-joined at merges — no false FAIL).
+
+# --- stdio handle: use-after-close and double-close (FILE* is a pointer handle) -----------
+# fopen returns an OPEN handle. A handle still `open` at return (see typestate-leak) — not
+# closed and not returned — is a resource leak (K).
+[fopen fdopen freopen tmpfile]
+typestate-set ret file open
+typestate-leak file open
+
+# fclose closes it — and refuses to close an already-closed handle (double-close).
+[fclose]
+typestate-require-not arg0 file closed
+typestate-set arg0 file closed
+
+# An operation on a stream whose handle is arg0 must not run on a closed handle.
+[fflush fseek ftell feof ferror fileno rewind clearerr]
+typestate-require-not arg0 file closed
+
+# fread(ptr,size,nmemb,stream) / fwrite(...): the stream is arg3 — use-after-close.
+[fread fwrite]
+typestate-require-not arg3 file closed
+
+# --- missing permission check (E): a privileged op requires a prior validation ------------
+# A recognised check marks the object validated.
+[security_check validate_access authorize_request]
+typestate-set arg0 perm checked
+
+# The privileged operation requires the object to have been checked first.
+[privileged_write]
+typestate-require arg0 perm checked
+
+# --- TOCTOU (G2): a check invalidated by an intervening yield ------------------------------
+# access()/stat() validate a path — it becomes `checked`.
+[access stat lstat faccessat]
+typestate-set arg0 toctou checked
+
+# A yield (blocking call, reschedule, sleep) lets an adversary act: every `checked` path
+# becomes `stale`. The yield lives on the blocking primitives' blocks in
+# kernel_sync.contract (`schedule`/`msleep`/`ssleep`/`cond_resched`/`mutex_lock`/`down`),
+# since one name has exactly one contract block.
+
+# Using (open) a path whose check went stale across a yield is a TOCTOU race.
+[open openat fopen_path]
+typestate-require-not arg0 toctou stale
+
+# --- Reference counts (G8): a decrement below zero is a premature free / UAF ---------------
+[kref_get refcount_inc kobject_get get_task_struct atomic_inc_not_zero]
+refcount-inc arg0 kref
+
+[kref_put refcount_dec kobject_put put_task_struct refcount_dec_and_test]
+refcount-dec arg0 kref
+
+# --- Type confusion (H): a per-object type tag, checked at a typed operation ---------------
+# An allocator/initialiser stamps the object's type; a typed op requires the matching tag.
+[init_as_request]
+typestate-set arg0 objtype request
+
+[init_as_reply]
+typestate-set arg0 objtype reply
+
+[handle_request]
+typestate-require arg0 objtype request

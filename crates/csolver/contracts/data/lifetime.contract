@@ -1,0 +1,76 @@
+# Object-lifetime reference counts (get/put protocols). Each `get` raises and each `put` lowers
+# the object's refcount; a `put` that takes it below the number of holders is a premature free
+# (use-after-free). The count is composed interprocedurally (Summary.refcount_effect), so a get
+# in one function/syscall and a put in another balance — an unbalanced put underflows.
+
+# A *plain* (unchecked) get raises the count unconditionally; concurrent with the final put it can
+# resurrect a zeroed object (a refcount race — subsystem 4). A *checked* get (`*_unless_zero` /
+# `*_inc_not_zero`) refuses to raise a zeroed count and so is race-safe — `refcount-inc-checked`.
+
+# --- kref (generic kernel refcount) --------------------------------------------------------
+[kref_get]
+refcount-inc arg0 lifetime
+[kref_get_unless_zero]
+refcount-inc-checked arg0 lifetime
+[kref_put kref_put_lock refcount_dec_and_test]
+refcount-dec arg0 lifetime
+
+# --- struct sock (network socket) ----------------------------------------------------------
+[sock_hold __sock_put_hold sk_get sock_get]
+refcount-inc arg0 lifetime
+[refcount_inc_not_zero atomic_inc_not_zero sk_get_unless_zero]
+refcount-inc-checked arg0 lifetime
+[sock_put __sock_put sk_put]
+refcount-dec arg0 lifetime
+
+# --- kobject -------------------------------------------------------------------------------
+[kobject_get]
+refcount-inc arg0 lifetime
+[kobject_get_unless_zero]
+refcount-inc-checked arg0 lifetime
+[kobject_put]
+refcount-dec arg0 lifetime
+
+# --- net_device ----------------------------------------------------------------------------
+[dev_hold dev_hold_track netdev_hold]
+refcount-inc arg0 lifetime
+[dev_put dev_put_track netdev_put]
+refcount-dec arg0 lifetime
+
+# --- block I/O (bio) -----------------------------------------------------------------------
+[bio_get bio_inc_remaining]
+refcount-inc arg0 lifetime
+[bio_put]
+refcount-dec arg0 lifetime
+
+# --- dma_buf / DRM GEM objects (driver object lifetime) ------------------------------------
+[dma_buf_get get_dma_buf drm_gem_object_get drm_gem_object_get_unlocked]
+refcount-inc arg0 lifetime
+[dma_buf_put drm_gem_object_put drm_gem_object_put_unlocked]
+refcount-dec arg0 lifetime
+
+# --- generic get_device / put_device -------------------------------------------------------
+[get_device get_task_struct mmgrab mmget]
+refcount-inc arg0 lifetime
+[put_device put_task_struct mmdrop mmput]
+refcount-dec arg0 lifetime
+
+# --- Compare-and-swap (ABA detection) ------------------------------------------------------
+# A lock-free CAS on the location; a concurrent modification (A->B->A) is the ABA problem.
+[atomic_cmpxchg cmpxchg try_cmpxchg atomic_try_cmpxchg atomic64_cmpxchg atomic_cmpxchg_relaxed cmpxchg_relaxed]
+cas arg0
+
+# The **ordered** CAS variants carry BOTH the ABA (`cas`) effect AND a weak-memory ordering
+# barrier, so a lock-free publish/consume built on them (`cmpxchg_release` to publish a node,
+# `cmpxchg_acquire` to consume it) is seen as ordered and the SC-robustness pass does not
+# falsely flag a missing barrier. A **release** orders prior stores before it (write barrier);
+# an **acquire** orders later loads after it (read barrier) — the *weakest* correct fence, so
+# no genuine full-barrier bug is hidden. One name = one contract entry, so both effect lines
+# live in the same block (a later duplicate registration would overwrite, not merge).
+[cmpxchg_release atomic_cmpxchg_release atomic64_cmpxchg_release try_cmpxchg_release]
+cas arg0
+barrier write
+
+[cmpxchg_acquire atomic_cmpxchg_acquire atomic64_cmpxchg_acquire try_cmpxchg_acquire]
+cas arg0
+barrier read

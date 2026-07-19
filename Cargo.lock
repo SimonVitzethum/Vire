@@ -3,6 +3,146 @@
 version = 4
 
 [[package]]
+name = "csolver-absint"
+version = "0.1.0"
+dependencies = [
+ "csolver-cfg",
+ "csolver-core",
+ "csolver-ir",
+ "csolver-memory",
+]
+
+[[package]]
+name = "csolver-asm"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-ir",
+ "csolver-parser",
+]
+
+[[package]]
+name = "csolver-cfg"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-ir",
+]
+
+[[package]]
+name = "csolver-cli"
+version = "0.1.0"
+dependencies = [
+ "csolver-asm",
+ "csolver-contracts",
+ "csolver-core",
+ "csolver-elf",
+ "csolver-ir",
+ "csolver-llvm",
+ "csolver-mir",
+ "csolver-report",
+ "csolver-verifier",
+]
+
+[[package]]
+name = "csolver-contracts"
+version = "0.1.0"
+
+[[package]]
+name = "csolver-core"
+version = "0.1.0"
+
+[[package]]
+name = "csolver-elf"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-ir",
+]
+
+[[package]]
+name = "csolver-ir"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+]
+
+[[package]]
+name = "csolver-llvm"
+version = "0.1.0"
+dependencies = [
+ "csolver-contracts",
+ "csolver-core",
+ "csolver-ir",
+ "csolver-parser",
+]
+
+[[package]]
+name = "csolver-memory"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+]
+
+[[package]]
+name = "csolver-mir"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-ir",
+ "csolver-parser",
+]
+
+[[package]]
+name = "csolver-parser"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+]
+
+[[package]]
+name = "csolver-report"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-verifier",
+]
+
+[[package]]
+name = "csolver-solver"
+version = "0.1.0"
+dependencies = [
+ "csolver-core",
+ "csolver-memory",
+]
+
+[[package]]
+name = "csolver-symbolic"
+version = "0.1.0"
+dependencies = [
+ "csolver-absint",
+ "csolver-cfg",
+ "csolver-contracts",
+ "csolver-core",
+ "csolver-ir",
+ "csolver-memory",
+ "csolver-solver",
+]
+
+[[package]]
+name = "csolver-verifier"
+version = "0.1.0"
+dependencies = [
+ "csolver-absint",
+ "csolver-cfg",
+ "csolver-core",
+ "csolver-ir",
+ "csolver-memory",
+ "csolver-solver",
+ "csolver-symbolic",
+]
+
+[[package]]
 name = "fastllvm-backend"
 version = "0.1.0"
 dependencies = [
