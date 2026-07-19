@@ -121,18 +121,20 @@ Feature sequence on top:
   runtime statements (this executes at comptime to a value; unrolling is separate),
   comptime over reference/aggregate values (scalars only today), `return`/`break` in
   a comptime body.
-- [~] **(b) typed reflection over the type graph** — **`@derive(Eq, Show)`** works
-  ([derive.rs](crates/vire/src/derive.rs)): a `@name(args)` attribute parses onto a
-  `type` (new `Attr` AST node + `parse_attrs`), and a post-macro pass reads the type's
-  fields and synthesizes ordinary methods (`eq(self, other) -> Bool` structural `==`;
-  `show(self) -> Str` a `T(f, …)` string) that infer+lower like hand-written ones. An
-  explicit method of the same name overrides the derive; unknown derives / sum /
-  generic targets are rejected. The type graph reflects declared derives
-  (`vire types`). tests/vire_derive.sh (8/8). Open: `Hash`/`Ord`/`Json`; derive for
-  **sum types** (match on the tag) and **generic** types; and the deeper
-  **`@typeinfo(T)`** as a *comptime-iterable typed value* (needs aggregate comptime
-  values — the interpreter is scalar-only today), from which derives would be written
-  in-language rather than hard-coded in Rust.
+- [~] **(b) typed reflection over the type graph** — **`@derive(Eq, Show, Ord, Hash)`**
+  works ([derive.rs](crates/vire/src/derive.rs)): a `@name(args)` attribute parses onto
+  a `type` (new `Attr` AST node + `parse_attrs`), and a post-macro pass reads the type
+  structure and synthesizes ordinary methods that infer+lower like hand-written ones —
+  **product types**: `eq`/`show`/`cmp` (lexicographic -1/0/1)/`hash` (31-combiner;
+  numeric/Bool by value, `Str` via `hashCode()`, per-field-type aware); **sum types**:
+  `eq`/`show` via a `match` on the tag (dataless + multi-field variants). An explicit
+  method of the same name overrides the derive; unknown derives, nested-field Ord/Hash,
+  sum-type Ord/Hash, and generic targets are rejected with a clear message. The type
+  graph reflects declared derives (`vire types`). tests/vire_derive.sh (11/11). Open:
+  `Json`; Ord/Hash for **sum types**; **generic** types; nested-user-type fields
+  (recursive derive); and the deeper **`@typeinfo(T)`** as a *comptime-iterable typed
+  value* (needs aggregate comptime values — the interpreter is scalar-only today), from
+  which derives would be written in-language rather than hard-coded in Rust.
 - [ ] **(c) hygienic macros** — `macro name(args) { … }` with typed parameters
   (`expr`/`block`/`ident`/`pat`/`type`), full type-checking *after* expansion,
   hygiene (no capture — fresh names for macro-introduced bindings), and diagnostic

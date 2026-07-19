@@ -38,21 +38,21 @@ pub fn derive_expand(m: &mut Module) -> Vec<String> {
         if wanted.is_empty() {
             continue;
         }
-        // Derivation reads the fields; only non-generic product types today.
+        // Derivation reads the structure; generic types (fields reference `T`) are
+        // not yet supported for either shape.
         if !t.generics.is_empty() {
             errs.push(format!("@derive on generic type `{}` is not yet supported", t.name));
             continue;
         }
-        if !t.variants.is_empty() {
-            errs.push(format!("@derive on sum type `{}` is not yet supported (product types only)", t.name));
-            continue;
-        }
+        let is_sum = !t.variants.is_empty();
         for (d, _span) in wanted {
-            let (mname, gen): (&str, fn(&TypeDef) -> FnDef) = match d.as_str() {
-                "Eq" => ("eq", derive_eq),
-                "Show" => ("show", derive_show),
+            let mname = match d.as_str() {
+                "Eq" => "eq",
+                "Show" => "show",
+                "Ord" => "cmp",
+                "Hash" => "hash",
                 _ => {
-                    errs.push(format!("unknown derive `{d}` on `{}` (supported: Eq, Show)", t.name));
+                    errs.push(format!("unknown derive `{d}` on `{}` (supported: Eq, Show, Ord, Hash)", t.name));
                     continue;
                 }
             };
@@ -60,11 +60,39 @@ pub fn derive_expand(m: &mut Module) -> Vec<String> {
             if t.methods.iter().any(|md| md.sig.name == mname) {
                 continue;
             }
-            let md = gen(t);
-            t.methods.push(md);
+            let md: Option<FnDef> = match (d.as_str(), is_sum) {
+                ("Eq", false) => Some(derive_eq(t)),
+                ("Show", false) => Some(derive_show(t)),
+                ("Eq", true) => Some(derive_eq_sum(t)),
+                ("Show", true) => Some(derive_show_sum(t)),
+                ("Ord", false) => unwrap_or_err(derive_ord(t), &mut errs),
+                ("Hash", false) => unwrap_or_err(derive_hash(t), &mut errs),
+                // Ord/Hash over a sum type (order/hash across variants) is not yet
+                // implemented — deferred with a clear message rather than wrong code.
+                ("Ord" | "Hash", true) => {
+                    errs.push(format!("@derive({d}) on sum type `{}` is not yet supported (Eq/Show only)", t.name));
+                    continue;
+                }
+                _ => unreachable!(),
+            };
+            match md {
+                Some(m) => t.methods.push(m),
+                None => continue, // an error was already recorded
+            }
         }
     }
     errs
+}
+
+/// Fold a `Result<FnDef, String>` into an `Option<FnDef>`, recording the error.
+fn unwrap_or_err(r: Result<FnDef, String>, errs: &mut Vec<String>) -> Option<FnDef> {
+    match r {
+        Ok(m) => Some(m),
+        Err(e) => {
+            errs.push(e);
+            None
+        }
+    }
 }
 
 // --- AST construction helpers ------------------------------------------------
@@ -87,8 +115,46 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
 fn str_lit(s: &str) -> Expr {
     Expr::Str(s.into(), S)
 }
+fn int_lit(v: i128) -> Expr {
+    Expr::Int(v, S)
+}
 fn self_field(name: &str) -> Expr {
     field(Expr::SelfExpr(S), name)
+}
+fn other_field(name: &str) -> Expr {
+    field(ident("other"), name)
+}
+fn cast_int(e: Expr) -> Expr {
+    Expr::Cast { inner: Box::new(e), ty: ty_ref("Int"), span: S }
+}
+/// A method call `recv.name(args)`.
+fn method_call(recv: Expr, name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Call { callee: Box::new(field(recv, name)), args, span: S }
+}
+/// `if cond { then_e } else { else_e }` as an expression.
+fn if_expr(cond: Expr, then_e: Expr, else_e: Expr) -> Expr {
+    let blk = |e: Expr| Block { stmts: vec![], tail: Some(Box::new(e)), span: S };
+    Expr::If { cond: Box::new(cond), then: blk(then_e), elifs: vec![], els: Some(blk(else_e)), span: S }
+}
+
+/// Scalar/Str field kinds relevant to structural derivation. `Other` (a nested
+/// user type) is not derivable for `Ord`/`Hash` without recursion → rejected.
+#[derive(PartialEq)]
+enum FKind {
+    Int,
+    Float,
+    Bool,
+    Str,
+    Other,
+}
+fn fkind(ty: &Type) -> FKind {
+    match ty.name.as_str() {
+        "Int" | "I64" | "I32" | "U32" | "U64" => FKind::Int,
+        "Float" | "F64" | "F32" => FKind::Float,
+        "Bool" => FKind::Bool,
+        "Str" => FKind::Str,
+        _ => FKind::Other,
+    }
 }
 fn method(name: &str, params: Vec<Param>, ret: Type, tail: Expr) -> FnDef {
     FnDef {
@@ -128,4 +194,127 @@ fn derive_show(t: &TypeDef) -> FnDef {
     }
     expr = bin(BinOp::Add, expr, str_lit(")"));
     method("show", vec![param("self", None)], ty_ref("Str"), expr)
+}
+
+/// `@derive(Ord)`/`@derive(Hash)` need per-field ordering/hashing, which is only
+/// defined here for scalar and `Str` fields — a nested user-type field would need
+/// its own derive (recursion), not yet supported.
+fn require_scalar(t: &TypeDef, what: &str) -> Result<(), String> {
+    for f in &t.fields {
+        if fkind(&f.ty) == FKind::Other {
+            return Err(format!(
+                "@derive({what}) on `{}`: field `{}: {}` is not a scalar/Str type (nested derive not yet supported)",
+                t.name, f.name, f.ty.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `fn cmp(self, other: T) -> Int { … }` — lexicographic ordering, returning
+/// -1/0/1. Numeric/bool fields compare with `<`/`>`; `Str` fields via `compareTo`.
+fn derive_ord(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar(t, "Ord")?;
+    let body = cmp_chain(&t.fields, 0);
+    Ok(method("cmp", vec![param("self", None), param("other", Some(ty_ref(&t.name)))], ty_ref("Int"), body))
+}
+
+fn cmp_chain(fields: &[Field], i: usize) -> Expr {
+    if i >= fields.len() {
+        return int_lit(0); // all fields equal
+    }
+    let f = &fields[i];
+    let (lt, gt) = if fkind(&f.ty) == FKind::Str {
+        // `self.f.compareTo(other.f)` is <0 / 0 / >0.
+        let cmp = || method_call(self_field(&f.name), "compareTo", vec![other_field(&f.name)]);
+        (bin(BinOp::Lt, cmp(), int_lit(0)), bin(BinOp::Gt, cmp(), int_lit(0)))
+    } else {
+        (bin(BinOp::Lt, self_field(&f.name), other_field(&f.name)), bin(BinOp::Gt, self_field(&f.name), other_field(&f.name)))
+    };
+    if_expr(lt, int_lit(-1), if_expr(gt, int_lit(1), cmp_chain(fields, i + 1)))
+}
+
+/// `fn hash(self) -> Int { ((7 * 31 + h(f0)) * 31 + h(f1)) … }` — the classic
+/// 31-multiplier combiner. Per-field hash: an Int/Bool/Float field is folded in
+/// by value (Bool/Float cast to Int), a `Str` field via `hashCode()`.
+fn derive_hash(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar(t, "Hash")?;
+    let mut acc = int_lit(7);
+    for f in &t.fields {
+        let fh = match fkind(&f.ty) {
+            FKind::Int => self_field(&f.name),
+            FKind::Bool | FKind::Float => cast_int(self_field(&f.name)),
+            FKind::Str => method_call(self_field(&f.name), "hashCode", vec![]),
+            FKind::Other => unreachable!("rejected by require_scalar"),
+        };
+        acc = bin(BinOp::Add, bin(BinOp::Mul, acc, int_lit(31)), fh);
+    }
+    Ok(method("hash", vec![param("self", None)], ty_ref("Int"), acc))
+}
+
+// --- Sum types (match on the variant tag) ------------------------------------
+
+/// A constructor pattern `Name(p0, …, p{n-1})` binding `{prefix}0..{prefix}{n-1}`.
+fn ctor_pat(name: &str, n: usize, prefix: &str) -> Pattern {
+    Pattern::Ctor { name: name.into(), args: (0..n).map(|k| Pattern::Bind(format!("{prefix}{k}"), S)).collect(), span: S }
+}
+
+/// `fn show(self) -> Str { match self { Variant(a…) -> "Variant(" + str(a) + …, … } }`.
+fn derive_show_sum(t: &TypeDef) -> FnDef {
+    let arms = t
+        .variants
+        .iter()
+        .map(|v| {
+            let n = v.fields.len();
+            let pat = ctor_pat(&v.name, n, "_a");
+            let body = if n == 0 {
+                str_lit(&v.name) // dataless → just the name
+            } else {
+                let mut e = str_lit(&format!("{}(", v.name));
+                for k in 0..n {
+                    if k > 0 {
+                        e = bin(BinOp::Add, e, str_lit(", "));
+                    }
+                    e = bin(BinOp::Add, e, call("str", vec![ident(&format!("_a{k}"))]));
+                }
+                bin(BinOp::Add, e, str_lit(")"))
+            };
+            (pat, None, body)
+        })
+        .collect();
+    let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
+    method("show", vec![param("self", None)], ty_ref("Str"), body)
+}
+
+/// `fn eq(self, other: T) -> Bool { match self { V(a…) -> match other { V(b…) ->
+/// a==b && …, _ -> false }, … } }` — same variant with equal payloads, else false.
+fn derive_eq_sum(t: &TypeDef) -> FnDef {
+    let arms = t
+        .variants
+        .iter()
+        .map(|v| {
+            let n = v.fields.len();
+            let payload_eq = if n == 0 {
+                Expr::Bool(true, S)
+            } else {
+                let mut c: Option<Expr> = None;
+                for k in 0..n {
+                    let eq = bin(BinOp::Eq, ident(&format!("_a{k}")), ident(&format!("_b{k}")));
+                    c = Some(match c {
+                        None => eq,
+                        Some(p) => bin(BinOp::And, p, eq),
+                    });
+                }
+                c.unwrap()
+            };
+            let inner = Expr::Match {
+                scrutinee: Box::new(ident("other")),
+                arms: vec![(ctor_pat(&v.name, n, "_b"), None, payload_eq), (Pattern::Wildcard(S), None, Expr::Bool(false, S))],
+                span: S,
+            };
+            (ctor_pat(&v.name, n, "_a"), None, inner)
+        })
+        .collect();
+    let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
+    method("eq", vec![param("self", None), param("other", Some(ty_ref(&t.name)))], ty_ref("Bool"), body)
 }

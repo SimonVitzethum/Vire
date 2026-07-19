@@ -2399,6 +2399,7 @@ impl<'a> FnLower<'a> {
                     "charAt" | "char_at" => Some(("jrt_str_char_at", Ty::I64, &['i'])),
                     "indexOf" | "index_of" => Some(("jrt_str_indexof", Ty::I64, &['r'])),
                     "compareTo" | "compare_to" => Some(("jrt_str_compareto", Ty::I64, &['r'])),
+                    "hashCode" | "hash_code" => Some(("jrt_str_hashcode", Ty::I64, &[])),
                     "isEmpty" | "is_empty" => Some(("jrt_str_is_empty", Ty::I32, &[])),
                     "equals" => Some(("jrt_str_equals", Ty::I32, &['r'])),
                     "startsWith" | "starts_with" => Some(("jrt_str_startswith", Ty::I32, &['r'])),

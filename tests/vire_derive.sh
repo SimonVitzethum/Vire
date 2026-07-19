@@ -74,15 +74,75 @@ fn main() {
 EOF
 check "derived eq in control flow" "42" "$work/use.vr"
 
-# Errors: unknown derive, sum type, generic type.
-printf '@derive(Ord)\ntype T { x: Int }\nfn main(){print(1)}\n' > "$work/unk.vr"
-errck "unknown derive rejected" "unknown derive .Ord." "$work/unk.vr"
+# Ord + Hash on a product type (numeric, Str, Float fields).
+cat > "$work/ord.vr" <<'EOF'
+@derive(Ord, Hash, Eq)
+type Rec {
+    name: Str
+    score: Int
+}
+fn main() {
+    mut a = Rec("Ann", 5)
+    mut b = Rec("Ann", 9)
+    mut c = Rec("Bob", 1)
+    mut d = Rec("Ann", 5)
+    print(a.cmp(b))               // -1  (score 5 < 9)
+    print(a.cmp(c))               // -1  ("Ann" < "Bob")
+    print(a.cmp(d))               // 0
+    print(b.cmp(a))               // 1
+    print(a.hash() == d.hash())   // 1   (equal -> equal hash)
+    print(a.hash() == b.hash())   // 0
+}
+EOF
+check "Ord + Hash (product)" "-1
+-1
+0
+1
+1
+0" "$work/ord.vr"
 
-printf '@derive(Eq)\ntype S { A(Int)\n B(Int) }\nfn main(){print(1)}\n' > "$work/sum.vr"
-errck "sum-type derive rejected" "sum type" "$work/sum.vr"
+# Eq + Show on a sum type (match on the tag; dataless + multi-field variants).
+cat > "$work/sum.vr" <<'EOF'
+@derive(Eq, Show)
+type Shape {
+    Circle(Float)
+    Rect(w: Float, h: Float)
+    Nothing
+}
+fn main() {
+    mut a = Circle(2.0)
+    mut b = Circle(2.0)
+    mut c = Rect(3.0, 4.0)
+    mut n = Nothing
+    print(a.show())    // Circle(2)
+    print(c.show())    // Rect(3, 4)
+    print(n.show())    // Nothing
+    print(a.eq(b))     // 1
+    print(a.eq(c))     // 0
+    print(a.eq(n))     // 0
+    print(n.eq(n))     // 1
+}
+EOF
+check "Eq + Show (sum type)" "Circle(2)
+Rect(3, 4)
+Nothing
+1
+0
+0
+1" "$work/sum.vr"
+
+# Errors: genuinely unknown derive, Ord on a sum type, generic type, nested field.
+printf '@derive(Json)\ntype T { x: Int }\nfn main(){print(1)}\n' > "$work/unk.vr"
+errck "unknown derive rejected" "unknown derive .Json." "$work/unk.vr"
+
+printf '@derive(Ord)\ntype S { A(Int)\n B(Int) }\nfn main(){print(1)}\n' > "$work/sumord.vr"
+errck "Ord on sum type rejected" "sum type" "$work/sumord.vr"
 
 printf '@derive(Eq)\ntype Box[T] { value: T }\nfn main(){print(1)}\n' > "$work/gen.vr"
 errck "generic derive rejected" "generic type" "$work/gen.vr"
+
+printf '@derive(Ord)\ntype Inner { v: Int }\n@derive(Ord)\ntype Outer { a: Int\n inner: Inner }\nfn main(){print(1)}\n' > "$work/nest.vr"
+errck "nested-field Ord rejected" "not a scalar" "$work/nest.vr"
 
 # The type graph reflects the declared derives.
 if "$vire" types "$work/mix.vr" 2>/dev/null | grep -q 'derive Eq'; then
