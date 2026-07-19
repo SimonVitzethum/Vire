@@ -33,7 +33,7 @@ pub fn desugar_spawn(m: &mut Module) -> (Vec<String>, Vec<String>) {
             params.insert(f.sig.name.clone(), f.sig.params.iter().map(|p| p.ty.clone()).collect());
         }
     }
-    let mut ctx = Ctx { params, shims: HashSet::new(), generated: Vec::new(), errs: Vec::new() };
+    let mut ctx = Ctx { params, roots: HashSet::new(), gen: HashSet::new(), generated: Vec::new(), errs: Vec::new() };
     for item in &mut m.items {
         if let Item::Fn(f) = item {
             if let Some(body) = &mut f.body {
@@ -42,14 +42,16 @@ pub fn desugar_spawn(m: &mut Module) -> (Vec<String>, Vec<String>) {
         }
     }
     m.items.extend(std::mem::take(&mut ctx.generated));
-    let workers: Vec<String> = ctx.shims.into_iter().collect();
+    let workers: Vec<String> = ctx.roots.into_iter().collect();
     (ctx.errs, workers)
 }
 
 struct Ctx {
     params: HashMap<String, Vec<Option<Type>>>,
-    /// Worker names that already have a generated `__spawn_<f>` shim (dedupe).
-    shims: HashSet<String>,
+    /// Worker fn names invoked through generated glue → kept as RTA roots.
+    roots: HashSet<String>,
+    /// Generated shim names, for one-per-worker deduplication.
+    gen: HashSet<String>,
     generated: Vec<Item>,
     errs: Vec<String>,
 }
@@ -104,10 +106,24 @@ impl Ctx {
 
     fn expr(&mut self, e: &mut Expr) {
         self.children(e);
-        if let Expr::Spawn { call, span } = e {
-            if let Some(rep) = self.build(call, *span) {
-                *e = rep;
+        match e {
+            Expr::Spawn { call, span } => {
+                if let Some(rep) = self.build(call, *span) {
+                    *e = rep;
+                }
             }
+            // `parallel_for(n, shared, worker)` — a normal call, desugared to a shim
+            // that fork/joins n threads over the runtime `jrt_parallel_for`.
+            Expr::Call { callee, args, span } => {
+                if let Expr::Ident(n, _) = callee.as_ref() {
+                    if n == "parallel_for" {
+                        if let Some(rep) = self.build_parallel_for(args, *span) {
+                            *e = rep;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -210,7 +226,8 @@ impl Ctx {
         }
         let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
         let shim = format!("__spawn_{fname}");
-        let first = self.shims.insert(fname.clone());
+        self.roots.insert(fname.clone());
+        let first = self.gen.insert(shim.clone());
         if cargs.len() == 1 {
             let cty = ctys[0];
             if first {
@@ -267,6 +284,70 @@ impl Ctx {
         }
         let env = Expr::Call { callee: Box::new(Expr::Ident(pack, span)), args: cargs, span };
         Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![env], span })
+    }
+
+    /// `parallel_for(n, shared, worker)` → `__pfor_worker(n, shared)`. Forks `n`
+    /// threads running `worker(i, shared)` for i in 0..n and joins them all
+    /// (`jrt_parallel_for`). `worker` is a bare function name; `shared` must be a
+    /// Sync type (`Atomic`/`Mutex`).
+    fn build_parallel_for(&mut self, args: &[Expr], span: Span) -> Option<Expr> {
+        if args.len() != 3 {
+            self.errs.push("parallel_for: expected `parallel_for(count, shared, worker)`".into());
+            return None;
+        }
+        let worker = match &args[2] {
+            Expr::Ident(n, _) => n.clone(),
+            _ => {
+                self.errs.push("parallel_for: the third argument must be a worker function name".into());
+                return None;
+            }
+        };
+        let ptys = match self.params.get(&worker) {
+            Some(t) => t.clone(),
+            None => {
+                self.errs.push(format!("parallel_for: `{worker}` is not a top-level function"));
+                return None;
+            }
+        };
+        if ptys.len() != 2 {
+            self.errs.push(format!("parallel_for: `{worker}` must take (index: Int, shared) — found {} parameter(s)", ptys.len()));
+            return None;
+        }
+        // index is a scalar; shared must be a Sync type.
+        if let Err(e) = boundary_cty(ptys[0].as_ref()) {
+            self.errs.push(e);
+            return None;
+        }
+        let shared_cty = match boundary_cty(ptys[1].as_ref()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.errs.push(e);
+                return None;
+            }
+        };
+        let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
+        let shim = format!("__pfor_{worker}");
+        self.roots.insert(worker.clone());
+        if self.gen.insert(shim.clone()) {
+            let code = format!(
+                "// generated glue for `parallel_for(.., {worker})` — trusted runtime handoff\n\
+                 #include <stdint.h>\n\
+                 extern void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *));\n\
+                 extern int64_t {worker}(int64_t, {shared_cty});\n\
+                 int64_t {shim}(int64_t n, void *shared) {{\n\
+                 \x20   jrt_parallel_for(n, shared, (int64_t (*)(int64_t, void *)){worker});\n\
+                 \x20   return 0;\n\
+                 }}\n"
+            );
+            self.generated.push(Item::Native { abi: "c-glue".into(), code, links: vec![], span });
+            let params = vec![
+                Param { name: "n".into(), ty: Some(ty("Int")), default: None },
+                Param { name: "shared".into(), ty: Some(ptys[1].clone().unwrap_or_else(|| ty("Int"))), default: None },
+            ];
+            let sig = FnSig { name: shim.clone(), generics: vec![], params, ret: Some(ty("Int")), span };
+            self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+        }
+        Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![args[0].clone(), args[1].clone()], span })
     }
 }
 

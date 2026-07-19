@@ -112,6 +112,23 @@ fn w(a: Int, b: Int) -> Int { a + b }
 fn main() { print(join(spawn w(1))) }
 EOF
 
+# parallel_for: fork n threads over 0..n, join all
+ok_case parallel_for 5050 20 <<'EOF'
+fn work(i: Int, total: Atomic) -> Int { total.fetch_add(i + 1)  0 }
+fn main() {
+    mut total = Atomic(0)
+    parallel_for(100, total, work)
+    print(total.load())
+}
+EOF
+
+# parallel_for shared must be a Sync type
+err_case parallel_for_send "cannot send" <<'EOF'
+type Bag { n: Int }
+fn work(i: Int, b: Bag) -> Int { b.n }
+fn main() { mut b = Bag(0)  parallel_for(4, b, work)  print(b.n) }
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

@@ -1470,6 +1470,32 @@ void jrt_mutex_lock(void *p) { pthread_mutex_lock(&((VMutex *)p)->m); }
 void jrt_mutex_unlock(void *p) { pthread_mutex_unlock(&((VMutex *)p)->m); }
 int64_t jrt_mutex_get(void *p) { return ((VMutex *)p)->val; }
 void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
+/* parallel_for(n, shared, worker): fork n threads, worker(i, shared) for
+ * i in 0..n, join all. shared is a Sync object (Atomic/Mutex). */
+typedef struct {
+    int64_t i;
+    void *shared;
+    int64_t (*fn)(int64_t, void *);
+} PForArg;
+static void *pfor_tramp(void *p) {
+    PForArg *a = (PForArg *)p;
+    a->fn(a->i, a->shared);
+    return NULL;
+}
+void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
+    if (n <= 0) return;
+    pthread_t *tids = (pthread_t *)malloc((size_t)n * sizeof(pthread_t));
+    PForArg *args = (PForArg *)malloc((size_t)n * sizeof(PForArg));
+    for (int64_t i = 0; i < n; i++) {
+        args[i].i = i;
+        args[i].shared = shared;
+        args[i].fn = fn;
+        pthread_create(&tids[i], NULL, pfor_tramp, &args[i]);
+    }
+    for (int64_t i = 0; i < n; i++) pthread_join(tids[i], NULL);
+    free(args);
+    free(tids);
+}
 #else
 void *jrt_spawn(int64_t (*fn)(void *), void *arg) {
     /* No threads: run synchronously now, stash the result for jrt_join. */
@@ -1506,6 +1532,10 @@ void jrt_mutex_lock(void *p) { (void)p; }
 void jrt_mutex_unlock(void *p) { (void)p; }
 int64_t jrt_mutex_get(void *p) { return ((VMutex *)p)->val; }
 void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
+void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
+    /* No threads: run the iterations sequentially (a valid schedule). */
+    for (int64_t i = 0; i < n; i++) fn(i, shared);
+}
 #endif
 
 void *jrt_atomic_new(int64_t v) {
