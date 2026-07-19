@@ -121,9 +121,14 @@ Attach: monomorphization (front-end) + `comptime`.
   → direct (in fact inlined) calls** — works via monomorphization; a violated
   bound is now a precise compile error at the instantiation (enforced in the mono
   worklist). tests/vire_generics.sh.
-- [ ] Value generics `[comptime N: Int]`, fixed arrays `[T; N]`. Bounds/`is_comptime`
-  parse but value generics need call-site turbofish `f[N](..)` (parser lookahead vs
-  indexing) + value substitution; fixed arrays need `[T; N]` in `parse_type`.
+- [x] **Value generics `[comptime N: Int]`** with call-site **turbofish** `f[N](..)`
+  (parser disambiguates from indexing by the trailing `(`): distinct monomorph per
+  N, N substituted as a literal — so `0..N`/`array(N)` become constant (the array
+  then stack-promotes). Mixed type+value turbofish; extra type params still
+  inferred. tests/vire_generics.sh, examples/vire/value_generics.vr.
+- [ ] Fixed arrays `[T; N]` as a distinct inline-storage value type (a larger
+  feature; value-generic `array(N)` already gives constant-size stack arrays).
+  Array **parameter** indexing in a Vire body (`fn f(a: array){ a[i] }`) also open.
 - [ ] Overlapping/coherence checking for generic impls; inference of a type arg that
   appears only in return position (defaults to `Int` today).
 

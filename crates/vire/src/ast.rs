@@ -154,6 +154,10 @@ pub enum Expr {
     Unary { op: UnOp, rhs: Box<Expr>, span: Span },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
     Call { callee: Box<Expr>, args: Vec<Expr>, span: Span },
+    /// Turbofish call `f[T, N](args)`: explicit generic arguments. Each `targ` is
+    /// a type name (`Expr::Ident`) or a comptime value (`Expr::Int`). Used to bind
+    /// value generics `[comptime N: Int]` at the call site.
+    TurboCall { callee: String, targs: Vec<Expr>, args: Vec<Expr>, span: Span },
     Field { base: Box<Expr>, name: String, span: Span },
     Index { base: Box<Expr>, index: Box<Expr>, span: Span },
     /// Constructor/call with type arguments or generics application: here as a call.

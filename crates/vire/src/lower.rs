@@ -20,6 +20,9 @@ type VariantInfo = (String, i64, Vec<(String, Ty, Option<String>)>);
 struct GInfo {
     /// Type parameter names, e.g. `["T"]` for `fn f[T](…)`.
     tparams: Vec<String>,
+    /// Per generic parameter: is it a comptime VALUE param (`[comptime N: Int]`)?
+    /// Parallel to `tparams`. Value params bind to a literal, not a type.
+    comptime: Vec<bool>,
     /// Parameter type annotations (with T placeholders), for binding the type arguments.
     param_tys: Vec<Option<Type>>,
     /// Return annotation (with T).
@@ -81,14 +84,32 @@ fn subst_stmt(s: &mut Stmt, bind: &HashMap<String, String>) {
     match s {
         Stmt::Let { value: Some(v), .. } => subst_expr(v, bind),
         Stmt::Expr(e) | Stmt::Return(Some(e), _) => subst_expr(e, bind),
-        Stmt::Assign { value, .. } => subst_expr(value, bind),
-        Stmt::While { body, .. } | Stmt::For { body, .. } => subst_block(body, bind),
+        Stmt::Assign { target, value, .. } => {
+            subst_expr(target, bind);
+            subst_expr(value, bind);
+        }
+        Stmt::While { cond, body, .. } => {
+            subst_expr(cond, bind);
+            subst_block(body, bind);
+        }
+        Stmt::For { iter, body, .. } => {
+            subst_expr(iter, bind);
+            subst_block(body, bind);
+        }
         _ => {}
     }
 }
 
 fn subst_expr(e: &mut Expr, bind: &HashMap<String, String>) {
     match e {
+        // A comptime value parameter (`N`) bound to a literal → inline the literal.
+        // Value bindings are numeric strings; type bindings (e.g. "Int") never
+        // appear in value position, so this only fires for value generics.
+        Expr::Ident(n, sp) => {
+            if let Some(v) = bind.get(n).and_then(|s| s.parse::<i128>().ok()) {
+                *e = Expr::Int(v, *sp);
+            }
+        }
         Expr::Cast { ty, inner, .. } => {
             *ty = subst_type(ty, bind);
             subst_expr(inner, bind);
@@ -104,6 +125,22 @@ fn subst_expr(e: &mut Expr, bind: &HashMap<String, String>) {
                 subst_expr(a, bind);
             }
         }
+        Expr::TurboCall { targs, args, .. } => {
+            for t in targs {
+                subst_expr(t, bind);
+            }
+            for a in args {
+                subst_expr(a, bind);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            subst_expr(base, bind);
+            subst_expr(index, bind);
+        }
+        Expr::Range { start, end, .. } => {
+            subst_expr(start, bind);
+            subst_expr(end, bind);
+        }
         Expr::If { cond, then, elifs, els, .. } => {
             subst_expr(cond, bind);
             subst_block(then, bind);
@@ -115,8 +152,24 @@ fn subst_expr(e: &mut Expr, bind: &HashMap<String, String>) {
                 subst_block(b, bind);
             }
         }
+        Expr::Match { scrutinee, arms, .. } => {
+            subst_expr(scrutinee, bind);
+            for (_, g, b) in arms {
+                if let Some(g) = g {
+                    subst_expr(g, bind);
+                }
+                subst_expr(b, bind);
+            }
+        }
+        Expr::List(xs, _) => xs.iter_mut().for_each(|x| subst_expr(x, bind)),
+        Expr::MapLit(kvs, _) => {
+            for (k, v) in kvs {
+                subst_expr(k, bind);
+                subst_expr(v, bind);
+            }
+        }
         Expr::Block(b) => subst_block(b, bind),
-        Expr::Field { base, .. } | Expr::Try { inner: base, .. } => subst_expr(base, bind),
+        Expr::Field { base, .. } | Expr::Try { inner: base, .. } | Expr::Comptime { inner: base, .. } => subst_expr(base, bind),
         _ => {}
     }
 }
@@ -424,6 +477,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
                     f.sig.name.clone(),
                     GInfo {
                         tparams: f.sig.generics.iter().map(|g| g.name.clone()).collect(),
+                        comptime: f.sig.generics.iter().map(|g| g.is_comptime).collect(),
                         param_tys: f.sig.params.iter().map(|p| p.ty.clone()).collect(),
                         ret: f.sig.ret.clone(),
                     },
@@ -1636,6 +1690,7 @@ impl<'a> FnLower<'a> {
                 (Operand::Copy(d), fty)
             }
             Expr::Call { callee, args, .. } => self.lower_call(callee, args),
+            Expr::TurboCall { callee, targs, args, .. } => self.lower_turbocall(callee, targs, args),
             Expr::If { cond, then, elifs, els, .. } => self.lower_if(cond, then, elifs, els),
             Expr::Match { scrutinee, arms, .. } => self.lower_match(scrutinee, arms),
             // `comptime <expr>` → compile-time folding of constant expressions.
@@ -1838,6 +1893,77 @@ impl<'a> FnLower<'a> {
                 (Operand::ConstI64(0), Ty::I64)
             }
         }
+    }
+
+    /// `f[T, N](args)` — a generic call with EXPLICIT arguments. Type params bind
+    /// to the named type; comptime value params bind to the folded literal (value
+    /// generics). Remaining type params are still inferred from the arguments.
+    fn lower_turbocall(&mut self, callee: &str, targs: &[Expr], call_args: &[Expr]) -> (Operand, Ty) {
+        let g = match self.generics.get(callee).cloned() {
+            Some(g) => g,
+            None => {
+                self.errs.push(format!("turbofish `{callee}[..]`: `{callee}` is not a generic function"));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        if targs.len() > g.tparams.len() {
+            self.errs.push(format!("turbofish `{callee}`: {} generic arg(s) given but only {} declared", targs.len(), g.tparams.len()));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
+        let lowered: Vec<(Operand, Ty)> = call_args.iter().map(|a| self.lower_expr(a)).collect();
+        let mut bind: HashMap<String, String> = HashMap::new();
+        // Explicit positional generic args.
+        for (i, ta) in targs.iter().enumerate() {
+            let tp = g.tparams[i].clone();
+            if g.comptime.get(i).copied().unwrap_or(false) {
+                match const_eval(ta) {
+                    Some(CVal::Int(v)) => {
+                        bind.insert(tp, v.to_string());
+                    }
+                    _ => {
+                        self.errs.push(format!("turbofish `{callee}[{tp}]`: value generic must be a comptime Int"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
+                }
+            } else {
+                match ta {
+                    Expr::Ident(n, _) => {
+                        bind.insert(tp, n.clone());
+                    }
+                    _ => {
+                        self.errs.push(format!("turbofish `{callee}[{tp}]`: type argument must be a type name"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
+                }
+            }
+        }
+        // Infer any type params not given explicitly, from the argument types.
+        for (i, pty) in g.param_tys.iter().enumerate() {
+            if let Some(t) = pty {
+                if g.tparams.contains(&t.name) && !bind.contains_key(&t.name) {
+                    if let Some((op, ty)) = lowered.get(i) {
+                        let cls = self.class_of_operand(op);
+                        bind.entry(t.name.clone()).or_insert_with(|| concrete_tyname(*ty, cls.as_ref()));
+                    }
+                }
+            }
+        }
+        let targ_strs: Vec<String> = g.tparams.iter().map(|tp| bind.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
+        let sym = mono_sym(callee, &targ_strs);
+        self.mono.push((callee.to_string(), targ_strs));
+        let ret = g.ret.as_ref().map(|t| ty_of(Some(&subst_type(t, &bind)))).unwrap_or(Ty::Void);
+        let ret_class = g.ret.as_ref().and_then(|t| class_of(Some(&subst_type(t, &bind))));
+        let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
+        if ret == Ty::Void {
+            self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
+            return (Operand::ConstI64(0), Ty::Void);
+        }
+        let d = self.new_local(ret);
+        if let Some(c) = ret_class {
+            self.local_class.insert(d.0, c);
+        }
+        self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
+        (Operand::Copy(d), ret)
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr]) -> (Operand, Ty) {

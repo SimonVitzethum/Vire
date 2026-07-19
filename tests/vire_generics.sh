@@ -67,6 +67,34 @@ fn need[T: A + Show](x: T) -> Int { x.a() }
 fn main() { print(need(Only(1))) }
 EOF
 
+# value generics: distinct monomorph per N; N substituted as a literal so
+# `array(N)` becomes a constant-size (stack-promotable) array
+ok_case value_generic "$(printf '30\n285')" <<'EOF'
+fn build_sum[comptime N: Int]() -> Int {
+    mut a = array(N)
+    mut i = 0
+    while i < N { a[i] = i * i  i = i + 1 }
+    mut s = 0
+    mut j = 0
+    while j < N { s = s + a[j]  j = j + 1 }
+    s
+}
+fn main() { print(build_sum[5]())  print(build_sum[10]()) }
+EOF
+
+# turbofish with a scalar arg, and type-only turbofish
+ok_case turbofish_mixed "$(printf '28\n99')" <<'EOF'
+fn repeat[comptime N: Int](x: Int) -> Int { mut s = 0  for i in 0..N { s = s + x }  s }
+fn id[T](x: T) -> T { x }
+fn main() { print(repeat[4](7))  print(id[Int](99)) }
+EOF
+
+# too many generic args → rejected
+err_case turbofish_arity "generic arg" <<'EOF'
+fn f[comptime N: Int]() -> Int { N }
+fn main() { print(f[1, 2]()) }
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

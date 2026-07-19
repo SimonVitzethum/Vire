@@ -724,10 +724,33 @@ impl Parser {
                     e = Expr::Call { callee: Box::new(e), args, span: sp };
                 }
                 Tok::LBracket => {
+                    // `f[T, N](args)` turbofish (explicit generic args) vs `a[i]`
+                    // indexing. Only a bare-identifier base can be a turbofish; the
+                    // trailing `(` after `]` disambiguates (an array element is never
+                    // callable in Vire). The bracket content parses the same for both.
                     self.bump();
-                    let index = self.parse_expr(0);
+                    let mut targs = vec![self.parse_expr(0)];
+                    let multi = self.eat(&Tok::Comma);
+                    if multi {
+                        loop {
+                            targs.push(self.parse_expr(0));
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                    }
                     self.expect(&Tok::RBracket, "']'");
-                    e = Expr::Index { base: Box::new(e), index: Box::new(index), span: sp };
+                    if let (Expr::Ident(name, _), Tok::LParen) = (&e, self.peek()) {
+                        let name = name.clone();
+                        let args = self.parse_call_args();
+                        e = Expr::TurboCall { callee: name, targs, args, span: sp };
+                    } else if !multi {
+                        let index = targs.pop().unwrap();
+                        e = Expr::Index { base: Box::new(e), index: Box::new(index), span: sp };
+                    } else {
+                        self.err("`[a, b]` is only valid as turbofish `f[..](..)`");
+                        e = Expr::Index { base: Box::new(e), index: Box::new(targs.pop().unwrap()), span: sp };
+                    }
                 }
                 Tok::Question => {
                     self.bump();
