@@ -2,6 +2,7 @@
 //! (language/FRONTEND-PLAN.md). Backend/solver remain unchanged.
 
 pub mod ast;
+pub mod cblock;
 pub mod diag;
 pub mod expand;
 pub mod infer;
@@ -11,6 +12,7 @@ pub mod lower;
 pub mod parser;
 pub mod syntax;
 
+pub use cblock::desugar_cblocks;
 pub use diag::Diag;
 pub use expand::expand_macros;
 pub use infer::infer_module;

@@ -408,6 +408,18 @@ fn build_or_run(args: &[String]) {
         }
     }
 
+    // First-class inline blocks: `@c(""" … """, caps)` / `@asm(…)` → a generated
+    // `native "c"`/`native "asm"` function + an `extern "C"` decl + a call at the
+    // site. Runs before the native-block collection below so the generated blocks are
+    // compiled and verified like any other native block.
+    let cblock_errs = vire::desugar_cblocks(&mut module);
+    if !cblock_errs.is_empty() {
+        for e in &cblock_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
+
     // C++ bridge generator: `cxx { fn sig = "c++ body" }` → generate an
     // `extern "C"` trampoline per fn (compiled via the native "c++" path) and
     // replace the item with an `extern` item so that infer/lower see the
