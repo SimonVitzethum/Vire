@@ -202,5 +202,12 @@ must write the assumption down, and it is logged.
    compile error. `vire audit FILE.vr` lists every inline block and its assumptions (or
    "fully proven") — the complete, named trust boundary. Demonstrated: `@assume:
    valid_returns` discharges a `no_null_deref` UNKNOWN.
-6. **CSolver as a crate dependency** (structured verdicts; no subprocess).
-7. Verification **cache** (content-addressed per block).
+6. **[done] CSolver vendored + called as a crate** — the verifier lives in `crates/csolver/`
+   (16 crates, no external deps), built into this workspace, and `vire` calls
+   `csolver_verifier::verify_module` directly (structured verdicts, no subprocess, no
+   external `solver` binary needed).
+7. **[done] verification cache** — content-addressed per block (hash of kind + source);
+   an unchanged block prints "PASS (…, cached)" and skips re-verification.
+8. **[done] broader captures** — scalars (Int/Float/Bool) + int/float buffers (array→long*,
+   farray→double*). *Still harder:* struct capture (field-layout matching) and
+   multi-dimensional arrays.
