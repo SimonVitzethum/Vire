@@ -72,6 +72,13 @@ pub fn run(program: &mut Program) -> Stats {
             }
         }
     }
+    // Functions invoked through generated/native glue invisible to RTA (Vire
+    // `spawn` workers, called from their C shim via jrt_spawn) → keep as roots.
+    for name in &program.exported {
+        if func_index.contains_key(name) {
+            roots.push(name.clone());
+        }
+    }
     // Runnable.run() implementations are invoked through the native thread
     // trampoline (invisible to RTA) → treat them as roots.
     if program.class("java/lang/Runnable").is_some() {

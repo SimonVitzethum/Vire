@@ -10,11 +10,13 @@ pub mod inline;
 pub mod lexer;
 pub mod lower;
 pub mod parser;
+pub mod spawn;
 pub mod syntax;
 
 pub use cblock::desugar_cblocks;
 pub use diag::Diag;
 pub use expand::expand_macros;
+pub use spawn::desugar_spawn;
 pub use infer::infer_module;
 pub use inline::inline_recursion;
 pub use lower::lower_module;

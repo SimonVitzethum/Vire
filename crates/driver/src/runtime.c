@@ -1389,6 +1389,99 @@ void jrt_thread_start(void *thread) {
 void jrt_thread_join(void *thread) { (void)thread; }
 #endif
 
+/* --- Vire concurrency: spawn/join + Atomic ---------------------------------
+ * A first-class, function-pointer thread model for Vire `spawn f(arg)` (distinct
+ * from the Java Runnable/vtable path above). `jrt_spawn` takes a worker
+ * `long(void*)` and its single argument, runs it on a pthread, and returns an
+ * opaque handle; `jrt_join` waits and yields the worker's return value.
+ *
+ * The handle/Atomic/Mutex objects carry a jrt object header with refcount = -1
+ * (immortal → retain/release are no-ops and they are NOT tracked in
+ * live_objects), exactly like the Vire `list()`/`map()` objects: RC-safe when
+ * held in a Vire ref local, and the heap-balance oracle stays at 0-live. They
+ * are small and freed at process exit (documented, like the global monitor).
+ *
+ * Under FASTLLVM_THREADS the RC path is already atomic (see jrt_retain above),
+ * so shared refcounted state crossing threads is safe; without it, `spawn` runs
+ * the worker synchronously (a valid sequential schedule) and Atomic is a plain
+ * counter. */
+#ifndef FASTLLVM_FREESTANDING /* needs malloc/pthreads — hosted only */
+typedef struct {
+    int64_t refcount; /* jrt header: immortal */
+    void *vtable;
+    int64_t (*fn)(void *);
+    void *arg;
+    int64_t result;
+    int64_t tid;
+} VThread;
+
+typedef struct {
+    int64_t refcount;
+    void *vtable;
+    int64_t val;
+} VAtomic;
+
+#if defined(FASTLLVM_THREADS) && !defined(FASTLLVM_FREESTANDING)
+static void *vthread_tramp(void *p) {
+    VThread *t = (VThread *)p;
+    t->result = t->fn(t->arg);
+    return NULL;
+}
+void *jrt_spawn(int64_t (*fn)(void *), void *arg) {
+    VThread *t = (VThread *)malloc(sizeof(VThread));
+    t->refcount = -1;
+    t->vtable = 0;
+    t->fn = fn;
+    t->arg = arg;
+    t->result = 0;
+    pthread_t tid;
+    pthread_create(&tid, NULL, vthread_tramp, t);
+    t->tid = (int64_t)tid;
+    return t;
+}
+int64_t jrt_join(void *h) {
+    if (!h) return 0;
+    VThread *t = (VThread *)h;
+    if (t->tid) pthread_join((pthread_t)t->tid, NULL);
+    t->tid = 0;
+    return t->result;
+}
+int64_t jrt_atomic_add(void *a, int64_t d) {
+    return __atomic_fetch_add(&((VAtomic *)a)->val, d, __ATOMIC_SEQ_CST);
+}
+int64_t jrt_atomic_get(void *a) {
+    return __atomic_load_n(&((VAtomic *)a)->val, __ATOMIC_SEQ_CST);
+}
+#else
+void *jrt_spawn(int64_t (*fn)(void *), void *arg) {
+    /* No threads: run synchronously now, stash the result for jrt_join. */
+    VThread *t = (VThread *)malloc(sizeof(VThread));
+    t->refcount = -1;
+    t->vtable = 0;
+    t->fn = fn;
+    t->arg = arg;
+    t->tid = 0;
+    t->result = fn(arg);
+    return t;
+}
+int64_t jrt_join(void *h) { return h ? ((VThread *)h)->result : 0; }
+int64_t jrt_atomic_add(void *a, int64_t d) {
+    int64_t old = ((VAtomic *)a)->val;
+    ((VAtomic *)a)->val = old + d;
+    return old;
+}
+int64_t jrt_atomic_get(void *a) { return ((VAtomic *)a)->val; }
+#endif
+
+void *jrt_atomic_new(int64_t v) {
+    VAtomic *a = (VAtomic *)malloc(sizeof(VAtomic));
+    a->refcount = -1;
+    a->vtable = 0;
+    a->val = v;
+    return a;
+}
+#endif /* !FASTLLVM_FREESTANDING */
+
 /* --- Bacon-Rajan: MarkRoots / ScanRoots / CollectRoots --------------- */
 #ifdef FASTLLVM_COLLECTOR
 

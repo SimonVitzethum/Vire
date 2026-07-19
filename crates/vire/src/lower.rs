@@ -1888,6 +1888,25 @@ impl<'a> FnLower<'a> {
             }
             // Methods on growing lists ($List) and maps ($Map).
             if let Some(sent) = self.class_of_operand(&obj) {
+                // `$Atomic` = a locally-constructed `Atomic(..)`; `Atomic` = a value
+                // arriving typed as such (e.g. a worker parameter `c: Atomic`).
+                if sent == "$Atomic" || sent == "Atomic" {
+                    // `a.fetch_add(d)` (returns the previous value), `a.load()`.
+                    let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
+                    let (func, ret): (&str, Ty) = match name.as_str() {
+                        "fetch_add" | "add" => ("jrt_atomic_add", Ty::I64),
+                        "load" | "get" => ("jrt_atomic_get", Ty::I64),
+                        _ => {
+                            self.errs.push(format!("Atomic has no method `{name}` (fetch_add/load)"));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                    };
+                    let mut all = vec![obj];
+                    all.extend(a);
+                    let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
                 if sent == "$List" {
                     let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
                     let (func, ret): (&str, Ty) = match name.as_str() {
@@ -2124,6 +2143,21 @@ impl<'a> FnLower<'a> {
             self.local_class.insert(d.0, sentinel.into());
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![] });
             return (Operand::Copy(d), Ty::Ref);
+        }
+        // `Atomic(v)` → shared atomic counter (a `$Atomic` ref; immortal, thread-safe).
+        if name == "Atomic" {
+            let init = lowered.into_iter().next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "$Atomic".into());
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_atomic_new".into(), args: vec![init] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        // `join(h)` → wait for the spawned thread, yield its result.
+        if name == "join" {
+            let h = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstNull);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_join".into(), args: vec![h] });
+            return (Operand::Copy(d), Ty::I64);
         }
         // Builtin `str(x)` → text representation (Ref).
         if name == "str" {

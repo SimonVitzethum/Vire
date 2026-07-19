@@ -404,6 +404,7 @@ fn build_or_run(args: &[String]) {
     // the vendored CSolver verifier (linked in — no external binary) or it is a compile
     // error. `--noverify` turns it off.
     let mut noverify = false;
+    let mut threads_flag = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -415,6 +416,9 @@ fn build_or_run(args: &[String]) {
                 }
             },
             "--noverify" => noverify = true,
+            // Force the threads runtime even without `spawn` (atomic RC + pthreads).
+            // `spawn` enables it automatically; this is for explicit control.
+            "--threads" => threads_flag = true,
             // Obsolete: the verifier is now linked in (vendored). Accept + ignore the
             // old `--verify-c <path>` form so existing invocations keep working.
             "--verify-c" => {
@@ -525,6 +529,16 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // `spawn f(arg)` → generated worker shim + `jrt_spawn`. Any spawn forces the
+    // threads runtime (atomic RC + pthreads), enabled automatically below.
+    let (spawn_errs, spawn_workers) = vire::desugar_spawn(&mut module);
+    if !spawn_errs.is_empty() {
+        for e in &spawn_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
+    let want_threads = !spawn_workers.is_empty();
 
     // C++ bridge generator: `cxx { fn sig = "c++ body" }` → generate an
     // `extern "C"` trampoline per fn (compiled via the native "c++" path) and
@@ -601,6 +615,9 @@ fn build_or_run(args: &[String]) {
         eprintln!("no entry point: expected `fn main()`");
         exit(1);
     }
+    // Spawn workers are called only from their generated C shim (invisible to the
+    // solver's RTA) → keep them as reachability roots so they are not pruned.
+    program.exported = spawn_workers;
     // Also trigger the Python bridge when `py_*` is used WITHOUT an extern block
     // (the signatures are built in) — detectable on the lowered program.
     if !want_py_bridge {
@@ -663,6 +680,10 @@ fn build_or_run(args: &[String]) {
     let mut want_python = false;
     for (i, (abi, code)) in native_blocks.iter().enumerate() {
         let a = abi.to_ascii_lowercase();
+        // Compiler-generated glue (`c-glue`, e.g. the `spawn` shim): compiled as C
+        // but exempt from the verification gate — it is a trusted runtime handoff,
+        // not user `unsafe`.
+        let glue = a == "c-glue";
         let ext = if a == "c++" || a == "cpp" || a == "cxx" {
             want_cpp = true;
             "cpp"
@@ -684,7 +705,7 @@ fn build_or_run(args: &[String]) {
         // (called as a library — structured verdicts, no subprocess) — the sound
         // replacement for a blind `unsafe`. A block that cannot be proven safe is a
         // compile error, not a runtime hazard. `--noverify` opts out.
-        if !noverify && (ext == "c" || ext == "s") {
+        if !noverify && !glue && (ext == "c" || ext == "s") {
             match verify_native_block(&p, code, ext, &build_dir, i) {
                 Ok(cached) => eprintln!(
                     "verify: native \"{abi}\" block {i}: PASS (proven memory-safe{})",
@@ -748,6 +769,13 @@ fn build_or_run(args: &[String]) {
             // if a site is missing from the profile, that is not an error (just uninstrumented codegen).
             cmd.arg("-Wno-profile-instr-unprofiled").arg("-Wno-profile-instr-out-of-date");
         }
+    }
+    // Threads: enabled automatically when the program uses `spawn` (or explicitly
+    // via `--threads`). Switches on atomic reference counting + pthreads. Note the
+    // incremental cycle collector is disabled under threads (documented limit in
+    // runtime.c), so it composes with the acyclic/NO_CYCLES flags below.
+    if want_threads || threads_flag {
+        cmd.arg("-DFASTLLVM_THREADS").arg("-pthread");
     }
     if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");

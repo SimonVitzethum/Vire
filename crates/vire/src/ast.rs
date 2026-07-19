@@ -179,6 +179,11 @@ pub enum Expr {
     /// `&`-marked inputs are borrowed/read-only (no copy). See
     /// language/CAPSULE-EVALUATION.md.
     Capsule { inputs: Vec<(String, bool)>, body: Block, span: Span },
+    /// `spawn f(arg)` — run a call on a new thread, safe by construction. The
+    /// inner expression is the spawned call; lowering (see `spawn.rs`) desugars
+    /// it to a generated worker shim + `jrt_spawn`, yielding a thread handle that
+    /// `join(h)` awaits. See language/REFERENCE.md §10.
+    Spawn { call: Box<Expr>, span: Span },
 }
 
 #[derive(Debug, Clone)]

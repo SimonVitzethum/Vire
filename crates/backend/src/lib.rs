@@ -178,6 +178,12 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_monitor_exit", "void (ptr)"),
     ("jrt_thread_start", "void (ptr)"),
     ("jrt_thread_join", "void (ptr)"),
+    // Vire concurrency: spawn/join + Atomic (jrt_spawn itself is referenced only
+    // from the generated per-worker C shim, so it needs no IR declaration here).
+    ("jrt_join", "i64 (ptr)"),
+    ("jrt_atomic_new", "ptr (i64)"),
+    ("jrt_atomic_add", "i64 (ptr, i64)"),
+    ("jrt_atomic_get", "i64 (ptr)"),
     ("jrt_class_getname", "ptr (ptr)"),
     ("jrt_class_getsimplename", "ptr (ptr)"),
     ("jrt_parse_int", "i32 (ptr)"),

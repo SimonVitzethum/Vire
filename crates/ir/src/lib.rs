@@ -295,6 +295,10 @@ pub struct Program {
     /// (JAR manifest `Main-Class` or `--main`). Only its `main` becomes
     /// `java_main`; if `None`, any `main` method applies (single-file mode).
     pub main_class: Option<String>,
+    /// Functions kept as reachability roots because they are invoked through
+    /// generated/native glue invisible to RTA (e.g. a Vire `spawn` worker, called
+    /// from its C shim via `jrt_spawn`). Analogous to the Runnable.run() roots.
+    pub exported: Vec<String>,
 }
 
 impl Program {

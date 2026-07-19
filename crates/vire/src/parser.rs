@@ -814,6 +814,15 @@ impl Parser {
                 let body = self.parse_block();
                 Expr::Capsule { inputs, body, span: sp }
             }
+            Tok::Kw(Kw::Spawn) => {
+                // `spawn f(arg)` — the inner call runs on a new thread. Parse the
+                // call at primary+postfix level so `f(arg)` is captured (but not a
+                // trailing binary operator).
+                self.bump();
+                let prim = self.parse_primary();
+                let inner = self.parse_postfix(prim);
+                Expr::Spawn { call: Box::new(inner), span: sp }
+            }
             Tok::At => {
                 // compiler intrinsic @name(...) — as a call on ident "@name"
                 self.bump();
