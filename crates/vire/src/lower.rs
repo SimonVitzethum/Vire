@@ -1042,7 +1042,7 @@ impl<'a> FnLower<'a> {
             || self.variants.contains_key(n)
             || self.generic_ptypes.contains_key(n)
             || self.variant_owner_g.contains_key(n)
-            || matches!(n, "list" | "map" | "array" | "farray")
+            || matches!(n, "list" | "map" | "set" | "array" | "farray")
     }
 
     /// AUTOMATIC LOOP ARENA (escape→arena). A `while` iteration whose
@@ -2049,7 +2049,7 @@ impl<'a> FnLower<'a> {
                     return (Operand::ConstI64(0), Ty::Void);
                 }
             }
-            let (obj, _) = self.lower_expr(base);
+            let (obj, base_ty) = self.lower_expr(base);
             // `xs.len()` on an array → ArrayLen.
             if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
                 let l = self.array_len_i64(obj);
@@ -2166,6 +2166,83 @@ impl<'a> FnLower<'a> {
                         return (Operand::ConstI64(0), Ty::Void);
                     }
                     let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
+                if sent == "$Set" {
+                    // A hash set of Ints (backed by the map runtime). `add`/`remove`
+                    // return void/bool, `contains` a bool, `len` the count.
+                    let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
+                    let (func, ret): (&str, Ty) = match name.as_str() {
+                        "add" => ("vire_set_add", Ty::Void),
+                        "contains" => ("vire_set_contains", Ty::I64),
+                        "remove" => ("vire_set_remove", Ty::I64),
+                        "len" => ("vire_set_len", Ty::I64),
+                        _ => {
+                            self.errs.push(format!("Set has no method `{name}` (add/contains/remove/len)"));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                    };
+                    let mut all = vec![obj];
+                    all.extend(a);
+                    if ret == Ty::Void {
+                        self.emit(Statement::Call { dest: None, func: func.into(), args: all });
+                        return (Operand::ConstI64(0), Ty::Void);
+                    }
+                    let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
+            }
+            // STRING methods. A string receiver is a bare `Ty::Ref` carrying no
+            // sentinel/class (a literal, a concat/`str()` result, or a `Str`-typed
+            // parameter — `class_of` returns `None`/`"Str"`). Route only KNOWN
+            // method names to the `jrt_str_*` runtime; anything else falls through
+            // to the "annotate the receiver" error so genuine unknown-type calls
+            // still fail. Arg kinds: `'i'` = index → i32, else a string ref.
+            if base_ty == Ty::Ref
+                && self.arr_of_operand(&obj).is_none()
+                && self.class_of_operand(&obj).as_deref().map_or(true, |c| c == "Str")
+            {
+                // (func, Vire result type, arg kinds). The `jrt_str_*` runtime
+                // returns i32 for every scalar; an `Int`-typed result (`Ty::I64`)
+                // is therefore widened from the i32 the call yields, whereas a
+                // `Bool` result (`Ty::I32`) is used verbatim (Vire `Bool` = i32).
+                let strm: Option<(&str, Ty, &[char])> = match name.as_str() {
+                    "len" | "length" => Some(("jrt_str_length", Ty::I64, &[])),
+                    "charAt" | "char_at" => Some(("jrt_str_char_at", Ty::I64, &['i'])),
+                    "indexOf" | "index_of" => Some(("jrt_str_indexof", Ty::I64, &['r'])),
+                    "compareTo" | "compare_to" => Some(("jrt_str_compareto", Ty::I64, &['r'])),
+                    "isEmpty" | "is_empty" => Some(("jrt_str_is_empty", Ty::I32, &[])),
+                    "equals" => Some(("jrt_str_equals", Ty::I32, &['r'])),
+                    "startsWith" | "starts_with" => Some(("jrt_str_startswith", Ty::I32, &['r'])),
+                    "endsWith" | "ends_with" => Some(("jrt_str_endswith", Ty::I32, &['r'])),
+                    "trim" => Some(("jrt_str_trim", Ty::Ref, &[])),
+                    "lower" | "toLowerCase" | "to_lower" => Some(("jrt_str_lower", Ty::Ref, &[])),
+                    "upper" | "toUpperCase" | "to_upper" => Some(("jrt_str_upper", Ty::Ref, &[])),
+                    "substring" if args.len() == 1 => Some(("jrt_str_substring1", Ty::Ref, &['i'])),
+                    "substring" => Some(("jrt_str_substring2", Ty::Ref, &['i', 'i'])),
+                    _ => None,
+                };
+                if let Some((func, ret, kinds)) = strm {
+                    let mut all = vec![obj];
+                    for (i, e) in args.iter().enumerate() {
+                        let (o, t) = self.lower_expr(e);
+                        all.push(match kinds.get(i) {
+                            Some('i') => self.to_i32(o),
+                            _ if t == Ty::Ref => o,
+                            _ => to_i64(o),
+                        });
+                    }
+                    // Integer result: the call is i32, widen to Int (i64).
+                    if ret == Ty::I64 {
+                        let d = self.new_local(Ty::I32);
+                        self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                        return (self.widen_i32(Operand::Copy(d)), Ty::I64);
+                    }
+                    let d = self.new_local(ret);
+                    // A string-returning method yields another string (chainable).
+                    if ret == Ty::Ref { self.local_class.insert(d.0, "Str".into()); }
                     self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
                     return (Operand::Copy(d), ret);
                 }
@@ -2350,9 +2427,14 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
             return (Operand::Copy(arr), Ty::Ref);
         }
-        // Collection builtins: `list()` (growing list), `map()` (Int→Int).
-        if name == "list" || name == "map" {
-            let (func, sentinel) = if name == "list" { ("vire_list_new", "$List") } else { ("vire_map_new", "$Map") };
+        // Collection builtins: `list()` (growing list), `map()` (Int→Int),
+        // `set()` (Int hash set).
+        if name == "list" || name == "map" || name == "set" {
+            let (func, sentinel) = match name.as_str() {
+                "list" => ("vire_list_new", "$List"),
+                "map" => ("vire_map_new", "$Map"),
+                _ => ("vire_set_new", "$Set"),
+            };
             let d = self.new_local(Ty::Ref);
             self.local_class.insert(d.0, sentinel.into());
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![] });

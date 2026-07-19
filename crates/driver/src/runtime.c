@@ -451,6 +451,17 @@ int64_t vire_map_remove(VMap *m, int64_t k) {
     return 0;
 }
 
+/* --- Set (Int) --------------------------------------------------------------
+ * A hash set is a map whose values are ignored, so it reuses VMap's tested
+ * open-addressing + backward-shift delete verbatim (dummy value 1). The `$Set`
+ * sentinel in the frontend keeps its method surface (add/contains/remove/len)
+ * distinct from a map's. */
+VMap *vire_set_new(void) { return vmap_new_cap(16); }
+void vire_set_add(VMap *m, int64_t k) { vire_map_put(m, k, 1); }
+int64_t vire_set_contains(VMap *m, int64_t k) { return vire_map_has(m, k); }
+int64_t vire_set_remove(VMap *m, int64_t k) { return vire_map_remove(m, k); }
+int64_t vire_set_len(VMap *m) { return m->len; }
+
 /* FFI: Vire string → NUL-terminated C `char*` (for extern-C functions that
  * expect `const char*`). Copies; the buffer is not freed again
  * (short-lived argument strings) — copy it yourself for lasting use. */
@@ -562,8 +573,9 @@ void *jrt_str_tostring(void *s) {
     return s;
 }
 
-/* Forward declaration (str_from_buf is defined further below). */
+/* Forward declarations (defined further below). */
 static JStr *str_from_buf(const char *buf, int n);
+static JStr *str_alloc(int64_t len);
 void *jrt_obj_tostring(void *o) {
     (void)o;
     return str_from_buf("object", 6);
@@ -621,6 +633,26 @@ void *jrt_str_trim(const JStr *s) {
     while (a < b && (unsigned char)s->bytes[a] <= ' ') a++;
     while (b > a && (unsigned char)s->bytes[b - 1] <= ' ') b--;
     return str_from_buf((const char *)s->bytes + a, (int)(b - a));
+}
+/* ASCII case folding → new (RC-managed) strings (str_alloc / str_from_buf are
+ * declared above). Non-ASCII bytes pass through unchanged. */
+void *jrt_str_lower(const JStr *s) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    JStr *r = str_alloc(s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        uint8_t c = s->bytes[i];
+        r->bytes[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+    }
+    return r;
+}
+void *jrt_str_upper(const JStr *s) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    JStr *r = str_alloc(s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        uint8_t c = s->bytes[i];
+        r->bytes[i] = (c >= 'a' && c <= 'z') ? (uint8_t)(c - 32) : c;
+    }
+    return r;
 }
 
 /* --- Wrapper classes (autoboxing) -----------------------------------

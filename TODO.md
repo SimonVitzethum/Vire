@@ -85,11 +85,15 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 
 ## Stdlib + FFI
 
-- [~] **Collections breadth.** `list()` (push/pop/len/get/set/contains/clear) and
-  `map()` (put/get/has/remove/len) exist. Open: **`Str` methods** (lower/upper/split/
-  trim/…), **`Set`**, **iterators/adapters** (map/filter/fold over lists & ranges),
-  and the full **`Option`/`Result`** surface (`.wrap(msg)` context/chain — the core
-  `?`/`match` works).
+- [~] **Collections breadth.** `list()` (push/pop/len/get/set/contains/clear),
+  `map()` (put/get/has/remove/len), and **`set()`** (add/contains/remove/len — a
+  hash Set reusing the map runtime) exist. **`Str` methods** now dispatch too
+  (length/charAt/substring/indexOf/startsWith/endsWith/trim/lower/upper/isEmpty/
+  equals/compareTo → `jrt_str_*`; chainable, a string receiver is a bare `Ty::Ref`).
+  Open: **iterators/adapters** (map/filter/fold over lists & ranges — lambdas already
+  inline, so a fused-loop lowering is the path), **`Str.split`** (needs a typed
+  `list[Str]` — elements are pointers, not `Int`), and the full **`Option`/`Result`**
+  surface (`.wrap(msg)` context/chain — the core `?`/`match` works).
 
 ---
 
