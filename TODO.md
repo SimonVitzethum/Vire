@@ -30,10 +30,18 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   loop **phis**, needing a phi-aware greatest-fixpoint + tracking of the non-strict
   `<=` loop guard. No production compiler does this for these patterns (rustc keeps
   the check); payoff caps at Rust parity (~14% on binsearch), not below clang.
-- [ ] **Allocator gap (pagerank/binary-trees).** Region inference has closed the RC
-  gap on the traversal path (hot loop is retain/release-free); the residual ~2×–2.7×
-  to Rust/C++ is **malloc-per-node vs bulk/arena allocation** — addressable via
-  capsule/arena promotion, orthogonal to borrow analysis (see M0.2 / capsule docs).
+- [~] **Allocator gap.** Region inference closed the RC gap on traversal; the
+  auto-arena (escape→arena) now covers `for`-loops and non-escaping scalar-store
+  loops too, and arrays participate in the arena (all sound, heap-balanced —
+  tests/vire_heap.sh). btree measures **1.08× Rust / 1.38× C++** (the cited
+  malloc-per-node case is already at parity). **Still open — the real array win:**
+  *stack-promote non-escaping fixed-size arrays* (`StackNewArray`→alloca, like
+  objects get `StackNew`). Measured: a `for` loop over `array(16)` is ~20× Rust,
+  because clang *eliminates* the non-escaping alloc entirely (scalar replacement)
+  while Vire still allocates. Needs: array alloc-site escape collection +
+  const-size gate + IR variant + backend sized-alloca. Bounded, high-value.
+- [ ] **pagerank/ring** is the collector case (persistent shared cycle), not an
+  allocator one — the distance there is the cycle collector, orthogonal to arenas.
 - [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
   field array) — closes part of the residual toward ~1.1×.
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and
@@ -45,8 +53,8 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 - [~] **Error messages** — panic-mode recovery now collects multiple diagnostics;
   still open: fix suggestions and pointing near the true cause.
 - [~] **Trait resolution + coherence.** Duplicate/overlapping method definitions per
-  type are now rejected; still open: overlapping **generic** impls, full trait
-  resolution beyond the flat monomorphic case.
+  type are rejected; **bounded generics `[T: Trait]` resolve + are enforced** (see
+  [2]). Still open: overlapping **generic** impls, coherence across impls.
 - [~] **Monomorphization** — works via the inliner/`instantiate`; full value-generic
   monomorphization (`[comptime N: Int]`, distinct instances per N) is open.
 - [~] **`comptime` evaluator.** `comptime if` (conditional compilation, drops the
@@ -72,18 +80,30 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 
 ### [1] Multithreading, safe by construction
 Attach: backend `--threads` (atomic RC, pthreads, monitor) — present.
-- [ ] `Channel[T]`, `spawn`, `Mutex[T]`, `Atomic[T]` in the stdlib (`spawn` keyword
-  is lexed but not yet parsed/lowered).
+- [x] **`spawn f(arg)` + `join(h)` + `Atomic`** (`.fetch_add`/`.load`) — Vire
+  frontend wired to the runtime via a generated per-worker C shim + `jrt_spawn`
+  (function-pointer thread model); threads auto-enable on `spawn`. Workers kept as
+  RTA roots via `Program.exported`. tests/vire_threads.sh (5/5, atomic counter
+  deterministic ×20). See spawn.rs.
+- [x] **Send check**: a `spawn` worker's parameter must be a scalar (copied) or a
+  Sync type (`Atomic`/`Mutex`); sharing a bare mutable record/list is a compile
+  error — a data race cannot be written.
+- [ ] `Channel[T]`, `Mutex[T]` methods (`.lock`), multi-argument workers (env
+  struct — currently single-arg only).
 - [ ] `parallel_map`/`parallel_for` (fork-join).
-- [ ] **Send check**: a value passed to `spawn` must be moved/copied *or* a Sync type,
-  else a compile error (conservative — same analysis as the iterator check §9a).
 - [ ] (M0.1c) measure real multithread atomic contention.
 
 ### [2] Template programming
 Attach: monomorphization (front-end) + `comptime`.
-- [ ] Generics `[T: Trait]`, multiple bounds.
-- [ ] Value generics `[comptime N: Int]`, fixed arrays `[T; N]`.
-- [ ] Monomorphization + static trait resolution → direct calls.
+- [x] Generics `[T: Trait]`, multiple bounds `T: A + B`, **static trait resolution
+  → direct (in fact inlined) calls** — works via monomorphization; a violated
+  bound is now a precise compile error at the instantiation (enforced in the mono
+  worklist). tests/vire_generics.sh.
+- [ ] Value generics `[comptime N: Int]`, fixed arrays `[T; N]`. Bounds/`is_comptime`
+  parse but value generics need call-site turbofish `f[N](..)` (parser lookahead vs
+  indexing) + value substitution; fixed arrays need `[T; N]` in `parse_type`.
+- [ ] Overlapping/coherence checking for generic impls; inference of a type arg that
+  appears only in return position (defaults to `Int` today).
 
 ### [3] Compile-time reflection
 Attach: whole-program type graph + `comptime`.
