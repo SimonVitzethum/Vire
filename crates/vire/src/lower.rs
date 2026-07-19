@@ -1041,6 +1041,50 @@ impl<'a> FnLower<'a> {
     /// Inline a lambda body at the current position: bind each parameter to a
     /// fresh local holding the corresponding argument, lower the body, return its
     /// value. Mirrors the `local_lambda` call path — no closure object is made.
+    /// Build the printable expression for a `log.LEVEL(...)` call. With a literal
+    /// message containing `{}` placeholders and matching extra args, it is a **structured
+    /// field** log: `log.info("user={} ms={}", id, t)` → `"[INFO] user=" + str(id) + " ms="
+    /// + str(t)`, interpolated at compile time (no parser change; positional args, so the
+    /// disabled-call = zero-cost property is preserved). A placeholder/arg count mismatch
+    /// is a compile error. A non-literal message is printed as-is (no tag). Returns `None`
+    /// on error (a diagnostic was pushed).
+    fn build_log_message(&mut self, level: &str, tag: &str, msg: &Expr, extra: &[Expr], span: crate::diag::Span) -> Option<Expr> {
+        use crate::ast::BinOp;
+        let Expr::Str(s, sp) = msg else {
+            // Non-literal message (e.g. a built string): emit it verbatim.
+            if !extra.is_empty() {
+                self.errs.push(format!("log.{level}: structured fields need a literal message with `{{}}`"));
+                return None;
+            }
+            return Some(msg.clone());
+        };
+        if !s.contains("{}") {
+            if !extra.is_empty() {
+                self.errs.push(format!("log.{level}: {} extra argument(s) but no `{{}}` in the message", extra.len()));
+                return None;
+            }
+            return Some(Expr::Str(format!("{tag}{s}"), *sp));
+        }
+        let segs: Vec<&str> = s.split("{}").collect();
+        let nph = segs.len() - 1;
+        if nph != extra.len() {
+            self.errs.push(format!("log.{level}: {nph} `{{}}` placeholder(s) but {} argument(s)", extra.len()));
+            return None;
+        }
+        // tag+seg0 + str(a0) + seg1 + str(a1) + … (drop empty trailing segments).
+        let mut e = Expr::Str(format!("{tag}{}", segs[0]), *sp);
+        let add = |lhs: Expr, rhs: Expr| Expr::Binary { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs), span: *sp };
+        for (i, a) in extra.iter().enumerate() {
+            let stra = Expr::Call { callee: Box::new(Expr::Ident("str".into(), *sp)), args: vec![a.clone()], span: *sp };
+            e = add(e, stra);
+            if !segs[i + 1].is_empty() {
+                e = add(e, Expr::Str(segs[i + 1].to_string(), *sp));
+            }
+        }
+        let _ = span;
+        Some(e)
+    }
+
     fn apply_lambda(&mut self, params: &[String], body: &Expr, args: &[(Operand, Ty)]) -> (Operand, Ty) {
         self.scopes.push(HashMap::new());
         for (p, (op, ty)) in params.iter().zip(args) {
@@ -2189,8 +2233,10 @@ impl<'a> FnLower<'a> {
             // level tag to a literal message at compile time and print it.
             if let Expr::Ident(id, _) = base.as_ref() {
                 if id == "log" {
-                    // 0=debug 1=info 2=warn 3=error. Default threshold: info and up.
-                    const LOG_THRESHOLD: i32 = 1;
+                    // 0=debug 1=info 2=warn 3=error. Threshold is a BUILD-TIME choice
+                    // (`FASTLLVM_LOG_LEVEL`/`--log-level`, default info): a level below it
+                    // lowers to nothing (zero instructions).
+                    let threshold = log_threshold();
                     let (level, tag) = match name.as_str() {
                         "debug" => (0, "[DEBUG] "),
                         "info" => (1, "[INFO] "),
@@ -2201,18 +2247,17 @@ impl<'a> FnLower<'a> {
                             return (Operand::ConstI64(0), Ty::Void);
                         }
                     };
-                    if level >= LOG_THRESHOLD {
+                    if level >= threshold {
                         if let Some(msg) = args.first() {
-                            let printed = match msg {
-                                Expr::Str(s, sp) => Expr::Str(format!("{tag}{s}"), *sp),
-                                other => other.clone(),
-                            };
-                            let call = Expr::Call {
-                                callee: Box::new(Expr::Ident("print".into(), *span)),
-                                args: vec![printed],
-                                span: *span,
-                            };
-                            self.lower_expr(&call);
+                            let printed = self.build_log_message(&name, tag, msg, &args[1..], *span);
+                            if let Some(printed) = printed {
+                                let call = Expr::Call {
+                                    callee: Box::new(Expr::Ident("print".into(), *span)),
+                                    args: vec![printed],
+                                    span: *span,
+                                };
+                                self.lower_expr(&call);
+                            }
                         }
                     }
                     // Below threshold: emit nothing at all.
@@ -3474,6 +3519,19 @@ fn arrkind_of(t: Ty) -> ArrKind {
         Ty::I32 => ArrKind::Int,
         Ty::Ref => ArrKind::Ref,
         _ => ArrKind::Long,
+    }
+}
+
+/// Build-time log threshold (`FASTLLVM_LOG_LEVEL`, set by `--log-level`): a level below
+/// it lowers to nothing. debug=0 info=1 warn=2 error=3 off=4; default info.
+fn log_threshold() -> i32 {
+    match std::env::var("FASTLLVM_LOG_LEVEL").ok().as_deref() {
+        Some("debug") => 0,
+        Some("info") => 1,
+        Some("warn") => 2,
+        Some("error") => 3,
+        Some("off") | Some("none") => 4,
+        _ => 1,
     }
 }
 

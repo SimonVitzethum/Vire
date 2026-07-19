@@ -542,6 +542,17 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
+            // Build-time minimum log level (debug|info|warn|error|off); default info.
+            // Levels below it lower to nothing (zero instructions). Read in lower.rs.
+            "--log-level" => match it.next() {
+                Some(l) if matches!(l.as_str(), "debug" | "info" | "warn" | "error" | "off" | "none") => {
+                    std::env::set_var("FASTLLVM_LOG_LEVEL", l);
+                }
+                _ => {
+                    eprintln!("--log-level needs one of: debug info warn error off");
+                    exit(2);
+                }
+            },
             "-O0" => opt0 = true,
             // MEASUREMENT: cycle collector forced OFF (even for cyclic types).
             // Unsound (leaks cycles), but isolates the collector cost against the

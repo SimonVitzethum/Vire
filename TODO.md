@@ -297,7 +297,12 @@ Attach: clang→object (present).
 
 ### [6] Logger — remaining
 The **compile-time level filter** (disabled calls = 0 instructions) works.
-- [ ] Structured fields, `with log.span(...)`.
+- [x] **Structured fields** via `{}` interpolation: `log.info("user={} ms={}", id, t)`
+  → `[INFO] user=<id> ms=<t>`, built at compile time (positional args, so the
+  zero-cost-when-disabled property holds); a placeholder/arg mismatch is a compile error.
+- [x] **Build-time level** `--log-level debug|info|warn|error|off` (env `FASTLLVM_LOG_LEVEL`),
+  default info; below-threshold calls lower to nothing. tests/vire_log.sh.
+- [ ] `with log.span(...)` (scoped context fields).
 - [ ] Sinks (colored console / JSON / file), chosen at build time.
 
 ### [7] Go-style error handling — remaining
