@@ -1,7 +1,7 @@
 //! Diagnostics with source span (byte range). Reporting errors close to the
 //! cause is ergonomics-critical (BEWERTUNG §5).
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Span(pub usize, pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -84,9 +84,16 @@ subsystem, sequenced.
   Preserves what the IR lattice erases — generics, nested type apps, borrow marks —
   i.e. exactly what reflection reads. Introspect with `vire types FILE.vr`.
   tests/vire_types.sh (15/15).
-- [ ] **Phase 1 — typed expressions.** A span-indexed side-table of inferred
-  expression types (AST nodes have no identity), populated by a strengthened
-  `infer.rs` — the actual *typed* AST.
+- [x] **Phase 1 — typed expressions.** [infer.rs](crates/vire/src/infer.rs)
+  `infer_module_typed` now returns an `ExprTypes` side-table: the resolved type of
+  every expression keyed by source span (`Span` gained `Hash`/`Ord`). AST nodes have
+  no identity, so the byte-range span is the key. `InferTy` = Int/Float/Bool/Ref/
+  Unit/Unknown — `Unknown` is an honest "inference couldn't constrain it", not a
+  default. Inference logic unchanged (recording is a pure addition); `infer_module`
+  is a thin wrapper. Introspect with `vire infer FILE.vr`. tests/vire_infer.sh (8/8).
+  Still open (Phase 1b): richer than the scalar lattice — user-type/generic identity
+  per expression (today they collapse to `Ref`), and synthesized/`Span(0,0)` nodes
+  from desugaring share keys.
 - [ ] **Phase 2 — move passes after inference.** comptime + macro expansion consume
   the type graph (macros currently run *before* inference — the untyped anti-pattern).
 - [ ] **Phase 3+ — features on the foundation:** the sequence below.

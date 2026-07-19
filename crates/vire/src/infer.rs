@@ -26,6 +26,48 @@ enum T {
     Var(u32),
 }
 
+/// Public, resolved type of an expression — the value stored in the typed-AST
+/// side-table. `Unknown` is a type variable that stayed free (nothing constrained
+/// it): honest about what inference could not determine, rather than defaulting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InferTy {
+    Int,
+    Float,
+    Bool,
+    Ref,
+    Unit,
+    Unknown,
+}
+
+impl InferTy {
+    pub fn name(self) -> &'static str {
+        match self {
+            InferTy::Int => "Int",
+            InferTy::Float => "Float",
+            InferTy::Bool => "Bool",
+            InferTy::Ref => "Ref",
+            InferTy::Unit => "Unit",
+            InferTy::Unknown => "?",
+        }
+    }
+    fn of(t: T) -> Self {
+        match t {
+            T::I64 => InferTy::Int,
+            T::F64 => InferTy::Float,
+            T::I32 => InferTy::Bool,
+            T::Ref => InferTy::Ref,
+            T::Void => InferTy::Unit,
+            T::Var(_) => InferTy::Unknown,
+        }
+    }
+}
+
+/// The typed AST: inferred type of every expression, keyed by its source span.
+/// AST nodes have no identity, so the span (byte range) is the key. This is the
+/// side-table Phase 1 produces — the persisted per-expression type view that
+/// comptime/reflection/macros consume.
+pub type ExprTypes = HashMap<Span, InferTy>;
+
 /// Union-find over type variables; concrete types are leaves.
 struct Unifier {
     parent: Vec<T>, // parent[v] for Var(v); non-Var = bound concrete type
@@ -83,7 +125,16 @@ struct Sig {
 /// conflict diagnostics (mistyped programs) — these MUST be reported, because
 /// the default fallback (I64) would otherwise silently miscompile them.
 pub fn infer_module(m: &mut Module) -> Vec<String> {
+    infer_module_typed(m).0
+}
+
+/// Like `infer_module`, but also returns the typed-AST side-table: the resolved
+/// type of every expression, keyed by source span. This is the Phase-1 foundation
+/// for the compile-time programming layer.
+pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
     let mut u = Unifier::new();
+    // Per-expression type record (type variables; resolved to concrete at the end).
+    let mut rec: HashMap<Span, T> = HashMap::new();
     // 1. Create global signature variables (annotated → concrete, otherwise fresh).
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
@@ -132,6 +183,7 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
                     sigs: &sigs,
                     scopes: vec![HashMap::new()],
                     ret: sig.ret,
+                    types: &mut rec,
                 };
                 for (p, pv) in f.sig.params.iter().zip(&sig.params) {
                     cx.bind(&p.name, *pv);
@@ -174,7 +226,42 @@ pub fn infer_module(m: &mut Module) -> Vec<String> {
         .collect();
     msgs.sort();
     msgs.dedup();
-    msgs
+
+    // Resolve the recorded type variables to concrete types → the typed AST.
+    let exprtypes: ExprTypes = rec.iter().map(|(s, t)| (*s, InferTy::of(u.resolve(*t)))).collect();
+    (msgs, exprtypes)
+}
+
+/// Source span of an expression node (the side-table key).
+fn expr_span(e: &Expr) -> Span {
+    match e {
+        Expr::Int(_, s)
+        | Expr::Float(_, s)
+        | Expr::Str(_, s)
+        | Expr::Char(_, s)
+        | Expr::Bool(_, s)
+        | Expr::Ident(_, s)
+        | Expr::SelfExpr(s)
+        | Expr::List(_, s)
+        | Expr::MapLit(_, s) => *s,
+        Expr::Unary { span, .. }
+        | Expr::Binary { span, .. }
+        | Expr::Call { span, .. }
+        | Expr::TurboCall { span, .. }
+        | Expr::Field { span, .. }
+        | Expr::Index { span, .. }
+        | Expr::If { span, .. }
+        | Expr::Match { span, .. }
+        | Expr::Lambda { span, .. }
+        | Expr::Comprehension { span, .. }
+        | Expr::Try { span, .. }
+        | Expr::Cast { span, .. }
+        | Expr::Comptime { span, .. }
+        | Expr::Range { span, .. }
+        | Expr::Capsule { span, .. }
+        | Expr::Spawn { span, .. } => *span,
+        Expr::Block(b) => b.span,
+    }
 }
 
 fn ty_name(t: T) -> &'static str {
@@ -193,6 +280,8 @@ struct Ctx<'a> {
     sigs: &'a HashMap<String, Sig>,
     scopes: Vec<HashMap<String, T>>,
     ret: T,
+    /// Typed-AST side-table being populated: span → (unresolved) type variable.
+    types: &'a mut HashMap<Span, T>,
 }
 
 impl<'a> Ctx<'a> {
@@ -284,7 +373,15 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Infer an expression's type AND record it in the typed-AST side-table,
+    /// keyed by the node's span.
     fn infer_expr(&mut self, e: &Expr) -> T {
+        let t = self.infer_expr_inner(e);
+        self.types.insert(expr_span(e), t);
+        t
+    }
+
+    fn infer_expr_inner(&mut self, e: &Expr) -> T {
         match e {
             Expr::Int(..) => T::I64,
             Expr::Float(..) => T::F64,

@@ -76,6 +76,36 @@ fn main() {
                 exit(1);
             }
         }
+        "infer" => {
+            // Dump the typed AST: the inferred type of every expression, keyed by
+            // source span (Phase 1 of the compile-time programming layer). Proves
+            // that per-expression types survive inference as a persisted table.
+            let (mut module, diags) = vire::parse(&src);
+            for d in &diags {
+                eprintln!("{}", d.render(&src));
+            }
+            if !diags.is_empty() {
+                exit(1);
+            }
+            if let Err(es) = vire::expand_macros(&mut module) {
+                for e in es {
+                    eprintln!("macro: {e}");
+                }
+                exit(1);
+            }
+            let (conflicts, types) = vire::infer_module_typed(&mut module);
+            for c in &conflicts {
+                eprintln!("{c}");
+            }
+            let mut rows: Vec<(vire::diag::Span, vire::InferTy)> = types.into_iter().collect();
+            rows.sort_by_key(|(s, _)| *s);
+            for (span, ty) in rows {
+                let (line, col) = vire::diag::line_col(&src, span.0);
+                let snippet = src.get(span.0..span.1).unwrap_or("").replace('\n', " ");
+                let snippet: String = snippet.chars().take(32).collect();
+                println!("{line}:{col}\t{}\t{snippet}", ty.name());
+            }
+        }
         "types" => {
             // Introspect the persisted, source-level type graph (the foundation of
             // the compile-time programming layer). Runs the front-end up to and
@@ -99,7 +129,7 @@ fn main() {
             print!("{}", graph.dump());
         }
         other => {
-            eprintln!("unknown command: {other} (parse|lex|types|build|run)");
+            eprintln!("unknown command: {other} (parse|lex|types|infer|build|run)");
             exit(2);
         }
     }
