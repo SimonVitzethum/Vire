@@ -73,7 +73,25 @@ graph* — so users get the power of metaprogramming without the classic C-prepr
 failure modes (blind text splicing, name capture, no type checking). Everything runs
 *after* parse+inference on typed nodes and is re-checked after expansion. This unifies
 features **[2] comptime**, **[3] reflection**, and **[4] macros** below — they are one
-subsystem, sequenced:
+subsystem, sequenced.
+
+**Rebuild path (chosen): typed AST first.** No typed representation survives past
+`lower.rs` today, so the foundation comes before features:
+- [x] **Phase 0 — persisted type graph.** [tygraph.rs](crates/vire/src/tygraph.rs):
+  a source-level, structural `TypeGraph::build(&Module)` (product/sum types with
+  generics + variants, trait method sigs, impls, fn sigs) built *after* inference,
+  decoupled from lowering (lower.rs untouched, still builds its own IR-erased maps).
+  Preserves what the IR lattice erases — generics, nested type apps, borrow marks —
+  i.e. exactly what reflection reads. Introspect with `vire types FILE.vr`.
+  tests/vire_types.sh (15/15).
+- [ ] **Phase 1 — typed expressions.** A span-indexed side-table of inferred
+  expression types (AST nodes have no identity), populated by a strengthened
+  `infer.rs` — the actual *typed* AST.
+- [ ] **Phase 2 — move passes after inference.** comptime + macro expansion consume
+  the type graph (macros currently run *before* inference — the untyped anti-pattern).
+- [ ] **Phase 3+ — features on the foundation:** the sequence below.
+
+Feature sequence on top:
 
 - [ ] **(a) comptime evaluator core** — a real interpreter over the typed AST:
   comptime `let`/`for` (loop unrolling), comptime function calls with a recursion

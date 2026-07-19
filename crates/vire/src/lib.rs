@@ -12,6 +12,7 @@ pub mod lower;
 pub mod parser;
 pub mod spawn;
 pub mod syntax;
+pub mod tygraph;
 
 pub use cblock::desugar_cblocks;
 pub use diag::Diag;
@@ -22,3 +23,4 @@ pub use inline::inline_recursion;
 pub use lower::{lower_module, lower_module_src};
 pub use parser::{parse, parse_with_syntax};
 pub use syntax::Syntax;
+pub use tygraph::TypeGraph;

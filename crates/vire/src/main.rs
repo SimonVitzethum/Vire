@@ -76,8 +76,30 @@ fn main() {
                 exit(1);
             }
         }
+        "types" => {
+            // Introspect the persisted, source-level type graph (the foundation of
+            // the compile-time programming layer). Runs the front-end up to and
+            // including inference, then prints the structural view of all types,
+            // traits, impls, and functions.
+            let (mut module, diags) = vire::parse(&src);
+            for d in &diags {
+                eprintln!("{}", d.render(&src));
+            }
+            if !diags.is_empty() {
+                exit(1);
+            }
+            if let Err(es) = vire::expand_macros(&mut module) {
+                for e in es {
+                    eprintln!("macro: {e}");
+                }
+                exit(1);
+            }
+            vire::infer_module(&mut module);
+            let graph = vire::TypeGraph::build(&module);
+            print!("{}", graph.dump());
+        }
         other => {
-            eprintln!("unknown command: {other} (parse|lex|build|run)");
+            eprintln!("unknown command: {other} (parse|lex|types|build|run)");
             exit(2);
         }
     }
