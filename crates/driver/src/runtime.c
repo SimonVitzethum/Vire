@@ -1743,6 +1743,20 @@ void *jrt_alloc_array(int64_t count, int64_t elem_size, void *vtable) {
         plat_puts("Exception in thread \"main\" java.lang.NegativeArraySizeException\n");
         plat_abort();
     }
+#ifndef FASTLLVM_FREESTANDING
+    /* In the capsule/loop arena: bump-allocate the array too (immortal, not tracked
+     * in live_objects, freed en bloc by jrt_arena_pop). Same soundness gate as
+     * jrt_alloc: promotion only happens where the lowering proved no escape, so no
+     * arena array can outlive the arena. arena_alloc already zeroes the block. */
+    if (arena_top) {
+        JArray *aa = (JArray *)arena_alloc(sizeof(JArray) + (size_t)count * (size_t)elem_size);
+        aa->refcount = -1;
+        aa->vtable = vtable;
+        aa->length = count;
+        aa->elem_size = elem_size;
+        return aa;
+    }
+#endif
     void *p = plat_alloc(sizeof(JArray) + (size_t)count * (size_t)elem_size);
     if (!p) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");

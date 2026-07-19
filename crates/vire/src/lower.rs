@@ -988,15 +988,32 @@ impl<'a> FnLower<'a> {
             // beyond the iteration → forbidden. New body-local names
             // (not in `outer`) are harmless (they die with the iteration).
             Stmt::Let { name, value, .. } => {
-                let escapes = top && outer.contains(name) && value.as_ref().map(|v| self.expr_may_be_ref(v)).unwrap_or(false);
+                // Rebinding an OUTER var with a ref escapes the iteration — unless the
+                // outer var is scalar-typed (no ref fits) or the value is provably scalar.
+                let outer_is_ref = self.lookup(name).map(|(_, t)| t == Ty::Ref).unwrap_or(true);
+                let escapes = top
+                    && outer.contains(name)
+                    && outer_is_ref
+                    && value.as_ref().map(|v| self.expr_may_be_ref(v)).unwrap_or(false);
                 escapes || value.as_ref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
             }
             Stmt::Assign { target, value, .. } => {
                 let target_bad = match target {
-                    // Field/index mutation = writing into an existing object → forbidden.
-                    Expr::Field { .. } | Expr::Index { .. } => true,
-                    // Ref to an outer variable (compound `x op= e`) → escapes.
-                    Expr::Ident(n, _) => top && outer.contains(n) && self.expr_may_be_ref(value),
+                    // Field/index mutation only leaks the arena if the WRITTEN VALUE can be
+                    // an arena pointer. A provably-scalar store (`a[i] = int`, `p.x = i*2`)
+                    // can never make an arena object outlive the arena — a scalar is not a
+                    // pointer — so it is safe regardless of whether the base escapes.
+                    // `expr_may_be_ref` is conservative (true when unsure), so `!…` means
+                    // "definitely scalar".
+                    Expr::Field { .. } | Expr::Index { .. } => self.expr_may_be_ref(value),
+                    // Ref to an outer variable (compound `x op= e`) → escapes. Safe if the
+                    // outer variable is scalar-typed (a ref cannot be stored into an I64/F64
+                    // slot) or the written value is provably scalar.
+                    Expr::Ident(n, _) => {
+                        top && outer.contains(n)
+                            && self.lookup(n).map(|(_, t)| t == Ty::Ref).unwrap_or(true)
+                            && self.expr_may_be_ref(value)
+                    }
                     _ => false,
                 };
                 target_bad || self.region_bad_expr(value, outer, seen)
@@ -1437,12 +1454,36 @@ impl<'a> FnLower<'a> {
                 let exit = self.new_block();
                 self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(cond), then_blk: bodyb, else_blk: exit });
                 self.cur = bodyb.0 as usize;
+                // Bind the loop variable (always scalar I64) BEFORE the arena analysis so
+                // `expr_may_be_ref` can see it — otherwise `a[i] = i` reads `i` as an
+                // unknown (conservatively ref) and the scalar-store relaxation never fires.
                 self.scopes.push(HashMap::new());
                 self.bind(&name, ivar, Ty::I64);
+                // AUTO-ARENA (escape→arena), same soundness gate as the `while` case:
+                // a numeric `for` iteration whose allocations provably do not escape the
+                // iteration runs in a per-iteration bump arena (no malloc/free per node).
+                // `while_arena_safe` forbids body-level return/break/continue, so the
+                // arena_pop below is never skipped.
+                let arena = self.while_arena_safe(body);
+                let body_locals_start = self.locals.len();
+                if arena {
+                    self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
+                }
                 self.loops.push((latch, exit)); // continue → latch (not header!), otherwise no increment
                 self.lower_block(body);
                 self.loops.pop();
                 self.scopes.pop();
+                if arena {
+                    // Ref locals created in the body point into the arena; null them
+                    // before the pop so the function-end release does not read freed
+                    // memory (UAF) — identical to the `while` arena.
+                    for idx in body_locals_start..self.locals.len() {
+                        if self.locals[idx] == Ty::Ref {
+                            self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
+                        }
+                    }
+                    self.emit(Statement::Call { dest: None, func: "jrt_arena_pop".into(), args: vec![] });
+                }
                 let end = self.cur;
                 self.term(end, Terminator::Goto(latch));
                 self.cur = latch.0 as usize;
