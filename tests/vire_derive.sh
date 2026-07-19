@@ -175,8 +175,27 @@ check "Json + Hash (sum type)" '{"Circle": [2]}
 printf '@derive(Serialize)\ntype T { x: Int }\nfn main(){print(1)}\n' > "$work/unk.vr"
 errck "unknown derive rejected" "unknown derive .Serialize." "$work/unk.vr"
 
-printf '@derive(Ord)\ntype S { A(Int)\n B(Int) }\nfn main(){print(1)}\n' > "$work/sumord.vr"
-errck "Ord on sum type rejected" "sum type" "$work/sumord.vr"
+# Ord on a sum type: variants order by declaration ordinal, payloads lexicographic.
+cat > "$work/sumord.vr" <<'EOF'
+@derive(Ord)
+type Shape {
+    Circle(Float)
+    Rect(w: Float, h: Float)
+    Nothing
+}
+fn main() {
+    print(Circle(2.0).cmp(Circle(5.0)))   // -1  (same variant, 2 < 5)
+    print(Circle(9.0).cmp(Rect(1.0, 1.0)))// -1  (Circle before Rect)
+    print(Rect(1.0, 1.0).cmp(Nothing))    // -1  (Rect before Nothing)
+    print(Nothing.cmp(Circle(0.0)))       // 1   (Nothing after Circle)
+    print(Nothing.cmp(Nothing))           // 0
+}
+EOF
+check "Ord (sum type)" "-1
+-1
+-1
+1
+0" "$work/sumord.vr"
 
 printf '@derive(Eq)\ntype Box[T] { value: T }\nfn main(){print(1)}\n' > "$work/gen.vr"
 errck "generic derive rejected" "generic type" "$work/gen.vr"

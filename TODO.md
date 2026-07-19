@@ -128,15 +128,18 @@ Feature sequence on top:
   **product types**: `eq`/`show`/`cmp` (lexicographic -1/0/1)/`hash` (31-combiner;
   numeric/Bool by value, `Str` via `hashCode()`, per-field-type aware); **sum types**:
   `eq`/`show` via a `match` on the tag (dataless + multi-field variants). An explicit
-  method of the same name overrides the derive. Coverage: **product** — Eq/Show/Ord/
-  Hash/**Json**; **sum** — Eq/Show/**Hash** (ordinal + payload)/**Json** (`{"V":[…]}` /
-  `"V"`). Rejected with a clear message: unknown derives, nested-field Ord/Hash/Json,
-  sum-type Ord, generic targets. The type graph reflects declared derives
-  (`vire types`). tests/vire_derive.sh (13/13). Open: **sum-type Ord** (ordinal +
-  payload lexicographic); **generic** types; nested-user-type fields (recursive derive);
-  JSON string escaping; and the deeper **`@typeinfo(T)`** as a *comptime-iterable typed
-  value* (needs aggregate comptime values — the interpreter is scalar-only today), from
-  which derives would be written in-language rather than hard-coded in Rust.
+  method of the same name overrides the derive. **Full matrix — product AND sum:**
+  Eq/Show/Ord/Hash/Json. (Sum Ord orders by variant declaration ordinal via a nested
+  match, then payloads lexicographically; sum Hash folds ordinal + payload; sum Json
+  renders `{"V":[…]}` / `"V"`.) Rejected with a clear message: unknown derives,
+  nested-user-type fields (Ord/Hash/Json), generic targets. The type graph reflects
+  declared derives (`vire types`). tests/vire_derive.sh (13/13). Open: **generic**
+  types (needs generic-method monomorphization in lower.rs — inherent methods on a
+  generic type do not currently instantiate); nested-user-type fields (recursive
+  derive); JSON string escaping; and the deeper **`@typeinfo(T)`** as a
+  *comptime-iterable typed value* (needs aggregate comptime values — the interpreter is
+  scalar-only today), from which derives would be written in-language rather than
+  hard-coded in Rust.
 - [~] **(c) hygienic item macros** — `macro name(P: type, n: ident, e: expr) { <items> }`
   invoked `name!(args)` ([itemmacro.rs](crates/vire/src/itemmacro.rs)): expands to
   declarations (`fn`/`type`/`impl`/`const`). Safe by construction — the C-preprocessor

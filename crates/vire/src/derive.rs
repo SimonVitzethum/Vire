@@ -71,12 +71,7 @@ pub fn derive_expand(m: &mut Module) -> Vec<String> {
                 ("Show", true) => Some(derive_show_sum(t)),
                 ("Json", true) => unwrap_or_err(derive_json_sum(t), &mut errs),
                 ("Hash", true) => unwrap_or_err(derive_hash_sum(t), &mut errs),
-                // Ordering across a sum type's variants (ordinal + payload) is not
-                // yet implemented — deferred with a clear message, never wrong code.
-                ("Ord", true) => {
-                    errs.push(format!("@derive(Ord) on sum type `{}` is not yet supported (Eq/Show/Hash/Json)", t.name));
-                    continue;
-                }
+                ("Ord", true) => unwrap_or_err(derive_ord_sum(t), &mut errs),
                 _ => unreachable!(),
             };
             match md {
@@ -387,6 +382,55 @@ fn derive_hash_sum(t: &TypeDef) -> Result<FnDef, String> {
         .collect();
     let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms, span: S };
     Ok(method("hash", vec![param("self", None)], ty_ref("Int"), body))
+}
+
+/// `fn cmp(self, other: T) -> Int { … }` for a sum type: variants order by
+/// declaration ordinal (an earlier variant is smaller); within the same variant,
+/// payloads compare lexicographically. A nested match on `other` gives the
+/// ordinal comparison exactly (no separate ordinal accessor needed).
+fn derive_ord_sum(t: &TypeDef) -> Result<FnDef, String> {
+    require_scalar_sum(t, "Ord")?;
+    let outer = t
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(i, vi)| {
+            let inner = t
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(j, vj)| {
+                    let body = if j < i {
+                        int_lit(1) // self's variant is declared later → greater
+                    } else if j > i {
+                        int_lit(-1) // self's variant is declared earlier → smaller
+                    } else {
+                        cmp_chain_vars(&vi.fields, 0) // same variant → compare payloads
+                    };
+                    (ctor_pat(&vj.name, vj.fields.len(), "_b"), None, body)
+                })
+                .collect();
+            let inner_match = Expr::Match { scrutinee: Box::new(ident("other")), arms: inner, span: S };
+            (ctor_pat(&vi.name, vi.fields.len(), "_a"), None, inner_match)
+        })
+        .collect();
+    let body = Expr::Match { scrutinee: Box::new(Expr::SelfExpr(S)), arms: outer, span: S };
+    Ok(method("cmp", vec![param("self", None), param("other", Some(ty_ref(&t.name)))], ty_ref("Int"), body))
+}
+
+/// Lexicographic comparison of bound payload variables `_a{k}` vs `_b{k}`.
+fn cmp_chain_vars(fields: &[Field], i: usize) -> Expr {
+    if i >= fields.len() {
+        return int_lit(0);
+    }
+    let (a, b) = (ident(&format!("_a{i}")), ident(&format!("_b{i}")));
+    let (lt, gt) = if fkind(&fields[i].ty) == FKind::Str {
+        let c = || method_call(ident(&format!("_a{i}")), "compareTo", vec![ident(&format!("_b{i}"))]);
+        (bin(BinOp::Lt, c(), int_lit(0)), bin(BinOp::Gt, c(), int_lit(0)))
+    } else {
+        (bin(BinOp::Lt, a.clone(), b.clone()), bin(BinOp::Gt, a, b))
+    };
+    if_expr(lt, int_lit(-1), if_expr(gt, int_lit(1), cmp_chain_vars(fields, i + 1)))
 }
 
 /// `fn to_json(self) -> Str { match self { V(a…) -> "{\"V\": [json a, …]}", dataless
