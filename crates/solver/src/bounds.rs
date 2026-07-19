@@ -29,9 +29,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use fastllvm_ir::*;
 
 pub fn elide_bounds(program: &mut Program) -> usize {
+    let dbg = std::env::var_os("FASTLLVM_DEBUG_BOUNDS").is_some();
     let mut total = 0;
     for f in &mut program.functions {
-        total += run(f);
+        let c = run(f);
+        if dbg && c > 0 {
+            eprintln!("[bounds] {} elided {c} check(s)", f.name);
+        }
+        total += c;
     }
     total
 }
@@ -39,6 +44,7 @@ pub fn elide_bounds(program: &mut Program) -> usize {
 /// Value-number expression. Each variant is unique through its fields, so
 /// the interner maps structurally equal values to the same number.
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 enum SymExpr {
     Const(i64),
     Param(u32),
@@ -236,8 +242,14 @@ fn transfer_block(
                 let s = sym_of_rvalue(rv, &env, it, site(b, si), dt, &f.locals);
                 env.insert(d.0, s);
             }
-            Statement::NewArray { dest, len, .. } => {
+            Statement::NewArray { dest, len, .. } | Statement::RegionNewArray { dest, len, .. } => {
                 let lensym = sym_of_operand(len, &env, it);
+                let asym = it.intern(SymExpr::Array(site(b, si)));
+                len_of.insert(asym, lensym);
+                env.insert(dest.0, asym);
+            }
+            Statement::StackNewArray { dest, len, .. } => {
+                let lensym = it.intern(SymExpr::Const(*len));
                 let asym = it.intern(SymExpr::Array(site(b, si)));
                 len_of.insert(asym, lensym);
                 env.insert(dest.0, asym);
@@ -396,6 +408,10 @@ fn run(f: &mut Function) -> usize {
     // GVN would otherwise hold invariant values flowing around the loop as a phi.
     let repr = compute_repr(&it, &phi_inc, &incomplete);
     let nn = compute_nonneg(&it, &phi_inc, &repr, &incomplete);
+    // Constant upper + lower bound per sym (proves `lo ≤ i ≤ hi` across loop phis) —
+    // the binary-search midpoint and matmul affine index, against a constant length.
+    let ub_fix = compute_ub(&it, &phi_inc, &repr, &nn, &incomplete);
+    let lb_fix = compute_lb(&it, &phi_inc, &repr, &nn, &incomplete);
     // Constant upper bound per sym: Const(c≥0) → c, And(_,m≥0) → m. For
     // indices without a loop guard (`sh[i & 1]`): in-bounds against a constant
     // length, if this bound < length.
@@ -488,10 +504,10 @@ fn run(f: &mut Function) -> usize {
                 // since `jrt_?astore` carries the covariance check (ArrayStoreException)
                 // that the inline path would not have.
                 Statement::ArrayLoad { arr, index, checked, .. } if *checked => {
-                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &repr, &mut it)
+                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &ub_fix, &lb_fix, &repr, &mut it)
                 }
                 Statement::ArrayStore { arr, index, kind, checked, .. } if *checked && !kind.is_ref() => {
-                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &repr, &mut it)
+                    provably_in_bounds(arr, index, &env, &len_of, &lt, &nn, &ub_const, &ub_fix, &lb_fix, &repr, &mut it)
                 }
                 _ => false,
             };
@@ -525,8 +541,14 @@ fn step_env(st: &Statement, b: usize, si: usize, env: &mut Env, it: &mut Interne
             let s = sym_of_rvalue(rv, env, it, site(b, si), dt, locals);
             env.insert(d.0, s);
         }
-        Statement::NewArray { dest, len, .. } => {
+        Statement::NewArray { dest, len, .. } | Statement::RegionNewArray { dest, len, .. } => {
             let lensym = sym_of_operand(len, env, it);
+            let asym = it.intern(SymExpr::Array(site(b, si)));
+            len_of.insert(asym, lensym);
+            env.insert(dest.0, asym);
+        }
+        Statement::StackNewArray { dest, len, .. } => {
+            let lensym = it.intern(SymExpr::Const(*len));
             let asym = it.intern(SymExpr::Array(site(b, si)));
             len_of.insert(asym, lensym);
             env.insert(dest.0, asym);
@@ -573,6 +595,8 @@ fn provably_in_bounds(
     lt: &BTreeSet<(u32, u32)>,
     nn: &BTreeSet<u32>,
     ub_const: &[Option<i64>],
+    ub_fix: &[Option<i64>],
+    lb_fix: &[Option<i64>],
     repr: &[u32],
     it: &mut Interner,
 ) -> bool {
@@ -588,6 +612,21 @@ fn provably_in_bounds(
     if let SymExpr::Const(l) = it.exprs[lensym as usize] {
         if let Some(Some(u)) = ub_const.get(isym as usize) {
             return *u >= 0 && *u < l;
+        }
+    }
+    // Path 3: a proven constant upper bound on the index `i ≤ u`, a proven lower
+    // bound `i ≥ 0`, and a proven constant lower bound on the length `len ≥ L` with
+    // `u < L`. Then `0 ≤ i ≤ u < L ≤ len`, so the access is in bounds. This is
+    // fixpoint-over-loop-phis reasoning: the binary-search midpoint
+    // `0 ≤ (lo+hi)/2 ≤ n-1 < n = len`, and the matmul affine index
+    // `0 ≤ r*n+k ≤ n²-1 < n² = len` (len itself computed as `n*n`). `lb ≥ 0`
+    // subsumes the coarse `nn` set (which fails when a loop var like `hi` genuinely
+    // reaches −1 while the index stays non-negative).
+    let i = isym as usize;
+    let ln = lensym as usize;
+    if let (Some(Some(u)), Some(Some(low)), Some(Some(llen))) = (ub_fix.get(i), lb_fix.get(i), lb_fix.get(ln)) {
+        if *low >= 0 && *u >= 0 && *u < *llen {
+            return true;
         }
     }
     false
@@ -770,6 +809,199 @@ fn strict_facts(op: BinOp, sa: u32, sb: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)
         BinOp::CmpLe => (vec![], vec![(sb, sa)]),
         _ => (vec![], vec![]),
     }
+}
+
+/// Abstract upper bound of a sym: `Bot` = no value yet (fixpoint init), `Fin(c)`
+/// = proven `sym ≤ c`, `Top` = unbounded (unknown).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    Bot,
+    Fin(i64),
+    Top,
+}
+
+/// Constant upper bound per sym: proves `sym ≤ c` for a compile-time constant `c`,
+/// even across loop phis (`hi ≤ n-1` in binary search; `r*n+k ≤ n²-1` in matmul).
+///
+/// A Kleene least-fixpoint from `Bot`, joined by `max`, over sound over-approximating
+/// transfer functions (each returns a TRUE upper bound of the concrete value, or
+/// `Top`). Widening: a phi whose bound keeps rising is forced to `Top` after a few
+/// steps, so the fixpoint terminates and stays sound. Together with non-negativity
+/// (`0 ≤ i`) this gives `0 ≤ i ≤ c < len` — a proven in-bounds access.
+///
+/// Soundness sketch: by induction over the concrete run, every value of a sym `s`
+/// is `≤ ub[s]` — the entry value is `≤ ub[entry] ≤ ub[phi]`, and each later value
+/// `f(prev)` is `≤ transfer(ub[prev]) ≤ ub[phi]` at the fixpoint. `Mul` only bounds
+/// when both operands are non-negative (else a product of negatives flips sign).
+fn compute_ub(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32], nn: &BTreeSet<u32>, incomplete: &BTreeSet<u32>) -> Vec<Option<i64>> {
+    let n = it.exprs.len();
+    let mut ub = vec![Bound::Bot; n];
+    let mut rises = vec![0u32; n]; // per-phi widening counter
+    const WIDEN: u32 = 3;
+    const MAX_ITER: usize = 64;
+
+    let get = |ub: &Vec<Bound>, s: u32| ub[canon(repr, s) as usize];
+    let addc = |b: Bound, c: i64| match b {
+        Bound::Fin(x) => x.checked_add(c).map(Bound::Fin).unwrap_or(Bound::Top),
+        other => other,
+    };
+    let join = |a: Bound, b: Bound| match (a, b) {
+        (Bound::Top, _) | (_, Bound::Top) => Bound::Top,
+        (Bound::Bot, x) | (x, Bound::Bot) => x,
+        (Bound::Fin(x), Bound::Fin(y)) => Bound::Fin(x.max(y)),
+    };
+
+    for _ in 0..MAX_ITER {
+        let mut changed = false;
+        for i in 0..n {
+            // Only representatives carry a bound (collapsed phis follow repr).
+            if canon(repr, i as u32) != i as u32 {
+                continue;
+            }
+            let is_nn = |s: u32| nn.contains(&canon(repr, s));
+            let nv = match &it.exprs[i] {
+                SymExpr::Const(c) => Bound::Fin(*c),
+                SymExpr::And(_, m) if *m >= 0 => Bound::Fin(*m),
+                SymExpr::Add(s, c) => addc(get(&ub, *s), *c),
+                SymExpr::Add2(a, b) => match (get(&ub, *a), get(&ub, *b)) {
+                    (Bound::Fin(x), Bound::Fin(y)) => x.checked_add(y).map(Bound::Fin).unwrap_or(Bound::Top),
+                    (Bound::Bot, _) | (_, Bound::Bot) => Bound::Bot,
+                    _ => Bound::Top,
+                },
+                // Truncated division by d ≥ 1 is monotone in the dividend, so
+                // `v / d` (toward zero, as the IR's sdiv) is a sound upper bound.
+                SymExpr::Div(x, d) if *d >= 1 => match get(&ub, *x) {
+                    Bound::Fin(v) => Bound::Fin(v / *d),
+                    other => other,
+                },
+                // Product bounds only when both factors are non-negative.
+                SymExpr::Mul(a, b) if is_nn(*a) && is_nn(*b) => match (get(&ub, *a), get(&ub, *b)) {
+                    (Bound::Fin(x), Bound::Fin(y)) if x >= 0 && y >= 0 => x.checked_mul(y).map(Bound::Fin).unwrap_or(Bound::Top),
+                    (Bound::Bot, _) | (_, Bound::Bot) => Bound::Bot,
+                    _ => Bound::Top,
+                },
+                SymExpr::Phi(..) if !incomplete.contains(&(i as u32)) => match phi_inc.get(&(i as u32)) {
+                    Some(inc) if !inc.is_empty() => inc.iter().fold(Bound::Bot, |acc, &s| join(acc, get(&ub, s))),
+                    _ => Bound::Top,
+                },
+                _ => Bound::Top,
+            };
+            // Monotone join with the current value; widen a rising phi to Top.
+            let mut merged = join(ub[i], nv);
+            if matches!(it.exprs[i], SymExpr::Phi(..)) {
+                if let (Bound::Fin(old), Bound::Fin(new)) = (ub[i], merged) {
+                    if new > old {
+                        rises[i] += 1;
+                        if rises[i] > WIDEN {
+                            merged = Bound::Top;
+                        }
+                    }
+                }
+            }
+            if merged != ub[i] {
+                ub[i] = merged;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (0..n as u32)
+        .map(|i| match ub[canon(repr, i) as usize] {
+            Bound::Fin(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Constant *lower* bound per sym: proves `sym ≥ c`. The mirror of `compute_ub`
+/// (join by `min`, iterate from `Bot` = +∞ downward, widen a falling phi to `Top`
+/// = −∞). Needed for non-negativity where the coarse `nn` set fails: the binary-
+/// search `hi` genuinely reaches −1, so `nn(hi)` is false, yet `mid = (lo+hi)/2 ≥ 0`
+/// because `lo ≥ 0` dominates — `lb(mid) = 0`.
+///
+/// Here `Bot` = +∞ (no value yet), `Fin(c)` = `sym ≥ c`, `Top` = −∞ (no lower
+/// bound). Each transfer returns a TRUE lower bound of the concrete value, so
+/// `lb[s] ≤ val(s)` by the same induction as `compute_ub`.
+fn compute_lb(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32], nn: &BTreeSet<u32>, incomplete: &BTreeSet<u32>) -> Vec<Option<i64>> {
+    let n = it.exprs.len();
+    let mut lb = vec![Bound::Bot; n]; // Bot = +∞ here (nothing reaches yet)
+    let mut falls = vec![0u32; n];
+    const WIDEN: u32 = 40; // late widening — the binary-search `hi` halves to −1 in ~20 steps
+    const MAX_ITER: usize = 256;
+
+    let get = |lb: &Vec<Bound>, s: u32| lb[canon(repr, s) as usize];
+    let addc = |b: Bound, c: i64| match b {
+        Bound::Fin(x) => x.checked_add(c).map(Bound::Fin).unwrap_or(Bound::Top),
+        other => other,
+    };
+    // Meet by minimum: Bot (+∞) is the identity, Top (−∞) is absorbing.
+    let meet = |a: Bound, b: Bound| match (a, b) {
+        (Bound::Top, _) | (_, Bound::Top) => Bound::Top,
+        (Bound::Bot, x) | (x, Bound::Bot) => x,
+        (Bound::Fin(x), Bound::Fin(y)) => Bound::Fin(x.min(y)),
+    };
+
+    for _ in 0..MAX_ITER {
+        let mut changed = false;
+        for i in 0..n {
+            if canon(repr, i as u32) != i as u32 {
+                continue;
+            }
+            let is_nn = |s: u32| nn.contains(&canon(repr, s));
+            let nv = match &it.exprs[i] {
+                SymExpr::Const(c) => Bound::Fin(*c),
+                SymExpr::Len(_) => Bound::Fin(0), // an array length is ≥ 0
+                SymExpr::And(_, m) if *m >= 0 => Bound::Fin(0), // x & m ≥ 0
+                SymExpr::Add(s, c) => addc(get(&lb, *s), *c),
+                SymExpr::Add2(a, b) => match (get(&lb, *a), get(&lb, *b)) {
+                    (Bound::Fin(x), Bound::Fin(y)) => x.checked_add(y).map(Bound::Fin).unwrap_or(Bound::Top),
+                    (Bound::Bot, _) | (_, Bound::Bot) => Bound::Bot,
+                    _ => Bound::Top,
+                },
+                // Truncated division by d ≥ 1 is monotone, so `l / d` is a lower bound.
+                SymExpr::Div(x, d) if *d >= 1 => match get(&lb, *x) {
+                    Bound::Fin(v) => Bound::Fin(v / *d),
+                    other => other,
+                },
+                SymExpr::Mul(a, b) if is_nn(*a) && is_nn(*b) => match (get(&lb, *a), get(&lb, *b)) {
+                    (Bound::Fin(x), Bound::Fin(y)) if x >= 0 && y >= 0 => x.checked_mul(y).map(Bound::Fin).unwrap_or(Bound::Top),
+                    (Bound::Bot, _) | (_, Bound::Bot) => Bound::Bot,
+                    _ => Bound::Fin(0), // both non-negative ⇒ product ≥ 0
+                },
+                SymExpr::Phi(..) if !incomplete.contains(&(i as u32)) => match phi_inc.get(&(i as u32)) {
+                    Some(inc) if !inc.is_empty() => inc.iter().fold(Bound::Bot, |acc, &s| meet(acc, get(&lb, s))),
+                    _ => Bound::Top,
+                },
+                _ => Bound::Top, // Opaque / Param / Array: no lower bound
+            };
+            let mut merged = meet(lb[i], nv);
+            if matches!(it.exprs[i], SymExpr::Phi(..)) {
+                if let (Bound::Fin(old), Bound::Fin(new)) = (lb[i], merged) {
+                    if new < old {
+                        falls[i] += 1;
+                        if falls[i] > WIDEN {
+                            merged = Bound::Top;
+                        }
+                    }
+                }
+            }
+            if merged != lb[i] {
+                lb[i] = merged;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (0..n as u32)
+        .map(|i| match lb[canon(repr, i) as usize] {
+            Bound::Fin(c) => Some(c),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Non-negative syms (greatest fixpoint): const≥0, Add(nn,≥0), Mul(nn,nn),
