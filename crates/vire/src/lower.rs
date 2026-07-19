@@ -384,6 +384,24 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     // Methods (type-inline + impl blocks) → symbol `Class.method`, self = Ref.
     let methods = collect_methods(m);
+    // Trait/impl coherence: a type must not define the same method name more than
+    // once (across inline methods and `impl` blocks). Both would mangle to
+    // `Type.method` and one definition would silently shadow the other — reject it
+    // instead, so overlapping/duplicate impls are a compile error, not a surprise.
+    {
+        let mut counts: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        for (class, meth) in &methods {
+            *counts.entry((class.clone(), meth.sig.name.clone())).or_insert(0) += 1;
+        }
+        let mut dups: Vec<(String, String, usize)> =
+            counts.into_iter().filter(|(_, n)| *n > 1).map(|((c, m), n)| (c, m, n)).collect();
+        dups.sort();
+        for (class, mname, n) in dups {
+            errs.push(format!(
+                "coherence: method `{mname}` is defined {n} times for type `{class}` (conflicting or overlapping impls)"
+            ));
+        }
+    }
     for (class, meth) in &methods {
         let ps = meth
             .sig
