@@ -41,8 +41,10 @@ members = [
 edition = "2021"
 version = "0.1.0"
 # Extra fields inherited by the vendored CSolver crates (they use `field.workspace`).
+# CSolver (crates/csolver/**) is licensed under Apache-2.0 (see crates/csolver/LICENSE);
+# the rest of the project is GPL-3.0-or-later (see the root LICENSE). See LICENSING.md.
 rust-version = "1.94"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 authors = ["CSolver contributors"]
 repository = "https://example.invalid/csolver"
 description = "FastLLVM / Vire toolchain (with vendored CSolver memory-safety verifier)."

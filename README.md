@@ -97,6 +97,15 @@ technique the Java-AOT path uses to beat Rust). See [TODO.md](TODO.md) and
 - **[language/examples/](language/examples/)** — example programs across areas and
   features.
 - **[benchmarks/](benchmarks/)** — benchmark suite (Java/Rust/C++), runner, analysis.
+- **[LICENSING.md](LICENSING.md)** — dual license: CSolver (`crates/csolver/`) under
+  Apache-2.0, everything else under GPL-3.0-or-later.
+
+## License
+
+Dual-licensed by directory: **CSolver** (`crates/csolver/**`, the vendored
+memory-safety verifier) under the **Apache License 2.0**
+([`crates/csolver/LICENSE`](crates/csolver/LICENSE)); **everything else** under the
+**GNU GPL v3.0 or later** ([`LICENSE`](LICENSE)). See [LICENSING.md](LICENSING.md).
 
 ## Core language ideas (in brief)
 

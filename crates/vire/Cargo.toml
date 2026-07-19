@@ -1,5 +1,6 @@
 [package]
 name = "vire"
+license = "GPL-3.0-or-later"
 edition = "2021"
 version = "0.1.0"
 
