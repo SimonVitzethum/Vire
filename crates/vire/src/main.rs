@@ -77,6 +77,48 @@ fn main() {
     }
 }
 
+/// Gate a `native "c"` block through the CSolver memory-safety verifier:
+/// compile the C to LLVM IR (`clang -O0 -emit-llvm`), then run `solver verify`.
+/// Returns Ok only on a proven-safe verdict (exit 0 = PASS); otherwise Err with the
+/// verifier's residual obligations / counterexample, which become the compile error.
+fn verify_c_block(c_path: &std::path::Path, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
+    let ll = build_dir.join(format!("native_{i}.verify.ll"));
+    let clang = Command::new("clang")
+        .args(["-O0", "-S", "-emit-llvm", "-g", "-o"])
+        .arg(&ll)
+        .arg(c_path)
+        .output()
+        .map_err(|e| format!("clang not runnable for verification: {e}"))?;
+    if !clang.status.success() {
+        return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
+    }
+    // `--assume-valid-params`: raw-pointer parameters are the contract the typed Vire
+    // caller supplies (a Vire array = proven (ptr, len)). Every other obligation
+    // (bounds, arithmetic, UB, aliasing) must still be proven.
+    let out = Command::new(solver)
+        .arg("verify")
+        .arg(&ll)
+        .arg("--assume-valid-params")
+        .output()
+        .map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
+    // verify exit codes: 0 PASS · 1 FAIL · 2 UNKNOWN · 3 tool error.
+    if out.status.code() == Some(0) {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let report: String = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("FAIL") || t.starts_with("UNKNOWN") || t.contains("counterexample") || t.contains("residual") || t.contains("suggest")
+        })
+        .take(12)
+        .map(|l| format!("    {}", l.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(if report.is_empty() { text.lines().take(8).collect::<Vec<_>>().join("\n") } else { report })
+}
+
 /// Python include path + lib name via `python3`/sysconfig (for `native "python"`).
 fn python_config() -> Option<(String, String)> {
     let out = Command::new("python3")
@@ -148,6 +190,11 @@ fn build_or_run(args: &[String]) {
     let mut link_libs: Vec<String> = Vec::new();
     let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
+    // `--verify-c <solver-bin>`: gate every `native "c"` block through the CSolver
+    // memory-safety verifier — the block is accepted only if the verifier PROVES it
+    // safe (PASS); UNKNOWN/FAIL is a compile error. The sound alternative to a blind
+    // `unsafe`. Off by default (needs the external `solver` binary).
+    let mut verify_c: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -155,6 +202,13 @@ fn build_or_run(args: &[String]) {
                 Some(p) => out = Some(PathBuf::from(p)),
                 None => {
                     eprintln!("-o needs an argument");
+                    exit(2);
+                }
+            },
+            "--verify-c" => match it.next() {
+                Some(p) => verify_c = Some(p.clone()),
+                None => {
+                    eprintln!("--verify-c needs the path to the `solver` binary");
                     exit(2);
                 }
             },
@@ -397,6 +451,25 @@ fn build_or_run(args: &[String]) {
         if let Err(e) = std::fs::write(&p, code) {
             eprintln!("writing native block: {e}");
             exit(1);
+        }
+        // Verification gate: a `native "c"` block is only accepted when the CSolver
+        // memory-safety verifier PROVES it safe. This is the sound replacement for
+        // `unsafe` — a block that cannot be proven safe is a compile error, not a
+        // runtime hazard. Raw-pointer parameters are trusted as sized-and-valid
+        // (`--assume-valid-params`): that is the contract Vire's typed caller
+        // supplies (a Vire array is a proven (ptr, len)); the remaining obligations
+        // (bounds, arithmetic, UB) must be discharged by the proof.
+        if ext == "c" {
+            if let Some(solver) = &verify_c {
+                match verify_c_block(&p, &build_dir, i, solver) {
+                    Ok(()) => eprintln!("verify: native \"c\" block {i}: PASS (proven memory-safe)"),
+                    Err(report) => {
+                        eprintln!("error: native \"c\" block {i} is not provably memory-safe \
+                                   (rejected instead of trusted like `unsafe`):\n{report}");
+                        exit(1);
+                    }
+                }
+            }
         }
         native_paths.push(p);
     }
