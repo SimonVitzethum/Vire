@@ -492,6 +492,32 @@ impl Walker<'_> {
                 // runtime statements), rather than evaluating it to a scalar.
                 if let Expr::If { cond, then, elifs, els, .. } = inner.as_ref() {
                     fold_comptime_if(cond, then, elifs, els, &mut ip)
+                } else if let Expr::Call { callee, args, .. } = inner.as_ref() {
+                    // `comptime assert(cond[, "message"])` — a compile-time check: the
+                    // condition is evaluated now; a false/zero result is a compile error.
+                    // Folds to a no-op literal (zero runtime cost) either way.
+                    if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "assert") {
+                        match args.first().and_then(|a| ip.eval(a)) {
+                            Some(CVal::Bool(true)) => {}
+                            Some(CVal::Int(i)) if i != 0 => {}
+                            Some(CVal::Bool(false)) | Some(CVal::Int(_)) => {
+                                let msg = args
+                                    .get(1)
+                                    .and_then(|a| if let Expr::Str(s, _) = a { Some(s.as_str()) } else { None })
+                                    .unwrap_or("comptime assertion failed");
+                                self.errs.push(format!("comptime assert failed: {msg}"));
+                            }
+                            Some(CVal::Float(_)) => {
+                                self.errs.push("comptime assert: condition must be Bool/Int, not Float".into());
+                            }
+                            None => {
+                                self.errs.push("comptime assert: condition is not a compile-time constant".into());
+                            }
+                        }
+                        Some(Expr::Bool(true, span))
+                    } else {
+                        ip.eval(inner).map(|v| lit(v, span))
+                    }
                 } else {
                     ip.eval(inner).map(|v| lit(v, span))
                 }

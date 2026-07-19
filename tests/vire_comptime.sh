@@ -139,6 +139,39 @@ else
     echo "FAIL infinite comptime loop budget"; fail=$((fail+1))
 fi
 
+# comptime assert(cond[, msg]): a compile-time check. A passing assert is a no-op.
+cat > "$work/assertok.vr" <<'EOF'
+const N = 8
+fn sq(x: Int) -> Int = x * x
+fn main() {
+    comptime assert(N > 0)
+    comptime assert(sq(4) == 16, "square broken")
+    print(N)
+}
+EOF
+check "comptime assert (passing = no-op)" "8" "$work/assertok.vr"
+
+# A failing comptime assert is a compile error carrying the message.
+cat > "$work/assertbad.vr" <<'EOF'
+const N = 8
+fn main() { comptime assert(N > 100, "N too small")  print(N) }
+EOF
+if "$vire" run "$work/assertbad.vr" 2>&1 | grep -q 'comptime assert failed: N too small'; then
+    echo "ok   comptime assert failure is a compile error"; pass=$((pass+1))
+else
+    echo "FAIL comptime assert failure is a compile error"; fail=$((fail+1))
+fi
+
+# A non-constant condition is rejected (not silently passed).
+cat > "$work/assertnc.vr" <<'EOF'
+fn main() { mut x = 5  comptime assert(x > 0)  print(x) }
+EOF
+if "$vire" run "$work/assertnc.vr" 2>&1 | grep -q 'not a compile-time constant'; then
+    echo "ok   comptime assert rejects non-constant"; pass=$((pass+1))
+else
+    echo "FAIL comptime assert rejects non-constant"; fail=$((fail+1))
+fi
+
 # @when(os): platform conditional compilation. On this host (linux/macos/unix) the
 # matching same-named fn survives; the others are dropped (no duplicate-def clash).
 host_os="$(uname -s)"

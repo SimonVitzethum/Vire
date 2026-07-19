@@ -185,7 +185,11 @@ Feature sequence on top:
   `ident` param); multi-argument generics (`Map[K, V]`); `block`/`pat` parameter kinds.
   Expression macros (`macro name(p) = <expr>`) are unchanged.
 - [x] `@when(platform)` conditional compilation — landed (see [4]).
-- [ ] `comptime for`/`assert`/`emit` as the surface syntax once (a) lands.
+- [x] `comptime assert(cond[, "msg"])` — done: the condition is evaluated at compile
+  time (via the comptime interpreter, incl. `comptime` fn calls); false/zero → a compile
+  error with the message; a non-constant condition is rejected. Folds to a no-op.
+  tests/vire_comptime.sh.
+- [ ] `comptime for` (loop unrolling to runtime statements) / `emit` surface syntax.
 
 ## Front-end completeness
 
@@ -270,7 +274,7 @@ Attach: monomorphization (front-end) + `comptime`.
 Attach: whole-program type graph + `comptime`.
 - [ ] `@typeinfo(T)` (fields/variants/methods/attributes, comptime-iterable).
 - [ ] `@derive(Json, Eq, Hash, Ord, …)` via reflection.
-- [ ] `comptime for/assert`, `emit`. **No** runtime reflection (AOT).
+- [x] `comptime assert` — landed (see [4]). - [ ] `comptime for`, `emit`. **No** runtime reflection (AOT).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)*
 - [ ] Hygienic macros (`macro name(args) { … }`): **typed parameters** (`expr`/`block`/
