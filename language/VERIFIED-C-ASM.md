@@ -188,9 +188,12 @@ must write the assumption down, and it is logged.
    `elements` contracts (proven bounds, not blanket trust). *Next:* synthesize from the
    Vire **call-site types** directly (first-class blocks) rather than parsing them back
    out of the C signature.
-4. First-class `c { … }` / `asm { … }` **expression blocks** with typed in/out bindings
-   (not just top-level `native`) — the parser feature that lets #3 read the contract off
-   the Vire types instead of the C text.
+4. **[done, scalar capture] first-class `@c(…)` / `@asm(…)` expression blocks** — usable
+   inside any function; captured scalar parameters become the block's params (C reads by
+   name, asm by SysV register); every block goes through the default gate. *Next:*
+   buffer/array capture — the `(ptr,len)` data-pointer ABI plus the `elements` contract
+   synthesized from the Vire array type at the call site (so #3 reads the contract off
+   the Vire types, not the C text).
 5. **`@assume` surface** + `vire audit` (list every assumption + justification).
 6. **CSolver as a crate dependency** (structured verdicts; no subprocess).
 7. Verification **cache** (content-addressed per block).
