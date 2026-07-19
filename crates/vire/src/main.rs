@@ -202,8 +202,52 @@ fn assume_set(code: &str) -> Result<cverify::Assume, String> {
 /// C is compiled to LLVM IR (`clang -O0 -emit-llvm`); assembly (`ext == "s"`) is verified
 /// directly (CSolver decodes x86-64/AArch64). Returns Ok only on a proven-safe verdict
 /// (exit 0 = PASS); otherwise Err with the residual obligations / counterexample.
-fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize) -> Result<(), String> {
+/// Content-addressed verification cache. A block's proof is expensive (CDCL SAT +
+/// symbolic execution); an unchanged block need not be re-verified. Key = hash of the
+/// block kind + its exact source (the contract/assumptions are derived from it). Only
+/// PASS verdicts are cached (a rejection fails the build anyway). Bump VERIFY_CACHE_TAG
+/// when the verifier changes so stale PASSes are not reused.
+const VERIFY_CACHE_TAG: &str = "v1";
+
+fn cache_key(ext: &str, code: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    VERIFY_CACHE_TAG.hash(&mut h);
+    ext.hash(&mut h);
+    code.hash(&mut h);
+    h.finish()
+}
+
+fn cache_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("vire");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("verify-cache"))
+}
+
+fn cache_has(key: u64) -> bool {
+    let Some(f) = cache_file() else { return false };
+    let hex = format!("{key:016x}");
+    std::fs::read_to_string(f).map(|s| s.lines().any(|l| l == hex)).unwrap_or(false)
+}
+
+fn cache_add(key: u64) {
+    if let Some(f) = cache_file() {
+        use std::io::Write;
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(fh, "{key:016x}");
+        }
+    }
+}
+
+fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize) -> Result<bool, String> {
     let assume = assume_set(code)?;
+    let key = cache_key(ext, code);
+    if cache_has(key) {
+        return Ok(true); // cached PASS — skip re-verification
+    }
     let outcome = if ext == "s" {
         // Assembly is CSolver's native input — verify the .s text directly.
         let src = std::fs::read_to_string(path).map_err(|e| format!("reading asm block: {e}"))?;
@@ -226,7 +270,10 @@ fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir:
         cverify::verify_llvm(&src, &format!("native_{i}"), pre.as_deref(), &assume)
     };
     match outcome {
-        cverify::Outcome::Pass => Ok(()),
+        cverify::Outcome::Pass => {
+            cache_add(key);
+            Ok(false)
+        }
         cverify::Outcome::Rejected(report) => Err(report),
     }
 }
@@ -639,7 +686,10 @@ fn build_or_run(args: &[String]) {
         // compile error, not a runtime hazard. `--noverify` opts out.
         if !noverify && (ext == "c" || ext == "s") {
             match verify_native_block(&p, code, ext, &build_dir, i) {
-                Ok(()) => eprintln!("verify: native \"{abi}\" block {i}: PASS (proven memory-safe)"),
+                Ok(cached) => eprintln!(
+                    "verify: native \"{abi}\" block {i}: PASS (proven memory-safe{})",
+                    if cached { ", cached" } else { "" }
+                ),
                 Err(report) => {
                     eprintln!(
                         "error: native \"{abi}\" block {i} is not provably memory-safe \
