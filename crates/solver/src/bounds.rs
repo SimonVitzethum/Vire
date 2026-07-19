@@ -629,6 +629,35 @@ fn provably_in_bounds(
             return true;
         }
     }
+    // Path 4: the affine index `N*a + b` with `a < N`, `b < N` (both loop-guard
+    // facts), `a,b ≥ 0`, and a length `≥ N²`. Then `N*a+b ≤ N(N-1)+(N-1) = N²-1 <
+    // N² ≤ len`, in bounds. This is the classic dense matmul access `c[r*n+col]` /
+    // `a[r*n+k]` — the counted-loop bound lives in the guard (in `lt`), which the
+    // pure-arithmetic fixpoint cannot see, so it is proven here flow-sensitively.
+    if let SymExpr::Add2(x, y) = it.exprs[isym as usize].clone() {
+        for (mul_s, other) in [(x, y), (y, x)] {
+            if let SymExpr::Mul(p, q) = it.exprs[canon(repr, mul_s) as usize].clone() {
+                let (cp, cq) = (canon(repr, p), canon(repr, q));
+                // One Mul factor is a constant N, the other is the induction var a.
+                let (nsym, nval, a) = match (&it.exprs[cp as usize], &it.exprs[cq as usize]) {
+                    (SymExpr::Const(nv), _) => (cp, *nv, cq),
+                    (_, SymExpr::Const(nv)) => (cq, *nv, cp),
+                    _ => continue,
+                };
+                let b = canon(repr, other);
+                let nsq = nval.saturating_mul(nval);
+                if nval >= 1
+                    && lt.contains(&(a, nsym))
+                    && lt.contains(&(b, nsym))
+                    && nn.contains(&a)
+                    && nn.contains(&b)
+                    && matches!(lb_fix.get(ln), Some(Some(l)) if *l >= nsq)
+                {
+                    return true;
+                }
+            }
+        }
+    }
     false
 }
 
