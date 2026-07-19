@@ -1142,12 +1142,16 @@ static void jrt_shutdown(void) {
 #endif
 }
 
-/* --- capsule arena: bump allocator (pure form, scalar-in/scalar-out) ----
- * Between jrt_arena_push/_pop, allocations in the capsule body go into a private
- * arena: immortal (refcount -1 → retain/release/collector no-op), freed en bloc
- * at the end. No pointer may escape (the lowering enforces a scalar result), so
- * no arena object can outlive the arena. Nesting via prev. Hosted only; under
- * threads global (documented limit). */
+/* --- capsule/loop arena: bump allocator (a second, region stack) -------------
+ * Between jrt_arena_push/_pop, allocations in the body go into a private arena:
+ * immortal (refcount -1 → retain/release/collector no-op), freed en bloc at the
+ * end. Non-escaping by construction (the escape analysis / lowering proves it),
+ * so no arena object outlives the arena. Nesting via prev.
+ *
+ * SCALES TO MULTIPLE STACKS: `arena_top` is thread-local under threads, so each
+ * thread owns an independent region stack — concurrent `spawn` workers running
+ * arena-promoted loops no longer share (and race on) one global region. Without
+ * threads (or freestanding) it is a single global stack. Hosted only. */
 #ifndef FASTLLVM_FREESTANDING
 typedef struct ArenaChunk {
     struct ArenaChunk *prev;
@@ -1158,7 +1162,11 @@ typedef struct Arena {
     struct Arena *prev;
     ArenaChunk *chunk;
 } Arena;
+#ifdef FASTLLVM_THREADS
+static _Thread_local Arena *arena_top = NULL; /* one region stack per thread */
+#else
 static Arena *arena_top = NULL;
+#endif
 
 void jrt_arena_push(void) {
     Arena *a = (Arena *)malloc(sizeof(Arena));

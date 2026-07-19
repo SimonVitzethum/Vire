@@ -40,10 +40,20 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   nested-loop variant **0.06× Rust** (was 9.9×). btree stays at 1.08× Rust. All
   sound: Java heap oracle 65/65, benchmark outputs unchanged, tests/vire_heap.sh
   (incl. the escape-return guard). See escape.rs (`STACK_ARR_CAP`).
-- [ ] Remaining array cases: non-constant / large arrays (still heap — the size
-  must be a compile-time constant ≤ 1024), and ref-element arrays (kept heap to
-  avoid skipping element drops). **pagerank/ring** is the collector case
-  (persistent shared cycle), orthogonal to the allocator.
+- [x] **Second (region) stack for dynamic/large arrays + scales to multiple
+  stacks.** A non-escaping array too big / dynamically-sized for the call stack
+  goes into the bump-region arena instead of the RC heap when it sits in a
+  promotable loop body (measured: `array(m)` in a `while`/`for` loop already
+  arena-promotes, freed per iteration). The region is now **thread-local**, so
+  concurrent `spawn` workers each own an independent region stack — no shared
+  global `arena_top` to race on (was a documented threads limit). tests/
+  vire_threads.sh `per_thread_arena` (8 workers, deterministic ×20).
+- [ ] Remaining array cases: constant arrays only stack-promote to the call stack
+  when ≤ 1024; non-escaping dynamic/large arrays **not** inside a promotable loop
+  (e.g. allocated once in a straight-line function) still go to the heap — a
+  function-scoped region would catch them, lower value (one alloc per call). Ref-
+  element arrays stay heap (element drops). **pagerank/ring** is the collector
+  case (persistent shared cycle), orthogonal to the allocator.
 - [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
   field array) — closes part of the residual toward ~1.1×.
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and

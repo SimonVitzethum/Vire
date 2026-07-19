@@ -129,6 +129,25 @@ fn work(i: Int, b: Bag) -> Int { b.n }
 fn main() { mut b = Bag(0)  parallel_for(4, b, work)  print(b.n) }
 EOF
 
+# Per-thread region stacks: 8 workers each run an arena-promoted loop (allocations
+# go into a bump region, not the heap). The region is thread-local, so concurrent
+# workers do not share/race on it — the total must be deterministic across runs.
+ok_case per_thread_arena 80002800000 20 <<'EOF'
+fn compute(base: Int) -> Int {
+    mut s = 0
+    mut k = 0
+    while k < 100000 { mut a = array(4)  a[0] = base + k  a[1] = k  s = s + a[0] + a[1]  k = k + 1 }
+    s
+}
+fn main() {
+    mut h1 = spawn compute(1)  mut h2 = spawn compute(2)
+    mut h3 = spawn compute(3)  mut h4 = spawn compute(4)
+    mut h5 = spawn compute(5)  mut h6 = spawn compute(6)
+    mut h7 = spawn compute(7)  mut h8 = spawn compute(8)
+    print(join(h1)+join(h2)+join(h3)+join(h4)+join(h5)+join(h6)+join(h7)+join(h8))
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
