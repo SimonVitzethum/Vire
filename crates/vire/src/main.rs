@@ -465,6 +465,21 @@ fn build_or_run(args: &[String]) {
     let mut threads_flag = false;
     let mut backtrace_flag = false;
     let mut debug_flag = false;
+    // Build-system interop (Meson / C-ABI object files). `--emit=obj` lowers the whole
+    // `.vr` program to ONE relocatable object exposing C-ABI symbols (the runtime `main`
+    // included) that Meson/ld links with other objects; `--emit=staticlib` wraps it in a
+    // `.a`; `--emit=asm` emits the program IR as assembly. `--deps FILE` writes a
+    // Makefile/Ninja depfile (Meson `depfile:`); `-I DIR` forwards include paths;
+    // `--pkg NAME` pulls cflags+libs from pkg-config (first-class dependency consumption).
+    let mut emit_obj = false;
+    let mut emit_asm = false;
+    let mut emit_staticlib = false;
+    let mut deps_file: Option<String> = None;
+    let mut include_dirs: Vec<String> = Vec::new();
+    let mut pkgs: Vec<String> = Vec::new();
+    // Header files pulled in by `extern "C" header "…"` — recorded as build dependencies
+    // for the `--deps` depfile (so Meson/Ninja rebuild when a header changes).
+    let mut header_deps: Vec<String> = Vec::new();
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -492,6 +507,41 @@ fn build_or_run(args: &[String]) {
             }
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
+            // Unified emit selector (Meson-style): --emit=obj|asm|llvm|ir|staticlib|exe.
+            a if a.starts_with("--emit=") => match &a[7..] {
+                "ir" => emit_ir = true,
+                "llvm" => emit_llvm = true,
+                "obj" | "object" => emit_obj = true,
+                "asm" | "assembly" => emit_asm = true,
+                "staticlib" | "lib" | "static" => emit_staticlib = true,
+                "exe" | "bin" | "executable" => {}
+                k => {
+                    eprintln!("--emit: unknown kind '{k}' (obj|asm|llvm|ir|staticlib|exe)");
+                    exit(2);
+                }
+            },
+            "--deps" => match it.next() {
+                Some(f) => deps_file = Some(f.clone()),
+                None => {
+                    eprintln!("--deps needs a file path");
+                    exit(2);
+                }
+            },
+            "-I" => match it.next() {
+                Some(d) => include_dirs.push(d.clone()),
+                None => {
+                    eprintln!("-I needs a directory");
+                    exit(2);
+                }
+            },
+            a if a.starts_with("-I") && a.len() > 2 => include_dirs.push(a[2..].to_string()),
+            "--pkg" => match it.next() {
+                Some(n) => pkgs.push(n.clone()),
+                None => {
+                    eprintln!("--pkg needs a package name (pkg-config)");
+                    exit(2);
+                }
+            },
             "-O0" => opt0 = true,
             // MEASUREMENT: cycle collector forced OFF (even for cyclic types).
             // Unsound (leaks cycles), but isolates the collector cost against the
@@ -550,6 +600,27 @@ fn build_or_run(args: &[String]) {
         }
     };
 
+    // First-class dependency consumption: `--pkg NAME` resolves compile/link flags via
+    // pkg-config (`--cflags`/`--libs`), so a Vire project links system libraries the same
+    // way a Meson/C project does. cflags feed both the native-block compile and the final
+    // link; libs feed the link. A missing package is a hard error (fail early, clearly).
+    let mut pkg_cflags: Vec<String> = Vec::new();
+    let mut pkg_libs: Vec<String> = Vec::new();
+    for name in &pkgs {
+        let cflags = pkg_config_query("--cflags", name);
+        let libs = pkg_config_query("--libs", name);
+        match (cflags, libs) {
+            (Some(cf), Some(lf)) => {
+                pkg_cflags.extend(cf.split_whitespace().map(String::from));
+                pkg_libs.extend(lf.split_whitespace().map(String::from));
+            }
+            _ => {
+                eprintln!("--pkg: pkg-config has no package '{name}' (or pkg-config not installed)");
+                exit(1);
+            }
+        }
+    }
+
     // Front end: lex/parse (with optional user-defined syntax).
     let syntax = load_syntax(&path);
     let (mut module, diags) = vire::parse_with_syntax(&src, syntax);
@@ -565,6 +636,7 @@ fn build_or_run(args: &[String]) {
     for it in module.items.iter_mut() {
         if let vire::ast::Item::Extern { items, header: Some(h), .. } = it {
             let hpath = src_dir.join(&*h);
+            header_deps.push(hpath.to_string_lossy().into_owned());
             let htext = match std::fs::read_to_string(&hpath) {
                 Ok(t) => t,
                 Err(e) => {
@@ -851,6 +923,133 @@ fn build_or_run(args: &[String]) {
             }
         }
     }
+    // === Object / assembly / static-library emit (Meson & C/C++/Rust interop) ===
+    // A whole `.vr` program lowers to ONE relocatable object exposing C-ABI symbols
+    // (the runtime `main` included) that Meson/ld links with other objects. We must NOT
+    // use `-flto` here: `ld -r`/`ar` merge real ELF objects, not LTO bitcode (the exe
+    // path below keeps full LTO). The same `-D` defines as the exe path keep the runtime
+    // ABI identical, so the emitted object behaves exactly like a `vire build` binary.
+    if emit_obj || emit_asm || emit_staticlib {
+        let mut cg: Vec<String> = Vec::new();
+        cg.push(if opt0 { "-O0".into() } else { "-O2".into() });
+        match &target {
+            Some(t) => {
+                cg.push("-target".into());
+                cg.push(t.clone());
+            }
+            None => cg.push("-march=native".into()),
+        }
+        if want_threads || threads_flag {
+            cg.push("-DFASTLLVM_THREADS".into());
+        }
+        if backtrace_flag {
+            cg.push("-DFASTLLVM_BACKTRACE".into());
+        }
+        if debug_flag {
+            cg.push("-g".into());
+            cg.push("-fno-omit-frame-pointer".into());
+        }
+        if acyclic || force_no_cycles {
+            cg.push("-DFASTLLVM_NO_CYCLES".into());
+        }
+        if force_no_rc {
+            cg.push("-DFASTLLVM_NO_RC".into());
+        }
+        for inc in &include_dirs {
+            cg.push(format!("-I{inc}"));
+        }
+        if let Some(inc) = &py_include {
+            cg.push(format!("-I{inc}"));
+        }
+        cg.extend(pkg_cflags.iter().cloned());
+
+        let default_ext = if emit_asm {
+            "s"
+        } else if emit_staticlib {
+            "a"
+        } else {
+            "o"
+        };
+        // `out` is already resolved (the exe path defaulted it to the file stem). Give it
+        // the kind's extension when none was supplied (`-o prog` → `prog.o`).
+        let out = if out.extension().is_some() { out.clone() } else { out.with_extension(default_ext) };
+        // Ninja/Makefile depfile (Meson `depfile:`): the object depends on the .vr source
+        // and every C header it pulls in, so a header edit triggers a rebuild.
+        if let Some(df) = &deps_file {
+            write_depfile(df, &out, &path, &header_deps);
+        }
+
+        if emit_asm {
+            // Assembly of the program IR — the inspectable artifact (runtime excluded).
+            let st = Command::new("clang").args(&cg).arg("-S").arg(&ll_path).arg("-o").arg(&out).status();
+            match st {
+                Ok(s) if s.success() => {}
+                _ => {
+                    eprintln!("clang -S (assembly emit) failed");
+                    exit(1);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&build_dir);
+            eprintln!("vire: wrote {}", out.display());
+            return;
+        }
+
+        // Compile each input to a real ELF object, then partial-link into a single .o.
+        let mut objs: Vec<PathBuf> = Vec::new();
+        let compile = |src: &std::path::Path, tag: &str| -> PathBuf {
+            let o = build_dir.join(format!("{tag}.o"));
+            let st = Command::new("clang").args(&cg).arg("-c").arg(src).arg("-o").arg(&o).status();
+            match st {
+                Ok(s) if s.success() => o,
+                _ => {
+                    eprintln!("clang -c failed for {}", src.display());
+                    exit(1);
+                }
+            }
+        };
+        objs.push(compile(&ll_path, "program"));
+        objs.push(compile(&rt_path, "runtime"));
+        for (i, p) in native_paths.iter().enumerate() {
+            // Only compilable native sources land in the object (skip e.g. python .py,
+            // which is loaded at runtime via libpython, not linked).
+            let compilable = matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("c" | "cc" | "cpp" | "cxx" | "s" | "S")
+            );
+            if compilable {
+                objs.push(compile(p, &format!("native_{i}")));
+            }
+        }
+        // Relocatable partial link → one merged .o.
+        let merged = if emit_staticlib { build_dir.join("merged.o") } else { out.clone() };
+        let mut r = Command::new("clang");
+        r.arg("-r").arg("-nostdlib");
+        for o in &objs {
+            r.arg(o);
+        }
+        let st = r.arg("-o").arg(&merged).status();
+        match st {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("clang -r (object merge) failed");
+                exit(1);
+            }
+        }
+        if emit_staticlib {
+            let st = Command::new("ar").arg("rcs").arg(&out).arg(&merged).status();
+            match st {
+                Ok(s) if s.success() => {}
+                _ => {
+                    eprintln!("ar (static library) failed");
+                    exit(1);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&build_dir);
+        eprintln!("vire: wrote {}", out.display());
+        return;
+    }
+
     let mut cmd = Command::new("clang");
     if opt0 {
         // Measurement mode: no optimization, no LTO → allocations remain in place.
@@ -911,6 +1110,11 @@ fn build_or_run(args: &[String]) {
     if let Some(inc) = &py_include {
         cmd.arg(format!("-I{inc}"));
     }
+    // User include paths (`-I`) and pkg-config cflags — for `native "c"` blocks / headers.
+    for inc in &include_dirs {
+        cmd.arg(format!("-I{inc}"));
+    }
+    cmd.args(&pkg_cflags);
     for p in &native_paths {
         cmd.arg(p);
     }
@@ -926,6 +1130,8 @@ fn build_or_run(args: &[String]) {
     for l in &link_libs {
         cmd.arg(format!("-l{l}"));
     }
+    // pkg-config libs (`--libs`: -L/-l/other) resolved from `--pkg`.
+    cmd.args(&pkg_libs);
     let status = cmd.arg("-o").arg(&out).status();
     match status {
         Ok(st) if st.success() => {
@@ -951,6 +1157,34 @@ fn build_or_run(args: &[String]) {
                 exit(1);
             }
         }
+    }
+}
+
+/// Query pkg-config for a package's `--cflags` or `--libs`. Returns the trimmed output,
+/// or `None` if pkg-config is missing or the package is unknown (non-zero exit).
+fn pkg_config_query(flag: &str, name: &str) -> Option<String> {
+    let out = Command::new("pkg-config").arg(flag).arg(name).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Write a Makefile/Ninja depfile (`out: src header…`) for Meson's `depfile:` — Ninja
+/// rebuilds the object when the `.vr` source or any pulled-in C header changes. Paths
+/// with spaces are escaped `\ ` per the Make depfile convention.
+fn write_depfile(path: &str, out: &std::path::Path, src: &str, headers: &[String]) {
+    let esc = |s: &str| s.replace(' ', "\\ ");
+    let mut line = format!("{}:", esc(&out.to_string_lossy()));
+    line.push(' ');
+    line.push_str(&esc(src));
+    for h in headers {
+        line.push(' ');
+        line.push_str(&esc(h));
+    }
+    line.push('\n');
+    if let Err(e) = std::fs::write(path, line) {
+        eprintln!("warning: could not write depfile {path}: {e}");
     }
 }
 

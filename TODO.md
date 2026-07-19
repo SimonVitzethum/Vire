@@ -272,11 +272,18 @@ Attach: whole-program type graph + `comptime`.
 - [ ] `@when` platform switches (the `comptime if` conditional-compilation primitive
   already lands).
 
-### [5] Build interop, Meson first-class
+### [5] Build interop, Meson first-class — **DONE**
 Attach: clang→object (present).
-- [ ] Stable compiler CLI (`--emit=obj|llvm|asm`, `-O`, `--deps` Ninja `.d`).
-- [ ] Meson module `vire` (`vire.executable/static_library`), C-ABI `.o`/`.a`.
-- [ ] `vire build` wrapper delegates to Meson; pkg-config deps → binding generator.
+- [x] Stable compiler CLI: `--emit=obj|asm|llvm|ir|staticlib`, `--deps` (Makefile/Ninja
+      depfile), `-I DIR`. A whole `.vr` program lowers to ONE relocatable C-ABI object
+      (runtime `main` included), mergeable via `clang -r`; `--emit=staticlib` → `.a`.
+- [x] Meson integration `vire` (`vire.executable/static_library`), C-ABI `.o`/`.a`:
+      `build-integration/meson/` — a tested stock-DSL `custom_target` pattern (builds +
+      runs, links a Vire object with a C object → 42) and an optional `import('vire')`
+      Python module (`vire.py`). Incremental via the `--deps` depfile.
+- [x] pkg-config deps first-class: `--pkg NAME` resolves `--cflags`/`--libs` and forwards
+      them to both the native-block compile and the link (tested against zlib). The
+      binding generator (`vire bindgen` / `extern "C" header "…"`) already covers headers.
 
 ### [6] Logger — remaining
 The **compile-time level filter** (disabled calls = 0 instructions) works.

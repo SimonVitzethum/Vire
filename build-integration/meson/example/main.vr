@@ -1,0 +1,9 @@
+// Demonstrates Meson linking a Vire object with a C object.
+// `util_double` is defined in util.c and linked in by Meson.
+extern "C" {
+    fn util_double(x: Int) -> Int
+}
+
+fn main() {
+    print(util_double(21))   // → 42
+}
