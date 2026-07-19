@@ -76,6 +76,69 @@ else
     echo "FAIL non-constant const rejected"; fail=$((fail+1))
 fi
 
+# --- Phase 3a: the comptime interpreter ---------------------------------
+
+# comptime function call, including recursion.
+cat > "$work/call.vr" <<'EOF'
+fn fact(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
+fn sq(x: Int) -> Int { x * x }
+fn main() {
+    print(comptime fact(5))   // 120
+    print(comptime sq(9))     // 81
+}
+EOF
+check "comptime call + recursion" "120
+81" "$work/call.vr"
+
+# comptime block with let + for accumulation, and while.
+cat > "$work/block.vr" <<'EOF'
+fn main() {
+    print(comptime {
+        mut sum = 0
+        for i in 0..=10 { sum = sum + i }
+        sum
+    })                          // 55
+    print(comptime {
+        mut n = 1
+        mut c = 0
+        while n < 100 { n = n * 2; c = c + 1 }
+        c
+    })                          // 7
+}
+EOF
+check "comptime block let/for/while" "55
+7" "$work/block.vr"
+
+# A comptime function call as a const initializer AND as an array size.
+cat > "$work/csize.vr" <<'EOF'
+fn fact(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
+const F4 = fact(4)
+fn main() {
+    print(F4)                       // 24
+    mut a = array(comptime fact(4))
+    a[F4 - 1] = 9
+    print(a[23])                    // 9
+}
+EOF
+check "comptime fn in const + array size" "24
+9" "$work/csize.vr"
+
+# An accidental infinite comptime loop is caught by the step budget, not a hang.
+cat > "$work/loop.vr" <<'EOF'
+fn main() {
+    print(comptime {
+        mut n = 0
+        while n >= 0 { n = n + 1 }
+        n
+    })
+}
+EOF
+if timeout 60 "$vire" run "$work/loop.vr" 2>&1 | grep -q 'step budget'; then
+    echo "ok   infinite comptime loop caught by budget"; pass=$((pass+1))
+else
+    echo "FAIL infinite comptime loop budget"; fail=$((fail+1))
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

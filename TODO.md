@@ -109,10 +109,18 @@ subsystem, sequenced.
 
 Feature sequence on top:
 
-- [ ] **(a) comptime evaluator core** — a real interpreter over the typed AST:
-  comptime `let`/`for` (loop unrolling), comptime function calls with a recursion
-  limit, const-fold of pure expressions. Foundation the other two build on. Today
-  only `comptime if` (drop untaken branch) + literal const-fold exist.
+- [x] **(a) comptime evaluator core** — a budget-limited interpreter in
+  [comptime.rs](crates/vire/src/comptime.rs) (`Interp`): comptime `let`/assignment,
+  `for`/`while` executed at compile time (value accumulation), `if`, and calls to
+  pure module functions (`comptime f(x)`) with recursion — all with a step +
+  recursion budget (an infinite comptime loop is a compile error, not a hang) and
+  lexical isolation (a callee sees only its params + consts). Powers const
+  initializers (`const F = fact(6)`), comptime array sizes (`array(comptime fact(4))`),
+  and comptime blocks. Anything non-constant (runtime op, unbound name) defers to
+  lowering. tests/vire_comptime.sh (9/9). Open: comptime `for` *unrolling* into
+  runtime statements (this executes at comptime to a value; unrolling is separate),
+  comptime over reference/aggregate values (scalars only today), `return`/`break` in
+  a comptime body.
 - [ ] **(b) typed reflection over the type graph** — `@typeinfo(T)` yielding
   fields/variants/methods/attributes as a *comptime-iterable typed value*; then
   `@derive(Eq, Hash, Ord, Show, Json, …)` generated from it. AOT only, no runtime
