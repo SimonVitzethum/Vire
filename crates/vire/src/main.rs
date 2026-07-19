@@ -405,6 +405,7 @@ fn build_or_run(args: &[String]) {
     // error. `--noverify` turns it off.
     let mut noverify = false;
     let mut threads_flag = false;
+    let mut backtrace_flag = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -419,6 +420,9 @@ fn build_or_run(args: &[String]) {
             // Force the threads runtime even without `spawn` (atomic RC + pthreads).
             // `spawn` enables it automatically; this is for explicit control.
             "--threads" => threads_flag = true,
+            // Debug: print a native backtrace on an uncaught exception / hard crash
+            // (off by default → zero overhead). Needs -rdynamic for symbol names.
+            "--backtrace" => backtrace_flag = true,
             // Obsolete: the verifier is now linked in (vendored). Accept + ignore the
             // old `--verify-c <path>` form so existing invocations keep working.
             "--verify-c" => {
@@ -776,6 +780,11 @@ fn build_or_run(args: &[String]) {
     // runtime.c), so it composes with the acyclic/NO_CYCLES flags below.
     if want_threads || threads_flag {
         cmd.arg("-DFASTLLVM_THREADS").arg("-pthread");
+    }
+    // Debug backtraces: define the runtime hook and export symbols so the native
+    // backtrace resolves Vire function names.
+    if backtrace_flag {
+        cmd.arg("-DFASTLLVM_BACKTRACE").arg("-rdynamic").arg("-funwind-tables");
     }
     if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");

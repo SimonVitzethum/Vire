@@ -1831,8 +1831,42 @@ static JObjHeader arith_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader npe_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader bounds_exc_obj = {-1, jrt_sentinel_vtable};
 
+/* --- Debug backtraces (--backtrace, off by default) --------------------------
+ * Capture a native backtrace at the THROW ORIGIN (where the stack still holds the
+ * failing frames) and print it only if the exception goes uncaught. A SIGSEGV/
+ * SIGABRT handler covers hard crashes too. Needs -rdynamic so the Vire function
+ * names resolve. Zero cost without the flag (empty stubs). Hosted only. */
+#if defined(FASTLLVM_BACKTRACE) && !defined(FASTLLVM_FREESTANDING)
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+static void *bt_buf[64];
+static int bt_n = 0;
+static void capture_backtrace(void) { bt_n = backtrace(bt_buf, 64); }
+static void print_backtrace(void) {
+    if (bt_n <= 0) return;
+    plat_puts("backtrace (most recent call first, needs symbols; pipe through addr2line for file:line):\n");
+    backtrace_symbols_fd(bt_buf, bt_n, 2 /* stderr */);
+}
+static void bt_signal(int sig) {
+    void *buf[64];
+    int n = backtrace(buf, 64);
+    plat_puts(sig == SIGSEGV ? "\nfatal: segmentation fault\n" : "\nfatal: aborted\n");
+    backtrace_symbols_fd(buf, n, 2);
+    _exit(139);
+}
+__attribute__((constructor)) static void bt_install(void) {
+    signal(SIGSEGV, bt_signal);
+    signal(SIGBUS, bt_signal);
+}
+#else
+static void capture_backtrace(void) {}
+static void print_backtrace(void) {}
+#endif
+
 /* Called by the runtime checks: set a pending runtime exception. */
 static void throw_runtime(void *sentinel, const char *msg) {
+    capture_backtrace();
     pending_exception = sentinel;
     pending_message = msg;
 }
@@ -1985,6 +2019,7 @@ void jrt_check_uncaught(void) {
             plat_puts("Exception in thread \"main\" (unhandled exception)\n");
         }
     }
+    print_backtrace();
     plat_abort();
 }
 

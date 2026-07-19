@@ -162,9 +162,13 @@ The **compile-time level filter** (disabled calls = 0 instructions) works.
 
 ### [8] Debug symbols + crash paths
 Attach: LLVM debug metadata (backend extension), panic model.
-- [ ] Thread line numbers front-end→IR; emit `!DILocation`/`!DISubprogram`.
-- [ ] Debug runtime backtrace (`file:line:function`) on panic/bounds/null.
-- [ ] Off by default in release (0 overhead), `--release --backtrace` opt-in.
+- [x] **`--backtrace`**: native backtrace on an uncaught exception / hard crash
+  (SIGSEGV/SIGBUS handler), captured at the throw origin, printed only if
+  uncaught. Symbol names via `-rdynamic`. Off by default → zero overhead (empty
+  stubs). tests/vire_debug.sh.
+- [ ] `!DILocation`/`!DISubprogram` DWARF so the backtrace resolves to `file:line`
+  (needs source line numbers threaded front-end→IR; currently symbol+offset only,
+  and `-O2 -flto` inlining collapses inner frames).
 - [ ] freestanding: compact symbol table instead of libc `backtrace`.
 
 ---
