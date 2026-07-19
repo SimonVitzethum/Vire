@@ -140,6 +140,8 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_null_check", "void (ptr)"),
     ("jrt_throw_npe", "void ()"),
     ("jrt_throw_bounds", "void ()"),
+    ("jrt_throw_npe_fatal", "void ()"),
+    ("jrt_throw_bounds_fatal", "void ()"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
     ("jrt_throw", "void (ptr)"),
@@ -809,11 +811,20 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
 
     // Error/exception helpers are cold: marked `cold`, LLVM moves their
     // calls out of the hot path (better block layout, branch prediction
-    // like Rust's `#[cold]` panic). No `noreturn` — Vire's pending model returns.
+    // like Rust's `#[cold]` panic). The pending-model throws return (continue);
+    // the `_fatal` variants abort → `cold noreturn`, so the checked access's
+    // failure block ends in `unreachable` and the load result stays a direct value.
     const COLD: &[&str] = &["jrt_throw_npe", "jrt_throw_bounds", "jrt_throw", "jrt_check_uncaught"];
+    const COLD_NORETURN: &[&str] = &["jrt_throw_npe_fatal", "jrt_throw_bounds_fatal"];
     for (name, sig) in RUNTIME_DECLS {
         let (ret, params) = sig.split_once(' ').unwrap();
-        let attr = if COLD.contains(name) { " cold" } else { "" };
+        let attr = if COLD_NORETURN.contains(name) {
+            " cold noreturn"
+        } else if COLD.contains(name) {
+            " cold"
+        } else {
+            ""
+        };
         writeln!(w, "declare {ret} @{name}{params}{attr}").unwrap();
     }
 
@@ -841,8 +852,26 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     }
     writeln!(w).unwrap();
 
+    // Whole-program catchability: a runtime exception (bounds/NPE) can be caught
+    // only if SOME function has an exception handler — which in the pending model
+    // manifests as an `InstanceOfPending` (catch-type discrimination) or a
+    // `jrt_take_pending` call (a catch grabbing the exception; try-finally likewise
+    // takes-and-rethrows). If NO function does either, every such throw is
+    // uncatchable and MUST end the program, so the inline check can use the
+    // `_fatal` noreturn helpers (failure block ends in `unreachable`, the load
+    // result stays a direct value — Rust's structure). Verified sound by the Java
+    // oracle: Catch.java/Finally.java must keep the pending model (their output
+    // would diverge otherwise).
+    // Disabled under debug info (`-g`): the `unreachable` after a noreturn fatal
+    // throw disturbs the inlinedAt chain that `addr2line -i` resolves. Debug builds
+    // are -O0 and value precise crash lines over speed; release builds get the win.
+    let uncatchable = !dg.on
+        && !program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|st| {
+            matches!(st, Statement::InstanceOfPending { .. })
+                || matches!(st, Statement::Call { func, .. } if func == "jrt_take_pending")
+        });
     for f in &program.functions {
-        emit_function(w, &ctx, f, &mut dg, &fn_lines);
+        emit_function(w, &ctx, f, &mut dg, &fn_lines, uncatchable);
     }
 
     // Thread trampoline: called by the runtime (pthread or synchronous),
@@ -1101,6 +1130,10 @@ struct FnEmitter<'a> {
     /// store (`PutField` value / `return`) — the store takes their +1 (no retain),
     /// and they are not released at cleanup. See `moved_locals`.
     moved: BTreeSet<u32>,
+    /// Whole-program: no exception handler can catch a runtime exception, so an
+    /// inline bounds/NPE failure aborts via the `_fatal` noreturn helpers
+    /// (`unreachable` after) instead of the pending-continue merge.
+    uncatchable: bool,
     /// Provably non-null locals — the inline null check on field accesses
     /// is omitted.
     nn: BTreeSet<u32>,
@@ -1679,7 +1712,7 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
         .collect()
 }
 
-fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>) {
+fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool) {
     let ps: Vec<String> = f
         .params
         .iter()
@@ -1781,7 +1814,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let moved = moved_locals(f, &borrowed, &borrow, &imm);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, nn, md_inv: ctx.md_inv, marker_locs, cur_loc: default_loc };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -2386,6 +2419,58 @@ fn zero_lit(vty: Ty) -> &'static str {
 fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: ArrKind, nn: bool) -> String {
     let vty = k.value_ty();
     let sty = arr_store_ty(k);
+    let extend = |w: &mut String, e: &mut FnEmitter, raw: &str| -> String {
+        match k {
+            ArrKind::Byte | ArrKind::Short => {
+                let x = e.fresh();
+                writeln!(w, "  {x} = sext {sty} {raw} to i32").unwrap();
+                x
+            }
+            ArrKind::Bool | ArrKind::Char => {
+                let x = e.fresh();
+                writeln!(w, "  {x} = zext {sty} {raw} to i32").unwrap();
+                x
+            }
+            _ => raw.to_string(),
+        }
+    };
+    // UNCATCHABLE program: a bounds/NPE failure aborts (noreturn), so each failure
+    // block ends in `unreachable`. The valid load then dominates — its result is a
+    // direct value (no cont/phi), exactly like Rust's `panic` path.
+    if e.uncatchable {
+        let (npe, ck, bd, ld) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
+        if !nn {
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+            writeln!(w, "{npe}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe_fatal(){}", e.dbg()).unwrap();
+            writeln!(w, "  unreachable").unwrap();
+            writeln!(w, "{ck}:").unwrap();
+        }
+        let lenp = e.fresh();
+        writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
+        let len = e.fresh();
+        writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+        let idx = e.fresh();
+        writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
+        let oob = e.fresh();
+        writeln!(w, "  {oob} = icmp uge i64 {idx}, {len}").unwrap();
+        writeln!(w, "  br i1 {oob}, label %{bd}, label %{ld}").unwrap();
+        writeln!(w, "{bd}:").unwrap();
+        writeln!(w, "  call void @jrt_throw_bounds_fatal(){}", e.dbg()).unwrap();
+        writeln!(w, "  unreachable").unwrap();
+        writeln!(w, "{ld}:").unwrap();
+        let off = e.fresh();
+        writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
+        let base = e.fresh();
+        writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
+        let ep = e.fresh();
+        writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+        let raw = e.fresh();
+        writeln!(w, "  {raw} = load {sty}, ptr {ep}").unwrap();
+        return extend(w, e, &raw);
+    }
     let (npe, ck, bd, ld, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
     // Null check only if the array is NOT provably non-null (created locally via
     // `array(n)` or similar). Saves a branch per access in tight loops.
@@ -2419,19 +2504,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
     writeln!(w, "  {raw} = load {sty}, ptr {ep}").unwrap();
-    let ext = match k {
-        ArrKind::Byte | ArrKind::Short => {
-            let x = e.fresh();
-            writeln!(w, "  {x} = sext {sty} {raw} to i32").unwrap();
-            x
-        }
-        ArrKind::Bool | ArrKind::Char => {
-            let x = e.fresh();
-            writeln!(w, "  {x} = zext {sty} {raw} to i32").unwrap();
-            x
-        }
-        _ => raw,
-    };
+    let ext = extend(w, e, &raw);
     writeln!(w, "  br label %{cont}").unwrap();
     writeln!(w, "{cont}:").unwrap();
     let v = e.fresh();
@@ -2450,6 +2523,52 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
 /// pending; in the valid case a visible `store`.
 fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v: &str, k: ArrKind, nn: bool) {
     let sty = arr_store_ty(k);
+    let trunc_val = |w: &mut String, e: &mut FnEmitter| -> String {
+        match k {
+            ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
+                let x = e.fresh();
+                writeln!(w, "  {x} = trunc i32 {v} to {sty}").unwrap();
+                x
+            }
+            _ => v.to_string(),
+        }
+    };
+    // UNCATCHABLE program: failure blocks abort (noreturn) → `unreachable`, and the
+    // valid store dominates the continuation (no cont/merge).
+    if e.uncatchable {
+        let (npe, ck, bd, st) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
+        if !nn {
+            let isnull = e.fresh();
+            writeln!(w, "  {isnull} = icmp eq ptr {a}, null").unwrap();
+            writeln!(w, "  br i1 {isnull}, label %{npe}, label %{ck}").unwrap();
+            writeln!(w, "{npe}:").unwrap();
+            writeln!(w, "  call void @jrt_throw_npe_fatal(){}", e.dbg()).unwrap();
+            writeln!(w, "  unreachable").unwrap();
+            writeln!(w, "{ck}:").unwrap();
+        }
+        let lenp = e.fresh();
+        writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
+        let len = e.fresh();
+        writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+        let idx = e.fresh();
+        writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
+        let oob = e.fresh();
+        writeln!(w, "  {oob} = icmp uge i64 {idx}, {len}").unwrap();
+        writeln!(w, "  br i1 {oob}, label %{bd}, label %{st}").unwrap();
+        writeln!(w, "{bd}:").unwrap();
+        writeln!(w, "  call void @jrt_throw_bounds_fatal(){}", e.dbg()).unwrap();
+        writeln!(w, "  unreachable").unwrap();
+        writeln!(w, "{st}:").unwrap();
+        let off = e.fresh();
+        writeln!(w, "  {off} = mul i64 {idx}, {}", k.size()).unwrap();
+        let base = e.fresh();
+        writeln!(w, "  {base} = getelementptr i8, ptr {a}, i64 32").unwrap();
+        let ep = e.fresh();
+        writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
+        let sv = trunc_val(w, e);
+        writeln!(w, "  store {sty} {sv}, ptr {ep}").unwrap();
+        return;
+    }
     let (npe, ck, bd, st, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
     if !nn {
         let isnull = e.fresh();

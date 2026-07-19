@@ -1919,6 +1919,30 @@ void jrt_throw_sioobe(void) {
     throw_runtime(&bounds_exc_obj, "java.lang.StringIndexOutOfBoundsException");
 }
 
+/* Fatal (noreturn) variants: when the whole program provably has NO handler that
+ * could catch a runtime exception (no try/catch anywhere — the common case, always
+ * true for pure Vire), an inline bounds/NPE failure cannot be caught and MUST end
+ * the program. Reporting immediately here (identical text to jrt_check_uncaught)
+ * lets the generated check end its failure block with `unreachable` instead of the
+ * pending-continue merge — so the checked load's result is a direct value, exactly
+ * like Rust's `panic` path. Memory safety is unchanged: the check still runs; only
+ * the (uncatchable) throw aborts at the site instead of propagating via pending,
+ * which is *more* faithful to Java's unwinding semantics. */
+_Noreturn void jrt_throw_bounds_fatal(void) {
+    capture_backtrace();
+    plat_uncaught("java.lang.ArrayIndexOutOfBoundsException");
+    print_backtrace();
+    plat_abort();
+    __builtin_unreachable();
+}
+_Noreturn void jrt_throw_npe_fatal(void) {
+    capture_backtrace();
+    plat_uncaught("java.lang.NullPointerException");
+    print_backtrace();
+    plat_abort();
+    __builtin_unreachable();
+}
+
 /* Throwable.getMessage(): reads the $message field (first instance field of
  * java.lang.Throwable → offset 3 words). Runtime sentinels (Arith/NPE/…)
  * have no type descriptor (vt[2]==NULL) and no such field → null.
