@@ -55,6 +55,39 @@ fn sq(n: Int) -> Int { n * n }
 fn main() { mut a = spawn sq(6)  mut b = spawn sq(7)  print(join(a) + join(b)) }
 EOF
 
+# multi-argument worker (id + shared Atomic), packed via an env buffer
+ok_case multi_arg_spawn 300000 20 <<'EOF'
+fn worker(id: Int, c: Atomic) -> Int {
+    mut i = 0
+    while i < 50000 { c.fetch_add(id)  i = i + 1 }
+    0
+}
+fn main() {
+    mut c = Atomic(0)
+    mut h1 = spawn worker(1, c)
+    mut h2 = spawn worker(2, c)
+    mut h3 = spawn worker(3, c)
+    join(h1)  join(h2)  join(h3)
+    print(c.load())
+}
+EOF
+
+# Mutex: lock-guarded read-modify-write is race-free (a bare += would lose adds)
+ok_case mutex_guard 20000 20 <<'EOF'
+fn worker(m: Mutex) -> Int {
+    mut i = 0
+    while i < 10000 { m.lock()  m.set(m.get() + 1)  m.unlock()  i = i + 1 }
+    0
+}
+fn main() {
+    mut m = Mutex(0)
+    mut h1 = spawn worker(m)
+    mut h2 = spawn worker(m)
+    join(h1)  join(h2)
+    print(m.get())
+}
+EOF
+
 # fetch_add returns the previous value
 ok_case fetch_add_prev 0 <<'EOF'
 fn main() { mut c = Atomic(41)  print(c.fetch_add(1) - 41) }
@@ -67,10 +100,16 @@ fn worker(c: Counter) -> Int { c.n }
 fn main() { mut c = Counter(0)  join(spawn worker(c))  print(c.n) }
 EOF
 
-# only single-argument workers (multi-arg needs an env; refused for now)
-err_case multi_arg_reject "exactly one argument" <<'EOF'
+# two scalar arguments, joined result
+ok_case two_scalar_spawn 3 <<'EOF'
 fn w(a: Int, b: Int) -> Int { a + b }
 fn main() { print(join(spawn w(1, 2))) }
+EOF
+
+# arity mismatch (worker takes 2, called with 1) → rejected
+err_case arity_reject "takes 2 argument" <<'EOF'
+fn w(a: Int, b: Int) -> Int { a + b }
+fn main() { print(join(spawn w(1))) }
 EOF
 
 echo "---"

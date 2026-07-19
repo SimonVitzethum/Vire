@@ -26,15 +26,14 @@ use std::collections::{HashMap, HashSet};
 /// threads (link with `-DFASTLLVM_THREADS -pthread`) and each worker must be kept
 /// as a reachability root (it is called only from its C shim, invisible to RTA).
 pub fn desugar_spawn(m: &mut Module) -> (Vec<String>, Vec<String>) {
-    // Worker parameter type per top-level function (for the C signature + Send check).
-    let mut param_ty: HashMap<String, Option<Type>> = HashMap::new();
+    // All parameter types per top-level function (for the C signature + Send check).
+    let mut params: HashMap<String, Vec<Option<Type>>> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            let first = f.sig.params.first().and_then(|p| p.ty.clone());
-            param_ty.insert(f.sig.name.clone(), first);
+            params.insert(f.sig.name.clone(), f.sig.params.iter().map(|p| p.ty.clone()).collect());
         }
     }
-    let mut ctx = Ctx { param_ty, shims: HashSet::new(), generated: Vec::new(), errs: Vec::new() };
+    let mut ctx = Ctx { params, shims: HashSet::new(), generated: Vec::new(), errs: Vec::new() };
     for item in &mut m.items {
         if let Item::Fn(f) = item {
             if let Some(body) = &mut f.body {
@@ -48,7 +47,7 @@ pub fn desugar_spawn(m: &mut Module) -> (Vec<String>, Vec<String>) {
 }
 
 struct Ctx {
-    param_ty: HashMap<String, Option<Type>>,
+    params: HashMap<String, Vec<Option<Type>>>,
     /// Worker names that already have a generated `__spawn_<f>` shim (dedupe).
     shims: HashSet<String>,
     generated: Vec<Item>,
@@ -165,60 +164,126 @@ impl Ctx {
         }
     }
 
-    /// Rewrite `spawn f(arg)` → `__spawn_f(arg)`, generating the C shim + extern
-    /// on first sight of worker `f`.
+    /// Rewrite `spawn f(a, b, …)` into a call of a generated shim, generating the
+    /// C glue + extern on first sight of worker `f`. One argument → a direct
+    /// `__spawn_f(a)`; several → `__spawn_f(__envpack_f(a, b, …))`, where the args
+    /// are boxed into an immortal env buffer that the worker unpacks.
     fn build(&mut self, call: &Expr, span: Span) -> Option<Expr> {
-        let (fname, arg) = match call {
+        let (fname, cargs) = match call {
             Expr::Call { callee, args, .. } => match callee.as_ref() {
-                Expr::Ident(n, _) if args.len() == 1 => (n.clone(), args[0].clone()),
+                Expr::Ident(n, _) if !args.is_empty() => (n.clone(), args.clone()),
                 Expr::Ident(_, _) => {
-                    self.errs.push("spawn: the worker call must take exactly one argument (a scalar or an Atomic/Mutex)".into());
+                    self.errs.push("spawn: the worker call needs at least one argument (a scalar or an Atomic/Mutex)".into());
                     return None;
                 }
                 _ => {
-                    self.errs.push("spawn: expected `spawn worker(arg)` with a named worker function".into());
+                    self.errs.push("spawn: expected `spawn worker(args…)` with a named worker function".into());
                     return None;
                 }
             },
             _ => {
-                self.errs.push("spawn: expected a function call `spawn worker(arg)`".into());
+                self.errs.push("spawn: expected a function call `spawn worker(args…)`".into());
                 return None;
             }
         };
-        let pty = match self.param_ty.get(&fname) {
+        let ptys = match self.params.get(&fname) {
             Some(t) => t.clone(),
             None => {
                 self.errs.push(format!("spawn: `{fname}` is not a top-level function"));
                 return None;
             }
         };
-        let cty = match boundary_cty(pty.as_ref()) {
-            Ok(c) => c,
-            Err(e) => {
-                self.errs.push(e);
-                return None;
+        if ptys.len() != cargs.len() {
+            self.errs.push(format!("spawn: `{fname}` takes {} argument(s) but {} were given", ptys.len(), cargs.len()));
+            return None;
+        }
+        // Send check + C type per parameter.
+        let mut ctys: Vec<&'static str> = Vec::with_capacity(ptys.len());
+        for pt in &ptys {
+            match boundary_cty(pt.as_ref()) {
+                Ok(c) => ctys.push(c),
+                Err(e) => {
+                    self.errs.push(e);
+                    return None;
+                }
             }
-        };
+        }
+        let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
         let shim = format!("__spawn_{fname}");
-        if self.shims.insert(fname.clone()) {
-            // extern int64_t f(<cty>); the shim casts f to the runtime worker type
-            // and hands it to jrt_spawn. void* out = the thread handle.
+        let first = self.shims.insert(fname.clone());
+        if cargs.len() == 1 {
+            let cty = ctys[0];
+            if first {
+                let code = format!(
+                    "// generated glue for `spawn {fname}(..)` — trusted runtime handoff\n\
+                     #include <stdint.h>\n\
+                     extern void *jrt_spawn(int64_t (*fn)(void *), void *arg);\n\
+                     extern int64_t {fname}({cty});\n\
+                     void *{shim}({cty} a) {{\n\
+                     \x20   return jrt_spawn((int64_t (*)(void *)){fname}, (void *)(intptr_t)a);\n\
+                     }}\n"
+                );
+                self.generated.push(Item::Native { abi: "c-glue".into(), code, links: vec![], span });
+                let param = Param { name: "a".into(), ty: Some(ptys[0].clone().unwrap_or_else(|| ty("Int"))), default: None };
+                let sig = FnSig { name: shim.clone(), generics: vec![], params: vec![param], ret: Some(ty("$Thread")), span };
+                self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+            }
+            return Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: cargs, span });
+        }
+        // Multi-argument: pack into an env buffer, unpack in the worker trampoline.
+        let n = cargs.len();
+        let pack = format!("__envpack_{fname}");
+        if first {
+            let sig_params = ctys.iter().enumerate().map(|(i, c)| format!("{c} a{i}")).collect::<Vec<_>>().join(", ");
+            let call_params = ctys.iter().enumerate().map(|(i, c)| cast_from_slot(c, i)).collect::<Vec<_>>().join(", ");
+            let stores = ctys.iter().enumerate().map(|(i, c)| format!("    s[{i}] = {};", cast_to_slot(c, &format!("a{i}")))).collect::<Vec<_>>().join("\n");
             let code = format!(
                 "// generated glue for `spawn {fname}(..)` — trusted runtime handoff\n\
                  #include <stdint.h>\n\
                  extern void *jrt_spawn(int64_t (*fn)(void *), void *arg);\n\
-                 extern int64_t {fname}({cty});\n\
-                 void *{shim}({cty} a) {{\n\
-                 \x20   return jrt_spawn((int64_t (*)(void *)){fname}, (void *)(intptr_t)a);\n\
-                 }}\n"
+                 extern void *jrt_env_new(int64_t n);\n\
+                 extern int64_t {fname}({sig});\n\
+                 static int64_t __run_{fname}(void *env) {{\n\
+                 \x20   int64_t *s = (int64_t *)((char *)env + 16);\n\
+                 \x20   return {fname}({call});\n\
+                 }}\n\
+                 void *{pack}({sig_params}) {{\n\
+                 \x20   void *e = jrt_env_new({n});\n\
+                 \x20   int64_t *s = (int64_t *)((char *)e + 16);\n\
+                 {stores}\n\
+                 \x20   return e;\n\
+                 }}\n\
+                 void *{shim}(void *env) {{ return jrt_spawn(__run_{fname}, env); }}\n",
+                sig = ctys.join(", "),
+                call = call_params,
             );
             self.generated.push(Item::Native { abi: "c-glue".into(), code, links: vec![], span });
-            // extern "C" __spawn_f(a: <pty>) -> $Thread   ($Thread ⇒ Ty::Ref handle)
-            let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
-            let param = Param { name: "a".into(), ty: Some(pty.clone().unwrap_or_else(|| ty("Int"))), default: None };
-            let sig = FnSig { name: shim.clone(), generics: vec![], params: vec![param], ret: Some(ty("$Thread")), span };
-            self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+            // extern __envpack_f(a0: T0, …) -> $Env   and   __spawn_f(e: $Env) -> $Thread
+            let pack_params = ptys.iter().enumerate().map(|(i, pt)| Param { name: format!("a{i}"), ty: Some(pt.clone().unwrap_or_else(|| ty("Int"))), default: None }).collect();
+            let pack_sig = FnSig { name: pack.clone(), generics: vec![], params: pack_params, ret: Some(ty("$Env")), span };
+            self.generated.push(Item::Extern { abi: "C".into(), items: vec![pack_sig], links: vec![], header: None, span });
+            let spawn_sig = FnSig { name: shim.clone(), generics: vec![], params: vec![Param { name: "e".into(), ty: Some(ty("$Env")), default: None }], ret: Some(ty("$Thread")), span };
+            self.generated.push(Item::Extern { abi: "C".into(), items: vec![spawn_sig], links: vec![], header: None, span });
         }
-        Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![arg], span })
+        let env = Expr::Call { callee: Box::new(Expr::Ident(pack, span)), args: cargs, span };
+        Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![env], span })
+    }
+}
+
+/// C expression storing arg `name` (of C type `cty`) into an int64 env slot.
+fn cast_to_slot(cty: &str, name: &str) -> String {
+    if cty == "void*" {
+        format!("(int64_t)(intptr_t){name}")
+    } else {
+        format!("(int64_t){name}")
+    }
+}
+
+/// C expression reading env slot `i` back as C type `cty`.
+fn cast_from_slot(cty: &str, i: usize) -> String {
+    if cty == "void*" {
+        format!("(void *)(intptr_t)s[{i}]")
+    } else {
+        format!("(long)s[{i}]")
     }
 }

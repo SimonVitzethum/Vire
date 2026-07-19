@@ -80,17 +80,20 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 
 ### [1] Multithreading, safe by construction
 Attach: backend `--threads` (atomic RC, pthreads, monitor) — present.
-- [x] **`spawn f(arg)` + `join(h)` + `Atomic`** (`.fetch_add`/`.load`) — Vire
-  frontend wired to the runtime via a generated per-worker C shim + `jrt_spawn`
-  (function-pointer thread model); threads auto-enable on `spawn`. Workers kept as
-  RTA roots via `Program.exported`. tests/vire_threads.sh (5/5, atomic counter
-  deterministic ×20). See spawn.rs.
+- [x] **`spawn worker(args…)` + `join(h)`** — Vire frontend wired to the runtime
+  via a generated per-worker C shim + `jrt_spawn` (function-pointer thread model);
+  threads auto-enable on `spawn`. **Multi-argument** workers pack their args into
+  an immortal env buffer. Workers kept as RTA roots via `Program.exported`. See
+  spawn.rs.
+- [x] **`Atomic`** (`.fetch_add`/`.load`) and **`Mutex`** (`.lock`/`.unlock`/
+  `.get`/`.set`) — shared, race-free primitives (immortal header objects like
+  `list()`). tests/vire_threads.sh (8/8; atomic + mutex counters deterministic
+  ×20). Runnable demos in examples/vire/threads_*.vr.
 - [x] **Send check**: a `spawn` worker's parameter must be a scalar (copied) or a
   Sync type (`Atomic`/`Mutex`); sharing a bare mutable record/list is a compile
   error — a data race cannot be written.
-- [ ] `Channel[T]`, `Mutex[T]` methods (`.lock`), multi-argument workers (env
-  struct — currently single-arg only).
-- [ ] `parallel_map`/`parallel_for` (fork-join).
+- [ ] `Channel[T]`; `Mutex.lock(closure)` (scoped-guard form); `parallel_map`/
+  `parallel_for` (fork-join).
 - [ ] (M0.1c) measure real multithread atomic contention.
 
 ### [2] Template programming

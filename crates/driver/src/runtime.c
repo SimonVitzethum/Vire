@@ -1452,6 +1452,24 @@ int64_t jrt_atomic_add(void *a, int64_t d) {
 int64_t jrt_atomic_get(void *a) {
     return __atomic_load_n(&((VAtomic *)a)->val, __ATOMIC_SEQ_CST);
 }
+typedef struct {
+    int64_t refcount; /* jrt header: immortal */
+    void *vtable;
+    int64_t val;
+    pthread_mutex_t m;
+} VMutex;
+void *jrt_mutex_new(int64_t v) {
+    VMutex *x = (VMutex *)malloc(sizeof(VMutex));
+    x->refcount = -1;
+    x->vtable = 0;
+    x->val = v;
+    pthread_mutex_init(&x->m, NULL);
+    return x;
+}
+void jrt_mutex_lock(void *p) { pthread_mutex_lock(&((VMutex *)p)->m); }
+void jrt_mutex_unlock(void *p) { pthread_mutex_unlock(&((VMutex *)p)->m); }
+int64_t jrt_mutex_get(void *p) { return ((VMutex *)p)->val; }
+void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
 #else
 void *jrt_spawn(int64_t (*fn)(void *), void *arg) {
     /* No threads: run synchronously now, stash the result for jrt_join. */
@@ -1471,6 +1489,23 @@ int64_t jrt_atomic_add(void *a, int64_t d) {
     return old;
 }
 int64_t jrt_atomic_get(void *a) { return ((VAtomic *)a)->val; }
+/* Single-threaded: the lock is a no-op (a valid sequential schedule). */
+typedef struct {
+    int64_t refcount;
+    void *vtable;
+    int64_t val;
+} VMutex;
+void *jrt_mutex_new(int64_t v) {
+    VMutex *x = (VMutex *)malloc(sizeof(VMutex));
+    x->refcount = -1;
+    x->vtable = 0;
+    x->val = v;
+    return x;
+}
+void jrt_mutex_lock(void *p) { (void)p; }
+void jrt_mutex_unlock(void *p) { (void)p; }
+int64_t jrt_mutex_get(void *p) { return ((VMutex *)p)->val; }
+void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
 #endif
 
 void *jrt_atomic_new(int64_t v) {
@@ -1479,6 +1514,17 @@ void *jrt_atomic_new(int64_t v) {
     a->vtable = 0;
     a->val = v;
     return a;
+}
+
+/* Argument env for multi-argument `spawn worker(a, b, ...)`: a header + N i64
+ * slots (scalars directly, ref pointer-bits as i64). Immortal (refcount -1 →
+ * RC-safe, heap-oracle-clean); the generated packer/unpacker C shims read/write
+ * the slots at offset 16 (past the header). Small, freed at exit. */
+void *jrt_env_new(int64_t n) {
+    int64_t *e = (int64_t *)malloc(16 + (size_t)n * 8);
+    e[0] = -1; /* refcount: immortal */
+    e[1] = 0;  /* vtable */
+    return e;
 }
 #endif /* !FASTLLVM_FREESTANDING */
 
