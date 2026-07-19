@@ -1097,6 +1097,10 @@ struct FnEmitter<'a> {
     /// caller keeps the value alive for the call's duration (javac's `aload_0`
     /// reloads of `this` before every `getfield`).
     borrow: BTreeSet<u32>,
+    /// Move-on-last-use locals: owned ref locals whose sole use is a consuming
+    /// store (`PutField` value / `return`) — the store takes their +1 (no retain),
+    /// and they are not released at cleanup. See `moved_locals`.
+    moved: BTreeSet<u32>,
     /// Provably non-null locals — the inline null check on field accesses
     /// is omitted.
     nn: BTreeSet<u32>,
@@ -1574,6 +1578,107 @@ impl<'a> FnEmitter<'a> {
     }
 }
 
+/// Move-on-last-use: an *owned* ref local (defined by `New`/`Call`, holding a fresh
+/// +1) whose SOLE use is a consuming store (`PutField` value or `return`) hands its
+/// reference to that store. The store then need not `retain` (it takes the local's
+/// +1), and the local need not be released at cleanup. This removes the
+/// retain/release churn of ownership transfer — e.g. `Tree(make(d-1), make(d-1))`,
+/// which Rust avoids for free via moves.
+///
+/// Soundness: the consuming store takes the local's single +1; the local has no
+/// later use, so nothing reads a freed value and nothing double-frees (the field
+/// now owns exactly that +1, released when the owner is). The use scan below is an
+/// **exhaustive** match (no `_` arm) over every `Statement`/`Terminator` operand, so
+/// a use can never be silently missed (an under-count would be unsound); an
+/// over-count only forgoes the optimization.
+fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, imm: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let n = f.locals.len();
+    let mut uses = vec![0u32; n];
+    let mut consumed = vec![false; n]; // the local's use is a PutField-value / return
+    let mut owned = vec![false; n];
+    let touch = |uses: &mut [u32], op: &Operand| {
+        if let Operand::Copy(l) = op {
+            uses[l.0 as usize] += 1;
+        }
+    };
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            match st {
+                Statement::Assign(_, rv) => match rv {
+                    Rvalue::Use(o) | Rvalue::Neg(o) | Rvalue::Convert(o) => touch(&mut uses, o),
+                    Rvalue::Binary(_, a, b) => {
+                        touch(&mut uses, a);
+                        touch(&mut uses, b);
+                    }
+                },
+                Statement::Call { dest, args, .. }
+                | Statement::CallGuarded { dest, args, .. }
+                | Statement::CallVirtual { dest, args, .. }
+                | Statement::CallPoly { dest, args, .. } => {
+                    args.iter().for_each(|a| touch(&mut uses, a));
+                    if let Some(d) = dest {
+                        owned[d.0 as usize] = true;
+                    }
+                }
+                Statement::New { dest, .. } | Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } => {
+                    owned[dest.0 as usize] = true;
+                }
+                Statement::NewArray { dest, len, .. } | Statement::RegionNewArray { dest, len, .. } => {
+                    touch(&mut uses, len);
+                    owned[dest.0 as usize] = true;
+                }
+                Statement::GetField { obj, .. } => touch(&mut uses, obj),
+                Statement::PutField { obj, value, .. } => {
+                    touch(&mut uses, obj);
+                    touch(&mut uses, value);
+                    if let Operand::Copy(l) = value {
+                        consumed[l.0 as usize] = true;
+                    }
+                }
+                Statement::GetStatic { .. } | Statement::InstanceOfPending { .. } => {}
+                Statement::PutStatic { value, .. } => touch(&mut uses, value),
+                Statement::CheckCast { obj, .. } | Statement::InstanceOf { obj, .. } => touch(&mut uses, obj),
+                Statement::ArrayLen { arr, .. } => touch(&mut uses, arr),
+                Statement::ArrayLoad { arr, index, .. } => {
+                    touch(&mut uses, arr);
+                    touch(&mut uses, index);
+                }
+                Statement::ArrayStore { arr, index, value, .. } => {
+                    touch(&mut uses, arr);
+                    touch(&mut uses, index);
+                    touch(&mut uses, value);
+                }
+                Statement::DebugLine(_) => {}
+            }
+        }
+        match &bb.terminator {
+            Terminator::Goto(_) | Terminator::Return(None) => {}
+            Terminator::Branch { cond, .. } => touch(&mut uses, cond),
+            Terminator::Switch { value, .. } => touch(&mut uses, value),
+            Terminator::Return(Some(o)) => {
+                touch(&mut uses, o);
+                if let Operand::Copy(l) = o {
+                    consumed[l.0 as usize] = true;
+                }
+            }
+        }
+    }
+    let np = f.params.len();
+    (0..n as u32)
+        .filter(|&x| {
+            let xi = x as usize;
+            f.locals[xi] == Ty::Ref
+                && owned[xi]
+                && xi >= np
+                && !borrowed.contains(&x)
+                && !borrow.contains(&x)
+                && !imm.contains(&x)
+                && uses[xi] == 1
+                && consumed[xi]
+        })
+        .collect()
+}
+
 fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>) {
     let ps: Vec<String> = f
         .params
@@ -1675,7 +1780,8 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, nn, md_inv: ctx.md_inv, marker_locs, cur_loc: default_loc };
+    let moved = moved_locals(f, &borrowed, &borrow, &imm);
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, nn, md_inv: ctx.md_inv, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -1721,9 +1827,12 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_
             Terminator::Return(Some(op)) => {
                 let ty = operand_ty(f, op);
                 let v = e.operand(w, op);
-                // The returned ref must survive the cleanup → retain, then
-                // the caller transfers the +1.
-                if ty == Ty::Ref {
+                // The returned ref must survive the cleanup → retain, then the
+                // caller transfers the +1. A move-on-last-use local already holds
+                // the +1 handed to the caller (and is not released at cleanup), so
+                // its retain is omitted.
+                let moved_ret = matches!(op, Operand::Copy(l) if e.moved.contains(&l.0));
+                if ty == Ty::Ref && !moved_ret {
                     writeln!(w, "  call void @jrt_retain(ptr {v}){}", e.dbg()).unwrap();
                 }
                 emit_cleanup(w, ctx, &mut e);
@@ -1755,6 +1864,7 @@ fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
             && !e.borrowed.contains(&(i as u32))
             && !e.imm.contains(&(i as u32))
             && !e.borrow.contains(&(i as u32))
+            && !e.moved.contains(&(i as u32))
         {
             let t = e.fresh();
             writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
@@ -2075,10 +2185,12 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let tb = ctx.tbaa_suffix(&owner, field);
             if ty == Ty::Ref {
                 // The field takes over an owning reference: retain new, release old.
-                // `retain(null)` is a provable no-op (constant null) →
-                // omit it (saves a call per `x.f = null` / field init to null;
-                // helps allocation-heavy code like `Tree(null, null)`).
-                if !matches!(value, Operand::ConstNull) {
+                // `retain(null)` is a provable no-op (constant null) → omit it.
+                // A move-on-last-use local (`moved`) hands the field its own +1 —
+                // omit the retain here (the local's cleanup release is likewise
+                // skipped in emit_cleanup), removing the ownership-transfer churn.
+                let moved_in = matches!(value, Operand::Copy(l) if e.moved.contains(&l.0));
+                if !matches!(value, Operand::ConstNull) && !moved_in {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
                 let old = e.fresh();
