@@ -13,25 +13,37 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 | nbody (2000, 20 steps) | 0.075 | 0.076 | 0.074 | **~1.00×** |
 | montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
 | vcall (dyn dispatch, 100M) | 0.120 | 0.117 | 0.281 | **0.41×** |
-| sort (quicksort 2M) | 0.169 | 0.126 | 0.114 | 1.47× |
-| binsearch (10M lookups) | 0.612 | 0.499 | 0.470 | 1.30× |
+| sort (quicksort 2M) | 0.169 | 0.126 | 0.114 | 1.43× |
+| binsearch (10M lookups) | 0.478 | 0.480 | 0.449 | **1.06×** |
+
+**binsearch now = 1.00× Rust** (0.478 vs 0.480): the constant upper/lower-bound
+fixpoint (bounds.rs) proves the midpoint `0 ≤ (lo+hi)/2 ≤ n-1 < len` and elides its
+data-dependent check — safely (a real out-of-bounds access still throws). Its
+no-checks ceiling was 1.07× clang, so essentially every provably-safe check is gone.
 
 ## Interpretation
 - **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).
   Both go through LLVM → the same codegen optimum.
-- **matmul (256³ naive): Vire 1.28×.** The inner access `C[i*n+j]` has an *affine*
-  index whose bounds check is not yet elided (the residual over clang); at 0.017 s
-  the absolute gap is a few ms. The relational/affine bounds analysis (TODO #1) is
-  the lever, same root cause as sort/binsearch below.
+- **binsearch: Vire = 1.00× Rust / 1.06× clang** — the constant upper/lower-bound
+  fixpoint elides the data-dependent midpoint check (`0 ≤ (lo+hi)/2 ≤ n-1 < len`),
+  safely. This is the LLVM-safe-language ceiling (its no-checks floor is 1.07× clang).
+- **matmul (256³ naive): Vire ~1.25× clang / 1.6× Rust.** Two separate things: a
+  residual bounds check on the *affine* index `C[i*n+j]` (its counted-loop bound
+  lives in the loop guard, which the arithmetic fixpoint does not read — the
+  guard-aware affine extension is TODO #1), AND, more importantly, a **vectorization
+  gap**: even with all checks off (`FASTLLVM_NO_BOUNDS`) Vire is 1.5× Rust here —
+  Rust autovectorizes the inner product loop better. Bounds elision alone cannot win
+  matmul; it is a codegen/vectorization case.
 - **vcall = trait objects (dyn dispatch): Vire 0.41× — 2.4× FASTER than clang
   `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
   vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
   vs the previous snapshot as the devirt/vtable path matured.)
-- **Array-index-heavy (sort/binsearch): Vire 1.3–1.5× slower.** The reason is
-  **bounds checks** on every array access — the solver (`elide_bounds`) removes
-  many, but not the data-dependent ones (quicksort partition, binary-search mid). That
-  is the clear, honest optimization point (Rust has the same principle, but elides
-  more; C++ has no checks at all). The next perf lever for Vire.
+- **sort (quicksort): Vire 1.43× clang / 1.35× Rust.** The partition bounds `lo`/`hi`
+  are **loaded from an explicit stack array** (`lostack[sp]`), so they are opaque to
+  the value analysis — proving `a[j] < len` would need an array-*content* invariant
+  (the stack only ever holds in-range indices), a much harder analysis. Its no-checks
+  ceiling is 1.03× Rust, so bounds elision *could* win it, but not with the current
+  value-based reasoning. The honest remaining lever.
 - **DIFFs in the table** are pure float formatting (Vire/C++ `%g` scientific
   vs Rust's full precision) or summation rounding (nbody) — identical values.
 
@@ -76,26 +88,27 @@ measured shows the generated code is already at the LLVM optimum.
 - **`else` must be on the same line as `}`** (newline-terminated syntax).
 
 ## Bounds checks: analysis + honest ceiling (addendum)
-Measured ceiling with `FASTLLVM_NO_BOUNDS=1` (measurement mode, all checks off, unsound):
+Measured ceiling with `FASTLLVM_NO_BOUNDS=1` (a **measurement-only** flag that emits
+checks off — never shipped; the shipped path stays memory-safe):
 
-| Benchmark | Vire (checks) | Vire (no checks) | Rust | clang++ |
-|---|---|---|---|---|
-| sort | 0.168 | **0.132** (−21%) | 0.122 | 0.110 |
-| binsearch | 0.559 | **0.480** (−14%) | 0.479 | 0.458 |
+| Benchmark | Vire (safe) | Vire (no checks) | Rust | clang++ | status |
+|---|---|---|---|---|---|
+| **binsearch** | **0.478** | 0.482 | 0.480 | 0.449 | **won: 1.00× Rust** — check *proved* redundant and elided |
+| sort | 0.166 | **0.130** (−20%) | 0.126 | 0.110 | open — partition bounds loaded from a stack array (opaque) |
+| matmul | 0.017 | **0.015** (−10%) | 0.010 | 0.013 | open — affine index (guard-aware, TODO #1) **and** a vectorization gap |
 
-**Two findings:**
-1. **Bounds checks cost real time** (−14 to −21%). `elide_bounds` (GVN) removes many,
-   but NOT the data-dependent ones (`a[mid]` with `mid=(lo+hi)/2`, quicksort partition):
-   the proof `mid < len` would need the loop invariant `hi ≤ len-1`, which is no
-   direct branch condition. That is the elision lever toward **Rust parity**.
-2. **"under clang" is NOT reachable** — and that is no Vire weakness: even
-   with ALL checks off, Vire (0.132/0.480) stays above clang (0.110/0.458). **clang++
-   has ZERO bounds checks + the LLVM codegen optimum → it IS the ceiling for every
-   LLVM language.** Rust (which likewise has checks + uses LLVM) lands identically at
-   0.122/0.479 = ~1.05-1.10× clang. Vire can at best REACH clang (parity),
-   not undercut it — there is no Vire advantage that clang++ does not also have.
-
-**Conclusion:** the reachable + valuable target value is **Rust parity** (via
-bounds elision of the data-dependent indices), not "under clang". The `div/rem` fix
-(inline `sdiv`/`srem` with a constant divisor) is implemented (helps -O0/non-LTO;
-under -O2 -flto LTO inlines `jrt_ldiv` anyway). `FASTLLVM_NO_BOUNDS=1` = a measurement flag.
+**Findings:**
+1. **binsearch is now at parity with Rust.** The constant upper/lower-bound fixpoint
+   ([bounds.rs](../../crates/solver/src/bounds.rs)) *proves* `0 ≤ (lo+hi)/2 ≤ n-1 <
+   len` and elides the midpoint check — so the safe binary now measures like the
+   no-checks build. **This removed the redundant check, not the safety**: a genuinely
+   out-of-bounds access still throws (verified). This is exactly how Rust is fast.
+2. **"under clang" is NOT reachable** — and that is no Vire weakness: even with ALL
+   checks off, Vire stays at/above clang, because **clang++ has ZERO bounds checks +
+   the LLVM codegen optimum → it IS the ceiling for every safe LLVM language.** Rust
+   (safe, LLVM, with checks) lands at the same ~1.05–1.10× clang. So the honest,
+   valuable target for a *memory-safe* language is **Rust parity**, which binsearch
+   now reaches.
+3. **sort/matmul are not (yet) winnable by bounds elision**: sort's bounds are opaque
+   stack loads (would need an array-content invariant); matmul is vectorization-bound
+   vs Rust even with checks off. Both are documented, neither is a soundness issue.

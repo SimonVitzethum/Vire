@@ -62,14 +62,16 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | montecarlo | **0.99×** | compute-bound, parity |
 | nbody / bitmanip | **~1.00×** | at parity |
 | **vcall** | **0.41×** (2.4× faster) | solver devirtualization; near-Rust, beats clang `virtual` |
-| matmul (256³ naive) | 1.28× | affine index `C[i*n+j]` bounds check (see #1) |
-| sort (quicksort 2M) | 1.47× | array bounds checks (data-dependent index) |
-| binsearch (10M) | 1.30× | array bounds check + cache-miss-bound |
+| **binsearch (10M)** | **1.06×** (= 1.00× Rust) | midpoint check *proved* redundant + elided — safely |
+| matmul (256³ naive) | 1.25× | affine-index check (#1) + a vectorization gap vs Rust |
+| sort (quicksort 2M) | 1.43× | partition bounds loaded from a stack array (opaque) |
 
-Vire is at or above clang/Rust level on compute and **2.4× faster on virtual
-dispatch**; the remaining gaps are array-heavy kernels whose data-dependent bounds
-checks need a relational analysis to elide (see [TODO.md](TODO.md) and
-[benchmarks/suite/](benchmarks/suite/)). On the Java-AOT path, binary-trees is now
+Vire is at or above clang/Rust level on compute, **2.4× faster on virtual dispatch**,
+and now at **Rust parity on binary search** — the constant-bound solver *proves* the
+`(lo+hi)/2` midpoint in range and drops the check while staying fully memory-safe (a
+real out-of-bounds access still throws). The remaining array gaps are a vectorization
+case (matmul) and an opaque-stack case (sort); see [TODO.md](TODO.md) and
+[benchmarks/suite/](benchmarks/suite/). On the Java-AOT path, binary-trees is now
 **1.7× C++** (was 3.6×) after region inference — see [benchmarks/](benchmarks/).
 
 ## Documents

@@ -22,14 +22,20 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 
 ## Performance
 
-- [~] **#1 Relational bounds elision — headline.** The sound foundation is in
-  ([crates/solver/src/bounds.rs](crates/solver/src/bounds.rs): Div/Sub syms,
-  subtract axiom, transitive lt, const-length midpoint) so *loop-invariant-bounded*
-  indices (`a[i]` in `while i < hi` with `hi = len-1`) elide. **Still open:** binary
-  search's `a[mid]` and quicksort partition — their `lo<len ∧ hi<len` are carried by
-  loop **phis**, needing a phi-aware greatest-fixpoint + tracking of the non-strict
-  `<=` loop guard. No production compiler does this for these patterns (rustc keeps
-  the check); payoff caps at Rust parity (~14% on binsearch), not below clang.
+- [~] **#1 Relational bounds elision — headline.** Foundation in
+  [crates/solver/src/bounds.rs](crates/solver/src/bounds.rs) (Div/Sub syms, subtract
+  axiom, transitive lt, const-length midpoint). **Landed this round:** a constant
+  upper/lower-bound Kleene fixpoint over loop phis (`compute_ub`/`compute_lb`) that
+  proves `0 ≤ i ≤ ub(i) < lb(len)` across phis — so **binary search's `a[mid]` now
+  elides** (`0 ≤ (lo+hi)/2 ≤ n-1 < n`) and **binsearch reaches 1.00× Rust** (was
+  1.23×), soundly (a real OOB still throws; Java oracle 65/65). Also tracks lengths
+  for `RegionNewArray`/`StackNewArray`, not just `NewArray`. **Still open:** (a) the
+  **guard-aware affine** case — matmul's `r*n+k` counted-loop index whose bound lives
+  in the loop guard `r<n` (the arithmetic fixpoint does not read guards); note matmul
+  is *also* vectorization-bound vs Rust, so bounds alone will not win it. (b)
+  **quicksort partition** — bounds loaded from a stack array (opaque to the value
+  analysis; would need an array-content invariant). Payoff caps at Rust parity, not
+  below clang (clang = zero checks = the LLVM ceiling for safe code).
 - [x] **Allocator gap — closed for the array case.** Region inference closed the
   RC gap on traversal; the auto-arena (escape→arena) covers `for`-loops and
   scalar-store loops; and **non-escaping fixed-size primitive arrays now
