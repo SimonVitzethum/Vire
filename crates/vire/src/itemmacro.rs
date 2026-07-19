@@ -25,6 +25,8 @@ use crate::diag::Span;
 use crate::expand::{collect_binders_block, subst_block};
 
 const S: Span = Span(0, 0);
+/// Upper bound on fixpoint rounds (nested/recursive item-macro expansion).
+const ROUND_LIMIT: u32 = 64;
 
 /// Expand every `name!(...)` invocation into the macro's substituted items and
 /// drop the macro definitions. Returns diagnostics (unknown macro, arity, kind
@@ -44,22 +46,38 @@ pub fn expand_item_macros(m: &mut Module) -> Vec<String> {
     let mut errs = Vec::new();
     let had_defs = !defs.is_empty();
     let mut counter: u32 = 0;
-    let old = std::mem::take(&mut m.items);
-    let mut out: Vec<Item> = Vec::with_capacity(old.len());
-    for it in old {
-        match it {
-            Item::ItemMacro { .. } => {} // drop the definition
-            Item::MacroInvoke { name, args, .. } => match defs.get(&name) {
-                None => errs.push(format!("unknown item macro `{name}!`")),
-                Some((params, items)) => match expand_one(&name, params, items, &args, &mut counter) {
-                    Ok(mut gen) => out.append(&mut gen),
-                    Err(e) => errs.push(e),
-                },
-            },
-            other => out.push(other),
+
+    // Fixpoint: a macro body may itself invoke item macros, so re-expand until no
+    // invocation remains. Each round expands one level; a round that does not
+    // reduce the invocation count (or a hard round cap) breaks a diverging macro.
+    let mut round = 0;
+    loop {
+        if !m.items.iter().any(|it| matches!(it, Item::MacroInvoke { .. })) {
+            break;
         }
+        round += 1;
+        if round > ROUND_LIMIT {
+            errs.push("item macro expansion: recursion limit reached (diverging macro?)".into());
+            m.items.retain(|it| !matches!(it, Item::MacroInvoke { .. }));
+            break;
+        }
+        let old = std::mem::take(&mut m.items);
+        let mut out: Vec<Item> = Vec::with_capacity(old.len());
+        for it in old {
+            match it {
+                Item::ItemMacro { .. } => {} // drop the definition
+                Item::MacroInvoke { name, args, .. } => match defs.get(&name) {
+                    None => errs.push(format!("unknown item macro `{name}!`")),
+                    Some((params, items)) => match expand_one(&name, params, items, &args, &mut counter) {
+                        Ok(mut gen) => out.append(&mut gen),
+                        Err(e) => errs.push(e),
+                    },
+                },
+                other => out.push(other),
+            }
+        }
+        m.items = out;
     }
-    m.items = out;
 
     // Safety net: item macros make top-level name collisions easy (two invocations,
     // or the no-token-pasting limitation). Report duplicate `fn`/`type` names with a
@@ -106,11 +124,14 @@ fn expand_one(name: &str, params: &[MacroParam], items: &[Item], args: &[Expr], 
     let mut pmap: HashMap<String, Expr> = HashMap::new(); // expr subst (idents + exprs)
     for (p, a) in params.iter().zip(args) {
         match p.kind {
-            ParamKind::Type => match a {
-                Expr::Ident(n, sp) => {
-                    tmap.insert(p.name.clone(), Type { name: n.clone(), args: vec![], borrowed: false, span: *sp });
+            ParamKind::Type => match expr_to_type(a) {
+                Some(ty) => {
+                    // Also expose the type argument to nested invocations (as the
+                    // original expression) via the expression map.
+                    pmap.insert(p.name.clone(), a.clone());
+                    tmap.insert(p.name.clone(), ty);
                 }
-                _ => return Err(format!("item macro `{name}!`: argument for `{}: type` must be a type name", p.name)),
+                None => return Err(format!("item macro `{name}!`: argument for `{}: type` must be a type (name or `T[Arg]`)", p.name)),
             },
             ParamKind::Ident => match a {
                 Expr::Ident(n, _) => {
@@ -134,6 +155,21 @@ fn expand_one(name: &str, params: &[MacroParam], items: &[Item], args: &[Expr], 
         gen.push(c);
     }
     Ok(gen)
+}
+
+/// Reinterpret an expression argument as a type: a bare name `Foo`, or a single-
+/// argument generic application `Foo[Arg]` (which parses as an index). Returns
+/// `None` for anything that is not a valid type spelling.
+fn expr_to_type(e: &Expr) -> Option<Type> {
+    match e {
+        Expr::Ident(n, sp) => Some(Type { name: n.clone(), args: vec![], borrowed: false, span: *sp }),
+        Expr::Index { base, index, span } => {
+            let base = expr_to_type(base)?;
+            let arg = expr_to_type(index)?;
+            Some(Type { name: base.name, args: vec![arg], borrowed: false, span: *span })
+        }
+        _ => None,
+    }
 }
 
 // --- Substitution over declarations ------------------------------------------
@@ -168,6 +204,14 @@ fn subst_item(it: &mut Item, tmap: &HashMap<String, Type>, imap: &HashMap<String
             // A macro-body const references only params (no local binders) → no
             // hygiene rename needed; substitute parameters in its initializer.
             subst_block_expr(value, pmap);
+        }
+        // A nested `other!(args)` invocation inside a macro body: substitute the
+        // outer macro's parameters into its arguments, so it re-expands correctly
+        // in the next fixpoint round.
+        Item::MacroInvoke { args, .. } => {
+            for a in args {
+                subst_block_expr(a, pmap);
+            }
         }
         _ => {}
     }

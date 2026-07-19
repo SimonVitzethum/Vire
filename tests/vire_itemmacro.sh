@@ -76,7 +76,7 @@ check "item macro with a method" "7" "$work/method.vr"
 
 # SAFETY: an expression where a `type` is required is rejected (no blind splice).
 printf 'macro nt(N: ident, T: type) { type N { v: T } }\nnt!(Foo, 3 + 4)\nfn main(){print(1)}\n' > "$work/kind1.vr"
-errck "kind check: expr for type param" "must be a type name" "$work/kind1.vr"
+errck "kind check: expr for type param" "must be a type" "$work/kind1.vr"
 
 # SAFETY: an expression where an `ident` is required is rejected.
 printf 'macro nt(N: ident) { type N { v: Int } }\nnt!(1 + 2)\nfn main(){print(1)}\n' > "$work/kind2.vr"
@@ -89,6 +89,53 @@ errck "arity mismatch rejected" "expected 2 argument" "$work/arity.vr"
 # SAFETY: duplicate generated names are a clear front-end error, not a silent merge.
 printf 'macro mk(N: ident) { type N { v: Int } }\nmk!(Dup)\nmk!(Dup)\nfn main(){print(1)}\n' > "$work/dup.vr"
 errck "duplicate generated type rejected" "duplicate type .Dup." "$work/dup.vr"
+
+# Nested invocation: a macro body invokes another item macro (fixpoint expansion).
+cat > "$work/nested.vr" <<'EOF'
+macro field(Name: ident, T: type) {
+    type Name { inner: T }
+}
+macro pair(A: ident, B: ident, T: type) {
+    field!(A, T)
+    field!(B, T)
+}
+pair!(Left, Right, Int)
+fn main() {
+    mut l = Left(1)
+    mut r = Right(2)
+    print(l.inner + r.inner)    // 3
+}
+EOF
+check "nested item-macro invocation" "3" "$work/nested.vr"
+
+# Generic type argument `T[Arg]` in a `type` parameter lands as a real type app.
+cat > "$work/generic.vr" <<'EOF'
+type Box[T] { value: T }
+macro holder(Name: ident, T: type) {
+    type Name { boxed: T }
+}
+holder!(IntHolder, Box[Int])
+fn main() { print(1) }
+EOF
+if "$vire" types "$work/generic.vr" 2>/dev/null | grep -q 'field boxed: Box\[Int\]'; then
+    echo "ok   generic type arg in type param"; pass=$((pass+1))
+else
+    echo "FAIL generic type arg in type param"; fail=$((fail+1))
+fi
+
+# A diverging (self-invoking) macro is caught by the round limit, not a hang.
+cat > "$work/diverge.vr" <<'EOF'
+macro loop(N: ident) {
+    loop!(N)
+}
+loop!(X)
+fn main() { print(1) }
+EOF
+if timeout 30 "$vire" run "$work/diverge.vr" 2>&1 | grep -q 'recursion limit'; then
+    echo "ok   diverging macro caught by round limit"; pass=$((pass+1))
+else
+    echo "FAIL diverging macro round limit"; fail=$((fail+1))
+fi
 
 # Unknown macro invocation is rejected.
 printf 'nope!(x)\nfn main(){print(1)}\n' > "$work/unknown.vr"

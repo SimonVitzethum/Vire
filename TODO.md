@@ -146,10 +146,15 @@ Feature sequence on top:
   per expansion → no capture either way), **type-checked after expansion** (runs before
   inference, so generated items go through the full checker), and **duplicate generated
   names are a clear front-end error**, never a silent merge. tests/vire_itemmacro.sh (8/8).
-  Open: token **pasting** (deliberately omitted — pass each generated name as its own
-  `ident` param); generic type args in `type` params (`List[Int]`); nested item-macro
-  invocations inside a macro body; and `block`/`pat` parameter kinds. Expression macros
-  (`macro name(p) = <expr>`) are unchanged.
+  **Nested invocations** (a macro body invokes another item macro) expand to a
+  fixpoint with a round limit (a diverging/self-invoking macro is a compile error,
+  not a hang). **Generic type arguments** in a `type` parameter work — `holder!(H,
+  Box[Int])` lands `boxed: Box[Int]` as a real type application (`vire types` now runs
+  the full front-end incl. item-macro + derive expansion, so generated declarations
+  show up). tests/vire_itemmacro.sh (11/11). Open: token **pasting** (deliberately
+  omitted — needs identifier interpolation; for now pass each generated name as its own
+  `ident` param); multi-argument generics (`Map[K, V]`); `block`/`pat` parameter kinds.
+  Expression macros (`macro name(p) = <expr>`) are unchanged.
 - [ ] `@when(platform)` / `comptime for`/`assert`/`emit` as the surface syntax once
   (a) lands.
 

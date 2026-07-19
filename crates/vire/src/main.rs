@@ -118,11 +118,17 @@ fn main() {
             if !diags.is_empty() {
                 exit(1);
             }
+            for e in vire::expand_item_macros(&mut module) {
+                eprintln!("macro: {e}");
+            }
             if let Err(es) = vire::expand_macros(&mut module) {
                 for e in es {
                     eprintln!("macro: {e}");
                 }
                 exit(1);
+            }
+            for e in vire::derive_expand(&mut module) {
+                eprintln!("derive: {e}");
             }
             vire::infer_module(&mut module);
             let graph = vire::TypeGraph::build(&module);
