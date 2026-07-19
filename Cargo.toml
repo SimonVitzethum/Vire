@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# Default build set: `vire` + the Java driver pull in every fastllvm-* and (transitively)
+# csolver-* library they need. The standalone `csolver-cli` (`solver`) binary is NOT a
+# dependency of vire (which calls the verifier as a library), so it is left out of the
+# default build to save its LTO — still buildable on demand with `cargo build -p csolver-cli`.
+default-members = ["crates/vire", "crates/driver"]
 members = [
     "crates/vire",       # Vire front-end (lexer/parser/AST → SSA IR)
     "crates/ir",         # shared mid-level IR (lowering target)
