@@ -181,7 +181,13 @@ whoever does not, never sees it.
 
 ---
 
-## 5. Build-system interop, first-class Meson 🟢🟡
+## 5. Build-system interop, first-class Meson 🟢 — **implemented**
+
+**Status (2026-07): shipped.** The stable object-emit CLI (`--emit=obj|asm|llvm|ir|
+staticlib`, `--deps`, `-I`), a tested Meson integration (`build-integration/meson/` —
+stock-DSL `custom_target` pattern + optional `import('vire')` module), and pkg-config
+consumption (`--pkg NAME`) are all in place; see TODO [5]. The evaluation below stands as
+the original rationale.
 
 **Verdict:** Feasible and strategically smart (fits the C-interop core).
 "First-class Meson" concretely means two things, the first easy, the second some
@@ -334,7 +340,7 @@ panic: index 7 out of bounds for length 5
 | 2 | Template programming | 🟢 | generics+traits (monomorphized) + `comptime` instead of C++ templates |
 | 3 | Compile-time reflection | 🟢 | strongest fit (Closed-World), zero-cost, replaces `@derive`/serialization |
 | 4 | Custom optional preprocessor | 🟢 | as `comptime`/`@if`/hygienic macros (AST instead of text) — not the C preprocessor |
-| 5 | Meson first-class | 🟢🟡 | Meson module + stable CLI; recommendation: *adopt* Meson instead of a custom build |
+| 5 | Meson first-class | 🟢 **done** | object-emit CLI (`--emit=obj/staticlib`, `--deps`, `-I`) + Meson integration + `--pkg` pkg-config — `build-integration/meson/` |
 | 6 | Logger done well | 🟢 | structured, comptime-switched-off (0 cost), spans, sinks |
 | 7 | Error handling à la Go | 🟢* | values+explicit (Go spirit), `?`, wrapping, typed — **`Result`, no `nil`** |
 | 8 | Debug symbols + crash paths | 🟢 | DWARF via LLVM + runtime backtrace in debug; release 0 overhead |
