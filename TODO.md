@@ -94,8 +94,17 @@ subsystem, sequenced.
   Still open (Phase 1b): richer than the scalar lattice — user-type/generic identity
   per expression (today they collapse to `Ref`), and synthesized/`Span(0,0)` nodes
   from desugaring share keys.
-- [ ] **Phase 2 — move passes after inference.** comptime + macro expansion consume
-  the type graph (macros currently run *before* inference — the untyped anti-pattern).
+- [~] **Phase 2 — move passes after inference.** comptime folding now lives in a
+  dedicated post-inference pass ([comptime.rs](crates/vire/src/comptime.rs)
+  `eval_comptime`, run after `infer_module`), not fused inside lowering: it collects
+  module `const` declarations into a compile-time environment, inlines `const`
+  references to literals (respecting lexical shadowing — a local of the same name
+  wins), and folds `comptime`/`comptime if` on the AST. **`const` now actually works**
+  (value, `comptime`, array size — all previously broken: `unknown variable`).
+  Best-effort/non-regressive: unresolvable comptime (e.g. a value-generic `N`) defers
+  to lowering. tests/vire_comptime.sh (5/5). Still open: move **macro expansion**
+  after inference too (it still runs before — the untyped anti-pattern), and have the
+  pass consult the type graph / typed AST (type-aware `comptime if`).
 - [ ] **Phase 3+ — features on the foundation:** the sequence below.
 
 Feature sequence on top:

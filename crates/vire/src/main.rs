@@ -661,6 +661,15 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // Compile-time evaluation pass (after inference): resolve `const` references and
+    // fold `comptime`/`comptime if` on the AST before lowering sees them.
+    let comptime_errs = vire::eval_comptime(&mut module);
+    if !comptime_errs.is_empty() {
+        for e in &comptime_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
     // Lowering to crates/ir.
     // Debug builds thread the source so lowering emits per-statement DebugLine
     // markers; non-debug builds pass no source (no markers → no interference with
