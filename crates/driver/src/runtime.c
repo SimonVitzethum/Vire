@@ -410,6 +410,41 @@ int64_t vire_map_has(VMap *m, int64_t k) {
     return 0;
 }
 int64_t vire_map_len(VMap *m) { return m->len; }
+int64_t vire_list_contains(VList *l, int64_t v) {
+    for (int64_t i = 0; i < l->len; i++)
+        if (l->data[i] == v) return 1;
+    return 0;
+}
+void vire_list_clear(VList *l) { l->len = 0; }
+/* Remove key k. Backward-shift deletion keeps the linear-probing invariant
+ * (no tombstones): after clearing the slot, pull back any following element
+ * whose home slot is at or before the hole. Returns 1 if removed. */
+int64_t vire_map_remove(VMap *m, int64_t k) {
+    size_t mask = (size_t)(m->cap - 1);
+    size_t i = (size_t)(k * 2654435761u) & mask;
+    while (m->used[i]) {
+        if (m->keys[i] == k) {
+            size_t j = i;
+            m->used[j] = 0;
+            m->len--;
+            size_t next = (j + 1) & mask;
+            while (m->used[next]) {
+                size_t home = (size_t)(m->keys[next] * 2654435761u) & mask;
+                if (((next - home) & mask) >= ((next - j) & mask)) {
+                    m->keys[j] = m->keys[next];
+                    m->vals[j] = m->vals[next];
+                    m->used[j] = 1;
+                    m->used[next] = 0;
+                    j = next;
+                }
+                next = (next + 1) & mask;
+            }
+            return 1;
+        }
+        i = (i + 1) & mask;
+    }
+    return 0;
+}
 
 /* FFI: Vire string → NUL-terminated C `char*` (for extern-C functions that
  * expect `const char*`). Copies; the buffer is not freed again

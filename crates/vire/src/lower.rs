@@ -1776,6 +1776,8 @@ impl<'a> FnLower<'a> {
                         "len" => ("vire_list_len", Ty::I64),
                         "get" => ("vire_list_get", Ty::I64),
                         "set" => ("vire_list_set", Ty::Void),
+                        "contains" => ("vire_list_contains", Ty::I32),
+                        "clear" => ("vire_list_clear", Ty::Void),
                         _ => {
                             self.errs.push(format!("List has no method `{name}`"));
                             return (Operand::ConstI64(0), Ty::I64);
@@ -1797,6 +1799,7 @@ impl<'a> FnLower<'a> {
                         "put" => ("vire_map_put", Ty::Void),
                         "get" => ("vire_map_get", Ty::I64),
                         "has" => ("vire_map_has", Ty::I32),
+                        "remove" => ("vire_map_remove", Ty::I32),
                         "len" => ("vire_map_len", Ty::I64),
                         _ => {
                             self.errs.push(format!("Map has no method `{name}`"));
