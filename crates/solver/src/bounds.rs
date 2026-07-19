@@ -59,6 +59,10 @@ enum SymExpr {
     Mul(u32, u32),
     /// `x & m` with mask m ≥ 0 — the result provably lies in [0, m].
     And(u32, i64),
+    /// `x / d` with a constant divisor d ≥ 1 (also `x >> 1` for d = 2). For a
+    /// non-negative x the result lies in `[0, x/d]` ⊆ `[0, x]` — the midpoint
+    /// `(lo+hi)/2` of binary search / partition.
+    Div(u32, i64),
 }
 
 #[derive(Default)]
@@ -150,6 +154,45 @@ fn sym_of_rvalue(rv: &Rvalue, env: &Env, it: &mut Interner, s: u32, dst: Ty, loc
             }
             _ => it.intern(SymExpr::Opaque(s)),
         },
+        // Subtraction of a constant `x - c` = `Add(x, -c)` — the `len - 1` /
+        // `hi - 1` / `mid - 1` idioms that drive shrinking search intervals.
+        Rvalue::Binary(BinOp::Sub, a @ Operand::Copy(_), b) => {
+            let c = match b {
+                Operand::ConstI32(c) => Some(*c as i64),
+                Operand::ConstI64(c) => Some(*c),
+                _ => None,
+            };
+            match c {
+                Some(c) => {
+                    let x = sym_of_operand(a, env, it);
+                    it.intern(SymExpr::Add(x, -c))
+                }
+                None => it.intern(SymExpr::Opaque(s)),
+            }
+        }
+        // Division by a positive constant `x / d` (d ≥ 1): for non-negative x the
+        // result is in [0, x/d] ⊆ [0, x]. The binary-search / partition midpoint
+        // `(lo+hi)/2`. Non-negativity of x is checked separately (compute_nonneg).
+        Rvalue::Binary(BinOp::Div, a @ Operand::Copy(_), b) => {
+            let d = match b {
+                Operand::ConstI32(c) => Some(*c as i64),
+                Operand::ConstI64(c) => Some(*c),
+                _ => None,
+            };
+            match d {
+                Some(d) if d >= 1 => {
+                    let x = sym_of_operand(a, env, it);
+                    it.intern(SymExpr::Div(x, d))
+                }
+                _ => it.intern(SymExpr::Opaque(s)),
+            }
+        }
+        // Arithmetic/logical right shift by 1 = floor division by 2 for a
+        // non-negative value (`(lo+hi) >> 1`).
+        Rvalue::Binary(BinOp::Shr | BinOp::UShr, a @ Operand::Copy(_), Operand::ConstI32(1)) => {
+            let x = sym_of_operand(a, env, it);
+            it.intern(SymExpr::Div(x, 2))
+        }
         // Bit masking `x & m` (m ≥ 0): result in [0, m] — often as
         // index `arr[i & (len-1)]`/`sh[i & 1]` (power-of-2 ring buffer). The
         // mask can be an inline constant OR a const-valued local (javac
@@ -433,7 +476,8 @@ fn run(f: &mut Function) -> usize {
     // --- Mark accesses. ---
     let mut count = 0;
     for b in 0..nb {
-        let lt = lt_in[b].clone();
+        let mut lt = lt_in[b].clone();
+        saturate_lt(&mut lt, &it, &repr, &nn);
         // Carry env along at each statement.
         let mut env = env_in[b].clone();
         let mut dummy_len = len_of.clone();
@@ -547,6 +591,89 @@ fn provably_in_bounds(
         }
     }
     false
+}
+
+/// Saturate the strict-less-than set with SOUND derived facts, to a fixpoint:
+///
+/// - **subtract axiom**: if `(x, y)` and a sym `Add(x, c)` with `c ≤ 0` exists,
+///   then `x + c ≤ x < y`, so `(Add(x,c), y)`. And `(Add(x,c), x)` for any `c < 0`
+///   (`x - k < x`, the `len - 1 < len` idiom).
+/// - **transitivity**: `(a,b) ∧ (b,c) ⟹ (a,c)`.
+/// - **midpoint**: `(Div(Add2(a,b), 2), L)` when `(a,L) ∧ (b,L)`, `a,b ≥ 0`, and
+///   `L` is a constant `l` with `2·l ≤ i32::MAX` (so `a+b` cannot overflow i32 —
+///   `(a+b)/2 < l` then holds). This is the binary-search / partition midpoint.
+///
+/// All rules are pure integer-order reasoning (no width change), so the elision
+/// stays sound. Works over canonicalized syms.
+fn saturate_lt(lt: &mut BTreeSet<(u32, u32)>, it: &Interner, repr: &[u32], nn: &BTreeSet<u32>) {
+    // Precompute: syms of shape Add(base,c) and Div(Add2(a,b),2), canonicalized.
+    let n = it.exprs.len();
+    let is_const_len = |s: u32| matches!(it.exprs.get(s as usize), Some(SymExpr::Const(l)) if *l >= 0 && l.checked_mul(2).map(|x| x <= i32::MAX as i64).unwrap_or(false));
+    // Seed `len - k < len` style axioms: Add(base, c<0) < base.
+    for i in 0..n {
+        if let SymExpr::Add(base, c) = it.exprs[i] {
+            if c < 0 {
+                let a = canon(repr, i as u32);
+                let b = canon(repr, base);
+                if a != b {
+                    lt.insert((a, b));
+                }
+            }
+        }
+    }
+    loop {
+        let before = lt.len();
+        // Subtract axiom: (x,y) & Add(x,c≤0) ⟹ (Add(x,c), y).
+        for i in 0..n {
+            if let SymExpr::Add(base, c) = it.exprs[i] {
+                if c <= 0 {
+                    let addx = canon(repr, i as u32);
+                    let x = canon(repr, base);
+                    let ys: Vec<u32> = lt.iter().filter(|(a, _)| *a == x).map(|(_, y)| *y).collect();
+                    for y in ys {
+                        if addx != y {
+                            lt.insert((addx, y));
+                        }
+                    }
+                }
+            }
+        }
+        // Midpoint: Div(Add2(a,b),2) < L when (a,L),(b,L), a,b≥0, L const, no overflow.
+        for i in 0..n {
+            if let SymExpr::Div(inner, 2) = it.exprs[i] {
+                if let Some(SymExpr::Add2(a0, b0)) = it.exprs.get(inner as usize).cloned() {
+                    let (a, b) = (canon(repr, a0), canon(repr, b0));
+                    let mid = canon(repr, i as u32);
+                    if nn.contains(&a) && nn.contains(&b) {
+                        // any L bounding both a and b, const & overflow-safe.
+                        let ls: Vec<u32> = lt
+                            .iter()
+                            .filter(|(x, l)| *x == a && is_const_len(*l) && lt.contains(&(b, *l)))
+                            .map(|(_, l)| *l)
+                            .collect();
+                        for l in ls {
+                            if mid != l {
+                                lt.insert((mid, l));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Transitive closure.
+        let pairs: Vec<(u32, u32)> = lt.iter().copied().collect();
+        for &(a, b) in &pairs {
+            let bcs: Vec<u32> = pairs.iter().filter(|(x, _)| *x == b).map(|(_, c)| *c).collect();
+            for c in bcs {
+                if a != c {
+                    lt.insert((a, c));
+                }
+            }
+        }
+        if lt.len() == before {
+            break;
+        }
+    }
 }
 
 /// Representative of a sym after phi collapse (path following, bounds-safe).
@@ -663,6 +790,7 @@ fn compute_nonneg(it: &Interner, phi_inc: &HashMap<u32, Vec<u32>>, repr: &[u32],
                 SymExpr::Add2(a, b) => nn[canon(repr, *a) as usize] && nn[canon(repr, *b) as usize],
                 SymExpr::Mul(a, b) => nn[canon(repr, *a) as usize] && nn[canon(repr, *b) as usize],
                 SymExpr::And(_, m) => *m >= 0,
+                SymExpr::Div(x, d) => *d >= 1 && nn[canon(repr, *x) as usize],
                 SymExpr::Phi(..) => !incomplete.contains(&(i as u32))
                     && phi_inc
                         .get(&(i as u32))
