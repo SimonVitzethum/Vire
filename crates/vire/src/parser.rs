@@ -497,7 +497,19 @@ impl Parser {
         let mut tail = None;
         self.stmt_end();
         while !self.at(&Tok::RBrace) && !matches!(self.peek(), Tok::Eof) {
+            let before = self.pos;
             let s = self.parse_stmt();
+            // Panic-mode recovery: if parse_stmt made no progress (a syntax error
+            // left the cursor stuck), an earlier diagnostic was already recorded;
+            // skip to the next statement boundary and keep parsing so the rest of
+            // the block still yields diagnostics instead of one error masking all.
+            if self.pos == before {
+                while !matches!(self.peek(), Tok::Newline | Tok::Semi | Tok::RBrace | Tok::Eof) {
+                    self.bump();
+                }
+                self.stmt_end();
+                continue;
+            }
             let had_end = matches!(self.peek(), Tok::Newline | Tok::Semi);
             // last expression with no following statement → tail (block value)
             if let Stmt::Expr(e) = &s {
