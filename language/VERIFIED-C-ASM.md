@@ -188,12 +188,14 @@ must write the assumption down, and it is logged.
    `elements` contracts (proven bounds, not blanket trust). *Next:* synthesize from the
    Vire **call-site types** directly (first-class blocks) rather than parsing them back
    out of the C signature.
-4. **[done, scalar capture] first-class `@c(…)` / `@asm(…)` expression blocks** — usable
-   inside any function; captured scalar parameters become the block's params (C reads by
-   name, asm by SysV register); every block goes through the default gate. *Next:*
-   buffer/array capture — the `(ptr,len)` data-pointer ABI plus the `elements` contract
-   synthesized from the Vire array type at the call site (so #3 reads the contract off
-   the Vire types, not the C text).
+4. **[done] first-class expression blocks** — `inline:c(caps){ … }` / `inline:asm(caps){ … }`
+   (clean brace syntax, raw body via a lexer sugar) and the intrinsic form `@c(…)`/`@asm(…)`,
+   usable inside any function. Captures become the block's parameters:
+   - scalar (`Int`/`Float`/`Bool`) → C reads it by name, asm by its SysV register;
+   - **`array` → passed as a proven `(long* a, long a_len)` pair** via `@arraydata`/
+     `@arraylen`, and the `elements` contract is auto-synthesized — so the Vire array's
+     type at the call site supplies the buffer bound that raw C leaves UNKNOWN.
+   Verified: `total(a){ for(i<a_len) s+=a[i] }` → PASS, 60; `a[a_len]` → rejected.
 5. **`@assume` surface** + `vire audit` (list every assumption + justification).
 6. **CSolver as a crate dependency** (structured verdicts; no subprocess).
 7. Verification **cache** (content-addressed per block).
