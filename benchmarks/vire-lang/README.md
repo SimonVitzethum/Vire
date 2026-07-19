@@ -15,9 +15,10 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 | **nsieve** (i64-matched) | CLBG, array | 0.393 s | 0.367 s | 0.388 s | **1.07×** | **1.01×** |
 
 **Average:** across all 12 Vire benchmarks (this file + [../suite/](../suite/)),
-memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.01× (median 1.01×)** —
-at Rust parity — excluding the degenerate `fib` constant-fold (0.02×, a real but
-one-off closed-world win); including `fib` the geomean is 0.73×.
+memory-safe Vire vs memory-safe Rust is a **geometric-mean 0.97× (median 1.00×)** —
+at/just under Rust parity, improved from 1.01× by the matmul ikj port (0.83× Rust) —
+excluding the degenerate `fib` constant-fold (0.02×, a real but one-off closed-world
+win); including `fib` the geomean is ~0.70×.
 
 ## Reading
 **Compute-bound = parity or better.** Scalar arithmetic, stack structs, nsieve, and

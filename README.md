@@ -62,20 +62,21 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | montecarlo | **0.99×** | compute-bound, parity |
 | nbody / bitmanip | **~1.00×** | at parity |
 | **vcall** | **0.42×** (2.4× faster) | solver devirtualization; = Rust, beats clang `virtual` |
-| **matmul** (256³) | **~1.0×** (beats clang) | affine index `r*n+k` proved in range + elided |
+| **matmul** (256³ ikj) | **0.77×** (0.83× Rust) | ikj order → vectorized SAXPY; affine index elided |
 | **binsearch** (10M) | **1.06×** (= 1.00× Rust) | midpoint check *proved* redundant + elided — safely |
 | **sort** (quicksort 2M) | 1.14× (= 1.05× Rust) | uncatchable checks abort noreturn (Rust's structure) |
 
 Across the 12 Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
-memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.01× (median 1.01×) — at
-Rust parity**, with **11 of 12 at or within ~5% of Rust** and several faster (vcall
-0.42× clang / = Rust, mandelbrot 0.84× Rust, struct 0.93×, nbody/binsearch/btree ≈
-1.0×). The solver *proves* array indices in range (the `(lo+hi)/2` midpoint, the affine
+memory-safe Vire vs memory-safe Rust is a **geometric-mean 0.97× (median 1.00×) — at
+Rust parity**, with **11 of 12 at or within ~5% of Rust** and several faster (matmul
+0.83× Rust, vcall 0.42× clang / = Rust, mandelbrot 0.84× Rust, struct 0.93×, nbody/
+binsearch/btree ≈ 1.0×). The solver *proves* array indices in range (the `(lo+hi)/2` midpoint, the affine
 `r*n+k`) and, where a check can't be elided, makes it as cheap as Rust's (a noreturn
 abort when provably uncatchable) — **all fully memory-safe: a genuinely out-of-bounds
 access still throws**. binary-trees reached parity via region inference + move-on-
-last-use RC elision. The one residual is matmul's scalar register-scheduling (~1.3×
-Rust, but it beats clang). See [TODO.md](TODO.md) and
+last-use RC elision. matmul now **beats both Rust (0.83×) and clang (0.77×)**: the
+cache-friendly ikj loop order makes the inner loop a vectorizable SAXPY (the same
+technique the Java-AOT path uses to beat Rust). See [TODO.md](TODO.md) and
 [benchmarks/suite/](benchmarks/suite/).
 
 ## Documents

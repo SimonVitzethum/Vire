@@ -9,19 +9,20 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 | Benchmark | Vire | Rust | clang++ | Vire/clang |
 |---|---|---|---|---|
 | bitmanip (popcount) | 0.187 | 0.188 | 0.187 | **1.00×** |
-| matmul (256³ naive) | 0.0126 | 0.0099 | 0.0131 | **0.96×** |
+| matmul (256³ ikj) | 0.0036 | 0.0043 | 0.0047 | **0.77×** |
 | nbody (2000, 20 steps) | 0.072 | 0.076 | 0.074 | **0.97×** |
 | montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
 | vcall (dyn dispatch, 100M) | 0.115 | 0.115 | 0.276 | **0.41×** |
 | sort (quicksort 2M) | 0.128 | 0.122 | 0.112 | 1.14× |
 | binsearch (10M lookups) | 0.480 | 0.477 | 0.451 | **1.06×** |
 
-**Average (this suite, Vire/Rust):** geometric mean **1.01×** — memory-safe Vire is
-statistically at Rust parity here; every benchmark is within ±16% of Rust and two
-(nbody, vcall) are faster. **binsearch = 1.00× Rust** (the constant upper/lower-bound
+**Average (this suite, Vire/Rust):** geometric mean **0.97×** (was 1.01× before the
+matmul ikj port) — memory-safe Vire is at/just under Rust parity here; every benchmark is
+within ±16% of Rust and three (matmul, nbody, vcall) are faster. **binsearch = 1.00× Rust** (the constant upper/lower-bound
 fixpoint proves the midpoint `0 ≤ (lo+hi)/2 ≤ n-1 < len` and elides the check, safely
 — a real OOB still throws); **sort = 1.05× Rust** (its uncatchable checks abort
-noreturn, Rust's structure); **matmul beats clang** (affine index elided).
+noreturn, Rust's structure); **matmul = 0.83× Rust / 0.77× clang** — beats both
+(cache-friendly ikj order → vectorized SAXPY inner loop, affine index elided).
 
 ## Interpretation
 - **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).
@@ -29,14 +30,14 @@ noreturn, Rust's structure); **matmul beats clang** (affine index elided).
 - **binsearch: Vire = 1.00× Rust / 1.06× clang** — the constant upper/lower-bound
   fixpoint elides the data-dependent midpoint check (`0 ≤ (lo+hi)/2 ≤ n-1 < len`),
   safely. This is the LLVM-safe-language ceiling (its no-checks floor is 1.07× clang).
-- **matmul (256³ naive): Vire 0.96× clang / 1.27× Rust.** The affine index
-  `c[r*n+col]` / `a[r*n+k]` now elides via a flow-sensitive rule (`N*a+b < N² ≤ len`
-  from the loop-guard facts `a<N`, `b<N` — bounds.rs Path 4): the inner loop goes
-  from 2×-unrolled-with-check to 8×-unrolled FMA, **now beating clang** (was 1.28×).
-  The residual vs Rust (1.27×) is *not* bounds and *not* vectorization (both are
-  scalar here — the strided `b[k*n+col]` column access does not vectorize in either):
-  it is a subtle scalar register-allocation/scheduling difference in the identical
-  check-free FMA loop (Rust 0.0099 vs Vire's no-checks 0.0126). A deep-codegen case.
+- **matmul (256³ ikj): Vire 0.83× Rust / 0.77× clang — beats both.** The kernel now
+  uses the cache-friendly **ikj** loop order (the same order the Java-AOT `Matmul` uses
+  to beat Rust): the inner loop `c[ci+j] += aik*b[bk+j]` is unit-stride in `j` — a
+  SAXPY — so LLVM **vectorizes** it (8 packed-FP ops). The earlier ijk dot-product
+  order had a strided `b[k*n+col]` column read that vectorizes in no compiler, which is
+  why it sat at 1.27× Rust (a scalar-scheduling residual). Same algorithm across all
+  three languages (fair), bit-identical output (100659197). The affine index
+  (`bounds.rs` Path 4, `N·a+b < N² ≤ len`) is still elided; a real OOB still throws.
 - **vcall = trait objects (dyn dispatch): Vire 0.41× — 2.4× FASTER than clang
   `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
   vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
@@ -103,7 +104,7 @@ checks off — never shipped; the shipped path stays memory-safe):
 |---|---|---|---|---|---|
 | **binsearch** | **0.478** | 0.482 | 0.480 | 0.449 | **won: 1.00× Rust** — check *proved* redundant and elided |
 | sort | 0.166 | **0.130** (−20%) | 0.126 | 0.110 | open — partition bounds loaded from a stack array (opaque) |
-| matmul | 0.017 | **0.015** (−10%) | 0.010 | 0.013 | open — affine index (guard-aware, TODO #1) **and** a vectorization gap |
+| matmul | 0.0036 | ~0.0036 (elided) | 0.0043 | 0.0047 | **won: 0.83× Rust** — ikj vectorizes + affine index elided |
 
 **Findings:**
 1. **binsearch is now at parity with Rust.** The constant upper/lower-bound fixpoint
@@ -117,6 +118,8 @@ checks off — never shipped; the shipped path stays memory-safe):
    (safe, LLVM, with checks) lands at the same ~1.05–1.10× clang. So the honest,
    valuable target for a *memory-safe* language is **Rust parity**, which binsearch
    now reaches.
-3. **sort/matmul are not (yet) winnable by bounds elision**: sort's bounds are opaque
-   stack loads (would need an array-content invariant); matmul is vectorization-bound
-   vs Rust even with checks off. Both are documented, neither is a soundness issue.
+3. **matmul is now won** (0.83× Rust): the cache-friendly ikj order makes the inner
+   loop a vectorizable SAXPY, and the affine index is elided — so the safe build already
+   measures like the no-checks build. **sort is not (yet) winnable by bounds elision**:
+   its bounds are opaque stack loads (would need an array-content invariant). Documented,
+   not a soundness issue.
