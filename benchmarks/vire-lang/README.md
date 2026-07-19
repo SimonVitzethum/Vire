@@ -14,6 +14,11 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 | **binary-trees** | CLBG, alloc/GC | 0.190 s | 0.186 s | 0.154 s | **1.02×** | 1.23× |
 | **nsieve** (i64-matched) | CLBG, array | 0.393 s | 0.367 s | 0.388 s | **1.07×** | **1.01×** |
 
+**Average:** across all 12 Vire benchmarks (this file + [../suite/](../suite/)),
+memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.01× (median 1.01×)** —
+at Rust parity — excluding the degenerate `fib` constant-fold (0.02×, a real but
+one-off closed-world win); including `fib` the geomean is 0.73×.
+
 ## Reading
 **Compute-bound = parity or better.** Scalar arithmetic, stack structs, nsieve, and
 the CLBG classic mandelbrot run at C++/Rust level — mandelbrot now **beats Rust

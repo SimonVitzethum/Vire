@@ -14,12 +14,14 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 | montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
 | vcall (dyn dispatch, 100M) | 0.115 | 0.115 | 0.276 | **0.41×** |
 | sort (quicksort 2M) | 0.128 | 0.122 | 0.112 | 1.14× |
-| binsearch (10M lookups) | 0.478 | 0.480 | 0.449 | **1.06×** |
+| binsearch (10M lookups) | 0.480 | 0.477 | 0.451 | **1.06×** |
 
-**binsearch now = 1.00× Rust** (0.478 vs 0.480): the constant upper/lower-bound
-fixpoint (bounds.rs) proves the midpoint `0 ≤ (lo+hi)/2 ≤ n-1 < len` and elides its
-data-dependent check — safely (a real out-of-bounds access still throws). Its
-no-checks ceiling was 1.07× clang, so essentially every provably-safe check is gone.
+**Average (this suite, Vire/Rust):** geometric mean **1.01×** — memory-safe Vire is
+statistically at Rust parity here; every benchmark is within ±16% of Rust and two
+(nbody, vcall) are faster. **binsearch = 1.00× Rust** (the constant upper/lower-bound
+fixpoint proves the midpoint `0 ≤ (lo+hi)/2 ≤ n-1 < len` and elides the check, safely
+— a real OOB still throws); **sort = 1.05× Rust** (its uncatchable checks abort
+noreturn, Rust's structure); **matmul beats clang** (affine index elided).
 
 ## Interpretation
 - **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).
