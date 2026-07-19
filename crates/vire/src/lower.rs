@@ -1777,7 +1777,43 @@ impl<'a> FnLower<'a> {
     fn lower_call(&mut self, callee: &Expr, args: &[Expr]) -> (Operand, Ty) {
         // Method call `obj.method(args)` → direct call `Class.method(obj, args)`
         // (monomorphic, no virtual dispatch — Vire types are (still) flat).
-        if let Expr::Field { base, name, .. } = callee {
+        if let Expr::Field { base, name, span } = callee {
+            // Feature 6 — `log.LEVEL(msg)` with a COMPILE-TIME level filter. Levels
+            // below the threshold lower to nothing (zero instructions), exactly the
+            // "disabled log calls cost nothing" property. Enabled levels prepend a
+            // level tag to a literal message at compile time and print it.
+            if let Expr::Ident(id, _) = base.as_ref() {
+                if id == "log" {
+                    // 0=debug 1=info 2=warn 3=error. Default threshold: info and up.
+                    const LOG_THRESHOLD: i32 = 1;
+                    let (level, tag) = match name.as_str() {
+                        "debug" => (0, "[DEBUG] "),
+                        "info" => (1, "[INFO] "),
+                        "warn" => (2, "[WARN] "),
+                        "error" => (3, "[ERROR] "),
+                        _ => {
+                            self.errs.push(format!("log has no level `{name}` (use debug/info/warn/error)"));
+                            return (Operand::ConstI64(0), Ty::Void);
+                        }
+                    };
+                    if level >= LOG_THRESHOLD {
+                        if let Some(msg) = args.first() {
+                            let printed = match msg {
+                                Expr::Str(s, sp) => Expr::Str(format!("{tag}{s}"), *sp),
+                                other => other.clone(),
+                            };
+                            let call = Expr::Call {
+                                callee: Box::new(Expr::Ident("print".into(), *span)),
+                                args: vec![printed],
+                                span: *span,
+                            };
+                            self.lower_expr(&call);
+                        }
+                    }
+                    // Below threshold: emit nothing at all.
+                    return (Operand::ConstI64(0), Ty::Void);
+                }
+            }
             let (obj, _) = self.lower_expr(base);
             // `xs.len()` on an array → ArrayLen.
             if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
