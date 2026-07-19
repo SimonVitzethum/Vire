@@ -2407,6 +2407,7 @@ impl<'a> FnLower<'a> {
                     "trim" => Some(("jrt_str_trim", Ty::Ref, &[])),
                     "lower" | "toLowerCase" | "to_lower" => Some(("jrt_str_lower", Ty::Ref, &[])),
                     "upper" | "toUpperCase" | "to_upper" => Some(("jrt_str_upper", Ty::Ref, &[])),
+                    "jsonEscape" | "json_escape" => Some(("jrt_str_json_escape", Ty::Ref, &[])),
                     "substring" if args.len() == 1 => Some(("jrt_str_substring1", Ty::Ref, &['i'])),
                     "substring" => Some(("jrt_str_substring2", Ty::Ref, &['i', 'i'])),
                     _ => None,

@@ -256,11 +256,16 @@ fn field_hash_of(e: Expr, ty: &Type) -> Expr {
 }
 
 /// JSON rendering of one field value `e` of type `ty`: numbers bare, `Bool` as
-/// true/false, `Str` quoted. (No escaping yet — see TODO.)
+/// true/false, `Str` quoted **and escaped** (`.jsonEscape()` → `jrt_str_json_escape`,
+/// so quotes/backslashes/control chars produce valid RFC 8259 JSON).
 fn json_value(e: Expr, ty: &Type) -> Expr {
     match fkind(ty) {
         FKind::Bool => if_expr(e, str_lit("true"), str_lit("false")),
-        FKind::Str => bin(BinOp::Add, bin(BinOp::Add, str_lit("\""), e), str_lit("\"")),
+        FKind::Str => bin(
+            BinOp::Add,
+            bin(BinOp::Add, str_lit("\""), method_call(e, "jsonEscape", vec![])),
+            str_lit("\""),
+        ),
         _ => call("str", vec![e]), // Int / Float bare; Other rejected earlier
     }
 }

@@ -146,6 +146,20 @@ fn main() {
 EOF
 check "Json (product)" '{"name": "Ann", "age": 30, "active": true}' "$work/json.vr"
 
+# Json string escaping (RFC 8259): embedded quote + newline + tab in a Str field.
+cat > "$work/jesc.vr" <<'EOF'
+@derive(Json)
+type Msg {
+    text: Str
+    n: Int
+}
+fn main() {
+    mut m = Msg("a\"b\nc\td", 1)
+    print(m.to_json())
+}
+EOF
+check "Json (escaping)" '{"text": "a\"b\nc\td", "n": 1}' "$work/jesc.vr"
+
 # Json + Hash on a sum type (dataless + payload variants).
 cat > "$work/jsum.vr" <<'EOF'
 @derive(Json, Hash)

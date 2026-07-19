@@ -99,6 +99,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_str_trim", "ptr (ptr)"),
     ("jrt_str_lower", "ptr (ptr)"),
     ("jrt_str_upper", "ptr (ptr)"),
+    ("jrt_str_json_escape", "ptr (ptr)"),
     ("jrt_sb_new", "ptr ()"),
     ("jrt_sb_append_str", "ptr (ptr, ptr)"),
     ("jrt_sb_append_int", "ptr (ptr, i32)"),

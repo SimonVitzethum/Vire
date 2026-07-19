@@ -654,6 +654,47 @@ void *jrt_str_upper(const JStr *s) {
     }
     return r;
 }
+/* JSON string escaping (RFC 8259): ", \, and the C0 control chars become escape
+ * sequences (\", \\, \n, \r, \t, \b, \f, else \u00XX) → a new RC-managed string.
+ * Two passes: measure the escaped length, allocate once, then fill. Used by
+ * `@derive(Json)` so a Str field with quotes/newlines yields valid JSON. */
+void *jrt_str_json_escape(const JStr *s) {
+    if (!s) { jrt_throw_npe(); return NULL; }
+    int64_t out = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        uint8_t c = s->bytes[i];
+        switch (c) {
+            case '"': case '\\': case '\n': case '\r':
+            case '\t': case '\b': case '\f': out += 2; break;
+            default: out += (c < 0x20) ? 6 : 1; /* \u00XX */
+        }
+    }
+    JStr *r = str_alloc(out);
+    static const char hex[] = "0123456789abcdef";
+    int64_t j = 0;
+    for (int64_t i = 0; i < s->len; i++) {
+        uint8_t c = s->bytes[i];
+        switch (c) {
+            case '"':  r->bytes[j++] = '\\'; r->bytes[j++] = '"';  break;
+            case '\\': r->bytes[j++] = '\\'; r->bytes[j++] = '\\'; break;
+            case '\n': r->bytes[j++] = '\\'; r->bytes[j++] = 'n';  break;
+            case '\r': r->bytes[j++] = '\\'; r->bytes[j++] = 'r';  break;
+            case '\t': r->bytes[j++] = '\\'; r->bytes[j++] = 't';  break;
+            case '\b': r->bytes[j++] = '\\'; r->bytes[j++] = 'b';  break;
+            case '\f': r->bytes[j++] = '\\'; r->bytes[j++] = 'f';  break;
+            default:
+                if (c < 0x20) {
+                    r->bytes[j++] = '\\'; r->bytes[j++] = 'u';
+                    r->bytes[j++] = '0'; r->bytes[j++] = '0';
+                    r->bytes[j++] = hex[(c >> 4) & 0xf];
+                    r->bytes[j++] = hex[c & 0xf];
+                } else {
+                    r->bytes[j++] = c;
+                }
+        }
+    }
+    return r;
+}
 
 /* --- Wrapper classes (autoboxing) -----------------------------------
  * Integer/Long/Boolean are regular objects (RC-managed) with a
