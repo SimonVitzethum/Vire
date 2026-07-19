@@ -1566,15 +1566,52 @@ impl<'a> FnLower<'a> {
                 self.emit(Statement::Assign(d, Rvalue::Convert(op)));
                 (Operand::Copy(d), to)
             }
-            Expr::Comptime { inner, .. } => match const_eval(inner) {
-                Some(CVal::Int(v)) => (Operand::ConstI64(v), Ty::I64),
-                Some(CVal::Float(v)) => (Operand::ConstF64(v), Ty::F64),
-                Some(CVal::Bool(b)) => (Operand::ConstI32(if b { 1 } else { 0 }), Ty::I32),
-                None => {
-                    self.errs.push("comptime: expression is not constant-foldable (only literals/arithmetic/comparisons)".into());
-                    (Operand::ConstI64(0), Ty::I64)
+            // `comptime if COND { A } else { B }` — conditional compilation: fold
+            // COND at compile time and lower ONLY the taken branch, dropping the
+            // rest (so a branch may reference platform-specific / otherwise-invalid
+            // code that is never compiled). Falls back to constant folding for
+            // value expressions (`comptime 2 + 3`).
+            Expr::Comptime { inner, .. } => {
+                if let Expr::If { cond, then, elifs, els, .. } = inner.as_ref() {
+                    let taken: Option<&Block2> = match const_eval(cond) {
+                        Some(CVal::Bool(true)) => Some(then),
+                        Some(CVal::Bool(false)) => {
+                            let mut chosen = els.as_ref();
+                            for (ec, eb) in elifs {
+                                match const_eval(ec) {
+                                    Some(CVal::Bool(true)) => {
+                                        chosen = Some(eb);
+                                        break;
+                                    }
+                                    Some(CVal::Bool(false)) => continue,
+                                    _ => {
+                                        chosen = None;
+                                        break;
+                                    }
+                                }
+                            }
+                            chosen
+                        }
+                        _ => {
+                            self.errs.push("comptime if: condition is not a compile-time constant bool".into());
+                            None
+                        }
+                    };
+                    return match taken {
+                        Some(b) => self.lower_block_val(b),
+                        None => (Operand::ConstI64(0), Ty::Void),
+                    };
                 }
-            },
+                match const_eval(inner) {
+                    Some(CVal::Int(v)) => (Operand::ConstI64(v), Ty::I64),
+                    Some(CVal::Float(v)) => (Operand::ConstF64(v), Ty::F64),
+                    Some(CVal::Bool(b)) => (Operand::ConstI32(if b { 1 } else { 0 }), Ty::I32),
+                    None => {
+                        self.errs.push("comptime: expression is not constant-foldable (only literals/arithmetic/comparisons)".into());
+                        (Operand::ConstI64(0), Ty::I64)
+                    }
+                }
+            }
             // `e?` — error propagation for Result: Ok(v) → v; Err(_) → return e.
             // (Desugared to match; the enclosing function must return Result.)
             Expr::Try { inner, .. } => {
