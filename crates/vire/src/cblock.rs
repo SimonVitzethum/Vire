@@ -155,8 +155,20 @@ impl Desugar<'_> {
                 return None;
             }
         };
-        // captures: (name, vire type name, C type)
-        let mut caps: Vec<(String, String)> = Vec::new();
+        let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
+        let intr = |name: &str, arg: &str| Expr::Call {
+            callee: Box::new(Expr::Ident(name.to_string(), span)),
+            args: vec![Expr::Ident(arg.to_string(), span)],
+            span,
+        };
+        // Per capture, build: the C parameter(s), the extern parameter(s), and the
+        // call argument(s). A scalar is one of each; an array is a (ptr, len) PAIR —
+        // `long* nm, long nm_len` in C, passed as `@arraydata(nm), @arraylen(nm)`, so a
+        // Vire array reaches C as a proven (ptr, len) buffer (the `elements` contract is
+        // then auto-synthesized from that signature).
+        let mut c_params: Vec<String> = Vec::new();
+        let mut ext_params: Vec<Param> = Vec::new();
+        let mut call_args: Vec<Expr> = Vec::new();
         for a in &args[1..] {
             let nm = match a {
                 Expr::Ident(n, _) => n.clone(),
@@ -169,51 +181,49 @@ impl Desugar<'_> {
                 Some(t) => t.clone(),
                 None => {
                     self.errs
-                        .push(format!("@c/@asm: capture `{nm}` must be a parameter of the enclosing function (buffer capture not yet supported)"));
+                        .push(format!("@c/@asm: capture `{nm}` must be a parameter of the enclosing function"));
                     return None;
                 }
             };
-            let cty = match vty.as_str() {
-                "Int" => "long",
-                "Float" => "double",
-                "Bool" => "long",
+            match vty.as_str() {
+                "Int" | "Bool" => {
+                    c_params.push(format!("long {nm}"));
+                    ext_params.push(Param { name: nm.clone(), ty: Some(ty(&vty)), default: None });
+                    call_args.push(Expr::Ident(nm, span));
+                }
+                "Float" => {
+                    c_params.push(format!("double {nm}"));
+                    ext_params.push(Param { name: nm.clone(), ty: Some(ty("Float")), default: None });
+                    call_args.push(Expr::Ident(nm, span));
+                }
+                "array" => {
+                    let len = format!("{nm}_len");
+                    c_params.push(format!("long* {nm}, long {len}"));
+                    ext_params.push(Param { name: nm.clone(), ty: Some(ty("array")), default: None });
+                    ext_params.push(Param { name: len, ty: Some(ty("Int")), default: None });
+                    call_args.push(intr("@arraydata", &nm));
+                    call_args.push(intr("@arraylen", &nm));
+                }
                 other => {
-                    self.errs
-                        .push(format!("@c/@asm: capture `{nm}` has unsupported type `{other}` (scalar Int/Float/Bool only for now)"));
+                    self.errs.push(format!(
+                        "@c/@asm: capture `{nm}` has unsupported type `{other}` (Int/Float/Bool/array)"
+                    ));
                     return None;
                 }
-            };
-            caps.push((nm, cty.to_string()));
+            }
         }
         let n = *self.counter;
         *self.counter += 1;
         let fname = format!("__cblock_{n}");
-        let sig = if caps.is_empty() {
-            "void".to_string()
-        } else {
-            caps.iter().map(|(nm, cty)| format!("{cty} {nm}")).collect::<Vec<_>>().join(", ")
-        };
+        let sig = if c_params.is_empty() { "void".to_string() } else { c_params.join(", ") };
         let (abi, gen_code) = if is_asm {
             ("asm".to_string(), format!(".globl {fname}\n{fname}:\n{code}\n"))
         } else {
             ("c".to_string(), format!("long {fname}({sig}) {{\n{code}\n}}\n"))
         };
         self.generated.push(Item::Native { abi, code: gen_code, links: vec![], span });
-        // extern "C" declaration so Vire can call the generated function. It returns
-        // Int; scalar captures keep their Vire types.
-        let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
-        let ext_params: Vec<Param> = args[1..]
-            .iter()
-            .filter_map(|a| if let Expr::Ident(nm, _) = a { Some(nm.clone()) } else { None })
-            .map(|nm| {
-                let vty = self.ptypes.get(&nm).cloned().unwrap_or_else(|| "Int".into());
-                Param { name: nm, ty: Some(ty(&vty)), default: None }
-            })
-            .collect();
         let ext_sig = FnSig { name: fname.clone(), generics: vec![], params: ext_params, ret: Some(ty("Int")), span };
         self.generated.push(Item::Extern { abi: "C".into(), items: vec![ext_sig], links: vec![], header: None, span });
-        // Replacement: a plain call to the generated function with the captures.
-        let call_args: Vec<Expr> = args[1..].to_vec();
         Some(Expr::Call { callee: Box::new(Expr::Ident(fname, span)), args: call_args, span })
     }
 }

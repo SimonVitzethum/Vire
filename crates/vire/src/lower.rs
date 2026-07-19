@@ -1922,6 +1922,21 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
+        // Buffer-capture intrinsics for inline C/asm blocks: `@arraydata(a)` yields the
+        // raw data pointer (past the 16-byte object header), `@arraylen(a)` the element
+        // count. Together they pass a Vire array to a `native "c"` block as a proven
+        // (ptr, len) pair (see cblock.rs / language/VERIFIED-C-ASM.md).
+        if name == "@arraydata" {
+            let a = self.lower_expr(&args[0]).0;
+            let d = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_array_data".into(), args: vec![a] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        if name == "@arraylen" {
+            let a = self.lower_expr(&args[0]).0;
+            let l = self.array_len_i64(a);
+            return (l, Ty::I64);
+        }
         // Call of a lambda local `f(args)` → body inline (parameters bound).
         if let Some((l, _)) = self.lookup(&name) {
             if let Some((params, body)) = self.local_lambda.get(&l.0).cloned() {

@@ -331,6 +331,11 @@ typedef struct {
     int64_t len, cap;
     int64_t *data;
 } VList;
+/* Raw data pointer of a Vire array: past the 16-byte object header and the 8-byte
+ * length + padding, the element storage begins at offset 32 (matches the backend's
+ * array element GEP). Lets `@arraydata(a)` hand a Vire array to inline C as a plain
+ * element pointer. */
+void *jrt_array_data(void *a) { return (char *)a + 32; }
 VList *vire_list_new(void) {
     VList *l = (VList *)malloc(sizeof(VList));
     l->refcount = -1;

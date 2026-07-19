@@ -134,6 +134,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_println_float", "void (float)"),
     ("jrt_float_to_str", "ptr (float)"),
     ("jrt_alloc", "ptr (i64)"),
+    ("jrt_array_data", "ptr (ptr)"),
     ("jrt_null_check", "void (ptr)"),
     ("jrt_throw_npe", "void ()"),
     ("jrt_throw_bounds", "void ()"),
@@ -996,6 +997,11 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
                     }
                     Statement::Assign(d, _) => (Some(d.0), false),
                     Statement::New { dest, .. } => (Some(dest.0), false),
+                    // `jrt_array_data` returns an INTERIOR pointer into the array (its
+                    // data region), a borrow — it owns nothing, so its result must not be
+                    // retained/released (releasing an interior pointer reads a bogus
+                    // header). Treat it as immortal, like a stack/literal value.
+                    Statement::Call { dest, func, .. } if func == "jrt_array_data" => (dest.map(|d| d.0), true),
                     Statement::Call { dest, .. }
                     | Statement::CallGuarded { dest, .. }
                     | Statement::CallVirtual { dest, .. }
