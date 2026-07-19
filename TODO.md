@@ -29,13 +29,22 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   proves `0 ≤ i ≤ ub(i) < lb(len)` across phis — so **binary search's `a[mid]` now
   elides** (`0 ≤ (lo+hi)/2 ≤ n-1 < n`) and **binsearch reaches 1.00× Rust** (was
   1.23×), soundly (a real OOB still throws; Java oracle 65/65). Also tracks lengths
-  for `RegionNewArray`/`StackNewArray`, not just `NewArray`. **Still open:** (a) the
-  **guard-aware affine** case — matmul's `r*n+k` counted-loop index whose bound lives
-  in the loop guard `r<n` (the arithmetic fixpoint does not read guards); note matmul
-  is *also* vectorization-bound vs Rust, so bounds alone will not win it. (b)
-  **quicksort partition** — bounds loaded from a stack array (opaque to the value
-  analysis; would need an array-content invariant). Payoff caps at Rust parity, not
-  below clang (clang = zero checks = the LLVM ceiling for safe code).
+  for `RegionNewArray`/`StackNewArray`, not just `NewArray`. **Also landed:** the
+  **guard-aware affine** rule (Path 4) — matmul's `N*a+b < N² ≤ len` from the
+  loop-guard facts `a<N`, `b<N` in the flow-sensitive `lt`. matmul 1.64×→**1.22× Rust,
+  now beats clang** (0.96×); the inner loop becomes 8× FMA. The residual vs Rust is
+  scalar register-alloc/scheduling, not bounds or vectorization (both are scalar).
+  **Still open — quicksort `sort` (array-content invariant).** Worked out in full: the
+  hot `a[j]` IS soundly provable — `0 ≤ j` from the `lostack` content lower bound (all
+  stores ≥ 0, incl. the default 0), and `j < hi < len` from the guard `j<hi` plus the
+  `histack` content upper bound `hi ≤ n-1`. Needs, coupled: (i) reuse the existing
+  (proven) escape analysis to confirm `lostack`/`histack` never escape; (ii) a
+  per-array content ub/lb fixpoint (default element 0 folded in: `ub=max(0,stores)`,
+  `lb=min(0,stores)`); (iii) guard-aware counted bounds for `pi` so `histack`'s ub
+  converges to `n-1`; (iv) inject `(hi,len)` into `lt` so `a[j]` elides transitively.
+  Sound but escape-dependent + multi-part → deferred as too risky to ship unattended
+  (a content/escape edge case = an OOB read = a memory-safety violation). Payoff caps
+  at Rust parity (sort no-checks ceiling = 1.04× Rust), not below clang.
 - [x] **Allocator gap — closed for the array case.** Region inference closed the
   RC gap on traversal; the auto-arena (escape→arena) covers `for`-loops and
   scalar-store loops; and **non-escaping fixed-size primitive arrays now

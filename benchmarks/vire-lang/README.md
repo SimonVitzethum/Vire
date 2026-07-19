@@ -11,7 +11,7 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 | fib | recursion (fib 38) | 0.002 s | 0.087 s | 0.081 s | **0.02×** | **0.02×** |
 | struct | stack struct | 0.290 s | 0.309 s | 0.331 s | **0.94×** | **0.88×** |
 | **mandelbrot** | CLBG, float compute | 0.127 s | 0.152 s | 0.127 s | **0.84×** | **1.00×** |
-| **binary-trees** | CLBG, alloc/GC | 0.218 s | 0.207 s | 0.169 s | **1.05×** | 1.29× |
+| **binary-trees** | CLBG, alloc/GC | 0.190 s | 0.186 s | 0.154 s | **1.02×** | 1.23× |
 | **nsieve** (i64-matched) | CLBG, array | 0.393 s | 0.367 s | 0.388 s | **1.07×** | **1.01×** |
 
 ## Reading
@@ -26,13 +26,17 @@ a compile-time constant → ~instant (0.002 s) vs 0.08 s for `rustc -O` / `clang
 which keep the recursion. Real, but on a constant-input microbenchmark — not a claim
 about general recursion throughput.
 
-**Allocation/GC-bound = now near parity.** binary-trees (pure object allocation +
-freeing) is **1.05× Rust / 1.29× C++** — down from ~2.65× at the previous snapshot:
-region inference (`language/M0.3`) removed most of the reference-counting tax
-(retain/release per node + cascading free), and Vire still frees **everything** (0
-live; C++ only with explicit `delete`). No O(n²) blowup. The residual vs C++ is the
-last RC bookkeeping the region pass does not yet prove away; the oracle ceiling
-(`--no-rc`) is parity.
+**Allocation/GC-bound = now at Rust parity.** binary-trees (pure object allocation +
+freeing) is **1.02× Rust / 1.23× C++** — down from ~2.65× two snapshots ago. Region
+inference (`language/M0.3`) removed the bulk of the RC tax, and **move-on-last-use**
+(this round) removed the ownership-transfer churn: an owned ref whose sole use is a
+field store or `return` hands its +1 to the store (no retain, no cleanup release) —
+exactly Rust's move. Construction retains now drop to **zero**; the residual is the
+free cascade (per-node release), which Rust also pays. Vire still frees **everything**
+(0 live; C++ only with explicit `delete`), no O(n²) blowup. The `--no-rc` oracle
+(0.084 s = 0.46× Rust, but *leaks*) shows the remaining lever is **interprocedural
+region inference** (bulk-free the whole tree en bloc), which would beat Rust's
+per-node free — the open hard half.
 
 ## Summary
 Vire = **C++/Rust parity (or better) on compute-bound code**, **~1.05× Rust on pure

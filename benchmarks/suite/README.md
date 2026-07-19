@@ -8,9 +8,9 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 ## Results (best-of-5, the same machine, measured 2026-07)
 | Benchmark | Vire | Rust | clang++ | Vire/clang |
 |---|---|---|---|---|
-| bitmanip (popcount) | 0.191 | 0.193 | 0.192 | **1.00×** |
-| matmul (256³ naive) | 0.017 | 0.010 | 0.013 | 1.28× |
-| nbody (2000, 20 steps) | 0.075 | 0.076 | 0.074 | **~1.00×** |
+| bitmanip (popcount) | 0.187 | 0.188 | 0.187 | **1.00×** |
+| matmul (256³ naive) | 0.0126 | 0.0099 | 0.0131 | **0.96×** |
+| nbody (2000, 20 steps) | 0.072 | 0.076 | 0.074 | **0.97×** |
 | montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
 | vcall (dyn dispatch, 100M) | 0.120 | 0.117 | 0.281 | **0.41×** |
 | sort (quicksort 2M) | 0.169 | 0.126 | 0.114 | 1.43× |
@@ -27,13 +27,14 @@ no-checks ceiling was 1.07× clang, so essentially every provably-safe check is 
 - **binsearch: Vire = 1.00× Rust / 1.06× clang** — the constant upper/lower-bound
   fixpoint elides the data-dependent midpoint check (`0 ≤ (lo+hi)/2 ≤ n-1 < len`),
   safely. This is the LLVM-safe-language ceiling (its no-checks floor is 1.07× clang).
-- **matmul (256³ naive): Vire ~1.25× clang / 1.6× Rust.** Two separate things: a
-  residual bounds check on the *affine* index `C[i*n+j]` (its counted-loop bound
-  lives in the loop guard, which the arithmetic fixpoint does not read — the
-  guard-aware affine extension is TODO #1), AND, more importantly, a **vectorization
-  gap**: even with all checks off (`FASTLLVM_NO_BOUNDS`) Vire is 1.5× Rust here —
-  Rust autovectorizes the inner product loop better. Bounds elision alone cannot win
-  matmul; it is a codegen/vectorization case.
+- **matmul (256³ naive): Vire 0.96× clang / 1.27× Rust.** The affine index
+  `c[r*n+col]` / `a[r*n+k]` now elides via a flow-sensitive rule (`N*a+b < N² ≤ len`
+  from the loop-guard facts `a<N`, `b<N` — bounds.rs Path 4): the inner loop goes
+  from 2×-unrolled-with-check to 8×-unrolled FMA, **now beating clang** (was 1.28×).
+  The residual vs Rust (1.27×) is *not* bounds and *not* vectorization (both are
+  scalar here — the strided `b[k*n+col]` column access does not vectorize in either):
+  it is a subtle scalar register-allocation/scheduling difference in the identical
+  check-free FMA loop (Rust 0.0099 vs Vire's no-checks 0.0126). A deep-codegen case.
 - **vcall = trait objects (dyn dispatch): Vire 0.41× — 2.4× FASTER than clang
   `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
   vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
