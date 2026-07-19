@@ -105,11 +105,72 @@ fn resolve_solver(override_path: Option<&str>) -> Option<String> {
     None
 }
 
+/// Auto-synthesize a CSolver `--pre` contract from the C block's function signatures:
+/// an adjacent `(T* ptr, intN len)` parameter pair (the C `(buf, len)` idiom) becomes
+/// `<fn> <ptr#> elements <len#> <elem-bytes>` — a PROVEN bound, not a blanket trust.
+/// This is the contract a typed Vire caller supplies (a Vire array is a proven
+/// (ptr, len)). Returns the number of contracts written. Heuristic + prove-only
+/// (refutable=false), so it never introduces a false FAIL; the remaining pointers
+/// stay under `--assume-valid-params`.
+fn synthesize_pre(code: &str, pre_path: &std::path::Path) -> usize {
+    fn elem_bytes(ptr_ty: &str) -> u32 {
+        let t = ptr_ty.replace('*', " ");
+        let t = t.split_whitespace().filter(|w| *w != "const").collect::<Vec<_>>().join(" ");
+        if t.contains("char") || t.contains("int8") || t.contains("uint8") {
+            1
+        } else if t.contains("short") || t.contains("int16") {
+            2
+        } else if t.contains("long long") || t.contains("int64") || t.contains("double") || t.contains("size_t") {
+            8
+        } else if t.contains("long") {
+            8
+        } else {
+            4 // int / float / default
+        }
+    }
+    fn is_int_param(p: &str) -> bool {
+        !p.contains('*')
+            && ["int", "long", "short", "size_t", "unsigned", "int32", "int64", "size"].iter().any(|k| p.contains(k))
+    }
+    let mut lines = Vec::new();
+    let bytes = code.as_bytes();
+    let mut idx = 0;
+    while let Some(open) = code[idx..].find('(') {
+        let open = idx + open;
+        // Function name = identifier immediately before '('.
+        let mut ns = open;
+        while ns > 0 && (bytes[ns - 1].is_ascii_alphanumeric() || bytes[ns - 1] == b'_') {
+            ns -= 1;
+        }
+        let name = &code[ns..open];
+        let Some(close_rel) = code[open..].find(')') else { break };
+        let close = open + close_rel;
+        // Only real definitions: a '{' should follow the ')' (skip whitespace).
+        let after = code[close + 1..].trim_start();
+        idx = close + 1;
+        if name.is_empty() || !after.starts_with('{') {
+            continue;
+        }
+        let params: Vec<&str> = code[open + 1..close].split(',').map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "void").collect();
+        for (i, p) in params.iter().enumerate() {
+            if p.contains('*') && i + 1 < params.len() && is_int_param(params[i + 1]) {
+                lines.push(format!("{name} {i} elements {} {}", i + 1, elem_bytes(p)));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return 0;
+    }
+    let _ = std::fs::write(pre_path, lines.join("\n") + "\n");
+    lines.len()
+}
+
 /// Gate a `native "c"`/`native "asm"` block through the CSolver memory-safety verifier.
 /// C is compiled to LLVM IR (`clang -O0 -emit-llvm`); assembly (`ext == "s"`) is verified
 /// directly (CSolver decodes x86-64/AArch64). Returns Ok only on a proven-safe verdict
 /// (exit 0 = PASS); otherwise Err with the residual obligations / counterexample.
-fn verify_native_block(path: &std::path::Path, ext: &str, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
+fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
+    let mut pre_path: Option<std::path::PathBuf> = None;
     let target = if ext == "s" {
         // Assembly is CSolver's native input — verify the .s as written.
         path.to_path_buf()
@@ -124,17 +185,22 @@ fn verify_native_block(path: &std::path::Path, ext: &str, build_dir: &std::path:
         if !clang.status.success() {
             return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
         }
+        // Auto-synthesize precise (ptr,len)→elements contracts from the signatures.
+        let pp = build_dir.join(format!("native_{i}.pre"));
+        if synthesize_pre(code, &pp) > 0 {
+            pre_path = Some(pp);
+        }
         ll
     };
-    // `--assume-valid-params`: raw-pointer parameters are the contract the typed Vire
-    // caller supplies (a Vire array = proven (ptr, len)). Every other obligation
-    // (bounds, arithmetic, UB, aliasing) must still be proven.
-    let out = Command::new(solver)
-        .arg("verify")
-        .arg(&target)
-        .arg("--assume-valid-params")
-        .output()
-        .map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
+    // Precise `elements` contracts (auto-synthesized, above) give PROVEN buffer bounds;
+    // `--assume-valid-params` covers the remaining raw pointers that are not a (ptr,len)
+    // pair. Every other obligation (bounds, arithmetic, UB, aliasing) is still proven.
+    let mut cmd = Command::new(solver);
+    cmd.arg("verify").arg(&target).arg("--assume-valid-params");
+    if let Some(pp) = &pre_path {
+        cmd.arg("--pre").arg(pp);
+    }
+    let out = cmd.output().map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
     // verify exit codes: 0 PASS · 1 FAIL · 2 UNKNOWN · 3 tool error.
     if out.status.code() == Some(0) {
         return Ok(());
@@ -515,7 +581,7 @@ fn build_or_run(args: &[String]) {
                     exit(1);
                 }
             };
-            match verify_native_block(&p, ext, &build_dir, i, &solver) {
+            match verify_native_block(&p, code, ext, &build_dir, i, &solver) {
                 Ok(()) => eprintln!("verify: native \"{abi}\" block {i}: PASS (proven memory-safe)"),
                 Err(report) => {
                     eprintln!(
