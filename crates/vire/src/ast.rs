@@ -28,6 +28,15 @@ pub enum Item {
     /// argument subtrees, macro-local bindings are gensym-renamed
     /// (hygiene). See `expand.rs`.
     Macro { name: String, params: Vec<String>, body: Expr, span: Span },
+    /// `macro name(P: type, n: ident, e: expr) { <items> }` — a **hygienic item
+    /// macro** producing declarations. Parameters are *kind-typed* (`type`/`ident`/
+    /// `expr`); the expander checks each argument against its declared kind, so an
+    /// expression can never be spliced where a type is expected (no C-preprocessor
+    /// blind substitution). See `itemmacro.rs`.
+    ItemMacro { name: String, params: Vec<MacroParam>, items: Vec<Item>, span: Span },
+    /// `name!(args)` — invoke an item macro at item position, expanding to the
+    /// macro's (substituted, hygienic) items.
+    MacroInvoke { name: String, args: Vec<Expr>, span: Span },
     /// `cxx [link "lib"]* """preamble""" { fn sig = "c++ body" … }` — C++ bridge
     /// generator: for each `fn` an `extern "C"` trampoline is generated (with a
     /// C++ body) that is compiled/linked via the `native "c++"` path; the
@@ -88,6 +97,24 @@ pub struct TypeDef {
 pub struct Attr {
     pub name: String,
     pub args: Vec<String>,
+    pub span: Span,
+}
+
+/// Kind of an item-macro parameter — what the argument is allowed to be. The
+/// expander enforces this, which is what keeps item macros type-safe (an `expr`
+/// cannot be used where a `type` is required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    Type,
+    Ident,
+    Expr,
+}
+
+/// A kind-typed item-macro parameter, e.g. `T: type`.
+#[derive(Debug, Clone)]
+pub struct MacroParam {
+    pub name: String,
+    pub kind: ParamKind,
     pub span: Span,
 }
 

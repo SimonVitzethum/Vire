@@ -130,6 +130,8 @@ impl Parser {
             // `@derive(...)` introduces a type item (other `@…` stay expressions/
             // script statements, e.g. inline `@c`/`@asm` blocks).
             || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive"))
+            // `name!(…)` — an item-macro invocation.
+            || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }
 
     fn parse_item(&mut self) -> Option<Item> {
@@ -177,25 +179,9 @@ impl Parser {
             }
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
             Tok::Ident(n) if n == "cxx" => Some(self.parse_cxx()),
-            Tok::Kw(Kw::Macro) => {
-                // `macro name(p, …) = <expr>` — expression macro.
-                let sp = self.span();
-                self.bump();
-                let name = self.ident();
-                self.expect(&Tok::LParen, "'('");
-                let mut params = Vec::new();
-                while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
-                    params.push(self.ident());
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
-                    self.skip_nl();
-                }
-                self.expect(&Tok::RParen, "')'");
-                self.expect(&Tok::Eq, "'='");
-                let body = self.parse_expr(0);
-                Some(Item::Macro { name, params, body, span: sp })
-            }
+            // `name!(args)` — item-macro invocation.
+            Tok::Ident(_) if matches!(self.peek_at(1), Tok::Bang) => Some(self.parse_macro_invoke()),
+            Tok::Kw(Kw::Macro) => Some(self.parse_macro_def()),
             _ => {
                 self.err("expected an item (fn/type/trait/impl/const/use/extern)");
                 None
@@ -339,6 +325,89 @@ impl Parser {
         }
         self.expect(&Tok::RBrace, "'}'");
         TypeDef { name, generics, fields, variants, methods, attrs: Vec::new(), span: sp }
+    }
+
+    /// `macro name(params) = <expr>` (expression macro) OR
+    /// `macro name(params) { <items> }` (hygienic item macro). Parameters may be
+    /// kind-typed (`p: type|ident|expr`); the branch is chosen by `=` vs `{`.
+    fn parse_macro_def(&mut self) -> Item {
+        let sp = self.span();
+        self.bump(); // `macro`
+        let name = self.ident();
+        self.expect(&Tok::LParen, "'('");
+        let mut raw: Vec<(String, Option<ParamKind>, crate::diag::Span)> = Vec::new();
+        self.skip_nl();
+        while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+            let psp = self.span();
+            let pname = self.ident();
+            let kind = if self.eat(&Tok::Colon) {
+                // `type` is a keyword; `ident`/`expr` are plain identifiers.
+                if self.eat_kw(Kw::Type) {
+                    Some(ParamKind::Type)
+                } else {
+                    let k = self.ident();
+                    match k.as_str() {
+                        "ident" => Some(ParamKind::Ident),
+                        "expr" => Some(ParamKind::Expr),
+                        _ => {
+                            self.err("macro parameter kind must be `type`, `ident`, or `expr`");
+                            Some(ParamKind::Expr)
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            raw.push((pname, kind, psp));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            self.skip_nl();
+        }
+        self.expect(&Tok::RParen, "')'");
+        if self.eat(&Tok::Eq) {
+            // Expression macro (kinds, if any, are not meaningful here).
+            let params = raw.into_iter().map(|(n, _, _)| n).collect();
+            let body = self.parse_expr(0);
+            Item::Macro { name, params, body, span: sp }
+        } else {
+            // Item macro: a braced sequence of items.
+            let params = raw
+                .into_iter()
+                .map(|(n, k, s)| MacroParam { name: n, kind: k.unwrap_or(ParamKind::Expr), span: s })
+                .collect();
+            self.expect(&Tok::LBrace, "'{' or '=' after macro parameters");
+            self.stmt_end();
+            let mut items = Vec::new();
+            while !self.at(&Tok::RBrace) && !matches!(self.peek(), Tok::Eof) {
+                if let Some(it) = self.parse_item() {
+                    items.push(it);
+                }
+                self.stmt_end();
+            }
+            self.expect(&Tok::RBrace, "'}'");
+            Item::ItemMacro { name, params, items, span: sp }
+        }
+    }
+
+    /// `name!(arg, …)` — invoke an item macro. Arguments parse as expressions; the
+    /// expander later checks each against its parameter's declared kind.
+    fn parse_macro_invoke(&mut self) -> Item {
+        let sp = self.span();
+        let name = self.ident();
+        self.expect(&Tok::Bang, "'!'");
+        self.expect(&Tok::LParen, "'('");
+        let mut args = Vec::new();
+        self.skip_nl();
+        while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+            args.push(self.parse_expr(0));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            self.skip_nl();
+        }
+        self.expect(&Tok::RParen, "')'");
+        Item::MacroInvoke { name, args, span: sp }
     }
 
     /// Parse leading `@name(arg, …)` declaration attributes (bare-ident args).

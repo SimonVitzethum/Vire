@@ -643,6 +643,15 @@ fn build_or_run(args: &[String]) {
     }
 
     // Hygienic macros: AST→AST expansion BEFORE type inference.
+    // Hygienic item macros (`name!(...)` → declarations) expand first, so any
+    // expression macros / derives inside the generated items are then handled.
+    let item_macro_errs = vire::expand_item_macros(&mut module);
+    if !item_macro_errs.is_empty() {
+        for e in &item_macro_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
     if let Err(errs) = vire::expand_macros(&mut module) {
         for e in &errs {
             eprintln!("error: {e}");

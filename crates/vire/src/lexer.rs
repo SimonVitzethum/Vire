@@ -19,7 +19,7 @@ pub enum Tok {
     Kw(Kw),
     // brackets & separators
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
-    Comma, Colon, Semi, Arrow, FatArrow, Dot, DotDot, DotDotEq, At, Question,
+    Comma, Colon, Semi, Arrow, FatArrow, Dot, DotDot, DotDotEq, At, Question, Bang,
     // operators
     Plus, Minus, Star, Slash, Percent, PlusPct, MinusPct, StarPct,
     EqEq, Ne, Lt, Le, Gt, Ge,
@@ -451,8 +451,9 @@ impl<'a> Lexer<'a> {
             }
             b'!' => {
                 two!(b'=', Tok::Ne);
-                self.diags.push(Diag::error("unexpected '!' (use `not`)", Span(self.pos - 1, self.pos)));
-                Tok::Ne
+                // A lone `!` is a macro invocation marker (`name!(…)`); boolean
+                // negation is the `not` keyword, so there is no ambiguity.
+                Tok::Bang
             }
             b'<' => {
                 two!(b'=', Tok::Le);

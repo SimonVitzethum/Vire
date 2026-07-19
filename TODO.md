@@ -135,10 +135,19 @@ Feature sequence on top:
   (recursive derive); and the deeper **`@typeinfo(T)`** as a *comptime-iterable typed
   value* (needs aggregate comptime values — the interpreter is scalar-only today), from
   which derives would be written in-language rather than hard-coded in Rust.
-- [ ] **(c) hygienic macros** — `macro name(args) { … }` with typed parameters
-  (`expr`/`block`/`ident`/`pat`/`type`), full type-checking *after* expansion,
-  hygiene (no capture — fresh names for macro-introduced bindings), and diagnostic
-  spans that point into the expansion. Reuses (a)'s AST machinery.
+- [~] **(c) hygienic item macros** — `macro name(P: type, n: ident, e: expr) { <items> }`
+  invoked `name!(args)` ([itemmacro.rs](crates/vire/src/itemmacro.rs)): expands to
+  declarations (`fn`/`type`/`impl`/`const`). Safe by construction — the C-preprocessor
+  hazards cannot occur: **AST-level** (no text/token pasting), **kind-checked params**
+  (`type`/`ident`/`expr` — an arg of the wrong kind is a hard error, so an expression
+  can't be spliced where a type belongs), **hygiene** (macro-body bindings gensym-renamed
+  per expansion → no capture either way), **type-checked after expansion** (runs before
+  inference, so generated items go through the full checker), and **duplicate generated
+  names are a clear front-end error**, never a silent merge. tests/vire_itemmacro.sh (8/8).
+  Open: token **pasting** (deliberately omitted — pass each generated name as its own
+  `ident` param); generic type args in `type` params (`List[Int]`); nested item-macro
+  invocations inside a macro body; and `block`/`pat` parameter kinds. Expression macros
+  (`macro name(p) = <expr>`) are unchanged.
 - [ ] `@when(platform)` / `comptime for`/`assert`/`emit` as the surface syntax once
   (a) lands.
 
