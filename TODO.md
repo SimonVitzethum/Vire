@@ -90,10 +90,14 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   hash Set reusing the map runtime) exist. **`Str` methods** now dispatch too
   (length/charAt/substring/indexOf/startsWith/endsWith/trim/lower/upper/isEmpty/
   equals/compareTo → `jrt_str_*`; chainable, a string receiver is a bare `Ty::Ref`).
-  Open: **iterators/adapters** (map/filter/fold over lists & ranges — lambdas already
-  inline, so a fused-loop lowering is the path), **`Str.split`** (needs a typed
-  `list[Str]` — elements are pointers, not `Int`), and the full **`Option`/`Result`**
-  surface (`.wrap(msg)` context/chain — the core `?`/`match` works).
+  **Iterator adapters** (`fold`/`sum`/`count`/`map`/`filter`/`each`) now work over
+  ranges and lists: the lambda body inlines per element into a generated counting
+  loop (no closure object — LLVM fuses the pipeline like a hand loop). `map`/`filter`
+  yield a new `$List`, so pipelines chain (`(1..=10).filter(..).map(..).sum()`).
+  Open: **`Str.split`** (needs a typed `list[Str]` — elements are pointers, not
+  `Int`), **statement-bodied lambdas** (`each(x -> total = total + x)` — the body
+  must currently be an expression), and the full **`Option`/`Result`** surface
+  (`.wrap(msg)` context/chain — the core `?`/`match` works).
 
 ---
 

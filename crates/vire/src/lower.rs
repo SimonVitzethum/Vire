@@ -209,6 +209,13 @@ fn collect_methods(m: &Module) -> Vec<(String, &FnDef)> {
     out
 }
 
+/// Element source for an iterator adapter (`fold`/`map`/`filter`/…): either a
+/// numeric range counted `start..end` or a `$List` iterated by index.
+enum IterSrc {
+    Range { start: Operand, end: Operand, incl: bool },
+    List(Operand),
+}
+
 /// Call signature of a function: parameter types, return type, return class
 /// (for object returns the class name — for field access on the result).
 struct Sig {
@@ -1029,6 +1036,169 @@ impl<'a> FnLower<'a> {
         let d = self.new_local(Ty::I64);
         self.emit(Statement::Assign(d, Rvalue::Convert(op)));
         Operand::Copy(d)
+    }
+
+    /// Inline a lambda body at the current position: bind each parameter to a
+    /// fresh local holding the corresponding argument, lower the body, return its
+    /// value. Mirrors the `local_lambda` call path — no closure object is made.
+    fn apply_lambda(&mut self, params: &[String], body: &Expr, args: &[(Operand, Ty)]) -> (Operand, Ty) {
+        self.scopes.push(HashMap::new());
+        for (p, (op, ty)) in params.iter().zip(args) {
+            let d = self.new_local(*ty);
+            if let Some(c) = self.class_of_operand(op) {
+                self.local_class.insert(d.0, c);
+            }
+            self.emit(Statement::Assign(d, Rvalue::Use(op.clone())));
+            self.bind(p, d, *ty);
+        }
+        let r = self.lower_expr(body);
+        self.scopes.pop();
+        r
+    }
+
+    /// Iterator adapters (`fold`/`sum`/`count`/`each`/`map`/`filter`) over a range
+    /// or a `$List`. The lambda body is inlined per element into a generated
+    /// counting loop — there is no closure object, so LLVM optimizes the fused
+    /// loop like hand-written code. Returns `None` if `name` is not an adapter (the
+    /// caller then falls through to ordinary method dispatch). Elements are `Int`
+    /// (i64): a list stores i64 slots, a range counts i64.
+    fn lower_iter_adapter(&mut self, src: IterSrc, name: &str, args: &[Expr]) -> Option<(Operand, Ty)> {
+        if !matches!(name, "fold" | "sum" | "count" | "each" | "forEach" | "map" | "filter") {
+            return None;
+        }
+        // Validate the lambda argument up-front (adapters that take one).
+        let lam = |e: &Expr| -> Option<(Vec<String>, Expr)> {
+            if let Expr::Lambda { params, body, .. } = e { Some((params.clone(), (**body).clone())) } else { None }
+        };
+        let needs_lambda = matches!(name, "each" | "forEach" | "map" | "filter");
+        if needs_lambda && args.first().and_then(&lam).is_none() {
+            self.errs.push(format!("`{name}` expects a lambda argument, e.g. `.{name}(x -> …)`"));
+            return Some((Operand::ConstI64(0), Ty::I64));
+        }
+        if name == "fold" && (args.len() < 2 || lam(&args[1]).is_none()) {
+            self.errs.push("`fold` expects `(init, (acc, x) -> …)`".into());
+            return Some((Operand::ConstI64(0), Ty::I64));
+        }
+
+        // --- Pre-loop: bounds + accumulator in the current block ---
+        let ivar = self.new_local(Ty::I64);
+        let (init_i, end_op, incl) = match &src {
+            IterSrc::Range { start, end, incl } => (to_i64(start.clone()), to_i64(end.clone()), *incl),
+            IterSrc::List(obj) => {
+                let len = self.new_local(Ty::I64);
+                self.emit(Statement::Call { dest: Some(len), func: "vire_list_len".into(), args: vec![obj.clone()] });
+                (Operand::ConstI64(0), Operand::Copy(len), false)
+            }
+        };
+        self.emit(Statement::Assign(ivar, Rvalue::Use(init_i)));
+
+        // fold → init; sum/count → 0; map/filter → new $List; each → no accumulator.
+        let acc: Option<Local> = match name {
+            "fold" => {
+                let (initop, initty) = self.lower_expr(&args[0]);
+                let a = self.new_local(initty);
+                if let Some(c) = self.class_of_operand(&initop) { self.local_class.insert(a.0, c); }
+                self.emit(Statement::Assign(a, Rvalue::Use(initop)));
+                Some(a)
+            }
+            "sum" | "count" => {
+                let a = self.new_local(Ty::I64);
+                self.emit(Statement::Assign(a, Rvalue::Use(Operand::ConstI64(0))));
+                Some(a)
+            }
+            "map" | "filter" => {
+                let a = self.new_local(Ty::Ref);
+                self.local_class.insert(a.0, "$List".into());
+                self.emit(Statement::Call { dest: Some(a), func: "vire_list_new".into(), args: vec![] });
+                Some(a)
+            }
+            _ => None,
+        };
+        let acc_ty = acc.map(|a| self.locals[a.0 as usize]);
+
+        // --- Loop skeleton (mirrors the numeric `for` lowering) ---
+        let header = self.new_block();
+        let cur = self.cur;
+        self.term(cur, Terminator::Goto(header));
+        self.cur = header.0 as usize;
+        let cond = self.new_local(Ty::I32);
+        let cmp = if incl { IB::CmpLe } else { IB::CmpLt };
+        self.emit(Statement::Assign(cond, Rvalue::Binary(cmp, Operand::Copy(ivar), end_op)));
+        let bodyb = self.new_block();
+        let latch = self.new_block();
+        let exit = self.new_block();
+        self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(cond), then_blk: bodyb, else_blk: exit });
+
+        // --- Body: element + adapter action ---
+        self.cur = bodyb.0 as usize;
+        let elem: Operand = match &src {
+            IterSrc::Range { .. } => Operand::Copy(ivar),
+            IterSrc::List(obj) => {
+                let e = self.new_local(Ty::I64);
+                self.emit(Statement::Call { dest: Some(e), func: "vire_list_get".into(), args: vec![obj.clone(), Operand::Copy(ivar)] });
+                Operand::Copy(e)
+            }
+        };
+        match name {
+            "sum" => {
+                let a = acc.unwrap();
+                self.emit(Statement::Assign(a, Rvalue::Binary(IB::Add, Operand::Copy(a), elem)));
+            }
+            "count" => {
+                let a = acc.unwrap();
+                self.emit(Statement::Assign(a, Rvalue::Binary(IB::Add, Operand::Copy(a), Operand::ConstI64(1))));
+            }
+            "each" | "forEach" => {
+                let (params, body) = lam(&args[0]).unwrap();
+                self.apply_lambda(&params, &body, &[(elem, Ty::I64)]);
+            }
+            "fold" => {
+                let a = acc.unwrap();
+                let at = acc_ty.unwrap();
+                let (params, body) = lam(&args[1]).unwrap();
+                let (r, _) = self.apply_lambda(&params, &body, &[(Operand::Copy(a), at), (elem, Ty::I64)]);
+                // apply_lambda may have advanced self.cur (control flow in the body);
+                // the assignment lands in whatever block the value is live in.
+                let rr = if at == Ty::I64 { to_i64(r) } else { r };
+                self.emit(Statement::Assign(a, Rvalue::Use(rr)));
+            }
+            "map" => {
+                let a = acc.unwrap();
+                let (params, body) = lam(&args[0]).unwrap();
+                let (r, _) = self.apply_lambda(&params, &body, &[(elem, Ty::I64)]);
+                self.emit(Statement::Call { dest: None, func: "vire_list_push".into(), args: vec![Operand::Copy(a), to_i64(r)] });
+            }
+            "filter" => {
+                let a = acc.unwrap();
+                let (params, body) = lam(&args[0]).unwrap();
+                // Hold the element in a stable local across the predicate's blocks.
+                let el = self.new_local(Ty::I64);
+                self.emit(Statement::Assign(el, Rvalue::Use(elem)));
+                let (pred, _) = self.apply_lambda(&params, &body, &[(Operand::Copy(el), Ty::I64)]);
+                let c = self.new_local(Ty::I32);
+                self.emit(Statement::Assign(c, Rvalue::Binary(IB::CmpNe, to_i64(pred), Operand::ConstI64(0))));
+                let push_blk = self.new_block();
+                let after = self.new_block();
+                self.term(self.cur, Terminator::Branch { cond: Operand::Copy(c), then_blk: push_blk, else_blk: after });
+                self.cur = push_blk.0 as usize;
+                self.emit(Statement::Call { dest: None, func: "vire_list_push".into(), args: vec![Operand::Copy(a), Operand::Copy(el)] });
+                self.term(push_blk.0 as usize, Terminator::Goto(after));
+                self.cur = after.0 as usize;
+            }
+            _ => unreachable!(),
+        }
+        // Body (which may now end in a later block) → latch → header.
+        let bend = self.cur;
+        self.term(bend, Terminator::Goto(latch));
+        self.cur = latch.0 as usize;
+        self.emit(Statement::Assign(ivar, Rvalue::Binary(IB::Add, Operand::Copy(ivar), Operand::ConstI64(1))));
+        self.term(latch.0 as usize, Terminator::Goto(header));
+        self.cur = exit.0 as usize;
+
+        Some(match acc {
+            Some(a) => (Operand::Copy(a), self.locals[a.0 as usize]),
+            None => (Operand::ConstI64(0), Ty::Void),
+        })
     }
 
     fn lower_block(&mut self, b: &Block2) {
@@ -2049,11 +2219,27 @@ impl<'a> FnLower<'a> {
                     return (Operand::ConstI64(0), Ty::Void);
                 }
             }
+            // Iterator adapters over a RANGE receiver. A range is not a value, so
+            // match it syntactically before lowering the base as an expression.
+            if let Expr::Range { start, end, inclusive, .. } = base.as_ref() {
+                let (s, _) = self.lower_expr(start);
+                let (e, _) = self.lower_expr(end);
+                if let Some(r) = self.lower_iter_adapter(IterSrc::Range { start: s, end: e, incl: *inclusive }, &name, args) {
+                    return r;
+                }
+                // Not an adapter → fall through (range-as-value is an error below).
+            }
             let (obj, base_ty) = self.lower_expr(base);
             // `xs.len()` on an array → ArrayLen.
             if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
                 let l = self.array_len_i64(obj);
                 return (l, Ty::I64);
+            }
+            // Iterator adapters over a $List receiver (fold/map/filter/sum/…).
+            if self.class_of_operand(&obj).as_deref() == Some("$List") {
+                if let Some(r) = self.lower_iter_adapter(IterSrc::List(obj.clone()), &name, args) {
+                    return r;
+                }
             }
             // Methods on growing lists ($List) and maps ($Map).
             if let Some(sent) = self.class_of_operand(&obj) {
