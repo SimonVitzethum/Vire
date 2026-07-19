@@ -77,27 +77,61 @@ fn main() {
     }
 }
 
-/// Gate a `native "c"` block through the CSolver memory-safety verifier:
-/// compile the C to LLVM IR (`clang -O0 -emit-llvm`), then run `solver verify`.
-/// Returns Ok only on a proven-safe verdict (exit 0 = PASS); otherwise Err with the
-/// verifier's residual obligations / counterexample, which become the compile error.
-fn verify_c_block(c_path: &std::path::Path, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
-    let ll = build_dir.join(format!("native_{i}.verify.ll"));
-    let clang = Command::new("clang")
-        .args(["-O0", "-S", "-emit-llvm", "-g", "-o"])
-        .arg(&ll)
-        .arg(c_path)
-        .output()
-        .map_err(|e| format!("clang not runnable for verification: {e}"))?;
-    if !clang.status.success() {
-        return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
+/// Locate the CSolver `solver` binary for on-by-default verification: an explicit
+/// override first, then `$CSOLVER`, then `solver` on `PATH`, then a sibling CSolver
+/// build next to this repo. Returns None if none is runnable.
+fn resolve_solver(override_path: Option<&str>) -> Option<String> {
+    let runnable = |p: &str| Command::new(p).arg("--help").output().map(|o| o.status.code().is_some()).unwrap_or(false);
+    if let Some(p) = override_path {
+        return runnable(p).then(|| p.to_string());
     }
+    if let Ok(p) = std::env::var("CSOLVER") {
+        if runnable(&p) {
+            return Some(p);
+        }
+    }
+    if runnable("solver") {
+        return Some("solver".to_string());
+    }
+    for cand in [
+        "../CSolver/target/release/solver",
+        "../../CSolver/target/release/solver",
+        concat!(env!("HOME"), "/Schreibtisch/CSolver/target/release/solver"),
+    ] {
+        if std::path::Path::new(cand).exists() && runnable(cand) {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// Gate a `native "c"`/`native "asm"` block through the CSolver memory-safety verifier.
+/// C is compiled to LLVM IR (`clang -O0 -emit-llvm`); assembly (`ext == "s"`) is verified
+/// directly (CSolver decodes x86-64/AArch64). Returns Ok only on a proven-safe verdict
+/// (exit 0 = PASS); otherwise Err with the residual obligations / counterexample.
+fn verify_native_block(path: &std::path::Path, ext: &str, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
+    let target = if ext == "s" {
+        // Assembly is CSolver's native input — verify the .s as written.
+        path.to_path_buf()
+    } else {
+        let ll = build_dir.join(format!("native_{i}.verify.ll"));
+        let clang = Command::new("clang")
+            .args(["-O0", "-S", "-emit-llvm", "-g", "-o"])
+            .arg(&ll)
+            .arg(path)
+            .output()
+            .map_err(|e| format!("clang not runnable for verification: {e}"))?;
+        if !clang.status.success() {
+            return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
+        }
+        ll
+    };
     // `--assume-valid-params`: raw-pointer parameters are the contract the typed Vire
     // caller supplies (a Vire array = proven (ptr, len)). Every other obligation
     // (bounds, arithmetic, UB, aliasing) must still be proven.
     let out = Command::new(solver)
         .arg("verify")
-        .arg(&ll)
+        .arg(&target)
         .arg("--assume-valid-params")
         .output()
         .map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
@@ -190,11 +224,12 @@ fn build_or_run(args: &[String]) {
     let mut link_libs: Vec<String> = Vec::new();
     let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
-    // `--verify-c <solver-bin>`: gate every `native "c"` block through the CSolver
-    // memory-safety verifier — the block is accepted only if the verifier PROVES it
-    // safe (PASS); UNKNOWN/FAIL is a compile error. The sound alternative to a blind
-    // `unsafe`. Off by default (needs the external `solver` binary).
-    let mut verify_c: Option<String> = None;
+    // Memory-safety verification of `native "c"`/`native "asm"` blocks is ON BY
+    // DEFAULT (the sound alternative to a blind `unsafe`): each block is proven safe
+    // by CSolver or it is a compile error. `--noverify` turns it off; `--verify-c
+    // <solver-bin>` overrides the auto-discovered `solver` binary path.
+    let mut verify_override: Option<String> = None;
+    let mut noverify = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -205,8 +240,9 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
+            "--noverify" => noverify = true,
             "--verify-c" => match it.next() {
-                Some(p) => verify_c = Some(p.clone()),
+                Some(p) => verify_override = Some(p.clone()),
                 None => {
                     eprintln!("--verify-c needs the path to the `solver` binary");
                     exit(2);
@@ -443,31 +479,51 @@ fn build_or_run(args: &[String]) {
     let mut want_python = false;
     for (i, (abi, code)) in native_blocks.iter().enumerate() {
         let a = abi.to_ascii_lowercase();
-        let ext = if a == "c++" || a == "cpp" || a == "cxx" { want_cpp = true; "cpp" } else { "c" };
-        if a == "python" || a == "py" {
+        let ext = if a == "c++" || a == "cpp" || a == "cxx" {
+            want_cpp = true;
+            "cpp"
+        } else if a == "asm" || a == "s" || a == "assembly" {
+            "s"
+        } else if a == "python" || a == "py" {
             want_python = true;
-        }
+            "py"
+        } else {
+            "c"
+        };
         let p = build_dir.join(format!("native_{i}.{ext}"));
         if let Err(e) = std::fs::write(&p, code) {
             eprintln!("writing native block: {e}");
             exit(1);
         }
-        // Verification gate: a `native "c"` block is only accepted when the CSolver
-        // memory-safety verifier PROVES it safe. This is the sound replacement for
-        // `unsafe` — a block that cannot be proven safe is a compile error, not a
-        // runtime hazard. Raw-pointer parameters are trusted as sized-and-valid
-        // (`--assume-valid-params`): that is the contract Vire's typed caller
-        // supplies (a Vire array is a proven (ptr, len)); the remaining obligations
-        // (bounds, arithmetic, UB) must be discharged by the proof.
-        if ext == "c" {
-            if let Some(solver) = &verify_c {
-                match verify_c_block(&p, &build_dir, i, solver) {
-                    Ok(()) => eprintln!("verify: native \"c\" block {i}: PASS (proven memory-safe)"),
-                    Err(report) => {
-                        eprintln!("error: native \"c\" block {i} is not provably memory-safe \
-                                   (rejected instead of trusted like `unsafe`):\n{report}");
-                        exit(1);
-                    }
+        // Verification gate (ON BY DEFAULT): a `native "c"`/`native "asm"` block is
+        // accepted only when the CSolver memory-safety verifier PROVES it safe — the
+        // sound replacement for a blind `unsafe`. A block that cannot be proven safe
+        // is a compile error, not a runtime hazard. `--noverify` opts out. Raw-pointer
+        // parameters are trusted as sized-and-valid (`--assume-valid-params`): the
+        // contract Vire's typed caller supplies (a Vire array is a proven (ptr, len));
+        // every other obligation (bounds, arithmetic, UB) must be discharged.
+        if !noverify && (ext == "c" || ext == "s") {
+            let solver = match resolve_solver(verify_override.as_deref()) {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "error: memory-safety verification of `native \"{abi}\"` is on by default \
+                         but the CSolver `solver` binary was not found.\n       Install it (set \
+                         $CSOLVER, put `solver` on PATH, or pass `--verify-c <path>`), or opt out \
+                         with `--noverify`."
+                    );
+                    exit(1);
+                }
+            };
+            match verify_native_block(&p, ext, &build_dir, i, &solver) {
+                Ok(()) => eprintln!("verify: native \"{abi}\" block {i}: PASS (proven memory-safe)"),
+                Err(report) => {
+                    eprintln!(
+                        "error: native \"{abi}\" block {i} is not provably memory-safe \
+                         (rejected instead of trusted like `unsafe`):\n{report}\n       \
+                         Close the proof with a contract/`@assume`, or opt out with `--noverify`."
+                    );
+                    exit(1);
                 }
             }
         }
