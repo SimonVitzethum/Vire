@@ -196,6 +196,11 @@ must write the assumption down, and it is logged.
      `@arraylen`, and the `elements` contract is auto-synthesized — so the Vire array's
      type at the call site supplies the buffer bound that raw C leaves UNKNOWN.
    Verified: `total(a){ for(i<a_len) s+=a[i] }` → PASS, 60; `a[a_len]` → rejected.
-5. **`@assume` surface** + `vire audit` (list every assumption + justification).
+5. **[done] `@assume` surface + `vire audit`** — `@assume: <name> [justification]` as a
+   comment directive inside a block authorizes exactly one CSolver assumption flag
+   (mmio/field_invariants/valid_returns/loop_ptrs/struct_tail); an unknown name is a
+   compile error. `vire audit FILE.vr` lists every inline block and its assumptions (or
+   "fully proven") — the complete, named trust boundary. Demonstrated: `@assume:
+   valid_returns` discharges a `no_null_deref` UNKNOWN.
 6. **CSolver as a crate dependency** (structured verdicts; no subprocess).
 7. Verification **cache** (content-addressed per block).
