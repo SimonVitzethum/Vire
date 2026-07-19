@@ -64,6 +64,32 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and
   **analysis caching** (compile time — M0.2 measured super-linear ~O(n^1.4)).
 
+## Compile-time programming layer (macros + comptime + reflection, one typed AST)
+
+**Framing (deliberate).** Avoid the term *preprocessor* in docs and naming: this
+is a **compile-time programming layer**, not text substitution. Macros, `comptime`,
+and reflection (`@typeinfo`/`@derive`) all operate on the *same typed AST / type
+graph* — so users get the power of metaprogramming without the classic C-preprocessor
+failure modes (blind text splicing, name capture, no type checking). Everything runs
+*after* parse+inference on typed nodes and is re-checked after expansion. This unifies
+features **[2] comptime**, **[3] reflection**, and **[4] macros** below — they are one
+subsystem, sequenced:
+
+- [ ] **(a) comptime evaluator core** — a real interpreter over the typed AST:
+  comptime `let`/`for` (loop unrolling), comptime function calls with a recursion
+  limit, const-fold of pure expressions. Foundation the other two build on. Today
+  only `comptime if` (drop untaken branch) + literal const-fold exist.
+- [ ] **(b) typed reflection over the type graph** — `@typeinfo(T)` yielding
+  fields/variants/methods/attributes as a *comptime-iterable typed value*; then
+  `@derive(Eq, Hash, Ord, Show, Json, …)` generated from it. AOT only, no runtime
+  reflection. Depends on (a) for the comptime `for` that walks the info.
+- [ ] **(c) hygienic macros** — `macro name(args) { … }` with typed parameters
+  (`expr`/`block`/`ident`/`pat`/`type`), full type-checking *after* expansion,
+  hygiene (no capture — fresh names for macro-introduced bindings), and diagnostic
+  spans that point into the expansion. Reuses (a)'s AST machinery.
+- [ ] `@when(platform)` / `comptime for`/`assert`/`emit` as the surface syntax once
+  (a) lands.
+
 ## Front-end completeness
 
 - [ ] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance.
