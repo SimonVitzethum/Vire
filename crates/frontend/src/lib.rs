@@ -224,6 +224,7 @@ fn register_concurrency(program: &mut Program) {
     program.functions.push(Function {
         name: init,
         receiver_nonnull: true,
+            line: 0,
         params: vec![Ty::Ref, Ty::Ref],
         ret: Ty::Void,
         locals: vec![Ty::Ref, Ty::Ref],
@@ -277,6 +278,7 @@ fn register_throwables(program: &mut Program) {
         program.functions.push(Function {
             name: init0,
         receiver_nonnull: true,
+            line: 0,
             params: vec![Ty::Ref],
             ret: Ty::Void,
             locals: vec![Ty::Ref],
@@ -294,6 +296,7 @@ fn register_throwables(program: &mut Program) {
         program.functions.push(Function {
             name: init1,
         receiver_nonnull: true,
+            line: 0,
             params: vec![Ty::Ref, Ty::Ref],
             ret: Ty::Void,
             locals: vec![Ty::Ref, Ty::Ref],
@@ -330,6 +333,7 @@ fn register_throwables(program: &mut Program) {
     program.functions.push(Function {
         name: me_init,
         receiver_nonnull: true,
+            line: 0,
         params: vec![Ty::Ref, Ty::Ref, Ty::Ref],
         ret: Ty::Void,
         locals: vec![Ty::Ref, Ty::Ref, Ty::Ref],
@@ -379,6 +383,7 @@ fn register_enum(program: &mut Program) {
     let getter_name = |mangled: String| Function {
         name: mangled,
         receiver_nonnull: true,
+            line: 0,
         params: vec![Ty::Ref],
         ret: Ty::Ref,
         locals: vec![Ty::Ref, Ty::Ref],
@@ -398,6 +403,7 @@ fn register_enum(program: &mut Program) {
     program.functions.push(Function {
         name: ord_m,
         receiver_nonnull: true,
+            line: 0,
         params: vec![Ty::Ref],
         ret: Ty::I32,
         locals: vec![Ty::Ref, Ty::I32],
@@ -415,6 +421,7 @@ fn register_enum(program: &mut Program) {
     program.functions.push(Function {
         name: init_m,
         receiver_nonnull: true,
+            line: 0,
         params: vec![Ty::Ref, Ty::Ref, Ty::I32],
         ret: Ty::Void,
         locals: vec![Ty::Ref, Ty::Ref, Ty::I32],
@@ -664,6 +671,7 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
     program.functions.push(Function {
         name: sam_mangled,
         receiver_nonnull: true,
+            line: 0,
         params: locals[..=n_sam].to_vec(),
         ret: sam_ret,
         locals,
@@ -1192,6 +1200,7 @@ fn lower_method(
         // Instance method: Local 0 = `this`, non-null (receiver checked by the
         // caller) → the inline null check on this-field accesses is omitted.
         receiver_nonnull: !m.is_static(),
+            line: 0,
     })
 }
 

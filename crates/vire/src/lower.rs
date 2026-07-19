@@ -218,6 +218,24 @@ struct Sig {
 }
 
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
+    lower_module_src(m, "")
+}
+
+/// Byte offset → 1-based source line (for debug info); 0 if unknown.
+fn line_of(line_starts: &[usize], byte: usize) -> u32 {
+    if line_starts.is_empty() {
+        return 0;
+    }
+    line_starts.partition_point(|&s| s <= byte) as u32
+}
+
+pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
+    let line_starts: Vec<usize> = if src.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(0).chain(src.match_indices('\n').map(|(i, _)| i + 1)).collect()
+    };
+    let ls = &line_starts[..];
     let mut prog = Program::default();
     let mut errs = Vec::new();
 
@@ -549,7 +567,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // higher-order template → only inline (defunctionalization)
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None) {
+            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0)) {
                 Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
@@ -562,7 +580,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym)) {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -610,7 +628,7 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
         // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym)) {
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0)) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -2894,6 +2912,7 @@ fn lower_fn(
     str_idx: &mut HashMap<String, u32>,
     recv_class: Option<&str>,
     sym: Option<&str>,
+    line: u32,
 ) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>), Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = match sym {
@@ -2991,6 +3010,7 @@ fn lower_fn(
             locals: fl.locals,
             blocks: fl.blocks,
             receiver_nonnull: false,
+            line,
         },
         mono,
         local_inst,

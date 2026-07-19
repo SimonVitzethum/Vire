@@ -166,9 +166,14 @@ Attach: LLVM debug metadata (backend extension), panic model.
   (SIGSEGV/SIGBUS handler), captured at the throw origin, printed only if
   uncaught. Symbol names via `-rdynamic`. Off by default → zero overhead (empty
   stubs). tests/vire_debug.sh.
-- [ ] `!DILocation`/`!DISubprogram` DWARF so the backtrace resolves to `file:line`
-  (needs source line numbers threaded front-end→IR; currently symbol+offset only,
-  and `-O2 -flto` inlining collapses inner frames).
+- [x] **DWARF debug info** (`--debug`/`-g`): `DICompileUnit`/`DIFile`/per-function
+  `DISubprogram`+`DILocation` mapping to the `.vr` source. Debug builds are
+  `-O0 -no-pie` so gdb/lldb/addr2line resolve backtrace addresses to `.vr:line`
+  (`--debug --backtrace` → `addr2line` → `crash.vr:6`). Source lines threaded
+  front-end→IR (`Function.line`). tests/vire_debug.sh.
+- [ ] Per-STATEMENT `DILocation` (the exact crash line, not the function's decl
+  line) via the `DebugLine` markers already in the IR + `inlinedAt` for inlined
+  frames — today it is function-granular.
 - [ ] freestanding: compact symbol table instead of libc `backtrace`.
 
 ---

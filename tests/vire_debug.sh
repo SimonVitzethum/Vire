@@ -36,6 +36,35 @@ else
     echo "FAIL --backtrace (no backtrace: $out_dbg)"; fail=$((fail+1))
 fi
 
+# --debug build embeds DWARF referencing the .vr source file.
+"$vire" build "$work/crash.vr" --debug -o "$work/dw" >/dev/null 2>&1
+if command -v readelf >/dev/null 2>&1; then
+    if readelf --debug-dump=info "$work/dw" 2>/dev/null | grep -q 'crash\.vr'; then
+        echo "ok   --debug (DWARF references crash.vr)"; pass=$((pass+1))
+    else
+        echo "FAIL --debug (no .vr in DWARF)"; fail=$((fail+1))
+    fi
+else
+    echo "skip --debug DWARF (no readelf)"
+fi
+
+# --debug --backtrace: a crash address resolves to the .vr source via addr2line.
+if command -v addr2line >/dev/null 2>&1; then
+    "$vire" build "$work/crash.vr" --debug --backtrace -o "$work/dwbt" >/dev/null 2>&1
+    bt="$("$work/dwbt" 2>&1)"
+    resolved=no
+    for a in $(echo "$bt" | grep -oE '\[0x[0-9a-f]+\]' | tr -d '[]'); do
+        if addr2line -e "$work/dwbt" "$a" 2>/dev/null | grep -q '\.vr:'; then resolved=yes; break; fi
+    done
+    if [ "$resolved" = yes ]; then
+        echo "ok   addr2line (backtrace address → .vr:line)"; pass=$((pass+1))
+    else
+        echo "FAIL addr2line (no .vr:line resolved)"; fail=$((fail+1))
+    fi
+else
+    echo "skip addr2line (not installed)"
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

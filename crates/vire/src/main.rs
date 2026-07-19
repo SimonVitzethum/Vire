@@ -406,6 +406,7 @@ fn build_or_run(args: &[String]) {
     let mut noverify = false;
     let mut threads_flag = false;
     let mut backtrace_flag = false;
+    let mut debug_flag = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -423,6 +424,9 @@ fn build_or_run(args: &[String]) {
             // Debug: print a native backtrace on an uncaught exception / hard crash
             // (off by default → zero overhead). Needs -rdynamic for symbol names.
             "--backtrace" => backtrace_flag = true,
+            // Emit DWARF debug info (DISubprogram/DILocation) mapping to the .vr
+            // source, and build at -O0 so gdb/lldb/addr2line resolve file:line.
+            "--debug" | "-g" => debug_flag = true,
             // Obsolete: the verifier is now linked in (vendored). Accept + ignore the
             // old `--verify-c <path>` form so existing invocations keep working.
             "--verify-c" => {
@@ -606,7 +610,7 @@ fn build_or_run(args: &[String]) {
         exit(1);
     }
     // Lowering to crates/ir.
-    let mut program = match vire::lower_module(&module) {
+    let mut program = match vire::lower_module_src(&module, &src) {
         Ok(p) => p,
         Err(errs) => {
             for e in &errs {
@@ -647,7 +651,24 @@ fn build_or_run(args: &[String]) {
         print!("{program}");
         return;
     }
-    let ll = fastllvm_backend::emit(&program);
+    // Debug info (DWARF) mapping to the .vr source for `--debug`/`-g`. Debug builds
+    // compile at -O0 (below), so the partial `!dbg` (calls/returns) is valid — the
+    // inliner, which would demand it on every call, does not run. `--backtrace`
+    // stays independent (symbol-level at -O2); combine `--debug --backtrace` for a
+    // file:line backtrace.
+    let ll = if debug_flag {
+        let p = std::path::Path::new(&path);
+        let fname = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        let dir = p.parent().and_then(|d| d.canonicalize().ok()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+        fastllvm_backend::emit_debug(&program, Some((&fname, &dir)))
+    } else {
+        fastllvm_backend::emit(&program)
+    };
+    // Debug builds compile at -O0 (no LTO/inlining) so the line info stays precise
+    // and partial !dbg is accepted.
+    if debug_flag {
+        opt0 = true;
+    }
     if emit_llvm {
         print!("{ll}");
         return;
@@ -785,6 +806,11 @@ fn build_or_run(args: &[String]) {
     // backtrace resolves Vire function names.
     if backtrace_flag {
         cmd.arg("-DFASTLLVM_BACKTRACE").arg("-rdynamic").arg("-funwind-tables");
+    }
+    // Debug (DWARF) build: keep the metadata (`-g`) and disable PIE so the runtime
+    // addresses in a backtrace equal the static addresses addr2line/gdb expect.
+    if debug_flag {
+        cmd.arg("-g").arg("-no-pie").arg("-fno-omit-frame-pointer");
     }
     if acyclic || force_no_cycles {
         cmd.arg("-DFASTLLVM_NO_CYCLES");

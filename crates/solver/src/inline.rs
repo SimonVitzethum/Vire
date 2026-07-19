@@ -253,5 +253,7 @@ fn remap_statement(st: &mut Statement, off: u32) {
             remap_local(dest, off);
             remap_operand(obj, off);
         }
+        // No locals — the inlined callee's source line rides along unchanged.
+        Statement::DebugLine(_) => {}
     }
 }

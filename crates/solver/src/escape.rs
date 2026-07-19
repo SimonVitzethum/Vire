@@ -557,6 +557,7 @@ fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
             u(obj);
             None
         }
+        Statement::DebugLine(_) => None,
     };
     (def, uses)
 }

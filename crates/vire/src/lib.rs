@@ -19,6 +19,6 @@ pub use expand::expand_macros;
 pub use spawn::desugar_spawn;
 pub use infer::infer_module;
 pub use inline::inline_recursion;
-pub use lower::lower_module;
+pub use lower::{lower_module, lower_module_src};
 pub use parser::{parse, parse_with_syntax};
 pub use syntax::Syntax;

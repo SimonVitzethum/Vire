@@ -148,6 +148,12 @@ pub enum Statement {
     ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },
     /// `arr[index] = value`; bounds-checked if `checked`.
     ArrayStore { arr: Operand, index: Operand, value: Operand, kind: ArrKind, checked: bool },
+    /// Debug line marker (source line for the statements that follow, until the
+    /// next marker). Emits no code; drives `!DILocation` when debug info is on.
+    /// A robust way to carry source lines through the optimizing passes (they may
+    /// insert/remove real statements, but the marker before the next one still
+    /// gives a correct-enough line).
+    DebugLine(u32),
 }
 
 /// Array element kind: value type (stack) + storage width. Bool/Byte = 1 byte,
@@ -227,6 +233,8 @@ pub struct Function {
     /// checks the receiver, or `this` comes from `new`). Lets the backend omit
     /// the inline null check on `this` field accesses.
     pub receiver_nonnull: bool,
+    /// Source line of the function declaration (for the `DISubprogram`); 0 = none.
+    pub line: u32,
 }
 
 // --- Class model (closed world: all classes are known at build time) ---
