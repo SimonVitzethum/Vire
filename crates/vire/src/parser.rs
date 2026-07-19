@@ -720,6 +720,31 @@ impl Parser {
         }
     }
 
+    /// Body of a lambda (`x -> …`). An expression body is returned as-is; a **braceless
+    /// statement body** — an assignment `x -> total = total + x` — is wrapped in a
+    /// unit-valued block so statement-bodied lambdas work without explicit `{ … }`
+    /// (used by `each`/`forEach`). A `{ … }` body already parses as a block expression.
+    fn parse_lambda_body(&mut self) -> Expr {
+        let sp = self.span();
+        let e = self.parse_expr(0);
+        let op = match self.peek() {
+            Tok::Eq => Some(None),
+            Tok::PlusEq => Some(Some(BinOp::Add)),
+            Tok::MinusEq => Some(Some(BinOp::Sub)),
+            Tok::StarEq => Some(Some(BinOp::Mul)),
+            Tok::SlashEq => Some(Some(BinOp::Div)),
+            _ => None,
+        };
+        if let Some(o) = op {
+            self.bump();
+            let value = self.parse_expr(0);
+            let assign = Stmt::Assign { target: e, op: o, value, span: sp };
+            Expr::Block(Block { stmts: vec![assign], tail: None, span: sp })
+        } else {
+            e
+        }
+    }
+
     // --- Expressions (Pratt) ---
     fn parse_expr(&mut self, min_bp: u8) -> Expr {
         let mut lhs = self.parse_prefix();
@@ -968,7 +993,7 @@ impl Parser {
                 if matches!(self.peek_at(1), Tok::Arrow) {
                     let p = self.ident();
                     self.bump(); // ->
-                    let body = self.parse_expr(0);
+                    let body = self.parse_lambda_body();
                     Expr::Lambda { params: vec![p], body: Box::new(body), span: sp }
                 } else {
                     Expr::Ident(self.ident(), sp)
@@ -1075,7 +1100,7 @@ impl Parser {
             }
             self.expect(&Tok::RParen, "')'");
             self.expect(&Tok::Arrow, "'->'");
-            let body = self.parse_expr(0);
+            let body = self.parse_lambda_body();
             Expr::Lambda { params, body: Box::new(body), span: sp }
         } else {
             self.skip_nl();

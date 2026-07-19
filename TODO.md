@@ -213,10 +213,12 @@ Feature sequence on top:
   ranges and lists: the lambda body inlines per element into a generated counting
   loop (no closure object — LLVM fuses the pipeline like a hand loop). `map`/`filter`
   yield a new `$List`, so pipelines chain (`(1..=10).filter(..).map(..).sum()`).
+  **Statement-bodied lambdas** now work: `each(x -> total = total + x)` (and `+=` etc.)
+  — a braceless assignment body is wrapped in a unit-valued block (parser
+  `parse_lambda_body`); `x -> { … }` already worked. tests/vire_iter.sh.
   Open: **`Str.split`** (needs a typed `list[Str]` — elements are pointers, not
-  `Int`), **statement-bodied lambdas** (`each(x -> total = total + x)` — the body
-  must currently be an expression), and the full **`Option`/`Result`** surface
-  (`.wrap(msg)` context/chain — the core `?`/`match` works).
+  `Int`), and the full **`Option`/`Result`** surface (`.wrap(msg)` context/chain — the
+  core `?`/`match` works).
 
 ---
 

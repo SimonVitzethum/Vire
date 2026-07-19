@@ -69,6 +69,20 @@ EOF
 check "adapter chaining" "18
 3" "$work/chain.vr"
 
+# --- Statement-bodied lambdas (braceless assignment) -------------------
+cat > "$work/stmtlam.vr" <<'EOF'
+fn main() {
+    mut total = 0
+    (1..=5).each(x -> total = total + x)   // braceless assignment body
+    print(total)                            // 15
+    mut prod = 1
+    (1..=4).each(x -> prod *= x)            // compound assignment body
+    print(prod)                             // 24
+}
+EOF
+check "statement-bodied lambda (each)" "15
+24" "$work/stmtlam.vr"
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
