@@ -526,6 +526,31 @@ pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
             continue;
         }
         let Some(gdef) = generic_defs.get(&gname) else { continue };
+        // Enforce declared trait bounds (`[T: Shape]`): every type argument must
+        // implement each bound of its parameter. Checked here, at the concrete
+        // instantiation, with a precise message pointing at the boundary — rather
+        // than letting it surface downstream as a cryptic "type has no method X".
+        // Only user (nominal) types can carry impls, so a primitive/instance name
+        // absent from `type_traits` fails a non-empty bound. Skip lowering the
+        // ill-typed instance (the build already fails on the error) to avoid a
+        // duplicate downstream diagnostic.
+        let mut bound_violation = false;
+        for (gp, concrete) in gdef.sig.generics.iter().zip(targs.iter()) {
+            for bound in &gp.bounds {
+                let satisfied = type_traits.get(concrete).is_some_and(|ts| ts.iter().any(|t| t == bound));
+                if !satisfied {
+                    errs.push(format!(
+                        "trait bound not satisfied: `{gname}` requires `{}: {}`, but the type argument `{concrete}` does not implement `{bound}`",
+                        gp.name,
+                        gp.bounds.join(" + "),
+                    ));
+                    bound_violation = true;
+                }
+            }
+        }
+        if bound_violation {
+            continue;
+        }
         let bind: HashMap<String, String> = gdef.sig.generics.iter().map(|g| g.name.clone()).zip(targs.iter().cloned()).collect();
         let inst = subst_fndef(gdef, &bind);
         // Register instance signature (for recursion/mutual calls).
