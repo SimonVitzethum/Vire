@@ -17,8 +17,8 @@ public class HashMaps {
         System.out.println("size: " + m.size());           // 3
 
         System.out.println("has green: " + m.containsKey("green"));  // true
-        System.out.println("has gold: " + m.containsKey("gold"));    // false
-        System.out.println("gold: " + (m.get("gold") == null ? "null" : m.get("gold")));
+        System.out.println("has yellow: " + m.containsKey("yellow"));    // false
+        System.out.println("yellow: " + (m.get("yellow") == null ? "null" : m.get("yellow")));
 
         // many entries → resize (rehashing via hashCode)
         for (int i = 0; i < 50; i++) m.put("k" + i, "v" + i);

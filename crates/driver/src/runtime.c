@@ -506,11 +506,16 @@ int32_t jrt_obj_hashcode(void *o) {
 
 /* String.hashCode (JLS): s[0]*31^(n-1) + … + s[n-1]. */
 int32_t jrt_str_hashcode(const JStr *s) {
-    int32_t h = 0;
+    /* Accumulate in uint32_t: unsigned arithmetic has DEFINED wraparound. Signed
+     * (int32_t) would be undefined on overflow, and clang -O2/LTO then assumes the
+     * result is non-negative (sum of non-negative terms from 0, "no overflow") and
+     * folds a caller's `hashCode() & 0x7fffffff` down to `hashCode()` — dropping the
+     * mask while the value actually wraps negative at runtime (→ bad array index). */
+    uint32_t h = 0;
     for (int64_t i = 0; i < s->len; i++) {
-        h = 31 * h + (int32_t)s->bytes[i];
+        h = 31u * h + (uint8_t)s->bytes[i];
     }
-    return h;
+    return (int32_t)h;
 }
 /* String.toString returns itself. */
 void *jrt_str_tostring(void *s) {
