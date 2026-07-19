@@ -62,18 +62,19 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | montecarlo | **0.99×** | compute-bound, parity |
 | nbody / bitmanip | **~1.00×** | at parity |
 | **vcall** | **0.42×** (2.4× faster) | solver devirtualization; = Rust, beats clang `virtual` |
-| **matmul** (256³) | **0.96×** (beats clang) | affine index `r*n+k` proved in range + elided |
+| **matmul** (256³) | **~1.0×** (beats clang) | affine index `r*n+k` proved in range + elided |
 | **binsearch** (10M) | **1.06×** (= 1.00× Rust) | midpoint check *proved* redundant + elided — safely |
-| sort (quicksort 2M) | 1.48× | partition bounds loaded from a stack array (opaque) |
+| **sort** (quicksort 2M) | 1.14× (= 1.05× Rust) | uncatchable checks abort noreturn (Rust's structure) |
 
 Vire is at or above clang/Rust level on compute, **2.4× faster on virtual dispatch**,
-**at Rust parity on binary search**, and now **beats clang on matmul** — the solver
-*proves* the array indices in range (the `(lo+hi)/2` midpoint, the affine `r*n+k`) and
-drops the checks while staying fully memory-safe (a genuinely out-of-bounds access
-still throws). **binary-trees is at Rust parity** (1.02×) after region inference +
-move-on-last-use RC elision. The remaining Rust gaps are a deep scalar-codegen case
-(matmul 1.27× Rust) and the opaque-stack `sort` (1.36× Rust); see [TODO.md](TODO.md)
-and [benchmarks/suite/](benchmarks/suite/).
+**at Rust parity on binary search and quicksort**, and **beats clang on matmul** — the
+solver *proves* array indices in range (the `(lo+hi)/2` midpoint, the affine `r*n+k`)
+and, where a check can't be elided, makes it as cheap as Rust's (a noreturn abort when
+provably uncatchable). All fully memory-safe: a genuinely out-of-bounds access still
+throws. **binary-trees is at Rust parity** (1.02×) after region inference +
+move-on-last-use RC elision. **11 of 12 benchmarks now at or near Rust parity**; the
+one residual is matmul's scalar register-scheduling (~1.3× Rust, but beats clang). See
+[TODO.md](TODO.md) and [benchmarks/suite/](benchmarks/suite/).
 
 ## Documents
 

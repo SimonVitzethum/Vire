@@ -34,17 +34,24 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   loop-guard facts `a<N`, `b<N` in the flow-sensitive `lt`. matmul 1.64×→**1.22× Rust,
   now beats clang** (0.96×); the inner loop becomes 8× FMA. The residual vs Rust is
   scalar register-alloc/scheduling, not bounds or vectorization (both are scalar).
-  **Still open — quicksort `sort` (array-content invariant).** Worked out in full: the
-  hot `a[j]` IS soundly provable — `0 ≤ j` from the `lostack` content lower bound (all
-  stores ≥ 0, incl. the default 0), and `j < hi < len` from the guard `j<hi` plus the
-  `histack` content upper bound `hi ≤ n-1`. Needs, coupled: (i) reuse the existing
-  (proven) escape analysis to confirm `lostack`/`histack` never escape; (ii) a
-  per-array content ub/lb fixpoint (default element 0 folded in: `ub=max(0,stores)`,
-  `lb=min(0,stores)`); (iii) guard-aware counted bounds for `pi` so `histack`'s ub
-  converges to `n-1`; (iv) inject `(hi,len)` into `lt` so `a[j]` elides transitively.
-  Sound but escape-dependent + multi-part → deferred as too risky to ship unattended
-  (a content/escape edge case = an OOB read = a memory-safety violation). Payoff caps
-  at Rust parity (sort no-checks ceiling = 1.04× Rust), not below clang.
+  **quicksort `sort` — solved, but not by elision.** Measured finding: Rust's sort has
+  the *same* bounds checks (in fact 47× more `jae`); the gap was Vire's **check model**,
+  not missing elision. The array-content invariant is moot here (and blocked anyway by
+  the relational `pi ≤ hi` quicksort invariant). Instead: when the whole program
+  provably can't catch a runtime exception (no `InstanceOfPending`/`jrt_take_pending`
+  anywhere — always true for pure Vire), an inline bounds/NPE failure aborts via a
+  `_fatal` noreturn helper and the block ends in `unreachable`, so the checked access
+  is a direct value (Rust's panic structure), not a pending-continue `phi` merge.
+  **sort 1.35× → 1.05× Rust**, memory-safe (the check stays; a real OOB still throws),
+  gated by the Java oracle (Catch/Finally keep the pending model). Disabled under `-g`
+  (inlinedAt precision). The last ~5% is the explicit-stack structure — see below.
+- [ ] **Array as a function parameter** (`fn qsort(a: Array, lo, hi) { a[i] }`). Today a
+  ref param carries no `ArrKind`, so `a[i]` fails ("unknown array"); array-heavy code
+  (sort) is forced into an explicit `lostack`/`histack` stack instead of Rust's clean
+  recursion `qsort(a: &mut [i64], …)`. This structural overhead is sort's last ~5% vs
+  Rust. Fix: thread the element kind through ref-typed array parameters (annotation
+  `a: Array[Int]` or inference from call sites) so `a[i]` lowers as a real bounds-
+  checked/-elidable array access. Also closes the residual on any array-taking helper.
 - [x] **Allocator gap — closed for the array case.** Region inference closed the
   RC gap on traversal; the auto-arena (escape→arena) covers `for`-loops and
   scalar-store loops; and **non-escaping fixed-size primitive arrays now

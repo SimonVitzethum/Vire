@@ -12,8 +12,8 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 | matmul (256³ naive) | 0.0126 | 0.0099 | 0.0131 | **0.96×** |
 | nbody (2000, 20 steps) | 0.072 | 0.076 | 0.074 | **0.97×** |
 | montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
-| vcall (dyn dispatch, 100M) | 0.120 | 0.117 | 0.281 | **0.41×** |
-| sort (quicksort 2M) | 0.169 | 0.126 | 0.114 | 1.43× |
+| vcall (dyn dispatch, 100M) | 0.115 | 0.115 | 0.276 | **0.41×** |
+| sort (quicksort 2M) | 0.128 | 0.122 | 0.112 | 1.14× |
 | binsearch (10M lookups) | 0.478 | 0.480 | 0.449 | **1.06×** |
 
 **binsearch now = 1.00× Rust** (0.478 vs 0.480): the constant upper/lower-bound
@@ -39,12 +39,17 @@ no-checks ceiling was 1.07× clang, so essentially every provably-safe check is 
   `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
   vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
   vs the previous snapshot as the devirt/vtable path matured.)
-- **sort (quicksort): Vire 1.43× clang / 1.35× Rust.** The partition bounds `lo`/`hi`
-  are **loaded from an explicit stack array** (`lostack[sp]`), so they are opaque to
-  the value analysis — proving `a[j] < len` would need an array-*content* invariant
-  (the stack only ever holds in-range indices), a much harder analysis. Its no-checks
-  ceiling is 1.03× Rust, so bounds elision *could* win it, but not with the current
-  value-based reasoning. The honest remaining lever.
+- **sort (quicksort): Vire 1.14× clang / 1.05× Rust.** Measured finding: Rust's sort
+  has the SAME bounds checks (47× more `jae` than Vire, actually) — the gap was never
+  missing elision, it was Vire's **check model**. Vire's pending-exception throw
+  (set-pending + continue + a `phi` folding the load result with a default) was
+  costlier than Rust's noreturn panic. Now, when the whole program provably can't
+  catch a runtime exception (no try/catch — always true for pure Vire), the check
+  aborts via a `_fatal` noreturn helper and its failure block ends in `unreachable`,
+  so the load result is direct (Rust's structure). **1.35× → 1.05× Rust**, matching
+  the no-checks ceiling. Memory safety unchanged (a real OOB still throws, verified).
+  The last ~5% is the explicit-stack structure Vire needs *because it can't yet pass
+  arrays as parameters* — Rust writes `qsort(a: &mut [i64], …)` recursively (TODO).
 - **DIFFs in the table** are pure float formatting (Vire/C++ `%g` scientific
   vs Rust's full precision) or summation rounding (nbody) — identical values.
 
