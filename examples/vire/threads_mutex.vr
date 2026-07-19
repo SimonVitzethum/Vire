@@ -1,0 +1,30 @@
+// Mutex: guard a read-modify-write that is not a single atomic operation.
+//
+// `Atomic.fetch_add` covers atomic increments, but sometimes you must read a
+// value, compute, and write it back as one indivisible step. A `Mutex` makes the
+// critical section exclusive: between `lock()` and `unlock()` no other thread can
+// touch the guarded cell, so no update is lost.
+//
+//   vire run examples/vire/threads_mutex.vr
+
+fn accumulate(m: Mutex) -> Int {
+    mut i = 0
+    while i < 100000 {
+        m.lock()                 // enter the critical section
+        m.set(m.get() + 1)       // read-modify-write, race-free under the lock
+        m.unlock()               // leave it
+        i = i + 1
+    }
+    0
+}
+
+fn main() {
+    mut m = Mutex(0)
+    mut t1 = spawn accumulate(m)
+    mut t2 = spawn accumulate(m)
+    mut t3 = spawn accumulate(m)
+    join(t1)
+    join(t2)
+    join(t3)
+    print(m.get())   // 300000 — no lost updates
+}

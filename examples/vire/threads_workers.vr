@@ -1,0 +1,28 @@
+// Multi-argument workers: each thread gets its own id AND a shared accumulator.
+//
+// Four workers run in parallel; worker `id` adds its id to the shared total
+// `chunk` times. The arguments (a scalar id + a shared Atomic) are boxed into a
+// per-spawn env buffer automatically. Total = (1+2+3+4) * chunk.
+//
+//   vire run examples/vire/threads_workers.vr
+
+fn worker(id: Int, total: Atomic) -> Int {
+    mut i = 0
+    while i < 25000 {
+        total.fetch_add(id)
+        i = i + 1
+    }
+    id
+}
+
+fn main() {
+    mut total = Atomic(0)
+    mut a = spawn worker(1, total)
+    mut b = spawn worker(2, total)
+    mut c = spawn worker(3, total)
+    mut d = spawn worker(4, total)
+    // join returns each worker's own result (its id); sum = 1+2+3+4 = 10.
+    mut ids = join(a) + join(b) + join(c) + join(d)
+    print(total.load())   // (1+2+3+4)*25000 = 250000
+    print(ids)            // 10
+}

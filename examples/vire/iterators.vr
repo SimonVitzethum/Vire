@@ -1,0 +1,22 @@
+// Iterator adapters: fold / sum / count / map / filter / each over ranges and
+// lists. The lambda body is inlined per element into a generated loop — there is
+// no closure object, so the fused pipeline optimizes like a hand-written loop.
+//
+//   vire run examples/vire/iterators.vr
+
+fn main() {
+    // Ranges: sum, product (fold), count.
+    print((1..=100).sum())                        // 5050
+    print((1..=5).fold(1, (acc, x) -> acc * x))   // 120  (5!)
+
+    // Lists: map + filter + reduce, chained.
+    mut xs = list()
+    mut i = 1
+    while i <= 10 { xs.push(i); i = i + 1 }
+
+    print(xs.map(x -> x * x).sum())               // 385  (sum of squares 1..10)
+    print(xs.filter(x -> x % 2 == 0).sum())       // 30   (even: 2+4+6+8+10)
+
+    // A full pipeline: squares of the odd numbers 1..10, summed.
+    print((1..=10).filter(x -> x % 2 == 1).map(x -> x * x).sum())  // 1+9+25+49+81 = 165
+}

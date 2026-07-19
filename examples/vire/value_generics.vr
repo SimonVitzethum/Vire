@@ -1,0 +1,31 @@
+// Value generics: a compile-time number parameter, chosen at the call site with
+// turbofish `f[N](...)`. Each N produces a distinct specialized copy, with N
+// substituted as a literal — so `0..N` is a constant loop bound and `array(N)`
+// is a constant-size array (stack-promoted, no heap allocation).
+//
+//   vire run examples/vire/value_generics.vr
+
+fn sum_of_squares[comptime N: Int]() -> Int {
+    mut a = array(N)                 // N is a literal here → constant size
+    mut i = 0
+    while i < N {
+        a[i] = i * i
+        i = i + 1
+    }
+    mut s = 0
+    mut j = 0
+    while j < N {
+        s = s + a[j]
+        j = j + 1
+    }
+    s
+}
+
+// Value and type generics mix; extra type params are still inferred from args.
+fn scaled[comptime K: Int](x: Int) -> Int { x * K }
+
+fn main() {
+    print(sum_of_squares[5]())    // 0+1+4+9+16 = 30
+    print(sum_of_squares[10]())   // 285
+    print(scaled[3](14))          // 42
+}

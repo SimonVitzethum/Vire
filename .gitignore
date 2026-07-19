@@ -7,6 +7,8 @@
 # javac-/fastjavac-Ausgaben in den Beispielen: alles außer den Quellen
 examples/*
 !examples/*.java
+# Vire-Beispielprogramme + Runner/README sind Quellcode, kein Build-Artefakt.
+!examples/vire/
 
 # kompilierte Stub-Klassenbibliothek
 /stdlib/out/

@@ -1,0 +1,33 @@
+// Fork/join parallel reduction: sum 1..1_000_000 across four threads.
+//
+// Each worker sums one quarter of the range into a local accumulator (no
+// contention on the hot loop), then folds its partial sum into a shared Atomic
+// once. This is the efficient shape: share only at the boundary, compute in
+// private. Result = 1_000_000 * 1_000_001 / 2 = 500000500000.
+//
+//   vire run examples/vire/threads_parallel_sum.vr
+
+fn partial(base: Int, result: Atomic) -> Int {
+    mut sum = 0
+    mut i = base * 250000 + 1
+    mut end = base * 250000 + 250000
+    while i <= end {
+        sum = sum + i
+        i = i + 1
+    }
+    result.fetch_add(sum)   // one shared update per thread
+    sum
+}
+
+fn main() {
+    mut result = Atomic(0)
+    mut w0 = spawn partial(0, result)
+    mut w1 = spawn partial(1, result)
+    mut w2 = spawn partial(2, result)
+    mut w3 = spawn partial(3, result)
+    join(w0)
+    join(w1)
+    join(w2)
+    join(w3)
+    print(result.load())   // 500000500000
+}

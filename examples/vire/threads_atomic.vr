@@ -1,0 +1,29 @@
+// Parallel atomic counter — the "hello world" of safe concurrency in Vire.
+//
+// Two threads each add 1 a million times to the SAME shared counter. Because the
+// counter is an `Atomic`, every increment is indivisible: the result is exactly
+// 2_000_000, run after run. A plain integer here would race and lose adds.
+//
+//   vire run examples/vire/threads_atomic.vr     # threads link in automatically
+//
+// Safe by construction: a bare mutable value cannot be shared across `spawn` —
+// only a scalar (copied) or a `Sync` type (`Atomic`/`Mutex`). The compiler
+// rejects the racy version; you cannot write the data race.
+
+fn count_up(c: Atomic) -> Int {
+    mut i = 0
+    while i < 1000000 {
+        c.fetch_add(1)
+        i = i + 1
+    }
+    0
+}
+
+fn main() {
+    mut counter = Atomic(0)
+    mut t1 = spawn count_up(counter)
+    mut t2 = spawn count_up(counter)
+    join(t1)
+    join(t2)
+    print(counter.load())   // 2000000
+}

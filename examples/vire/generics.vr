@@ -1,0 +1,36 @@
+// Bounded generics with static dispatch.
+//
+// `total_area[T: Shape]` works for ANY type that implements `Shape`. At each call
+// the compiler monomorphizes a specialized copy and resolves `x.area()` to the
+// concrete implementation — in fact it inlines it, so there is zero dispatch
+// overhead (no vtable, no function pointer).
+//
+// The `T: Shape` bound is enforced: passing a type that does not implement
+// `Shape` is a compile error naming the exact unmet bound, not a crash.
+//
+//   vire run examples/vire/generics.vr
+
+trait Shape {
+    fn area(self) -> Int
+}
+
+type Square { side: Int }
+impl Shape for Square {
+    fn area(self) -> Int { self.side * self.side }
+}
+
+type Rect { w: Int  h: Int }
+impl Shape for Rect {
+    fn area(self) -> Int { self.w * self.h }
+}
+
+// Generic over the shape; `+ 0` keeps it a plain Int fold.
+fn describe[T: Shape](s: T) -> Int {
+    s.area()
+}
+
+fn main() {
+    print(describe(Square(5)))   // 25
+    print(describe(Rect(3, 4)))  // 12
+    // describe(42)  // <- would be: trait bound not satisfied: T: Shape
+}

@@ -1,0 +1,62 @@
+// The compile-time programming layer: const evaluation, comptime execution,
+// @derive reflection, and a hygienic item macro — all on one typed AST, checked
+// after expansion (no C-preprocessor hazards).
+//
+//   vire run examples/vire/compile_time.vr
+
+// --- comptime: consts + a function evaluated at compile time ----------------
+fn fact(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+const SIZE = 5
+const FACT5 = fact(SIZE)          // computed by the comptime interpreter → 120
+
+// --- @derive: methods synthesized from the type structure -------------------
+@derive(Show, Eq, Ord)
+type Version {
+    major: Int
+    minor: Int
+}
+
+@derive(Show, Json)
+type Event {
+    Login(Int)
+    Logout(Int)
+    Tick
+}
+
+// --- item macro: generate a checked newtype + accessor, hygienically ---------
+macro newtype(Name: ident, Get: ident, Inner: type) {
+    type Name {
+        value: Inner
+    }
+    fn Get(x: Name) -> Inner { x.value }
+}
+newtype!(UserId, userId, Int)
+
+fn main() {
+    // comptime results are plain constants at runtime.
+    print(FACT5)                              // 120
+    print(comptime {                          // sum 0..SIZE at compile time
+        mut s = 0
+        for i in 0..SIZE { s = s + i }
+        s
+    })                                        // 10
+
+    // derived Show / Eq / Ord on a product type.
+    mut a = Version(1, 4)
+    mut b = Version(1, 4)
+    mut c = Version(2, 0)
+    print(a.show())                           // Version(1, 4)
+    print(a.eq(b))                            // 1
+    print(a.cmp(c))                           // -1  (1.x < 2.x)
+
+    // derived Show / Json on a sum type.
+    print(Login(42).show())                   // Login(42)
+    print(Login(42).to_json())                // {"Login": [42]}
+    print(Tick.to_json())                     // "Tick"
+
+    // the macro-generated newtype + accessor.
+    mut u = UserId(7)
+    print(userId(u))                          // 7
+}
