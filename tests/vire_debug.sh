@@ -67,6 +67,25 @@ else
     echo "skip addr2line (not installed)"
 fi
 
+# inlinedAt: `compute` is inlined into `main`, so addr2line -i shows BOTH the
+# crash line in compute (crash.vr:4) and the call site in main (crash.vr:6).
+if command -v addr2line >/dev/null 2>&1; then
+    "$vire" build "$work/crash.vr" --debug --backtrace -o "$work/dwi" >/dev/null 2>&1
+    bti="$("$work/dwi" 2>&1)"
+    chain=""
+    for a in $(echo "$bti" | grep -oE '\[0x[0-9a-f]+\]' | tr -d '[]'); do
+        r="$(addr2line -i -e "$work/dwi" "$a" 2>/dev/null)"
+        case "$r" in *crash.vr:4*) chain="$r"; break;; esac
+    done
+    if echo "$chain" | grep -q 'crash.vr:4' && echo "$chain" | grep -q 'crash.vr:6'; then
+        echo "ok   inlinedAt (chain shows crash.vr:4 inlined at :6)"; pass=$((pass+1))
+    else
+        echo "FAIL inlinedAt (no inline chain: $(echo "$chain" | tr '\n' ' '))"; fail=$((fail+1))
+    fi
+else
+    echo "skip inlinedAt (no addr2line)"
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

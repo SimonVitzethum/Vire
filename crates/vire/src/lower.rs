@@ -895,6 +895,8 @@ struct FnLower<'a> {
     line_starts: &'a [usize],
     /// Line of the last emitted `DebugLine` marker (0 = none), to avoid repeats.
     last_dbg_line: u32,
+    /// Mangled name of the function being lowered (the innermost DebugLine frame).
+    fn_name: String,
 }
 
 impl<'a> FnLower<'a> {
@@ -1274,7 +1276,8 @@ impl<'a> FnLower<'a> {
         let line = line_of(self.line_starts, span.0);
         if line != 0 && line != self.last_dbg_line {
             self.last_dbg_line = line;
-            self.emit(Statement::DebugLine(line));
+            let frame = vec![(self.fn_name.clone(), line)];
+            self.emit(Statement::DebugLine(frame));
         }
     }
 
@@ -2972,6 +2975,7 @@ fn lower_fn(
         loops: Vec::new(),
         line_starts,
         last_dbg_line: 0,
+        fn_name: name.clone(),
     };
     // Block 0
     fl.new_block();

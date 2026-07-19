@@ -148,12 +148,12 @@ pub enum Statement {
     ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },
     /// `arr[index] = value`; bounds-checked if `checked`.
     ArrayStore { arr: Operand, index: Operand, value: Operand, kind: ArrKind, checked: bool },
-    /// Debug line marker (source line for the statements that follow, until the
-    /// next marker). Emits no code; drives `!DILocation` when debug info is on.
-    /// A robust way to carry source lines through the optimizing passes (they may
-    /// insert/remove real statements, but the marker before the next one still
-    /// gives a correct-enough line).
-    DebugLine(u32),
+    /// Debug marker: the inline stack for the statements that follow, until the
+    /// next marker — `(function symbol, source line)` innermost first. Emits no
+    /// code; drives `!DILocation` (with `inlinedAt` chains) when debug info is on.
+    /// The inliner appends the call-site frame so an inlined crash shows the full
+    /// caller chain. Robust across the optimizing passes (a bare marker statement).
+    DebugLine(Vec<(String, u32)>),
 }
 
 /// Array element kind: value type (stack) + storage width. Bool/Byte = 1 byte,

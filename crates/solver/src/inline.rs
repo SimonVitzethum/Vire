@@ -77,6 +77,16 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
     };
     let callee = &candidates[&func];
 
+    // Inline context for debug info: the call-site line in this caller. Appended
+    // to every DebugLine of the inlined body so a crash shows the caller chain
+    // (DWARF inlinedAt). The last DebugLine before the call gives the line.
+    let call_line = f.blocks[blk].statements[..idx]
+        .iter()
+        .rev()
+        .find_map(|st| if let Statement::DebugLine(fr) = st { fr.first().map(|(_, l)| *l) } else { None })
+        .unwrap_or(0);
+    let ctx = (f.name.clone(), call_line);
+
     let local_off = f.locals.len() as u32;
     f.locals.extend(callee.locals.iter().copied());
     // For a guarded call: two additional synthetic blocks (npe, arg)
@@ -117,7 +127,7 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
             .map(|(k, arg)| Statement::Assign(Local(local_off + k as u32), Rvalue::Use(arg)))
             .collect();
         f.blocks.push(BasicBlock { statements: arg_assigns, terminator: Terminator::Goto(Block(callee_first)) });
-        splice_callee(f, callee, dest, local_off, callee_first, cont_block);
+        splice_callee(f, callee, dest, local_off, callee_first, cont_block, &ctx);
         f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
         return;
     }
@@ -129,7 +139,7 @@ fn splice(f: &mut Function, blk: usize, idx: usize, candidates: &BTreeMap<String
             .push(Statement::Assign(Local(local_off + k as u32), Rvalue::Use(arg)));
     }
     let cont_term = std::mem::replace(&mut f.blocks[blk].terminator, Terminator::Goto(Block(callee_first)));
-    splice_callee(f, callee, dest, local_off, callee_first, cont_block);
+    splice_callee(f, callee, dest, local_off, callee_first, cont_block, &ctx);
     f.blocks.push(BasicBlock { statements: tail, terminator: cont_term });
 }
 
@@ -142,11 +152,16 @@ fn splice_callee(
     local_off: u32,
     block_off: u32,
     cont_block: Block,
+    ctx: &(String, u32),
 ) {
     for cb in &callee.blocks {
         let mut statements: Vec<Statement> = cb.statements.clone();
         for st in &mut statements {
             remap_statement(st, local_off);
+            // DWARF inlinedAt: record that this line is inlined at the call site.
+            if let Statement::DebugLine(frames) = st {
+                frames.push(ctx.clone());
+            }
         }
         let terminator = match &cb.terminator {
             Terminator::Goto(b) => Terminator::Goto(Block(b.0 + block_off)),

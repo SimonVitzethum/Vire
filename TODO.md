@@ -175,8 +175,12 @@ Attach: LLVM debug metadata (backend extension), panic model.
   `DebugLine` markers per statement/tail (debug builds only; they survive the
   optimizing passes), the backend maps each to a `!DILocation`. A bounds crash now
   resolves to the precise access line (`crash.vr:4`), not the function's line.
-- [ ] `inlinedAt` for frames Vire's own inliner collapses (the line is the inlined
-  callee's, without the caller-chain context); freestanding compact symbol table.
+- [x] **`inlinedAt` inline chains**: when Vire's own inliner splices a callee into
+  a caller, each DebugLine carries the inline stack `(fn, line)` innermost-first;
+  the backend builds a `!DILocation`→`inlinedAt`→`!DILocation` chain. `addr2line -i`
+  / gdb show the full chain (`compute` at crash.vr:4, inlined at `main` crash.vr:6).
+- [ ] freestanding: compact symbol table instead of libc `backtrace`; map the
+  entry symbol `java_main` back to `main` in the DISubprogram name (cosmetic).
 - [ ] freestanding: compact symbol table instead of libc `backtrace`.
 
 ---
