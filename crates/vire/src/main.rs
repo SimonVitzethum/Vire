@@ -630,6 +630,16 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // Platform conditional compilation: drop `@when(os)` items not for this target
+    // (before any other pass sees them — so per-platform same-named fns don't clash).
+    let os = vire::platform::target_os(target.as_deref());
+    let cfg_errs = vire::apply_platform_cfg(&mut module, os);
+    if !cfg_errs.is_empty() {
+        for e in &cfg_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
     // `extern "C" header "h.h"` → generate signatures at compile time from the C header
     // (auto-bindgen) and fill the extern block with them.
     let src_dir = std::path::Path::new(&path).parent().map(|p| p.to_path_buf()).unwrap_or_default();

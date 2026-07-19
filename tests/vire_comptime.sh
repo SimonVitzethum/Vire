@@ -139,6 +139,45 @@ else
     echo "FAIL infinite comptime loop budget"; fail=$((fail+1))
 fi
 
+# @when(os): platform conditional compilation. On this host (linux/macos/unix) the
+# matching same-named fn survives; the others are dropped (no duplicate-def clash).
+host_os="$(uname -s)"
+case "$host_os" in
+    Linux)  want_plat=1 ;;
+    Darwin) want_plat=3 ;;
+    *)      want_plat=1 ;;
+esac
+cat > "$work/when.vr" <<'EOF'
+@when(linux)
+fn plat() -> Int = 1
+@when(windows)
+fn plat() -> Int = 2
+@when(macos)
+fn plat() -> Int = 3
+fn main() { print(plat()) }
+EOF
+check "@when picks the host variant" "$want_plat" "$work/when.vr"
+
+# @when(unix) keeps the item on the unix family (linux + macos).
+cat > "$work/whenunix.vr" <<'EOF'
+@when(unix)
+fn only_unix() -> Int = 42
+fn main() { print(only_unix()) }
+EOF
+check "@when(unix) on the unix family" "42" "$work/whenunix.vr"
+
+# An unknown platform name is a compile error, not a silent drop.
+cat > "$work/whenbad.vr" <<'EOF'
+@when(atari)
+fn f() -> Int = 1
+fn main() { print(0) }
+EOF
+if "$vire" run "$work/whenbad.vr" 2>&1 | grep -q 'unknown platform'; then
+    echo "ok   @when unknown platform rejected"; pass=$((pass+1))
+else
+    echo "FAIL @when unknown platform rejected"; fail=$((fail+1))
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

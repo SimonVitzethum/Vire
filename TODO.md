@@ -180,8 +180,8 @@ Feature sequence on top:
   omitted — needs identifier interpolation; for now pass each generated name as its own
   `ident` param); multi-argument generics (`Map[K, V]`); `block`/`pat` parameter kinds.
   Expression macros (`macro name(p) = <expr>`) are unchanged.
-- [ ] `@when(platform)` / `comptime for`/`assert`/`emit` as the surface syntax once
-  (a) lands.
+- [x] `@when(platform)` conditional compilation — landed (see [4]).
+- [ ] `comptime for`/`assert`/`emit` as the surface syntax once (a) lands.
 
 ## Front-end completeness
 
@@ -269,8 +269,11 @@ Attach: whole-program type graph + `comptime`.
 - [ ] Hygienic macros (`macro name(args) { … }`): **typed parameters** (`expr`/`block`/
   `ident`/`pat`/`type`), **full type-checking after expansion**, hygiene (no capture),
   diagnostic spans into the expansion.
-- [ ] `@when` platform switches (the `comptime if` conditional-compilation primitive
-  already lands).
+- [x] `@when` platform switches — **done**. `@when(linux|macos|windows|unix)` on a `fn`
+  or `type` includes it only for the matching target (host by default, or `--target`
+  triple), dropped before inference so two same-named per-platform fns don't clash;
+  `@when(unix)` = linux+macos; unknown platform is a compile error. crates/vire/src/
+  platform.rs, tests/vire_comptime.sh.
 
 ### [5] Build interop, Meson first-class — **DONE**
 Attach: clang→object (present).

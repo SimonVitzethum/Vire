@@ -127,9 +127,9 @@ impl Parser {
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
-            // `@derive(...)` introduces a type item (other `@…` stay expressions/
-            // script statements, e.g. inline `@c`/`@asm` blocks).
-            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive"))
+            // `@derive(...)`/`@when(...)` introduce a declaration item (other `@…` stay
+            // expressions/script statements, e.g. inline `@c`/`@asm` blocks).
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive" || n == "when"))
             // `name!(…)` — an item-macro invocation.
             || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }
@@ -139,11 +139,11 @@ impl Parser {
         // meaningful on a `type` (attached below); on anything else → a diagnostic.
         let attrs = self.parse_attrs();
         let is_pub = self.eat_kw(Kw::Pub);
-        if !attrs.is_empty() && !matches!(self.peek(), Tok::Kw(Kw::Type)) {
-            self.err("attributes (@derive) are currently only supported on `type` declarations");
+        if !attrs.is_empty() && !matches!(self.peek(), Tok::Kw(Kw::Type) | Tok::Kw(Kw::Fn)) {
+            self.err("attributes (@derive/@when) are currently only supported on `type` and `fn` declarations");
         }
         match self.peek() {
-            Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn(is_pub))),
+            Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn_attrs(is_pub, attrs))),
             Tok::Kw(Kw::Native) => Some(self.parse_native()),
             Tok::Kw(Kw::Type) => {
                 let mut t = self.parse_type_def();
@@ -260,6 +260,10 @@ impl Parser {
     }
 
     fn parse_fn(&mut self, is_pub: bool) -> FnDef {
+        self.parse_fn_attrs(is_pub, vec![])
+    }
+
+    fn parse_fn_attrs(&mut self, is_pub: bool, attrs: Vec<Attr>) -> FnDef {
         let sig = self.parse_fn_sig();
         let body = if self.eat(&Tok::Eq) {
             // expression function: `= expr`
@@ -271,7 +275,7 @@ impl Parser {
         } else {
             None
         };
-        FnDef { sig, body, is_pub }
+        FnDef { sig, body, is_pub, attrs }
     }
 
     fn parse_type_def(&mut self) -> TypeDef {
@@ -1214,6 +1218,7 @@ fn synth_main(stmts: Vec<Stmt>) -> Item {
         sig: FnSig { name: "main".into(), generics: vec![], params: vec![], ret: None, span: Span(0, 0) },
         body: Some(Block { stmts, tail: None, span: Span(0, 0) }),
         is_pub: false,
+        attrs: vec![],
     })
 }
 

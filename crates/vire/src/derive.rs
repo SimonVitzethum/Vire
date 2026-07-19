@@ -160,6 +160,7 @@ fn method(name: &str, params: Vec<Param>, ret: Type, tail: Expr) -> FnDef {
         sig: FnSig { name: name.into(), generics: vec![], params, ret: Some(ret), span: S },
         body: Some(Block { stmts: vec![], tail: Some(Box::new(tail)), span: S }),
         is_pub: false,
+        attrs: vec![],
     }
 }
 fn param(name: &str, ty: Option<Type>) -> Param {

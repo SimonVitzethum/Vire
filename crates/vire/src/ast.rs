@@ -60,6 +60,8 @@ pub struct FnDef {
     /// `= expr` (expression function) or `{ … }` (block). None = signature only.
     pub body: Option<Block>,
     pub is_pub: bool,
+    /// Declaration attributes, e.g. `@when(linux)` (platform conditional compilation).
+    pub attrs: Vec<Attr>,
 }
 
 #[derive(Debug, Clone)]
