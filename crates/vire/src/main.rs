@@ -649,6 +649,15 @@ fn build_or_run(args: &[String]) {
         }
         exit(1);
     }
+    // `@derive(...)` reflection: synthesize methods (Eq/Show) from type structure.
+    // Runs before inference so generated methods are inferred + lowered normally.
+    let derive_errs = vire::derive_expand(&mut module);
+    if !derive_errs.is_empty() {
+        for e in &derive_errs {
+            eprintln!("error: {e}");
+        }
+        exit(1);
+    }
     // Shallow self-recursive inlining (small, pure, tail-shaped recursion →
     // 1–2 levels self-inlined; LLVM CSE captures the branching win). Before infer.
     vire::inline_recursion(&mut module);

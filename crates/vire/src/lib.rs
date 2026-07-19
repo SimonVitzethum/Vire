@@ -4,6 +4,7 @@
 pub mod ast;
 pub mod cblock;
 pub mod comptime;
+pub mod derive;
 pub mod diag;
 pub mod expand;
 pub mod infer;
@@ -17,6 +18,7 @@ pub mod tygraph;
 
 pub use cblock::desugar_cblocks;
 pub use comptime::eval_comptime;
+pub use derive::derive_expand;
 pub use diag::Diag;
 pub use expand::expand_macros;
 pub use spawn::desugar_spawn;

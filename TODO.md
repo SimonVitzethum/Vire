@@ -121,10 +121,18 @@ Feature sequence on top:
   runtime statements (this executes at comptime to a value; unrolling is separate),
   comptime over reference/aggregate values (scalars only today), `return`/`break` in
   a comptime body.
-- [ ] **(b) typed reflection over the type graph** — `@typeinfo(T)` yielding
-  fields/variants/methods/attributes as a *comptime-iterable typed value*; then
-  `@derive(Eq, Hash, Ord, Show, Json, …)` generated from it. AOT only, no runtime
-  reflection. Depends on (a) for the comptime `for` that walks the info.
+- [~] **(b) typed reflection over the type graph** — **`@derive(Eq, Show)`** works
+  ([derive.rs](crates/vire/src/derive.rs)): a `@name(args)` attribute parses onto a
+  `type` (new `Attr` AST node + `parse_attrs`), and a post-macro pass reads the type's
+  fields and synthesizes ordinary methods (`eq(self, other) -> Bool` structural `==`;
+  `show(self) -> Str` a `T(f, …)` string) that infer+lower like hand-written ones. An
+  explicit method of the same name overrides the derive; unknown derives / sum /
+  generic targets are rejected. The type graph reflects declared derives
+  (`vire types`). tests/vire_derive.sh (8/8). Open: `Hash`/`Ord`/`Json`; derive for
+  **sum types** (match on the tag) and **generic** types; and the deeper
+  **`@typeinfo(T)`** as a *comptime-iterable typed value* (needs aggregate comptime
+  values — the interpreter is scalar-only today), from which derives would be written
+  in-language rather than hard-coded in Rust.
 - [ ] **(c) hygienic macros** — `macro name(args) { … }` with typed parameters
   (`expr`/`block`/`ident`/`pat`/`type`), full type-checking *after* expansion,
   hygiene (no capture — fresh names for macro-introduced bindings), and diagnostic

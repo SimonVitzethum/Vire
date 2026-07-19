@@ -77,6 +77,17 @@ pub struct TypeDef {
     pub fields: Vec<Field>,
     pub variants: Vec<Variant>,
     pub methods: Vec<FnDef>,
+    /// Attributes attached to the declaration, e.g. `@derive(Eq, Show)`.
+    pub attrs: Vec<Attr>,
+    pub span: Span,
+}
+
+/// A declaration attribute: `@name(arg, arg, …)` (args are bare identifiers).
+/// Drives the compile-time programming layer (currently `@derive`).
+#[derive(Debug, Clone)]
+pub struct Attr {
+    pub name: String,
+    pub args: Vec<String>,
     pub span: Span,
 }
 

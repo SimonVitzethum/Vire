@@ -77,6 +77,8 @@ pub struct TypeDecl {
     pub methods: Vec<String>,
     /// Traits implemented for this type (from `impl Trait for T`).
     pub traits: Vec<String>,
+    /// Names requested via `@derive(...)` on the declaration.
+    pub derives: Vec<String>,
     /// True for the compiler-provided `Option`/`Result` (not user-written).
     pub builtin: bool,
 }
@@ -160,9 +162,15 @@ impl TypeGraph {
                         }
                     };
                     let methods = t.methods.iter().map(|md| md.sig.name.clone()).collect();
+                    let derives = t
+                        .attrs
+                        .iter()
+                        .filter(|a| a.name == "derive")
+                        .flat_map(|a| a.args.iter().cloned())
+                        .collect();
                     g.types.insert(
                         t.name.clone(),
-                        TypeDecl { name: t.name.clone(), generics, kind, methods, traits: Vec::new(), builtin: false },
+                        TypeDecl { name: t.name.clone(), generics, kind, methods, traits: Vec::new(), derives, builtin: false },
                     );
                 }
                 Item::Trait(tr) => {
@@ -193,6 +201,7 @@ impl TypeGraph {
                 kind: TypeKind::Sum { variants },
                 methods: Vec::new(),
                 traits: Vec::new(),
+                derives: Vec::new(),
                 builtin: true,
             });
         }
@@ -240,6 +249,9 @@ impl TypeGraph {
                         }
                     }
                 }
+            }
+            for d in &td.derives {
+                writeln!(s, "  derive {d}").unwrap();
             }
             for tr in &td.traits {
                 writeln!(s, "  impl {tr}").unwrap();

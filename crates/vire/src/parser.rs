@@ -127,14 +127,27 @@ impl Parser {
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
+            // `@derive(...)` introduces a type item (other `@…` stay expressions/
+            // script statements, e.g. inline `@c`/`@asm` blocks).
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive"))
     }
 
     fn parse_item(&mut self) -> Option<Item> {
+        // Leading declaration attributes: `@derive(Eq, Show)` etc. Currently only
+        // meaningful on a `type` (attached below); on anything else → a diagnostic.
+        let attrs = self.parse_attrs();
         let is_pub = self.eat_kw(Kw::Pub);
+        if !attrs.is_empty() && !matches!(self.peek(), Tok::Kw(Kw::Type)) {
+            self.err("attributes (@derive) are currently only supported on `type` declarations");
+        }
         match self.peek() {
             Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn(is_pub))),
             Tok::Kw(Kw::Native) => Some(self.parse_native()),
-            Tok::Kw(Kw::Type) => Some(Item::Type(self.parse_type_def())),
+            Tok::Kw(Kw::Type) => {
+                let mut t = self.parse_type_def();
+                t.attrs = attrs;
+                Some(Item::Type(t))
+            }
             Tok::Kw(Kw::Trait) => Some(Item::Trait(self.parse_trait())),
             Tok::Kw(Kw::Impl) => Some(Item::Impl(self.parse_impl())),
             Tok::Kw(Kw::Const) => {
@@ -325,7 +338,32 @@ impl Parser {
             self.stmt_end();
         }
         self.expect(&Tok::RBrace, "'}'");
-        TypeDef { name, generics, fields, variants, methods, span: sp }
+        TypeDef { name, generics, fields, variants, methods, attrs: Vec::new(), span: sp }
+    }
+
+    /// Parse leading `@name(arg, …)` declaration attributes (bare-ident args).
+    fn parse_attrs(&mut self) -> Vec<Attr> {
+        let mut attrs = Vec::new();
+        while self.at(&Tok::At) {
+            let sp = self.span();
+            self.bump(); // '@'
+            let name = self.ident();
+            let mut args = Vec::new();
+            if self.eat(&Tok::LParen) {
+                self.skip_nl();
+                while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+                    args.push(self.ident());
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                    self.skip_nl();
+                }
+                self.expect(&Tok::RParen, "')'");
+            }
+            attrs.push(Attr { name, args, span: sp });
+            self.skip_nl(); // allow a newline between the attribute and the item
+        }
+        attrs
     }
 
     fn parse_trait(&mut self) -> TraitDef {
