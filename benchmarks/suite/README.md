@@ -91,9 +91,12 @@ The gaps are **library + a few front-end features**, not the compiler core: ever
 measured shows the generated code is already at the LLVM optimum.
 
 ## Known Vire limitations that the benchmarks touched on
-- **Array as a function parameter** (`fn f(a: Ref)` + `a[i]`) → "no known array":
-  ref params carry no ArrKind. sort was therefore written iteratively-in-main
-  (the array stays local). An `Array[T]` param annotation would be the fix.
+- **Array as a function parameter** — **resolved**: `fn f(a: Array[Int])` + `a[i]` now
+  lowers to a real bounds-checked access (the element kind is threaded through the ref
+  param). Measured, though: rewriting sort as a recursive `qsort(a, lo, hi)` is *slower*
+  than the explicit in-main `lostack`/`histack` (0.144 vs 0.128 s at 2M) — call overhead
+  + lost cross-call bounds elision. So sort keeps the explicit stack; the array-param
+  feature's value is array-taking helpers in general, not this benchmark.
 - **`else` must be on the same line as `}`** (newline-terminated syntax).
 
 ## Bounds checks: analysis + honest ceiling (addendum)

@@ -45,13 +45,17 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   **sort 1.35× → 1.05× Rust**, memory-safe (the check stays; a real OOB still throws),
   gated by the Java oracle (Catch/Finally keep the pending model). Disabled under `-g`
   (inlinedAt precision). The last ~5% is the explicit-stack structure — see below.
-- [ ] **Array as a function parameter** (`fn qsort(a: Array, lo, hi) { a[i] }`). Today a
-  ref param carries no `ArrKind`, so `a[i]` fails ("unknown array"); array-heavy code
-  (sort) is forced into an explicit `lostack`/`histack` stack instead of Rust's clean
-  recursion `qsort(a: &mut [i64], …)`. This structural overhead is sort's last ~5% vs
-  Rust. Fix: thread the element kind through ref-typed array parameters (annotation
-  `a: Array[Int]` or inference from call sites) so `a[i]` lowers as a real bounds-
-  checked/-elidable array access. Also closes the residual on any array-taking helper.
+- [x] **Array as a function parameter** — **done** (`fn qsort(a: Array[Int], lo, hi) {
+  a[i] }`). A param typed `Array[Int]`/`Array[Float]` is a `Ref` whose element kind is
+  recorded in `local_arr` at param binding (lower.rs), so `a[i]`, `a[i] = v` and
+  `a.len()` in the body lower to real bounds-checked array accesses (was "unknown
+  array"). Sound: an OOB in the callee still throws; tests/vire_heap.sh
+  `array_param_qsort` (recursive in-place sort, 0-live). **Measured finding (corrects
+  the old hypothesis):** rewriting `sort` as a recursive `qsort(a, lo, hi)` is *slower*
+  than the explicit `lostack`/`histack` (0.144 vs 0.128 s at 2M) — the per-call overhead
+  plus the loss of cross-call bounds elision outweighs the cleaner structure. So the
+  explicit stack was **not** overhead; the benchmark stays as-is. The feature's value is
+  enabling array-taking helpers generally, not this benchmark.
 - [x] **Allocator gap — closed for the array case.** Region inference closed the
   RC gap on traversal; the auto-arena (escape→arena) covers `for`-loops and
   scalar-store loops; and **non-escaping fixed-size primitive arrays now
@@ -255,9 +259,10 @@ Attach: monomorphization (front-end) + `comptime`.
   N, N substituted as a literal — so `0..N`/`array(N)` become constant (the array
   then stack-promotes). Mixed type+value turbofish; extra type params still
   inferred. tests/vire_generics.sh, examples/vire/value_generics.vr.
+- [x] Array **parameter** indexing in a Vire body (`fn f(a: Array[Int]){ a[i] }`) —
+  **done** (see [1]). 
 - [ ] Fixed arrays `[T; N]` as a distinct inline-storage value type (a larger
   feature; value-generic `array(N)` already gives constant-size stack arrays).
-  Array **parameter** indexing in a Vire body (`fn f(a: array){ a[i] }`) also open.
 - [ ] Overlapping/coherence checking for generic impls; inference of a type arg that
   appears only in return position (defaults to `Int` today).
 

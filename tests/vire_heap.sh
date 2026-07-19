@@ -132,6 +132,37 @@ fn work(n: Int) -> Int {
 fn main() { print(work(1000000)) }
 EOF
 
+# --- Array as a function parameter: recursive quicksort over `Array[Int]`, sorting
+#     in place through a ref param (was impossible: a ref param carried no ArrKind).
+#     Prints 1 iff fully sorted, and must end 0-live (the array is freed). ---
+case_ array_param_qsort 1 <<'EOF'
+fn qsort(a: Array[Int], lo: Int, hi: Int) {
+    if lo < hi {
+        mut pivot = a[hi]
+        mut i = lo - 1
+        mut j = lo
+        while j < hi {
+            if a[j] <= pivot { i = i + 1  mut t = a[i]  a[i] = a[j]  a[j] = t }
+            j = j + 1
+        }
+        mut t2 = a[i + 1]  a[i + 1] = a[hi]  a[hi] = t2
+        qsort(a, lo, i)
+        qsort(a, i + 2, hi)
+    }
+}
+fn sorted(a: Array[Int], n: Int) -> Int {
+    mut i = 1
+    while i < n { if a[i] < a[i - 1] { return 0 }  i = i + 1 }
+    1
+}
+fn main() {
+    mut a = array(8)
+    a[0]=5 a[1]=2 a[2]=8 a[3]=1 a[4]=9 a[5]=3 a[6]=7 a[7]=4
+    qsort(a, 0, 7)
+    print(sorted(a, 8))
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

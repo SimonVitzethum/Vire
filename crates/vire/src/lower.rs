@@ -3252,9 +3252,18 @@ fn lower_fn(
     // Parameter → Locals 0..n
     let mut param_tys = Vec::new();
     for p in &f.sig.params {
+        // An array parameter (`a: Array[Int]` / `Array[Float]`): a `Ref` with a known
+        // element kind, recorded in `local_arr` below so `a[i]`, `a[i] = v` and `a.len()`
+        // in the body lower to real bounds-checked array accesses (previously a ref param
+        // carried no ArrKind → "unknown array"). Lets array-taking helpers (e.g. a
+        // recursive `qsort(a, lo, hi)`) be written directly instead of an explicit stack.
+        let mut arr_kind: Option<ArrKind> = None;
         // `self` receiver: Ref to the method class.
         let (t, cls) = if p.name == "self" {
             (Ty::Ref, recv_class.map(|c| c.to_string()))
+        } else if let Some(pt) = p.ty.as_ref().filter(|pt| pt.name == "Array" || pt.name == "array") {
+            arr_kind = Some(pt.args.first().map(|a| arrkind_of_name(&a.name)).unwrap_or(ArrKind::Long));
+            (Ty::Ref, None)
         } else if let Some(pt) = p.ty.as_ref().filter(|pt| !pt.args.is_empty() && fl.generic_ptypes.contains_key(&pt.name)) {
             // Annotated generic type `b: Box[Int]` → instance `Box$Int`, so that
             // field accesses in the body find the concrete layout.
@@ -3269,6 +3278,9 @@ fn lower_fn(
         let l = fl.new_local(t);
         if let Some(c) = cls {
             fl.local_class.insert(l.0, c);
+        }
+        if let Some(k) = arr_kind {
+            fl.local_arr.insert(l.0, k);
         }
         fl.bind(&p.name, l, t);
     }
@@ -3462,6 +3474,18 @@ fn arrkind_of(t: Ty) -> ArrKind {
         Ty::I32 => ArrKind::Int,
         Ty::Ref => ArrKind::Ref,
         _ => ArrKind::Long,
+    }
+}
+
+/// Element-type name in an array parameter (`Array[Int]`) → array element kind.
+/// `Int`/`Long` = i64 slots (like `array(n)`), `Float` = f64 (like `farray(n)`).
+fn arrkind_of_name(n: &str) -> ArrKind {
+    match n {
+        "Float" | "F64" | "Double" => ArrKind::Double,
+        "F32" => ArrKind::Float,
+        "I32" | "U32" => ArrKind::Int,
+        "Ref" | "Str" => ArrKind::Ref,
+        _ => ArrKind::Long, // Int / I64 / Long / default
     }
 }
 
