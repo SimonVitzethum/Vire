@@ -11,3 +11,11 @@ path = "src/main.rs"
 fastllvm-ir = { path = "../ir" }
 fastllvm-solver = { path = "../solver" }
 fastllvm-backend = { path = "../backend" }
+# Vendored CSolver memory-safety verifier, called as a library (structured verdicts)
+# to gate inline C/asm blocks. See language/VERIFIED-C-ASM.md.
+csolver-core = { path = "../csolver/core" }
+csolver-ir = { path = "../csolver/ir" }
+csolver-llvm = { path = "../csolver/llvm" }
+csolver-asm = { path = "../csolver/asm" }
+csolver-verifier = { path = "../csolver/verifier" }
+csolver-report = { path = "../csolver/report" }

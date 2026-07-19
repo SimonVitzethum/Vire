@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::process::{exit, Command};
 
+mod cverify;
+
 // The same runtime as the Java driver (crates/driver/src/runtime.c) — a
 // shared `main`→`java_main` entry point, the same jrt_ helpers.
 const RUNTIME_C: &str = include_str!("../../driver/src/runtime.c");
@@ -81,37 +83,6 @@ fn main() {
     }
 }
 
-/// Locate the CSolver `solver` binary for on-by-default verification. The verifier is
-/// vendored in this repo (crates/csolver), so it builds into this workspace's target
-/// dir right next to `vire` — that in-repo build is preferred. Order: explicit override
-/// → the `solver` sibling of this executable → `$CSOLVER` → `solver` on `PATH`.
-fn resolve_solver(override_path: Option<&str>) -> Option<String> {
-    let runnable = |p: &str| Command::new(p).arg("--help").output().map(|o| o.status.code().is_some()).unwrap_or(false);
-    if let Some(p) = override_path {
-        return runnable(p).then(|| p.to_string());
-    }
-    // The in-repo build: `solver` next to this `vire` executable (same target dir).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sib = dir.join("solver");
-            if let Some(s) = sib.to_str() {
-                if sib.exists() && runnable(s) {
-                    return Some(s.to_string());
-                }
-            }
-        }
-    }
-    if let Ok(p) = std::env::var("CSOLVER") {
-        if runnable(&p) {
-            return Some(p);
-        }
-    }
-    if runnable("solver") {
-        return Some("solver".to_string());
-    }
-    None
-}
-
 /// Map a Vire `@assume:` name to the CSolver assumption flag it authorizes. These are
 /// the irreducible hardware/framework invariants no software proof can discharge; each
 /// is unsound in general and is why it must be written down and audited.
@@ -150,10 +121,10 @@ fn parse_assumes(code: &str) -> Vec<(String, String)> {
 /// an adjacent `(T* ptr, intN len)` parameter pair (the C `(buf, len)` idiom) becomes
 /// `<fn> <ptr#> elements <len#> <elem-bytes>` — a PROVEN bound, not a blanket trust.
 /// This is the contract a typed Vire caller supplies (a Vire array is a proven
-/// (ptr, len)). Returns the number of contracts written. Heuristic + prove-only
-/// (refutable=false), so it never introduces a false FAIL; the remaining pointers
-/// stay under `--assume-valid-params`.
-fn synthesize_pre(code: &str, pre_path: &std::path::Path) -> usize {
+/// (ptr, len)). Returns the contract text (one line per pair) or None. Heuristic +
+/// prove-only (refutable=false), so it never introduces a false FAIL; the remaining
+/// pointers stay under `assume_valid_params`.
+fn synthesize_pre(code: &str) -> Option<String> {
     fn elem_bytes(ptr_ty: &str) -> u32 {
         let t = ptr_ty.replace('*', " ");
         let t = t.split_whitespace().filter(|w| *w != "const").collect::<Vec<_>>().join(" ");
@@ -200,22 +171,46 @@ fn synthesize_pre(code: &str, pre_path: &std::path::Path) -> usize {
         }
     }
     if lines.is_empty() {
-        return 0;
+        None
+    } else {
+        Some(lines.join("\n") + "\n")
     }
-    let _ = std::fs::write(pre_path, lines.join("\n") + "\n");
-    lines.len()
+}
+
+/// Parse the `@assume:` directives of a block into the CSolver assumption set. An
+/// unknown name is an error (no silent trust).
+fn assume_set(code: &str) -> Result<cverify::Assume, String> {
+    let mut a = cverify::Assume::default();
+    for (name, _just) in parse_assumes(code) {
+        match name.as_str() {
+            "mmio" => a.valid_mmio = true,
+            "field_invariants" | "field" => a.field_invariants = true,
+            "valid_returns" | "returns" => a.valid_returns = true,
+            "loop_ptrs" | "loop" => a.valid_loop_ptrs = true,
+            "struct_tail" => a.struct_tail = true,
+            other => {
+                return Err(format!(
+                    "    unknown @assume `{other}` (known: mmio, field_invariants, valid_returns, loop_ptrs, struct_tail)"
+                ))
+            }
+        }
+    }
+    Ok(a)
 }
 
 /// Gate a `native "c"`/`native "asm"` block through the CSolver memory-safety verifier.
 /// C is compiled to LLVM IR (`clang -O0 -emit-llvm`); assembly (`ext == "s"`) is verified
 /// directly (CSolver decodes x86-64/AArch64). Returns Ok only on a proven-safe verdict
 /// (exit 0 = PASS); otherwise Err with the residual obligations / counterexample.
-fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize, solver: &str) -> Result<(), String> {
-    let mut pre_path: Option<std::path::PathBuf> = None;
-    let target = if ext == "s" {
-        // Assembly is CSolver's native input — verify the .s as written.
-        path.to_path_buf()
+fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize) -> Result<(), String> {
+    let assume = assume_set(code)?;
+    let outcome = if ext == "s" {
+        // Assembly is CSolver's native input — verify the .s text directly.
+        let src = std::fs::read_to_string(path).map_err(|e| format!("reading asm block: {e}"))?;
+        cverify::verify_asm(&src, &assume)
     } else {
+        // C → LLVM IR via clang, then verify the IR. Auto-synthesized (ptr,len)→elements
+        // contracts give PROVEN buffer bounds; assume_valid_params covers the rest.
         let ll = build_dir.join(format!("native_{i}.verify.ll"));
         let clang = Command::new("clang")
             .args(["-O0", "-S", "-emit-llvm", "-g", "-o"])
@@ -226,52 +221,14 @@ fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir:
         if !clang.status.success() {
             return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
         }
-        // Auto-synthesize precise (ptr,len)→elements contracts from the signatures.
-        let pp = build_dir.join(format!("native_{i}.pre"));
-        if synthesize_pre(code, &pp) > 0 {
-            pre_path = Some(pp);
-        }
-        ll
+        let src = std::fs::read_to_string(&ll).map_err(|e| format!("reading lowered IR: {e}"))?;
+        let pre = synthesize_pre(code);
+        cverify::verify_llvm(&src, &format!("native_{i}"), pre.as_deref(), &assume)
     };
-    // Precise `elements` contracts (auto-synthesized, above) give PROVEN buffer bounds;
-    // `--assume-valid-params` covers the remaining raw pointers that are not a (ptr,len)
-    // pair. Every other obligation (bounds, arithmetic, UB, aliasing) is still proven.
-    let mut cmd = Command::new(solver);
-    cmd.arg("verify").arg(&target).arg("--assume-valid-params");
-    if let Some(pp) = &pre_path {
-        cmd.arg("--pre").arg(pp);
+    match outcome {
+        cverify::Outcome::Pass => Ok(()),
+        cverify::Outcome::Rejected(report) => Err(report),
     }
-    // `@assume:` directives — the named, auditable hardware invariants. Each authorizes
-    // exactly one CSolver assumption flag; an unknown name is rejected (no silent trust).
-    for (name, _just) in parse_assumes(code) {
-        match assume_flag(&name) {
-            Some(flag) => {
-                cmd.arg(flag);
-            }
-            None => {
-                return Err(format!(
-                    "    unknown @assume `{name}` (known: mmio, field_invariants, valid_returns, loop_ptrs, struct_tail)"
-                ));
-            }
-        }
-    }
-    let out = cmd.output().map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
-    // verify exit codes: 0 PASS · 1 FAIL · 2 UNKNOWN · 3 tool error.
-    if out.status.code() == Some(0) {
-        return Ok(());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let report: String = text
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            t.starts_with("FAIL") || t.starts_with("UNKNOWN") || t.contains("counterexample") || t.contains("residual") || t.contains("suggest")
-        })
-        .take(12)
-        .map(|l| format!("    {}", l.trim()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Err(if report.is_empty() { text.lines().take(8).collect::<Vec<_>>().join("\n") } else { report })
 }
 
 /// Python include path + lib name via `python3`/sysconfig (for `native "python"`).
@@ -396,10 +353,9 @@ fn build_or_run(args: &[String]) {
     let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
     // Memory-safety verification of `native "c"`/`native "asm"` blocks is ON BY
-    // DEFAULT (the sound alternative to a blind `unsafe`): each block is proven safe
-    // by CSolver or it is a compile error. `--noverify` turns it off; `--verify-c
-    // <solver-bin>` overrides the auto-discovered `solver` binary path.
-    let mut verify_override: Option<String> = None;
+    // DEFAULT (the sound alternative to a blind `unsafe`): each block is proven safe by
+    // the vendored CSolver verifier (linked in — no external binary) or it is a compile
+    // error. `--noverify` turns it off.
     let mut noverify = false;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
@@ -412,13 +368,11 @@ fn build_or_run(args: &[String]) {
                 }
             },
             "--noverify" => noverify = true,
-            "--verify-c" => match it.next() {
-                Some(p) => verify_override = Some(p.clone()),
-                None => {
-                    eprintln!("--verify-c needs the path to the `solver` binary");
-                    exit(2);
-                }
-            },
+            // Obsolete: the verifier is now linked in (vendored). Accept + ignore the
+            // old `--verify-c <path>` form so existing invocations keep working.
+            "--verify-c" => {
+                let _ = it.next();
+            }
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
             "-O0" => opt0 = true,
@@ -679,26 +633,12 @@ fn build_or_run(args: &[String]) {
             exit(1);
         }
         // Verification gate (ON BY DEFAULT): a `native "c"`/`native "asm"` block is
-        // accepted only when the CSolver memory-safety verifier PROVES it safe — the
-        // sound replacement for a blind `unsafe`. A block that cannot be proven safe
-        // is a compile error, not a runtime hazard. `--noverify` opts out. Raw-pointer
-        // parameters are trusted as sized-and-valid (`--assume-valid-params`): the
-        // contract Vire's typed caller supplies (a Vire array is a proven (ptr, len));
-        // every other obligation (bounds, arithmetic, UB) must be discharged.
+        // accepted only when the vendored CSolver memory-safety verifier PROVES it safe
+        // (called as a library — structured verdicts, no subprocess) — the sound
+        // replacement for a blind `unsafe`. A block that cannot be proven safe is a
+        // compile error, not a runtime hazard. `--noverify` opts out.
         if !noverify && (ext == "c" || ext == "s") {
-            let solver = match resolve_solver(verify_override.as_deref()) {
-                Some(s) => s,
-                None => {
-                    eprintln!(
-                        "error: memory-safety verification of `native \"{abi}\"` is on by default \
-                         but the CSolver `solver` binary was not found.\n       Install it (set \
-                         $CSOLVER, put `solver` on PATH, or pass `--verify-c <path>`), or opt out \
-                         with `--noverify`."
-                    );
-                    exit(1);
-                }
-            };
-            match verify_native_block(&p, code, ext, &build_dir, i, &solver) {
+            match verify_native_block(&p, code, ext, &build_dir, i) {
                 Ok(()) => eprintln!("verify: native \"{abi}\" block {i}: PASS (proven memory-safe)"),
                 Err(report) => {
                     eprintln!(

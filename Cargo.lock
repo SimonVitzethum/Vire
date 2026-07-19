@@ -187,6 +187,12 @@ dependencies = [
 name = "vire"
 version = "0.1.0"
 dependencies = [
+ "csolver-asm",
+ "csolver-core",
+ "csolver-ir",
+ "csolver-llvm",
+ "csolver-report",
+ "csolver-verifier",
  "fastllvm-backend",
  "fastllvm-ir",
  "fastllvm-solver",
