@@ -18,22 +18,34 @@ native "c" """ … """   ──clang──▶  LLVM-IR   ──CSolver.verify─
                                                        UNKNOWN: residual obligations
 ```
 
-## Status: working prototype
+## Status: working, ON BY DEFAULT
 
-Implemented (opt-in, `--verify-c <solver-bin>`): every `native "c"` block is compiled
-to LLVM (`clang -O0 -emit-llvm -g`) and run through `solver verify`. The block is
-accepted only on a **proven-safe** verdict (exit 0 = PASS).
+Implemented and **default-on**: every `native "c"` and `native "asm"` block is verified
+by CSolver and accepted only on a **proven-safe** verdict (exit 0 = PASS). `--noverify`
+opts out; `--verify-c <path>` overrides the auto-discovered `solver` (`$CSOLVER` → PATH →
+sibling build). C is compiled to LLVM (`clang -O0 -emit-llvm -g`); assembly is verified
+directly (CSolver's native input). Programs with no native block never invoke the solver
+(zero overhead).
 
 ```
-$ vire build --verify-c solver safe.vr   # native "c": bounded a[0..3] on int[4]
+$ vire build safe.vr        # native "c": bounded a[0..3] on int[4]  — no flag needed
 verify: native "c" block 0: PASS (proven memory-safe)     → binary produced
 
-$ vire build --verify-c solver oob.vr    # native "c": a[i]=7 on int[4], i unbounded
+$ vire build oob.vr         # native "c": a[i]=7 on int[4], i unbounded
 error: native "c" block 0 is not provably memory-safe (rejected instead of trusted
        like `unsafe`):
-    FAIL PO5 [in_bounds] @ llvm:oob#7
-    UNKNOWN PO1 [valid_pointer_arith] @ llvm:oob#5     → NO binary
+    FAIL PO5 [in_bounds] @ llvm:oob#7                     → NO binary  (unless --noverify)
+
+$ vire build asm.vr         # native "asm": register-only add
+verify: native "asm" block 0: PASS (proven memory-safe)   → binary produced
 ```
+
+**Auto-contract synthesis is live** (design part 1, below): the block's C signatures are
+parsed and every `(T* ptr, intN len)` pair emits an `elements` contract, giving *proven*
+buffer bounds. Measured on `long vsum(long* a, long n){ …a[i]… }`:
+`--assume-valid-params` alone → **UNKNOWN** (cannot relate `n` to `a`); with the
+auto-synthesized `elements 1 8` → **PASS**. That is the "Vire discharges the contract"
+advantage, working.
 
 This is the core mechanism: unsafe C is refused; safe C is admitted with a proof.
 
@@ -170,11 +182,15 @@ must write the assumption down, and it is logged.
 
 ## Roadmap
 
-1. **[done] prototype gate** — `native "c"` verified via CSolver, opt-in `--verify-c`.
-2. First-class `c { … }` / `asm { … }` **expression blocks** with typed in/out bindings
-   (not just top-level `native`).
-3. **Auto-contract synthesis** — emit the per-block `.pre` from the call-site Vire types
-   (replaces the blanket `--assume-valid-params`).
-4. **`@assume` surface** + `vire audit` (list every assumption + justification).
-5. **CSolver as a crate dependency** (structured verdicts; no subprocess).
-6. Verification **cache** (content-addressed per block).
+1. **[done] verification gate** — `native "c"` + `native "asm"` verified via CSolver.
+2. **[done] on by default** — `--noverify` opts out; solver auto-discovered.
+3. **[done, from signatures] auto-contract synthesis** — `(T* ptr, intN len)` pairs emit
+   `elements` contracts (proven bounds, not blanket trust). *Next:* synthesize from the
+   Vire **call-site types** directly (first-class blocks) rather than parsing them back
+   out of the C signature.
+4. First-class `c { … }` / `asm { … }` **expression blocks** with typed in/out bindings
+   (not just top-level `native`) — the parser feature that lets #3 read the contract off
+   the Vire types instead of the C text.
+5. **`@assume` surface** + `vire audit` (list every assumption + justification).
+6. **CSolver as a crate dependency** (structured verdicts; no subprocess).
+7. Verification **cache** (content-addressed per block).
