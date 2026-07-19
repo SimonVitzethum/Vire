@@ -196,10 +196,14 @@ impl Desugar<'_> {
                     ext_params.push(Param { name: nm.clone(), ty: Some(ty("Float")), default: None });
                     call_args.push(Expr::Ident(nm, span));
                 }
-                "array" => {
+                "array" | "farray" => {
+                    // Int array → long*, Float array → double* (both 8-byte elements, so
+                    // the `elements 1 8` contract is identical). @arraydata is
+                    // element-type-agnostic (raw data pointer past the header).
+                    let cty = if vty == "farray" { "double" } else { "long" };
                     let len = format!("{nm}_len");
-                    c_params.push(format!("long* {nm}, long {len}"));
-                    ext_params.push(Param { name: nm.clone(), ty: Some(ty("array")), default: None });
+                    c_params.push(format!("{cty}* {nm}, long {len}"));
+                    ext_params.push(Param { name: nm.clone(), ty: Some(ty(&vty)), default: None });
                     ext_params.push(Param { name: len, ty: Some(ty("Int")), default: None });
                     call_args.push(intr("@arraydata", &nm));
                     call_args.push(intr("@arraylen", &nm));
