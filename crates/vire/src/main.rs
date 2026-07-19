@@ -28,6 +28,10 @@ fn main() {
         bindgen(&args[1..]);
         return;
     }
+    if args[0] == "audit" {
+        audit(&args[1..]);
+        return;
+    }
     if args.len() < 2 {
         eprintln!("Usage: vire (parse|lex) FILE.vr");
         exit(2);
@@ -103,6 +107,40 @@ fn resolve_solver(override_path: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// Map a Vire `@assume:` name to the CSolver assumption flag it authorizes. These are
+/// the irreducible hardware/framework invariants no software proof can discharge; each
+/// is unsound in general and is why it must be written down and audited.
+fn assume_flag(name: &str) -> Option<&'static str> {
+    match name {
+        "mmio" => Some("--assume-valid-mmio"),
+        "field_invariants" | "field" => Some("--assume-field-invariants"),
+        "valid_returns" | "returns" => Some("--assume-valid-returns"),
+        "loop_ptrs" | "loop" => Some("--assume-valid-loop-ptrs"),
+        "struct_tail" => Some("--assume-struct-tail"),
+        _ => None,
+    }
+}
+
+/// Parse `@assume: <name> [justification]` directives out of an inline block's code
+/// (they are ordinary C/asm comments, copied verbatim into the generated block).
+/// Returns (name, justification) pairs in source order.
+fn parse_assumes(code: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in code.lines() {
+        if let Some(rest) = line.split("@assume:").nth(1) {
+            // strip a trailing `*/` if it was a block comment.
+            let rest = rest.trim().trim_end_matches("*/").trim();
+            let mut it = rest.splitn(2, char::is_whitespace);
+            let name = it.next().unwrap_or("").trim().to_string();
+            let just = it.next().unwrap_or("").trim().trim_matches('"').to_string();
+            if !name.is_empty() {
+                out.push((name, just));
+            }
+        }
+    }
+    out
 }
 
 /// Auto-synthesize a CSolver `--pre` contract from the C block's function signatures:
@@ -200,6 +238,20 @@ fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir:
     if let Some(pp) = &pre_path {
         cmd.arg("--pre").arg(pp);
     }
+    // `@assume:` directives — the named, auditable hardware invariants. Each authorizes
+    // exactly one CSolver assumption flag; an unknown name is rejected (no silent trust).
+    for (name, _just) in parse_assumes(code) {
+        match assume_flag(&name) {
+            Some(flag) => {
+                cmd.arg(flag);
+            }
+            None => {
+                return Err(format!(
+                    "    unknown @assume `{name}` (known: mmio, field_invariants, valid_returns, loop_ptrs, struct_tail)"
+                ));
+            }
+        }
+    }
     let out = cmd.output().map_err(|e| format!("solver not runnable ({solver}): {e}"))?;
     // verify exit codes: 0 PASS · 1 FAIL · 2 UNKNOWN · 3 tool error.
     if out.status.code() == Some(0) {
@@ -256,6 +308,56 @@ fn load_syntax(src_path: &str) -> vire::Syntax {
             }
             exit(1);
         }
+    }
+}
+
+/// `vire audit FILE.vr`: list every `@assume` in the program's inline C/asm blocks —
+/// the complete, named trust boundary. Everything NOT listed here is machine-proven;
+/// each entry is a hardware/framework invariant the proof rests on but cannot discharge.
+fn audit(args: &[String]) {
+    let Some(path) = args.first() else {
+        eprintln!("Usage: vire audit FILE.vr");
+        exit(2);
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            exit(1);
+        }
+    };
+    let (mut module, _diags) = vire::parse(&src);
+    let _ = vire::desugar_cblocks(&mut module);
+    let mut total_blocks = 0usize;
+    let mut total_assumes = 0usize;
+    println!("Trust audit — {path}");
+    println!("Every inline block below is memory-verified; the @assume lines are the ONLY");
+    println!("facts trusted without proof.\n");
+    for it in &module.items {
+        if let vire::ast::Item::Native { abi, code, .. } = it {
+            let a = abi.to_ascii_lowercase();
+            if a != "c" && a != "asm" && a != "s" && a != "assembly" {
+                continue;
+            }
+            total_blocks += 1;
+            let assumes = parse_assumes(code);
+            let label = code.lines().find(|l| l.contains("__cblock")).map(|l| l.trim()).unwrap_or("<inline block>");
+            if assumes.is_empty() {
+                println!("  ✓ {label}\n      fully proven — no assumptions");
+            } else {
+                println!("  ⚠ {label}");
+                for (name, just) in &assumes {
+                    total_assumes += 1;
+                    let flag = assume_flag(name).unwrap_or("<UNKNOWN>");
+                    let why = if just.is_empty() { "(no justification given)" } else { just.as_str() };
+                    println!("      @assume {name} [{flag}]  —  {why}");
+                }
+            }
+        }
+    }
+    println!("\n{total_blocks} inline block(s), {total_assumes} assumption(s) at the trust boundary.");
+    if total_assumes == 0 && total_blocks > 0 {
+        println!("No unproven assumptions — every inline block is fully machine-verified.");
     }
 }
 
