@@ -114,10 +114,74 @@ impl<'a> Lexer<'a> {
                 out.push(Token { tok: Tok::Eof, span: Span(start, start) });
                 break;
             }
+            if self.try_inline(&mut out) {
+                continue;
+            }
             let tok = self.next_token();
             out.push(Token { tok, span: Span(start, self.pos) });
         }
         (out, self.diags)
+    }
+
+    /// Sugar for first-class inline blocks: `inline:c(cap1, cap2) { …C… }` and
+    /// `inline:asm(cap) { …asm… }` lex into the same token stream as the intrinsic
+    /// form `@c(""" …C… """, cap1, cap2)` — the body is captured RAW (the Vire lexer
+    /// never tokenizes the foreign code), so `->`, `%`, `#include`, `{}` all pass
+    /// through untouched. Parser and the @c/@asm desugar are unchanged.
+    fn try_inline(&mut self, out: &mut Vec<Token>) -> bool {
+        let lang = if self.src[self.pos..].starts_with(b"inline:c(") {
+            "c"
+        } else if self.src[self.pos..].starts_with(b"inline:asm(") {
+            "asm"
+        } else {
+            return false;
+        };
+        let start = self.pos;
+        self.pos += "inline:".len() + lang.len() + 1; // past `inline:LANG(`
+        // Capture list: raw text up to the matching ')'.
+        let cap_start = self.pos;
+        while self.pos < self.src.len() && self.src[self.pos] != b')' {
+            self.pos += 1;
+        }
+        let caps_raw = String::from_utf8_lossy(&self.src[cap_start..self.pos]).into_owned();
+        self.pos += 1; // ')'
+        while self.pos < self.src.len() && (self.src[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+        if self.src.get(self.pos) != Some(&b'{') {
+            self.diags.push(Diag::error("inline:c/asm: expected `{` before the code body", Span(start, self.pos)));
+            return true;
+        }
+        self.pos += 1; // '{'
+        let body_start = self.pos;
+        let mut depth = 1;
+        while self.pos < self.src.len() {
+            match self.src[self.pos] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        let body = String::from_utf8_lossy(&self.src[body_start..self.pos]).into_owned();
+        self.pos += 1; // closing '}'
+        let sp = Span(start, self.pos);
+        // Emit @LANG("""body""", cap1, cap2, …).
+        out.push(Token { tok: Tok::At, span: sp });
+        out.push(Token { tok: Tok::Ident(lang.into()), span: sp });
+        out.push(Token { tok: Tok::LParen, span: sp });
+        out.push(Token { tok: Tok::Str(body), span: sp });
+        for cap in caps_raw.split(',').map(|c| c.trim()).filter(|c| !c.is_empty()) {
+            out.push(Token { tok: Tok::Comma, span: sp });
+            out.push(Token { tok: Tok::Ident(cap.into()), span: sp });
+        }
+        out.push(Token { tok: Tok::RParen, span: sp });
+        true
     }
 
     /// Skip whitespace/comments; append significant newlines as tokens to
