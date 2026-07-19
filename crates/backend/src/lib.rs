@@ -389,7 +389,9 @@ struct DebugGen {
     dir: String,
     base: usize,
     next: usize,
-    /// Per-function DISubprogram + DILocation definitions, emitted at the end.
+    /// DILocation dedup: (line, subprogram id) → metadata id.
+    locs: std::collections::HashMap<(u32, usize), usize>,
+    /// Metadata definitions (DISubprogram + DILocation), emitted at the end.
     defs: Vec<String>,
 }
 impl DebugGen {
@@ -399,24 +401,33 @@ impl DebugGen {
             None => (false, String::new(), String::new()),
         };
         // base..base+5 reserved: file, cu, flag_dwarf, flag_div, subroutine-type, types.
-        DebugGen { on, file, dir, base, next: base + 6, defs: Vec::new() }
+        DebugGen { on, file, dir, base, next: base + 6, locs: std::collections::HashMap::new(), defs: Vec::new() }
     }
     fn file_id(&self) -> usize { self.base }
     fn cu_id(&self) -> usize { self.base + 1 }
     fn subtype_id(&self) -> usize { self.base + 4 }
-    /// Allocate a DISubprogram + DILocation for a function; return the DILocation
-    /// id to attach to its instructions (and the subprogram id for the define).
-    fn function(&mut self, name: &str, line: u32) -> (usize, usize) {
+    /// Allocate a DISubprogram for a function; return its metadata id.
+    fn subprogram(&mut self, name: &str, line: u32) -> usize {
         let sub = self.next;
-        let loc = self.next + 1;
-        self.next += 2;
+        self.next += 1;
         let l = if line == 0 { 1 } else { line };
         self.defs.push(format!(
             "!{sub} = distinct !DISubprogram(name: \"{}\", scope: !{f}, file: !{f}, line: {l}, type: !{st}, scopeLine: {l}, spFlags: DISPFlagDefinition, unit: !{cu})",
             escape_md(name), f = self.file_id(), st = self.subtype_id(), cu = self.cu_id(),
         ));
-        self.defs.push(format!("!{loc} = !DILocation(line: {l}, column: 1, scope: !{sub})"));
-        (sub, loc)
+        sub
+    }
+    /// Allocate (deduped) a DILocation for `line` in subprogram `sub`.
+    fn location(&mut self, line: u32, sub: usize) -> usize {
+        let l = if line == 0 { 1 } else { line };
+        if let Some(&id) = self.locs.get(&(l, sub)) {
+            return id;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.locs.insert((l, sub), id);
+        self.defs.push(format!("!{id} = !DILocation(line: {l}, column: 1, scope: !{sub})"));
+        id
     }
     fn emit_tail(&self, w: &mut String) {
         if !self.on {
@@ -1032,8 +1043,10 @@ struct FnEmitter<'a> {
     sna: u32,
     /// This function allocates a region array → bracket it with region_enter/leave.
     region: bool,
-    /// DILocation metadata id to attach to instructions (debug info), if enabled.
-    di_loc: Option<usize>,
+    /// Debug info (if enabled): source line → DILocation id, and the current
+    /// DILocation to attach to instructions (updated by DebugLine markers).
+    line_locs: std::collections::HashMap<u32, usize>,
+    cur_loc: Option<usize>,
     /// Borrowed ref-parameter slots (never reassigned): RC elision — no
     /// entry retain, no cleanup release. The caller holds the reference for
     /// the call's duration (arguments are borrowed); copies into other locals
@@ -1486,9 +1499,9 @@ impl<'a> FnEmitter<'a> {
     }
 
     /// `!dbg` suffix for an instruction (empty unless debug info is on). Attach to
-    /// calls/returns so the backtrace addresses resolve to the .vr function line.
+    /// calls/returns/throws so backtrace addresses resolve to the exact .vr line.
     fn dbg(&self) -> String {
-        match self.di_loc {
+        match self.cur_loc {
             Some(n) => format!(", !dbg !{n}"),
             None => String::new(),
         }
@@ -1530,15 +1543,25 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen) {
         .enumerate()
         .map(|(i, t)| format!("{} %p{i}", llty(*t)))
         .collect();
-    // Debug: a DISubprogram for the function + a DILocation to attach to its
-    // instructions (per-function line — see DebugGen).
-    let di_loc = if dg.on {
-        let (sub, loc) = dg.function(&f.name, f.line);
+    // Debug: a DISubprogram for the function + one DILocation per distinct source
+    // line (from the DebugLine markers), so instructions map to the exact `.vr`
+    // line. `line_locs` maps a source line → its DILocation id.
+    let (line_locs, default_loc) = if dg.on {
+        let sub = dg.subprogram(&f.name, f.line);
         writeln!(w, "define {} @{}({}) !dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
-        Some(loc)
+        let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                if let Statement::DebugLine(n) = st {
+                    map.entry(*n).or_insert_with(|| dg.location(*n, sub));
+                }
+            }
+        }
+        let def = dg.location(f.line, sub);
+        (map, Some(def))
     } else {
         writeln!(w, "define {} @{}({}) {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
-        None
+        (std::collections::HashMap::new(), None)
     };
 
     writeln!(w, "entry:").unwrap();
@@ -1610,7 +1633,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen) {
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, nn, md_inv: ctx.md_inv, di_loc };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, nn, md_inv: ctx.md_inv, line_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -1700,8 +1723,13 @@ fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
 
 fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) {
     match st {
-        // Debug line markers carry no code (per-function DILocation is used).
-        Statement::DebugLine(_) => {}
+        // Debug line marker: switch the current DILocation for the instructions
+        // that follow (no code emitted).
+        Statement::DebugLine(n) => {
+            if let Some(&loc) = e.line_locs.get(n) {
+                e.cur_loc = Some(loc);
+            }
+        }
         Statement::Assign(dest, rv) => {
             let dty = llty(e.f.locals[dest.0 as usize]);
             let val = match rv {

@@ -610,7 +610,11 @@ fn build_or_run(args: &[String]) {
         exit(1);
     }
     // Lowering to crates/ir.
-    let mut program = match vire::lower_module_src(&module, &src) {
+    // Debug builds thread the source so lowering emits per-statement DebugLine
+    // markers; non-debug builds pass no source (no markers → no interference with
+    // the optimizing passes, IR byte-for-byte as before).
+    let lower_src = if debug_flag { src.as_str() } else { "" };
+    let mut program = match vire::lower_module_src(&module, lower_src) {
         Ok(p) => p,
         Err(errs) => {
             for e in &errs {

@@ -567,7 +567,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // higher-order template → only inline (defunctionalization)
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0)) {
+            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
                 Ok((func, mono, insts)) => {
                     prog.functions.push(func);
                     mono_queue.extend(mono);
@@ -580,7 +580,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0)) {
+        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -628,7 +628,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0)) {
+        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
             Ok((func, mono, insts)) => {
                 prog.functions.push(func);
                 mono_queue.extend(mono);
@@ -891,6 +891,10 @@ struct FnLower<'a> {
     errs: Vec<String>,
     /// Target blocks of the enclosing loops: (continue → header, break → exit).
     loops: Vec<(Block, Block)>,
+    /// Source line-start offsets (for debug `DebugLine` markers); empty = no debug.
+    line_starts: &'a [usize],
+    /// Line of the last emitted `DebugLine` marker (0 = none), to avoid repeats.
+    last_dbg_line: u32,
 }
 
 impl<'a> FnLower<'a> {
@@ -1250,14 +1254,32 @@ impl<'a> FnLower<'a> {
             self.lower_stmt(s);
         }
         let v = match &b.tail {
-            Some(t) => self.lower_expr(t),
+            Some(t) => {
+                self.mark_line(expr_span(t));
+                self.lower_expr(t)
+            }
             None => (Operand::ConstI64(0), Ty::Void),
         };
         self.scopes.pop();
         v
     }
 
+    /// Debug: emit a `DebugLine` marker for `span`'s source line (only in debug
+    /// builds, and only when the line changed). The backend turns it into a
+    /// `!DILocation` for the instructions that follow.
+    fn mark_line(&mut self, span: crate::diag::Span) {
+        if self.line_starts.is_empty() {
+            return;
+        }
+        let line = line_of(self.line_starts, span.0);
+        if line != 0 && line != self.last_dbg_line {
+            self.last_dbg_line = line;
+            self.emit(Statement::DebugLine(line));
+        }
+    }
+
     fn lower_stmt(&mut self, s: &Stmt) {
+        self.mark_line(stmt_span(s));
         match s {
             Stmt::Let { mutable, name, value, .. } => {
                 // `mut f = x -> …`: remember lambda (the call is inline-expanded).
@@ -2913,6 +2935,7 @@ fn lower_fn(
     recv_class: Option<&str>,
     sym: Option<&str>,
     line: u32,
+    line_starts: &[usize],
 ) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>), Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = match sym {
@@ -2947,6 +2970,8 @@ fn lower_fn(
         str_idx,
         errs: Vec::new(),
         loops: Vec::new(),
+        line_starts,
+        last_dbg_line: 0,
     };
     // Block 0
     fl.new_block();
@@ -2980,6 +3005,7 @@ fn lower_fn(
             fl.lower_stmt(s);
         }
         let term = if let Some(t) = &body.tail {
+            fl.mark_line(expr_span(t));
             let (op, _) = fl.lower_expr(t);
             if ret == Ty::Void { Terminator::Return(None) } else { Terminator::Return(Some(op)) }
         } else if ret == Ty::Void {
@@ -3198,6 +3224,29 @@ fn map_op(o: BinOp) -> IB {
 }
 
 /// For comparisons/range with mixed const widths: use i32 constants as i64.
+/// Best-effort source span of an expression (for debug line markers).
+fn expr_span(e: &Expr) -> crate::diag::Span {
+    use Expr::*;
+    match e {
+        Int(_, s) | Float(_, s) | Str(_, s) | Char(_, s) | Bool(_, s) | Ident(_, s) | SelfExpr(s) => *s,
+        Unary { span, .. } | Binary { span, .. } | Call { span, .. } | TurboCall { span, .. }
+        | Field { span, .. } | Index { span, .. } | If { span, .. } | Match { span, .. }
+        | Cast { span, .. } | Try { span, .. } | Range { span, .. } | Lambda { span, .. }
+        | List(_, span) | MapLit(_, span) | Comptime { span, .. } | Capsule { span, .. }
+        | Spawn { span, .. } => *span,
+        _ => crate::diag::Span(0, 0),
+    }
+}
+
+/// Best-effort source span of a statement (for debug line markers).
+fn stmt_span(s: &Stmt) -> crate::diag::Span {
+    match s {
+        Stmt::Let { span, .. } | Stmt::Assign { span, .. } | Stmt::While { span, .. } | Stmt::For { span, .. } => *span,
+        Stmt::Return(_, span) | Stmt::Break(span) | Stmt::Continue(span) => *span,
+        Stmt::Expr(e) => expr_span(e),
+    }
+}
+
 fn to_i64(op: Operand) -> Operand {
     match op {
         Operand::ConstI32(v) => Operand::ConstI64(v as i64),

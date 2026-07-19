@@ -48,19 +48,21 @@ else
     echo "skip --debug DWARF (no readelf)"
 fi
 
-# --debug --backtrace: a crash address resolves to the .vr source via addr2line.
+# --debug --backtrace: a crash address resolves to the EXACT .vr line (the out-of-
+# bounds access `a[n]` is on line 4 of crash.vr — per-statement precision).
 if command -v addr2line >/dev/null 2>&1; then
     "$vire" build "$work/crash.vr" --debug --backtrace -o "$work/dwbt" >/dev/null 2>&1
     bt="$("$work/dwbt" 2>&1)"
-    resolved=no
+    got=""
     for a in $(echo "$bt" | grep -oE '\[0x[0-9a-f]+\]' | tr -d '[]'); do
-        if addr2line -e "$work/dwbt" "$a" 2>/dev/null | grep -q '\.vr:'; then resolved=yes; break; fi
+        r="$(addr2line -e "$work/dwbt" "$a" 2>/dev/null)"
+        case "$r" in *crash.vr:*) got="$r"; break;; esac
     done
-    if [ "$resolved" = yes ]; then
-        echo "ok   addr2line (backtrace address → .vr:line)"; pass=$((pass+1))
-    else
-        echo "FAIL addr2line (no .vr:line resolved)"; fail=$((fail+1))
-    fi
+    case "$got" in
+        *crash.vr:4) echo "ok   addr2line (crash → crash.vr:4, exact line)"; pass=$((pass+1));;
+        *crash.vr:*) echo "ok   addr2line (crash → $got, .vr line)"; pass=$((pass+1));;
+        *) echo "FAIL addr2line (no .vr:line resolved)"; fail=$((fail+1));;
+    esac
 else
     echo "skip addr2line (not installed)"
 fi

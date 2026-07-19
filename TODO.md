@@ -171,9 +171,12 @@ Attach: LLVM debug metadata (backend extension), panic model.
   `-O0 -no-pie` so gdb/lldb/addr2line resolve backtrace addresses to `.vr:line`
   (`--debug --backtrace` → `addr2line` → `crash.vr:6`). Source lines threaded
   front-end→IR (`Function.line`). tests/vire_debug.sh.
-- [ ] Per-STATEMENT `DILocation` (the exact crash line, not the function's decl
-  line) via the `DebugLine` markers already in the IR + `inlinedAt` for inlined
-  frames — today it is function-granular.
+- [x] **Per-statement `DILocation`** (the exact crash line): lowering emits
+  `DebugLine` markers per statement/tail (debug builds only; they survive the
+  optimizing passes), the backend maps each to a `!DILocation`. A bounds crash now
+  resolves to the precise access line (`crash.vr:4`), not the function's line.
+- [ ] `inlinedAt` for frames Vire's own inliner collapses (the line is the inlined
+  callee's, without the caller-chain context); freestanding compact symbol table.
 - [ ] freestanding: compact symbol table instead of libc `backtrace`.
 
 ---
