@@ -109,8 +109,10 @@ Attach: backend `--threads` (atomic RC, pthreads, monitor) — present.
 - [x] **Send check**: a `spawn` worker's parameter must be a scalar (copied) or a
   Sync type (`Atomic`/`Mutex`); sharing a bare mutable record/list is a compile
   error — a data race cannot be written.
-- [ ] `Channel[T]`; `Mutex.lock(closure)` (scoped-guard form); `parallel_map`/
-  `parallel_for` (fork-join).
+- [x] **`Channel`** (`.send`/`.recv`, blocking) — thread-safe FIFO message passing;
+  a Sync type, may cross `spawn`. tests/vire_threads.sh, examples/vire/threads_channel.vr.
+- [ ] `Mutex.lock(closure)` (scoped-guard form); `parallel_map`; typed `Channel[T]`
+  for ref payloads (currently Int values).
 - [ ] (M0.1c) measure real multithread atomic contention.
 
 ### [2] Template programming

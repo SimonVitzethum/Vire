@@ -1504,6 +1504,53 @@ void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
     free(args);
     free(tids);
 }
+/* Channel[Int]: a thread-safe FIFO queue of i64 values (mutex + condvar).
+ * send enqueues + signals; recv blocks until an item is available. The safe
+ * message-passing primitive between spawned workers. */
+typedef struct ChNode {
+    struct ChNode *next;
+    int64_t val;
+} ChNode;
+typedef struct {
+    int64_t refcount; /* immortal header */
+    void *vtable;
+    pthread_mutex_t m;
+    pthread_cond_t cv;
+    ChNode *head, *tail;
+} VChan;
+void *jrt_chan_new(void) {
+    VChan *c = (VChan *)malloc(sizeof(VChan));
+    c->refcount = -1;
+    c->vtable = 0;
+    pthread_mutex_init(&c->m, NULL);
+    pthread_cond_init(&c->cv, NULL);
+    c->head = c->tail = NULL;
+    return c;
+}
+void jrt_chan_send(void *p, int64_t v) {
+    VChan *c = (VChan *)p;
+    ChNode *n = (ChNode *)malloc(sizeof(ChNode));
+    n->next = NULL;
+    n->val = v;
+    pthread_mutex_lock(&c->m);
+    if (c->tail) c->tail->next = n;
+    else c->head = n;
+    c->tail = n;
+    pthread_cond_signal(&c->cv);
+    pthread_mutex_unlock(&c->m);
+}
+int64_t jrt_chan_recv(void *p) {
+    VChan *c = (VChan *)p;
+    pthread_mutex_lock(&c->m);
+    while (!c->head) pthread_cond_wait(&c->cv, &c->m);
+    ChNode *n = c->head;
+    c->head = n->next;
+    if (!c->head) c->tail = NULL;
+    int64_t v = n->val;
+    pthread_mutex_unlock(&c->m);
+    free(n);
+    return v;
+}
 #else
 void *jrt_spawn(int64_t (*fn)(void *), void *arg) {
     /* No threads: run synchronously now, stash the result for jrt_join. */
@@ -1543,6 +1590,43 @@ void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
 void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
     /* No threads: run the iterations sequentially (a valid schedule). */
     for (int64_t i = 0; i < n; i++) fn(i, shared);
+}
+/* No threads: a plain FIFO queue; recv on an empty channel returns 0 (a
+ * single-threaded program sends before it receives). */
+typedef struct ChNode {
+    struct ChNode *next;
+    int64_t val;
+} ChNode;
+typedef struct {
+    int64_t refcount;
+    void *vtable;
+    ChNode *head, *tail;
+} VChan;
+void *jrt_chan_new(void) {
+    VChan *c = (VChan *)malloc(sizeof(VChan));
+    c->refcount = -1;
+    c->vtable = 0;
+    c->head = c->tail = NULL;
+    return c;
+}
+void jrt_chan_send(void *p, int64_t v) {
+    VChan *c = (VChan *)p;
+    ChNode *n = (ChNode *)malloc(sizeof(ChNode));
+    n->next = NULL;
+    n->val = v;
+    if (c->tail) c->tail->next = n;
+    else c->head = n;
+    c->tail = n;
+}
+int64_t jrt_chan_recv(void *p) {
+    VChan *c = (VChan *)p;
+    if (!c->head) return 0;
+    ChNode *n = c->head;
+    c->head = n->next;
+    if (!c->head) c->tail = NULL;
+    int64_t v = n->val;
+    free(n);
+    return v;
 }
 #endif
 

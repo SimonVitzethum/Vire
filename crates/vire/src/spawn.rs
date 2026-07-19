@@ -62,8 +62,8 @@ fn boundary_cty(t: Option<&Type>) -> Result<&'static str, String> {
     match t.map(|t| t.name.as_str()) {
         // Scalars: copied into the thread, no sharing.
         Some("Int") | Some("I64") | Some("U64") | Some("Bool") | Some("I32") | None => Ok("long"),
-        // Sync reference types: shared safely (atomic ops / lock).
-        Some("Atomic") | Some("Mutex") => Ok("void*"),
+        // Sync reference types: shared safely (atomic ops / lock / message queue).
+        Some("Atomic") | Some("Mutex") | Some("Channel") => Ok("void*"),
         // Anything else (a bare record/list/string) would share unsynchronized
         // mutable state across threads → refused (the Send check).
         Some(other) => Err(format!(

@@ -129,6 +129,42 @@ fn work(i: Int, b: Bag) -> Int { b.n }
 fn main() { mut b = Bag(0)  parallel_for(4, b, work)  print(b.n) }
 EOF
 
+# Channel: producer sends values, consumer receives them (blocking recv)
+ok_case channel_producer 150 20 <<'EOF'
+fn producer(c: Channel) -> Int {
+    mut i = 1
+    while i <= 5 { c.send(i * 10)  i = i + 1 }
+    0
+}
+fn main() {
+    mut c = Channel()
+    mut p = spawn producer(c)
+    mut sum = 0
+    mut k = 0
+    while k < 5 { sum = sum + c.recv()  k = k + 1 }
+    join(p)
+    print(sum)
+}
+EOF
+
+# Channel as a result queue: three workers send their partial sums
+ok_case channel_results 2997000 20 <<'EOF'
+fn worker(id: Int, out: Channel) -> Int {
+    mut s = 0
+    mut i = 0
+    while i < 1000 { s = s + id * i  i = i + 1 }
+    out.send(s)
+    0
+}
+fn main() {
+    mut out = Channel()
+    mut a = spawn worker(1, out)  mut b = spawn worker(2, out)  mut c = spawn worker(3, out)
+    mut total = out.recv() + out.recv() + out.recv()
+    join(a)  join(b)  join(c)
+    print(total)
+}
+EOF
+
 # Per-thread region stacks: 8 workers each run an arena-promoted loop (allocations
 # go into a bump region, not the heap). The region is thread-local, so concurrent
 # workers do not share/race on it — the total must be deterministic across runs.

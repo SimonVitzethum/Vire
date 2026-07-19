@@ -1907,6 +1907,27 @@ impl<'a> FnLower<'a> {
                     self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
                     return (Operand::Copy(d), ret);
                 }
+                if sent == "$Channel" || sent == "Channel" {
+                    // `c.send(v)` enqueues; `c.recv()` blocks for the next value.
+                    let a: Vec<Operand> = args.iter().map(|e| { let (o, t) = self.lower_expr(e); if t == Ty::Ref { o } else { to_i64(o) } }).collect();
+                    let (func, ret): (&str, Ty) = match name.as_str() {
+                        "send" => ("jrt_chan_send", Ty::Void),
+                        "recv" => ("jrt_chan_recv", Ty::I64),
+                        _ => {
+                            self.errs.push(format!("Channel has no method `{name}` (send/recv)"));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                    };
+                    let mut all = vec![obj];
+                    all.extend(a);
+                    if ret == Ty::Void {
+                        self.emit(Statement::Call { dest: None, func: func.into(), args: all });
+                        return (Operand::ConstI64(0), Ty::Void);
+                    }
+                    let d = self.new_local(ret);
+                    self.emit(Statement::Call { dest: Some(d), func: func.into(), args: all });
+                    return (Operand::Copy(d), ret);
+                }
                 if sent == "$Mutex" || sent == "Mutex" {
                     // `m.lock()` / `m.unlock()` around a critical section; `m.get()` /
                     // `m.set(v)` read/update the guarded cell.
@@ -2182,6 +2203,13 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(Ty::Ref);
             self.local_class.insert(d.0, "$Mutex".into());
             self.emit(Statement::Call { dest: Some(d), func: "jrt_mutex_new".into(), args: vec![init] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        // `Channel()` → a thread-safe FIFO queue (a `$Channel` ref; immortal).
+        if name == "Channel" {
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "$Channel".into());
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_chan_new".into(), args: vec![] });
             return (Operand::Copy(d), Ty::Ref);
         }
         // `join(h)` → wait for the spawned thread, yield its result.
