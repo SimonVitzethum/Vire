@@ -55,20 +55,22 @@ exit)** are the soundness oracle — the floor every optimization must keep gree
 ## Benchmarks (snapshot)
 
 Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, g++
-16, rustc 1.97, all `-O2 -flto -march=native`):
+16, rustc 1.97, all `-O2 -flto -march=native`; measured 2026-07):
 
 | Benchmark | Vire vs clang++ | Notes |
 |---|---|---|
-| montecarlo | **0.96×** (Vire faster) | compute-bound, Vire wins |
-| nbody / bitmanip | ~1.00× | at parity |
-| **vcall** | **0.42×** (2.4× faster) | solver devirtualization; matches Rust, near g++ |
-| matmul | ~1.0× | gcc/rustc auto-vectorizer leads (LLVM codegen limit) |
-| sort | 1.37× | array bounds checks (data-dependent index) |
-| binsearch | 1.16× | array bounds check + cache-miss-bound |
+| montecarlo | **0.99×** | compute-bound, parity |
+| nbody / bitmanip | **~1.00×** | at parity |
+| **vcall** | **0.41×** (2.4× faster) | solver devirtualization; near-Rust, beats clang `virtual` |
+| matmul (256³ naive) | 1.28× | affine index `C[i*n+j]` bounds check (see #1) |
+| sort (quicksort 2M) | 1.47× | array bounds checks (data-dependent index) |
+| binsearch (10M) | 1.30× | array bounds check + cache-miss-bound |
 
-Vire is at or above Rust level on compute and on virtual dispatch; the remaining
-gaps are array-heavy kernels whose data-dependent bounds checks need a relational
-analysis to elide (see [TODO.md](TODO.md) and [benchmarks/suite/](benchmarks/suite/)).
+Vire is at or above clang/Rust level on compute and **2.4× faster on virtual
+dispatch**; the remaining gaps are array-heavy kernels whose data-dependent bounds
+checks need a relational analysis to elide (see [TODO.md](TODO.md) and
+[benchmarks/suite/](benchmarks/suite/)). On the Java-AOT path, binary-trees is now
+**1.7× C++** (was 3.6×) after region inference — see [benchmarks/](benchmarks/).
 
 ## Documents
 

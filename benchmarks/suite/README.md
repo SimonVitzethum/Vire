@@ -5,25 +5,29 @@
 output equality. C++ = **clang++** (LLVM, like Vire) for a fair codegen
 comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 
-## Results (best-of-5, the same machine)
+## Results (best-of-5, the same machine, measured 2026-07)
 | Benchmark | Vire | Rust | clang++ | Vire/clang |
 |---|---|---|---|---|
-| bitmanip (popcount) | 0.187 | 0.186 | 0.186 | **1.00×** |
-| matmul (256³ naive) | 0.012 | 0.010 | 0.013 | **0.97×** |
-| nbody (2000, 20 steps) | 0.073 | 0.072 | 0.076 | **0.95×** |
-| montecarlo (20M, LCG) | 0.039 | 0.039 | 0.040 | **0.98×** |
-| vcall (dyn dispatch, 100M) | 0.244 | 0.116 | 0.273 | **0.89×** |
-| sort (quicksort 2M) | 0.170 | 0.122 | 0.111 | 1.52× |
-| binsearch (10M lookups) | 0.561 | 0.481 | 0.455 | 1.23× |
+| bitmanip (popcount) | 0.191 | 0.193 | 0.192 | **1.00×** |
+| matmul (256³ naive) | 0.017 | 0.010 | 0.013 | 1.28× |
+| nbody (2000, 20 steps) | 0.075 | 0.076 | 0.074 | **~1.00×** |
+| montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
+| vcall (dyn dispatch, 100M) | 0.120 | 0.117 | 0.281 | **0.41×** |
+| sort (quicksort 2M) | 0.169 | 0.126 | 0.114 | 1.47× |
+| binsearch (10M lookups) | 0.612 | 0.499 | 0.470 | 1.30× |
 
 ## Interpretation
-- **Compute (bitmanip/matmul/nbody/montecarlo): Vire = clang parity, partly faster**
-  (matmul/nbody 0.95–0.97×). Both via LLVM → the same codegen optimum.
-- **vcall = trait objects (dyn dispatch): Vire 0.89× — FASTER than C++ `virtual`.**
-  Vire's vtable dispatch (built this session) is as fast as C++, here even
-  somewhat faster. Rust's `dyn` is faster still (0.116) — Rust devirtualizes
-  the monomorphic call in the benchmark partly.
-- **Array-index-heavy (sort/binsearch): Vire 1.2–1.5× slower.** The reason is
+- **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).
+  Both go through LLVM → the same codegen optimum.
+- **matmul (256³ naive): Vire 1.28×.** The inner access `C[i*n+j]` has an *affine*
+  index whose bounds check is not yet elided (the residual over clang); at 0.017 s
+  the absolute gap is a few ms. The relational/affine bounds analysis (TODO #1) is
+  the lever, same root cause as sort/binsearch below.
+- **vcall = trait objects (dyn dispatch): Vire 0.41× — 2.4× FASTER than clang
+  `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
+  vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
+  vs the previous snapshot as the devirt/vtable path matured.)
+- **Array-index-heavy (sort/binsearch): Vire 1.3–1.5× slower.** The reason is
   **bounds checks** on every array access — the solver (`elide_bounds`) removes
   many, but not the data-dependent ones (quicksort partition, binary-search mid). That
   is the clear, honest optimization point (Rust has the same principle, but elides
@@ -31,23 +35,39 @@ comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 - **DIFFs in the table** are pure float formatting (Vire/C++ `%g` scientific
   vs Rust's full precision) or summation rounding (nbody) — identical values.
 
-## Category coverage (honest)
-Of the ~80 categories on the wishlist, the **compute-, memory-, data-structure-,
-algorithm-, and numerics-bound** ones run — the ones measured here cover
-microbenchmarks (arith/bit/recursion/virtual-calls/closures/generics — see also
-`../vire-lang/`), numerics (matmul/N-body/Monte-Carlo), algorithms (sort/search), and
-memory (arena/RC/heap — see RAM-REDUCTION.md, ESCAPE-ARENA.md).
+## What these benchmarks cover — and what they don't (honest assessment)
 
-**NOT covered (need libraries/features that Vire does not yet have):**
-- **Text processing** (regex, JSON, XML, CSV, YAML, TOML, HTML, Markdown) — needs
-  a string/parser library.
-- **Cryptography** (AES, SHA, BLAKE3, RSA, ECC, Argon2) — needs a crypto lib
-  (or byte arrays + bit ops; `ArrKind::Byte` still missing).
-- **Parallelism** (thread pool, work stealing, channels, lock-free, parallel sort) —
-  Vire has only the Java `--threads` path (pthreads), no high-level concurrency.
-- **I/O** (filesystem, mmap, TCP/UDP/HTTP/WebSocket) — needs an IO/network library.
-- **Complex data structures** (B-trees, AVL/RB, priority queue) — for lack of typed
-  collections (`List[T]`) and array-as-parameter (see below) only limited.
+**Covered here + in `../vire-lang/` + `../` (Java-AOT):** the **compute-, numerics-,
+algorithm-, data-structure-, memory-, and dispatch-bound** axes — arithmetic/bit
+(bitmanip, arith), recursion (fib), virtual dispatch (vcall), numerics (matmul,
+N-body, Monte-Carlo, mandelbrot), sorting/search (sort, binsearch), stack structs
+(struct), and allocation/GC throughput (btree, Trees, `../vire-m0/`). This is the
+core "is the generated code fast?" question — answered: **at/above clang on compute
+and 2.4× faster on dispatch; the residual is data-dependent bounds checks.**
+
+**Deliberately NOT exercised by these microbenchmarks** — and *why*, updated for the
+current language surface:
+
+- **Concurrency throughput** — Vire now HAS high-level, safe-by-construction
+  `spawn`/`join`/`Atomic`/`Mutex`/`Channel`/`parallel_for` (see `../../tests/
+  vire_threads.sh`, `../../examples/vire/threads_*.vr`), but there is **no contention/
+  scaling benchmark** here (thread-pool, work-stealing, parallel sort). Open: measure
+  real multi-thread scaling (M0.1c).
+- **Text processing** — `Str` methods (length/charAt/substring/indexOf/starts·endsWith/
+  trim/lower/upper), `list()/map()/set()`, iterator adapters, and `@derive(Json)` output
+  exist now, so simple string/collection kernels are expressible; still missing for a
+  real text benchmark: **regex, a parser lib, `Str.split`** (needs a typed `list[Str]`),
+  and string **escaping**.
+- **Cryptography** (AES/SHA/BLAKE3/…) — needs a byte-array element kind
+  (`ArrKind::Byte`) + a crypto lib; not present.
+- **I/O / networking** (filesystem, mmap, TCP/UDP/HTTP) — needs an IO/network library;
+  not present. These are **runtime-library** gaps, not codegen gaps.
+- **Large/complex data structures** (B-trees, AVL/RB, priority queues) — limited by the
+  lack of a **typed `List[T]`** and **array-as-a-function-parameter** (below), not by
+  performance.
+
+The gaps are **library + a few front-end features**, not the compiler core: everything
+measured shows the generated code is already at the LLVM optimum.
 
 ## Known Vire limitations that the benchmarks touched on
 - **Array as a function parameter** (`fn f(a: Ref)` + `a[i]`) → "no known array":
