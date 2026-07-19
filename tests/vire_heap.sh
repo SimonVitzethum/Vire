@@ -66,6 +66,28 @@ fn work(n: Int) -> Int {
 fn main() { print(work(10)) }
 EOF
 
+# --- stack-promoted fixed-size array (nested loops): non-escaping const array →
+#     alloca, no heap allocation; must still compute correctly + stay balanced. ---
+case_ stack_array_nested 3200002240000000 <<'EOF'
+fn work(n: Int) -> Int {
+    mut acc = 0
+    for i in 0..n {
+        mut a = array(16)
+        for j in 0..16 { a[j] = i + j }
+        for j in 0..16 { acc = acc + a[j] }
+    }
+    acc
+}
+fn main() { print(work(20000000)) }
+EOF
+
+# --- ESCAPE guard for stack arrays: an array returned from its function MUST stay
+#     on the heap (stack promotion there would be a use-after-return). ---
+case_ stack_array_escape_return 42 <<'EOF'
+fn make(k: Int) -> array { mut a = array(4)  a[0] = k  a }
+fn main() { mut x = make(42)  print(42) }
+EOF
+
 # --- while-loop arena still balanced (regression for the pre-existing path) ---
 case_ while_arena 500000500000 <<'EOF'
 fn work(n: Int) -> Int {

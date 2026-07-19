@@ -21,6 +21,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fastllvm_ir::*;
 
+/// Max element count for a stack-promoted array (bounds per-frame stack use).
+const STACK_ARR_CAP: i64 = 1024;
+/// Synthetic `news` class marker for a stack-eligible array site. Not a real
+/// class, never in `ref_field_classes` (primitive arrays hold no heap refs).
+const STACK_ARR_CLASS: &str = "$stackarr";
+
+/// Compile-time-constant array length, if the operand is a constant.
+fn const_len(op: &Operand) -> Option<i64> {
+    match op {
+        Operand::ConstI32(n) => Some(*n as i64),
+        Operand::ConstI64(n) => Some(*n),
+        _ => None,
+    }
+}
+
 pub fn stack_allocate(program: &mut Program) -> usize {
     // Interprocedural escape summaries: which ref parameters of each function
     // let their caller's object escape. This means an object passed to a call
@@ -158,18 +173,32 @@ fn run_function(
 ) -> usize {
     let cyclic = cyclic_blocks(f);
 
-    // Objects = allocation sites. Position (bi, si) + target local + class.
-    let news: Vec<(usize, usize, Local, String)> = f
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(bi, bb)| {
-            bb.statements.iter().enumerate().filter_map(move |(si, st)| match st {
-                Statement::New { dest, class } => Some((bi, si, *dest, class.clone())),
-                _ => None,
-            })
-        })
-        .collect();
+    // Allocation sites: objects (`New`) and stack-eligible arrays (a primitive
+    // `NewArray` of compile-time-constant, bounded length). Both flow through the
+    // SAME escape machinery; a parallel `arr_meta` distinguishes them at rewrite
+    // time. Only primitive (non-ref) arrays are eligible — a ref array could hold
+    // heap references whose drop must run, which stack promotion would skip.
+    let mut news: Vec<(usize, usize, Local, String)> = Vec::new();
+    let mut arr_meta: Vec<Option<(ArrKind, i64)>> = Vec::new();
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        for (si, st) in bb.statements.iter().enumerate() {
+            match st {
+                Statement::New { dest, class } => {
+                    news.push((bi, si, *dest, class.clone()));
+                    arr_meta.push(None);
+                }
+                Statement::NewArray { dest, kind, len } if !kind.is_ref() => {
+                    if let Some(n) = const_len(len) {
+                        if n > 0 && n <= STACK_ARR_CAP {
+                            news.push((bi, si, *dest, STACK_ARR_CLASS.to_string()));
+                            arr_meta.push(Some((*kind, n)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     if news.is_empty() {
         return 0;
     }
@@ -313,17 +342,24 @@ fn run_function(
         }
     }
 
-    // Stack-allocate non-escaping objects (loop safety is already
+    // Stack-allocate non-escaping objects and arrays (loop safety is already
     // in `escape`, see above).
     let mut count = 0;
     for (idx, (bi, si, _, _)) in news.iter().enumerate() {
         if escape[idx] {
             continue;
         }
-        let Statement::New { dest, class } = f.blocks[*bi].statements[*si].clone() else {
-            unreachable!()
-        };
-        f.blocks[*bi].statements[*si] = Statement::StackNew { dest, class };
+        let st = &mut f.blocks[*bi].statements[*si];
+        match arr_meta[idx] {
+            Some((kind, len)) => {
+                let Statement::NewArray { dest, .. } = *st else { unreachable!() };
+                *st = Statement::StackNewArray { dest, kind, len };
+            }
+            None => {
+                let Statement::New { dest, class } = st.clone() else { unreachable!() };
+                *st = Statement::StackNew { dest, class };
+            }
+        }
         count += 1;
     }
     count
@@ -450,7 +486,7 @@ fn stmt_def_use(st: &Statement) -> (Option<Local>, Vec<Local>) {
             args.iter().for_each(&mut u);
             *dest
         }
-        Statement::New { dest, .. } | Statement::StackNew { dest, .. } => Some(*dest),
+        Statement::New { dest, .. } | Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } => Some(*dest),
         Statement::GetField { dest, obj, .. } => {
             u(obj);
             Some(*dest)

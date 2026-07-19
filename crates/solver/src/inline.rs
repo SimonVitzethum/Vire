@@ -218,7 +218,7 @@ fn remap_statement(st: &mut Statement, off: u32) {
                 remap_operand(a, off);
             }
         }
-        Statement::New { dest, .. } | Statement::StackNew { dest, .. } => remap_local(dest, off),
+        Statement::New { dest, .. } | Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } => remap_local(dest, off),
         Statement::GetField { dest, obj, .. } => {
             remap_local(dest, off);
             remap_operand(obj, off);

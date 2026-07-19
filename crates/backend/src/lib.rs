@@ -953,6 +953,8 @@ struct FnEmitter<'a> {
     label: u32,
     /// Running index of the StackNew slots (%sn<k>), reserved in the entry block.
     sn: u32,
+    /// Running index of the StackNewArray slots (%sna<k>), reserved likewise.
+    sna: u32,
     /// Borrowed ref-parameter slots (never reassigned): RC elision — no
     /// entry retain, no cleanup release. The caller holds the reference for
     /// the call's duration (arguments are borrowed); copies into other locals
@@ -998,6 +1000,8 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
             for st in &bb.statements {
                 let (def, immortal): (Option<u32>, bool) = match st {
                     Statement::StackNew { dest, .. } => (Some(dest.0), true),
+                    // Stack array: immortal (refcount -1), RC-free like StackNew.
+                    Statement::StackNewArray { dest, .. } => (Some(dest.0), true),
                     Statement::Assign(d, Rvalue::Use(op)) => {
                         let ip = match op {
                             Operand::ConstNull | Operand::ConstStr(_) | Operand::ConstClass(_) => true,
@@ -1477,6 +1481,18 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
             }
         }
     }
+    // Reserve StackNewArray storage: a raw byte buffer sized 32-byte header +
+    // len*elem, reused across loop iterations (the slot is fixed).
+    let mut snak = 0u32;
+    for bb in &f.blocks {
+        for st in &bb.statements {
+            if let Statement::StackNewArray { kind, len, .. } = st {
+                let total = 32 + len * kind.size() as i64;
+                writeln!(w, "  %sna{snak} = alloca [{total} x i8]").unwrap();
+                snak += 1;
+            }
+        }
+    }
     writeln!(w, "  br label %bb0").unwrap();
 
     let imm = immortal_only_locals(f);
@@ -1486,7 +1502,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function) {
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, imm, borrow, nn, md_inv: ctx.md_inv };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, imm, borrow, nn, md_inv: ctx.md_inv };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -1777,6 +1793,27 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  store {sn} zeroinitializer, ptr {t}").unwrap();
             writeln!(w, "  store i64 -1, ptr {t}").unwrap();
             store_vtable(w, e, &t, class);
+            store_dest(w, e, *dest, &t, false);
+        }
+        Statement::StackNewArray { dest, kind, len } => {
+            // Pre-reserved entry-block byte buffer (%sna<k>): zero it (array default
+            // values, calloc semantics), then write the JArray header — refcount -1
+            // (immortal → RC-free, never freed), vtable, length, elem_size. Data
+            // lives at offset 32, matching the element-access GEPs.
+            let t = format!("%sna{}", e.sna);
+            e.sna += 1;
+            let total = 32 + len * kind.size() as i64;
+            writeln!(w, "  store [{total} x i8] zeroinitializer, ptr {t}").unwrap();
+            writeln!(w, "  store i64 -1, ptr {t}").unwrap();
+            let vp = e.fresh();
+            writeln!(w, "  {vp} = getelementptr i8, ptr {t}, i64 8").unwrap();
+            writeln!(w, "  store ptr {}, ptr {vp}", array_vtable(*kind)).unwrap();
+            let lp = e.fresh();
+            writeln!(w, "  {lp} = getelementptr i8, ptr {t}, i64 16").unwrap();
+            writeln!(w, "  store i64 {len}, ptr {lp}").unwrap();
+            let ep = e.fresh();
+            writeln!(w, "  {ep} = getelementptr i8, ptr {t}, i64 24").unwrap();
+            writeln!(w, "  store i64 {}, ptr {ep}", kind.size()).unwrap();
             store_dest(w, e, *dest, &t, false);
         }
         Statement::GetField { dest, obj, class, field } => {

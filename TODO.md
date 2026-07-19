@@ -30,18 +30,20 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   loop **phis**, needing a phi-aware greatest-fixpoint + tracking of the non-strict
   `<=` loop guard. No production compiler does this for these patterns (rustc keeps
   the check); payoff caps at Rust parity (~14% on binsearch), not below clang.
-- [~] **Allocator gap.** Region inference closed the RC gap on traversal; the
-  auto-arena (escape→arena) now covers `for`-loops and non-escaping scalar-store
-  loops too, and arrays participate in the arena (all sound, heap-balanced —
-  tests/vire_heap.sh). btree measures **1.08× Rust / 1.38× C++** (the cited
-  malloc-per-node case is already at parity). **Still open — the real array win:**
-  *stack-promote non-escaping fixed-size arrays* (`StackNewArray`→alloca, like
-  objects get `StackNew`). Measured: a `for` loop over `array(16)` is ~20× Rust,
-  because clang *eliminates* the non-escaping alloc entirely (scalar replacement)
-  while Vire still allocates. Needs: array alloc-site escape collection +
-  const-size gate + IR variant + backend sized-alloca. Bounded, high-value.
-- [ ] **pagerank/ring** is the collector case (persistent shared cycle), not an
-  allocator one — the distance there is the cycle collector, orthogonal to arenas.
+- [x] **Allocator gap — closed for the array case.** Region inference closed the
+  RC gap on traversal; the auto-arena (escape→arena) covers `for`-loops and
+  scalar-store loops; and **non-escaping fixed-size primitive arrays now
+  stack-promote** (`StackNewArray`→`alloca`, like objects get `StackNew`) — reuses
+  the object escape analysis, so a returned/stored array correctly stays on the
+  heap (no use-after-return). Measured on the `for … array(16)` loop that was
+  ~20× Rust: now **0.27× Rust** (LLVM eliminates the stack array entirely);
+  nested-loop variant **0.06× Rust** (was 9.9×). btree stays at 1.08× Rust. All
+  sound: Java heap oracle 65/65, benchmark outputs unchanged, tests/vire_heap.sh
+  (incl. the escape-return guard). See escape.rs (`STACK_ARR_CAP`).
+- [ ] Remaining array cases: non-constant / large arrays (still heap — the size
+  must be a compile-time constant ≤ 1024), and ref-element arrays (kept heap to
+  avoid skipping element drops). **pagerank/ring** is the collector case
+  (persistent shared cycle), orthogonal to the allocator.
 - [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
   field array) — closes part of the residual toward ~1.1×.
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and

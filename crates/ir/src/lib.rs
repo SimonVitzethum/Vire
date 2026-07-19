@@ -132,6 +132,11 @@ pub enum Statement {
     InstanceOf { dest: Local, obj: Operand, class: String },
     /// Array allocation of length `len`.
     NewArray { dest: Local, kind: ArrKind, len: Operand },
+    /// Stack array allocation, `len` a compile-time constant: the escape analysis
+    /// proved this (primitive) array never leaves the function, so its storage is
+    /// an entry-block `alloca [len x elem]` with an immortal header — no heap
+    /// allocation, freed with the frame. Same idea as `StackNew` for objects.
+    StackNewArray { dest: Local, kind: ArrKind, len: i64 },
     ArrayLen { dest: Local, arr: Operand },
     /// `dest = arr[index]`; bounds-checked if `checked`.
     ArrayLoad { dest: Local, arr: Operand, index: Operand, kind: ArrKind, checked: bool },
