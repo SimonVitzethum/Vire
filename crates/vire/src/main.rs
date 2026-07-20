@@ -869,6 +869,10 @@ fn build_or_run(args: &[String]) {
     let mut s = fastllvm_solver::run(&mut program);
     let _ = fastllvm_solver::elide_redundant_ref_copies(&mut program);
     let _ = fastllvm_solver::fuse_long_compares(&mut program);
+    // Constant-propagate entry-block scalar constants first: a divisor that was a
+    // `mut n = <const>` local becomes a literal → native srem/magic-multiply
+    // instead of a jrt_lrem call, and constant sizes/bounds help the passes below.
+    let _ = fastllvm_solver::propagate_const_scalars(&mut program);
     let _ = fastllvm_solver::elide_bounds(&mut program);
     let _ = fastllvm_solver::elide_pending_checks(&mut program);
     s.inlined_calls = fastllvm_solver::inline_program(&mut program);

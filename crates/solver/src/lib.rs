@@ -10,6 +10,7 @@
 //! closed world); the receiver keeps its null check.
 
 mod bounds;
+mod constprop;
 mod escape;
 mod inline;
 mod longcmp;
@@ -17,6 +18,7 @@ mod pending;
 mod narrow;
 mod refcopy;
 pub use bounds::elide_bounds;
+pub use constprop::propagate_const_scalars;
 pub use escape::stack_allocate;
 pub use inline::inline_program;
 pub use longcmp::fuse_long_compares;

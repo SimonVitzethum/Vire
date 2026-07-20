@@ -114,6 +114,10 @@ fn main() {
         // reloads of a loop-invariant reference otherwise produce a
         // retain/release pair per iteration that Rust does not have.
         let _rcopies = fastllvm_solver::elide_redundant_ref_copies(&mut program);
+        // Constant-propagate entry-block scalar constants: a `mut n = <const>`
+        // divisor becomes a literal → native srem/magic-multiply, not a jrt_lrem
+        // call; also feeds constant sizes/bounds to the passes below.
+        let _cprop = fastllvm_solver::propagate_const_scalars(&mut program);
         // Fuse long/double comparisons with their 0-test: a `jrt_lcmp` call
         // per loop iteration → native `icmp i64`. Before bounds elision, so
         // its loop-guard detection operates directly on the i64 comparison.
