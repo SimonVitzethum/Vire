@@ -2580,7 +2580,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
         let lenp = e.fresh();
         writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
         let len = e.fresh();
-        writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+        writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
         let idx = e.fresh();
         writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
         let oob = e.fresh();
@@ -2615,7 +2615,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
@@ -2678,7 +2678,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
         let lenp = e.fresh();
         writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
         let len = e.fresh();
-        writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+        writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
         let idx = e.fresh();
         writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
         let oob = e.fresh();
@@ -2711,7 +2711,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}, !invariant.load !{}", e.md_inv).unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
