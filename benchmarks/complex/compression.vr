@@ -1,0 +1,53 @@
+// LZ4-style compressor: greedy hash-table match finding over a 4 MB semi-
+// compressible byte stream (a 1 KB block repeated with periodic noise). For each
+// position: hash 4 bytes, look up the most-recent same-prefix position, verify +
+// extend the match, else emit a literal. Memory-bandwidth + branch heavy.
+// Output: estimated compressed size (literal bytes + 3 per match token).
+fn rd4(d: Array[Int], p: Int) -> Int {
+    d[p] + d[p + 1] * 256 + d[p + 2] * 65536 + d[p + 3] * 16777216
+}
+fn matchlen(d: Array[Int], cand: Int, pos: Int, n: Int) -> Int {
+    mut ml = 0
+    while pos + ml < n {
+        if d[cand + ml] == d[pos + ml] { ml = ml + 1 } else { return ml }
+    }
+    ml
+}
+fn main() {
+    mut n = 4194304
+    mut d = array(n)
+    mut block = array(1024)
+    mut seed = 777
+    mut i = 0
+    while i < 1024 { seed = (seed * 1103515245 + 12345) % 2147483648  block[i] = seed % 256  i = i + 1 }
+    i = 0
+    while i < n {
+        if i % 64 == 0 { seed = (seed * 1103515245 + 12345) % 2147483648  d[i] = seed % 256 } else { d[i] = block[i % 1024] }
+        i = i + 1
+    }
+    mut tsize = 65536
+    mut table = array(tsize)
+    i = 0
+    while i < tsize { table[i] = 0 - 1  i = i + 1 }
+    mut pos = 0
+    mut lits = 0
+    mut matches = 0
+    mut lim = n - 4
+    while pos < lim {
+        mut h = (d[pos] + d[pos + 1] * 251 + d[pos + 2] * 63001 + d[pos + 3] * 15813251) % tsize
+        mut cand = table[h]
+        table[h] = pos
+        if cand >= 0 { if rd4(d, cand) == rd4(d, pos) {
+            mut ml = matchlen(d, cand, pos, n)
+            matches = matches + 1
+            pos = pos + ml
+        } else {
+            lits = lits + 1
+            pos = pos + 1
+        } } else {
+            lits = lits + 1
+            pos = pos + 1
+        }
+    }
+    print(lits + matches * 3)
+}

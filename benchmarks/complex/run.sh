@@ -8,7 +8,7 @@ VIRE=../../target/release/vire
 export LC_ALL=C
 best() { m=999; for r in 1 2 3 4 5; do s=$(date +%s.%N); "$@" >/dev/null 2>&1; e=$(date +%s.%N); d=$(awk "BEGIN{print $e-$s}"); awk "BEGIN{exit !($d<$m)}" && m=$d; done; echo $m; }
 printf "%-13s %10s %10s %10s | %8s %8s  %s\n" Benchmark Vire Rust "C++" V/Rust V/C++ output
-for b in pipeline kmeans hashmap graph fft raytracer pquicksort pmontecarlo pmandel; do
+for b in pipeline kmeans hashmap graph matrix fft raytracer compression compiler json regex pquicksort pmontecarlo pmandel; do
   [ -f $b.vr ] || continue
   "$VIRE" build $b.vr -o /tmp/cx_$b 2>/dev/null
   rustc -O -C target-cpu=native -C llvm-args=-fp-contract=fast $b.rs -o /tmp/cx_${b}_r 2>/dev/null

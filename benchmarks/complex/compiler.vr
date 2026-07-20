@@ -1,0 +1,65 @@
+// Mini-compiler: for 400 seeds, generate a fully-parenthesized arithmetic
+// expression into a char buffer, then LEX + recursive-descent PARSE it into a
+// heap AST (Node tree) and EVALUATE it. Exercises char scanning, deep recursion,
+// per-node heap allocation + traversal, and freeing. Output: checksum of results.
+type Node { kind: Int  val: Int  l: Node  r: Node }
+fn gen(buf: Array[Int], p: Array[Int], depth: Int, s: Array[Int]) {
+    s[0] = (s[0] * 1103515245 + 12345) % 2147483648
+    if depth <= 0 or s[0] % 3 == 0 {
+        mut num = s[0] % 90 + 10
+        buf[p[0]] = num / 10 + 48  p[0] = p[0] + 1
+        buf[p[0]] = num % 10 + 48  p[0] = p[0] + 1
+    } else {
+        buf[p[0]] = 40  p[0] = p[0] + 1
+        gen(buf, p, depth - 1, s)
+        s[0] = (s[0] * 1103515245 + 12345) % 2147483648
+        mut op = 43
+        if s[0] % 3 == 1 { op = 45 }
+        if s[0] % 3 == 2 { op = 42 }
+        buf[p[0]] = op  p[0] = p[0] + 1
+        gen(buf, p, depth - 1, s)
+        buf[p[0]] = 41  p[0] = p[0] + 1
+    }
+}
+fn parse(buf: Array[Int], p: Array[Int]) -> Node {
+    mut c = buf[p[0]]
+    if c == 40 {
+        p[0] = p[0] + 1
+        mut l = parse(buf, p)
+        mut op = buf[p[0]]
+        p[0] = p[0] + 1
+        mut r = parse(buf, p)
+        p[0] = p[0] + 1
+        Node(op, 0, l, r)
+    } else {
+        mut v = 0
+        while buf[p[0]] >= 48 and buf[p[0]] <= 57 { v = v * 10 + (buf[p[0]] - 48)  p[0] = p[0] + 1 }
+        Node(0, v, null, null)
+    }
+}
+fn eval(n: Node) -> Int {
+    if n.kind == 0 { return n.val }
+    mut a = eval(n.l)
+    mut b = eval(n.r)
+    if n.kind == 43 { return (a + b) % 1000000007 }
+    if n.kind == 45 { mut r = (a - b) % 1000000007  if r < 0 { r = r + 1000000007 }  return r }
+    a * b % 1000000007
+}
+fn main() {
+    mut buf = array(2000000)
+    mut p = array(1)
+    mut s = array(1)
+    mut checksum = 0
+    mut it = 0
+    while it < 400 {
+        s[0] = it * 2654435761 + 12345
+        p[0] = 0
+        gen(buf, p, 15, s)
+        p[0] = 0
+        mut ast = parse(buf, p)
+        checksum = (checksum + eval(ast)) % 1000000007
+        if checksum < 0 { checksum = checksum + 1000000007 }
+        it = it + 1
+    }
+    print(checksum)
+}

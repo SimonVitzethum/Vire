@@ -1,0 +1,27 @@
+// Dense float matrix multiply C = A*B, 512x512, cache-friendly ikj order so the
+// inner loop c[ci+j] += aik*b[bk+j] is a unit-stride SAXPY that LLVM VECTORIZES
+// (packed FMA). Integer-valued inputs keep the result an exact integer (no float
+// reproducibility issues). The SIMD-throughput benchmark. Output: exact sum of C.
+fn main() {
+    mut n = 512
+    mut a = farray(n * n)  mut b = farray(n * n)  mut c = farray(n * n)
+    mut i = 0
+    while i < n * n { a[i] = ((i % 7) as Float)  b[i] = ((i % 5) as Float)  i = i + 1 }
+    mut r = 0
+    while r < n {
+        mut k = 0
+        while k < n {
+            mut aik = a[r * n + k]
+            mut ci = r * n
+            mut bk = k * n
+            mut j = 0
+            while j < n { c[ci + j] = c[ci + j] + aik * b[bk + j]  j = j + 1 }
+            k = k + 1
+        }
+        r = r + 1
+    }
+    mut t = 0.0
+    mut jj = 0
+    while jj < n * n { t = t + c[jj]  jj = jj + 1 }
+    print((t as Int))
+}

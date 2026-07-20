@@ -1,0 +1,45 @@
+// Backtracking regex matcher (Kernighan/Pike style: literals, '.', '*'), searched
+// against 300k generated texts over a 4-letter alphabet. The '*' quantifiers force
+// recursive backtracking — branch-heavy, small-string, cache-light. Counts how many
+// texts contain a match for the pattern. Output: the match count.
+fn matchhere(pat: Array[Int], pi: Int, pl: Int, tx: Array[Int], ti: Int, tl: Int) -> Int {
+    if pi >= pl { return 1 }
+    if pi + 1 < pl { if pat[pi + 1] == 42 { return matchstar(pat[pi], pat, pi + 2, pl, tx, ti, tl) } }
+    if ti < tl { if pat[pi] == 46 or pat[pi] == tx[ti] { return matchhere(pat, pi + 1, pl, tx, ti + 1, tl) } }
+    0
+}
+fn matchstar(c: Int, pat: Array[Int], pi: Int, pl: Int, tx: Array[Int], ti: Int, tl: Int) -> Int {
+    mut t = ti
+    while 1 == 1 {
+        if matchhere(pat, pi, pl, tx, t, tl) == 1 { return 1 }
+        if t < tl { if c == 46 or c == tx[t] { t = t + 1 } else { return 0 } } else { return 0 }
+    }
+    0
+}
+fn search(pat: Array[Int], pl: Int, tx: Array[Int], tl: Int) -> Int {
+    mut ti = 0
+    while ti <= tl {
+        if matchhere(pat, 0, pl, tx, ti, tl) == 1 { return 1 }
+        ti = ti + 1
+    }
+    0
+}
+fn main() {
+    // pattern: a.*b.*c.*d.*a.*b  (over alphabet a..d = 97..100; '.'=46 '*'=42)
+    mut pat = array(16)
+    pat[0]=97 pat[1]=46 pat[2]=42 pat[3]=98 pat[4]=46 pat[5]=42 pat[6]=99 pat[7]=46 pat[8]=42 pat[9]=100 pat[10]=46 pat[11]=42 pat[12]=97 pat[13]=46 pat[14]=42 pat[15]=98
+    mut pl = 16
+    mut tl = 40
+    mut tx = array(tl)
+    mut seed = 20240101
+    mut count = 0
+    mut n = 2000000
+    mut i = 0
+    while i < n {
+        mut j = 0
+        while j < tl { seed = (seed * 1103515245 + 12345) % 2147483648  tx[j] = 97 + seed % 4  j = j + 1 }
+        count = count + search(pat, pl, tx, tl)
+        i = i + 1
+    }
+    print(count)
+}
