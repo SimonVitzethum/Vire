@@ -14,8 +14,9 @@ logger, Go-style error handling, debug crash paths) in
    no memory management. What you can do in Python you can do here — only with
    `{ }` blocks instead of meaning-bearing indentation (clear for editors, tools,
    pasting; no indentation traps).
-2. **Statically typed by inference.** No type is written, but every one is known
-   (Hindley-Milner + local bidirectionality). Errors at compile time.
+2. **Statically typed by inference.** No type is written, yet types are resolved at
+   compile time (today a monomorphic scalar-lattice unifier; full Hindley–Milner +
+   traits is roadmap). Errors at compile time.
 3. **Memory is invisible.** No `new`/`free`, no lifetimes, no `&mut`.
    The solver decides stack/heap/RC and proves safety (bounds, null,
    use-after-free). You write logic, not bookkeeping.

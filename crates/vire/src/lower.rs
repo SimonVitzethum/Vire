@@ -692,7 +692,10 @@ fn ty_of(t: Option<&Type>) -> Ty {
 fn class_of(t: Option<&Type>) -> Option<String> {
     let name = t?.name.as_str();
     match name {
-        "Float" | "F64" | "F32" | "Bool" | "Str" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr" => None,
+        // `Ref` = an object reference of unknown class (the inference write-back name):
+        // no class attached, exactly like `Str` — so a method call falls through to the
+        // string-method / unknown-type path, never a bogus class named "Ref".
+        "Float" | "F64" | "F32" | "Bool" | "Str" | "Ref" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr" => None,
         _ => Some(name.to_string()),
     }
 }

@@ -29,9 +29,13 @@ Classically, memory safety comes with one of three costs: a garbage collector
 counting (a small runtime). Vire resolves this **per program site**: a whole-program
 solver **proves** ownership where possible (→ zero runtime, like Rust), and falls
 back to lean RC where necessary. The programmer writes **zero** memory annotations.
-Types are fully **inferred** (Python ergonomics without Python's dynamic cost). This
-is feasible because Vire is **closed-world** (all sources available at compile time)
-and sits on a backend that already delivers exactly these proofs.
+Un-annotated types are **inferred** (Python ergonomics without Python's dynamic cost) —
+today by a best-effort *monomorphic* unifier over a scalar type lattice (Int/Float/Bool/
+ref/Unit); full Hindley–Milner with trait resolution and reference-type checking is
+roadmap, not shipped (see [TODO.md](TODO.md) *Front-end completeness* and
+[language/EVALUATION.md](language/EVALUATION.md) §5). This is feasible because Vire is
+**closed-world** (all sources available at compile time) and sits on a backend that
+already delivers exactly these proofs.
 
 ## Status & architecture
 

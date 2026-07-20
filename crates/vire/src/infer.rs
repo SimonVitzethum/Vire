@@ -490,7 +490,12 @@ fn concrete_name(t: T) -> Option<&'static str> {
         T::I64 => Some("Int"),
         T::F64 => Some("Float"),
         T::I32 => Some("I32"),
-        T::Ref => Some("Str"),
+        // A reference of unknown class (inference collapses every object/Str to `Ref`).
+        // Write back the honest neutral name `Ref` — NOT `Str`, which falsely labelled
+        // every inferred object parameter a string. Both lower identically (`Ty::Ref`,
+        // no class → string methods still dispatch on a genuine string), so this is a
+        // truthfulness fix, but it stops `vire infer`/annotations from lying.
+        T::Ref => Some("Ref"),
         T::Void => Some("Unit"),
         T::Var(_) => None,
     }

@@ -63,10 +63,14 @@ monkey-patching. Exactly that dynamism makes Python slow and requires an
 interpreter/runtime. AOT + performance demands **static types**.
 
 The way out is well known and decades-proven (ML, Haskell, OCaml, F#, Swift,
-newer Rust ergonomics): **full type inference**. The code *looks like*
-Python (no type annotations), but is statically typed — the types are
-inferred (Hindley-Milner + local bidirectionality). You get Python's
-lightness **without** Python's dynamism cost.
+newer Rust ergonomics): **type inference**. The code *looks like* Python (no type
+annotations), but is statically typed. The **target** is full Hindley–Milner with local
+bidirectionality; **what ships today** is a best-effort monomorphic unifier over a scalar
+type lattice (Int/Float/Bool/ref/Unit) that fills in un-annotated parameter/return types
+and flags conflicts — reference types collapse to a single `ref` (class resolution then
+happens in lowering by name), and full HM + trait resolution is the open piece (§5, the
+most demanding part still to build). You get Python's lightness **without** Python's
+dynamism cost.
 
 ```python
 # Python — dynamic, slow, runtime needed
