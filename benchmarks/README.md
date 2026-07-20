@@ -39,7 +39,7 @@ the Vire suites ([../suite/](../suite/), [../vire-lang/](../vire-lang/)).
 | **Mandel** | **0.96×** | 1.02× | parity (2026-07) |
 | **Quick**  | 1.07× | **0.85×** | parity Rust, beats C++ (2026-07) |
 | **Trees**  | 1.73× | 1.80× | region inference (3.2×→1.7×); RC tax residual (2026-07) |
-| **NBody**  | 35.7× | 36.6× | **open** — interproc. static-array length (2026-07) |
+| **NBody**  | **1.46×** | ~1.5× | `Math.sqrt` → hardware `sqrtsd` (was 35.7×); residual = interproc. `nb`/length const (2026-07) |
 
 **Matmul now beats both Rust and C++** (0.76×/0.90×, was 6.6×/9.0×): the affine
 index-bounds rule elides `C[i*n+j]`'s check, and the noreturn check model makes the
@@ -54,19 +54,19 @@ loops cheaply. The inner loop is now 8×-unrolled FMA with no checks — **FastL
 (Java→native) matmul beats both Rust (0.76×) and C++ (0.90×)**, fully memory-safe (a
 real out-of-bounds access still throws).
 
-### NBody (35.7×) — interprocedural/static array length
-The arrays are **static fields**, created in `main`, used in `advance()`.
-Two partial fixes already took effect:
-- **RC-on-stable-statics eliminated** (72×→39×→35.7×): a static field that a
-  function + its callees do not write is constant during their execution →
-  `GetStatic` yields a stable reference held by the static root and
-  needs no retain/release (previously 66 RC ops per `advance`).
-- **Inline-checked array access**: accesses are now visible `load`/`store`
-  (hoistable) instead of opaque `jrt_daload` calls.
-What remains: the **length** of the static arrays is unknown in `advance` (no
-`NewArray` there) → bounds not elidable → the pending checks stay. Needed:
-track static array lengths whole-program (`static T[] f = new T[k]` ⇒ length
-`k`) **plus** the loop bound `nb` as an interprocedural constant.
+### NBody (35.7× → 1.46×) — the real cause was `Math.sqrt`, not bounds
+Measured, not assumed: the disassembly of `advance()` has **zero** bounds branches (the
+checks were already elided) — the earlier "static-array length" diagnosis was wrong. The
+actual hot spot was **`Math.sqrt` lowering to a runtime call `jrt_math_sqrt`, which ran
+60 Newton–Raphson iterations per call** (a freestanding, libm-free fallback). In the
+N²×20M-step inner loop that dominated everything (>30 s wall).
+**Fix:** the backend now emits the LLVM intrinsic `@llvm.sqrt.f64` (a single `sqrtsd`)
+for `Math.sqrt` instead of the call — Java semantics are identical (sqrt of a negative is
+NaN). **35.7× → 1.46× Rust, wall time >30 s → 1.95 s**, output bit-identical. (This also
+speeds up every other FP kernel that called sqrt.) Two earlier partial wins still stand:
+RC-on-stable-statics eliminated (72×→39×) and inline-checked (visible `load`/`store`)
+array access. The residual 1.46× is the last interprocedural step: propagate `nb=5` and
+the static array lengths into `advance` so its 5×5 loops fully unroll and register-allocate.
 
 ### Trees (1.68×, was 3.2×) — mostly closed by region inference
 `Node` references `Node` → the type-reference graph is cyclic → the

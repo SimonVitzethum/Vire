@@ -220,6 +220,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_math_max_d", "double (double, double)"),
     ("jrt_math_min_d", "double (double, double)"),
     ("jrt_math_sqrt", "double (double)"),
+    ("llvm.sqrt.f64", "double (double)"),
     ("jrt_current_time_millis", "i64 ()"),
     ("jrt_nano_time", "i64 ()"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -1961,6 +1962,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             // Copies/constants into the ref local are borrowed → retain the new,
             // release the old (store_dest). Non-ref: a plain store.
             store_dest(w, e, *dest, &val, true);
+        }
+        // Math.sqrt → the hardware sqrt (llvm.sqrt.f64 → a single `sqrtsd`), never a
+        // runtime call. jrt_math_sqrt ran 60 Newton iterations per call, which dominated
+        // FP-heavy N²-style loops (N-body: ~600× slower). Java semantics are identical:
+        // sqrt of a negative is NaN, sqrt(0)=0 — exactly what sqrtsd yields.
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_math_sqrt" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call double @llvm.sqrt.f64(double {a}){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
         }
         Statement::Call { dest, func, args } => {
             let avs = call_args(w, e, args);
