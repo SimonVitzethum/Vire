@@ -189,6 +189,11 @@ fn main() {
     // the hot loops. LTO enables exactly this cross-file inlining.
     if !freestanding {
         cmd.arg("-flto");
+        // Disable the LLVM loop unroller: under -flto its aggressive unrolling
+        // miscompiled some programs (wrong array index → spurious OOB) and is a
+        // net perf loss on this IR. Soundness-safe (only disables an opt). See
+        // the Vire driver + tests/fuzz.sh.
+        cmd.arg("-fno-unroll-loops");
     }
     if !freestanding {
         cmd.arg("-Wl,--gc-sections");

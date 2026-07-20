@@ -1136,6 +1136,14 @@ fn build_or_run(args: &[String]) {
         cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
         // ThinLTO (parallel, low memory) for huge programs; otherwise full LTO.
         cmd.arg(if thin_lto { "-flto=thin" } else { "-flto" });
+        // Disable the LLVM loop unroller. Under `-flto` its aggressive unrolling
+        // miscompiled some Vire programs (a computed array index came out wrong →
+        // spurious ArrayIndexOutOfBoundsException; found by the differential
+        // fuzzer, tests/fuzz.sh). Plain `-O2` never unrolls that way and is
+        // correct. It is also a net perf win on this IR (e.g. nbody ~1.8×
+        // faster) — LLVM over-unrolls our lowering, like it over-vectorizes
+        // divergent loops. Soundness-safe: only turns an optimization off.
+        cmd.arg("-fno-unroll-loops");
         // `-march=native` only without cross-compile (otherwise the host CPU does not
         // match the target triple). Pass the triple through when cross-compiling.
         match &target {
