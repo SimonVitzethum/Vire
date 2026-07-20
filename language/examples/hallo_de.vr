@@ -1,0 +1,7 @@
+//!syntax: german.syntax
+// Deutsche Schlüsselwörter — explizit via Direktive oben (kein stummer Ordner-Load).
+funktion main() {
+    veraenderlich summe = 0
+    fuer i in 0..10 { summe = summe + i }
+    print(summe)
+}

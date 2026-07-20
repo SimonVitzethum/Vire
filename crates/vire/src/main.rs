@@ -354,13 +354,29 @@ fn python_config() -> Option<(String, String)> {
 
 /// Loads a `vire.syntax` file next to the source (if present) → user-
 /// defined keyword spellings. If it is missing, the default syntax applies.
-fn load_syntax(src_path: &str) -> vire::Syntax {
-    let cfg = std::path::Path::new(src_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("vire.syntax");
-    let Ok(text) = std::fs::read_to_string(&cfg) else {
+/// Resolve a custom-syntax config **only when explicitly requested** — never the old
+/// silent folder-wide auto-load (which broke every standard-keyword `.vr` that merely
+/// sat next to a remapping `vire.syntax`). Two opt-ins, in priority order:
+///   1. `--syntax FILE` on the command line (`explicit`), resolved relative to the cwd;
+///   2. an in-file directive on an early comment line: `//!syntax: FILE` (or
+///      `// syntax: FILE`), resolved relative to the source file's directory.
+/// Absent both → default (standard) keywords. A requested-but-unreadable/invalid config
+/// is a hard error (never a silent fallback).
+fn load_syntax(src: &str, src_path: &str, explicit: Option<&str>) -> vire::Syntax {
+    let src_dir = std::path::Path::new(src_path).parent().unwrap_or_else(|| std::path::Path::new("."));
+    let cfg = if let Some(f) = explicit {
+        std::path::PathBuf::from(f)
+    } else if let Some(rel) = syntax_directive(src) {
+        src_dir.join(rel)
+    } else {
         return vire::Syntax::default();
+    };
+    let text = match std::fs::read_to_string(&cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("syntax config {}: {e}", cfg.display());
+            exit(1);
+        }
     };
     match vire::Syntax::parse(&text) {
         Ok(s) => {
@@ -374,6 +390,28 @@ fn load_syntax(src_path: &str) -> vire::Syntax {
             exit(1);
         }
     }
+}
+
+/// Scan the first few comment lines for an opt-in syntax directive
+/// `//!syntax: FILE` / `// syntax: FILE`, returning the FILE. Only comment lines and
+/// blank lines are scanned (the directive must precede real code), so it never triggers
+/// on incidental text.
+fn syntax_directive(src: &str) -> Option<String> {
+    for line in src.lines().take(10) {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("//") {
+            let rest = rest.trim_start_matches('!').trim();
+            if let Some(file) = rest.strip_prefix("syntax:") {
+                return Some(file.trim().trim_matches('"').to_string());
+            }
+            continue; // other comment → keep scanning
+        }
+        break; // first non-comment, non-blank line → stop
+    }
+    None
 }
 
 /// `vire audit FILE.vr`: list every `@assume` in the program's inline C/asm blocks —
@@ -480,6 +518,8 @@ fn build_or_run(args: &[String]) {
     // Header files pulled in by `extern "C" header "…"` — recorded as build dependencies
     // for the `--deps` depfile (so Meson/Ninja rebuild when a header changes).
     let mut header_deps: Vec<String> = Vec::new();
+    // Custom keyword syntax is opt-in only (`--syntax FILE`), never folder-auto-loaded.
+    let mut syntax_file: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -539,6 +579,15 @@ fn build_or_run(args: &[String]) {
                 Some(n) => pkgs.push(n.clone()),
                 None => {
                     eprintln!("--pkg needs a package name (pkg-config)");
+                    exit(2);
+                }
+            },
+            // Explicit custom-keyword syntax config (opt-in; replaces the old silent
+            // folder-wide auto-load). Also settable via an in-file `//!syntax:` directive.
+            "--syntax" => match it.next() {
+                Some(f) => syntax_file = Some(f.clone()),
+                None => {
+                    eprintln!("--syntax needs a config file");
                     exit(2);
                 }
             },
@@ -633,7 +682,7 @@ fn build_or_run(args: &[String]) {
     }
 
     // Front end: lex/parse (with optional user-defined syntax).
-    let syntax = load_syntax(&path);
+    let syntax = load_syntax(&src, &path, syntax_file.as_deref());
     let (mut module, diags) = vire::parse_with_syntax(&src, syntax);
     if !diags.is_empty() {
         for d in &diags {
