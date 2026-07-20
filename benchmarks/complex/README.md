@@ -34,27 +34,35 @@ the result is identical regardless of thread scheduling and the comparison is fa
 `pquicksort` is per-thread-independent rather than a single shared array — a data race
 cannot be written.)
 
-## Results (best-of-5, freshly measured 2026-07, 20-core machine)
+## Results (best-of-5 wall time + peak RSS, freshly measured 2026-07, 20-core machine)
 
-| Benchmark | Vire | Rust | C++ | V/Rust | V/C++ |
-|---|---|---|---|---|---|
-| **hashmap** | 0.030 s | 0.045 s | 0.042 s | **0.67×** | **0.73×** |
-| graph | 0.065 s | 0.040 s | 0.058 s | 1.61× | 1.12× |
-| **matrix** (SIMD) | 0.034 s | 0.035 s | 0.033 s | **0.98×** | 1.01× |
-| **fft** (NTT) | 0.066 s | 0.081 s | 0.078 s | **0.82×** | **0.85×** |
-| raytracer | 0.326 s | 0.170 s | 0.152 s | 1.92× | 2.14× |
-| compression | 0.032 s | 0.027 s | 0.033 s | 1.17× | **0.96×** |
-| compiler | 0.021 s | 0.006 s | 0.017 s | 3.45× | 1.27× |
-| json | 0.023 s | *(0.002 s — folded)* | 0.022 s | *n/a* | **1.02×** |
-| regex | 0.209 s | 0.186 s | 0.178 s | 1.12× | 1.17× |
-| pipeline | 0.020 s | 0.018 s | 0.014 s | 1.13× | 1.44× |
-| **kmeans** | 0.034 s | 0.063 s | 0.027 s | **0.55×** | 1.28× |
-| **pmontecarlo** (4 thr) | 0.187 s | 0.195 s | 0.194 s | **0.96×** | **0.96×** |
-| **pmandel** (4 thr) | 0.201 s | 0.215 s | 0.215 s | **0.93×** | **0.93×** |
-| pquicksort (4 thr) | 0.115 s | 0.093 s | 0.098 s | 1.24× | 1.18× |
+Time is best-of-5; **RAM is peak resident set** (`../peakrss.c`, `ru_maxrss`). `run.sh`
+reproduces both.
+
+| Benchmark | Vire | Rust | C++ | V/Rust | V/C++ | RAM V/R/C |
+|---|---|---|---|---|---|---|
+| **hashmap** | 0.043 s | 0.044 s | 0.042 s | **0.98×** | 1.04× | 17 / 17 / 19 MB |
+| graph | 0.061 s | 0.039 s | 0.053 s | 1.58× | 1.15× | **55 / 30 / 56 MB** |
+| **matrix** (SIMD) | 0.033 s | 0.036 s | 0.035 s | **0.93×** | **0.95×** | 7 / 7 / 9 MB |
+| **fft** (NTT) | 0.047 s | 0.080 s | 0.078 s | **0.58×** | **0.60×** | 9 / 9 / 11 MB |
+| raytracer | 0.326 s | 0.170 s | 0.152 s | 1.92× | 2.14× | **1 / 1 / 3 MB** |
+| compression | 0.033 s | 0.027 s | 0.032 s | 1.23× | 1.03× | 34 / 34 / 35 MB |
+| compiler | 0.021 s | 0.006 s | 0.017 s | 3.27× | 1.26× | **20 / 2 / 18 MB** |
+| json | 0.022 s | *(0.002 — folded)* | 0.022 s | *n/a* | **0.99×** | 32 / 1 / 33 MB |
+| regex | 0.209 s | 0.186 s | 0.178 s | 1.12× | 1.17× | 1 / 1 / 3 MB |
+| pipeline | 0.021 s | 0.018 s | 0.018 s | 1.15× | 1.15× | 3 / 3 / 5 MB |
+| **kmeans** | 0.034 s | 0.044 s | 0.027 s | **0.77×** | 1.26× | 2 / 2 / 4 MB |
+| **pmontecarlo** (4 thr) | 0.174 s | 0.194 s | 0.194 s | **0.90×** | **0.90×** | 1 / 1 / 3 MB |
+| **pmandel** (4 thr) | 0.233 s | 0.215 s | 0.216 s | 1.08× | 1.08× | 2 / 1 / 3 MB |
+| pquicksort (4 thr) | 0.117 s | 0.094 s | 0.096 s | 1.24× | 1.21× | 31 / 31 / 33 MB |
 
 Fast benchmarks (≈0.02–0.07 s) carry ~±15% run-to-run variance; the parallel and
-≥0.1 s ones are stable.
+≥0.1 s ones are stable. **On memory Vire is at or below both** almost everywhere —
+consistently ~2 MB under C++ (no `libstdc++`/iostream baseline) and level with Rust — with
+two telling exceptions: **graph** (55 vs Rust's 30 MB) and **compiler** (20 vs 2 MB), the
+same two spots where the allocation/IR analysis below applies (Rust's Dijkstra keeps the
+graph tighter; Rust eliminates the short-lived AST allocation entirely). `json` shows Rust
+at 1 MB because it constant-folds the program away.
 
 ## Honest reading
 
