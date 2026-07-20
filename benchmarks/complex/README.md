@@ -47,7 +47,7 @@ reproduces both.
 | **fft** (NTT) | 0.047 s | 0.080 s | 0.078 s | **0.58×** | **0.60×** | 9 / 9 / 11 MB |
 | raytracer | 0.326 s | 0.170 s | 0.152 s | 1.92× | 2.14× | **1 / 1 / 3 MB** |
 | compression | 0.033 s | 0.027 s | 0.032 s | 1.23× | 1.03× | 34 / 34 / 35 MB |
-| compiler | 0.021 s | 0.006 s | 0.017 s | 3.27× | 1.26× | **20 / 2 / 18 MB** |
+| compiler | 0.018 s | *(0.006 — folded)* | 0.017 s | *n/a* | **1.08×** | 17 / 2 / 18 MB |
 | json | 0.022 s | *(0.002 — folded)* | 0.022 s | *n/a* | **0.99×** | 32 / 1 / 33 MB |
 | regex | 0.209 s | 0.186 s | 0.178 s | 1.12× | 1.17× | 1 / 1 / 3 MB |
 | pipeline | 0.021 s | 0.018 s | 0.018 s | 1.15× | 1.15× | 3 / 3 / 5 MB |
@@ -59,10 +59,11 @@ reproduces both.
 Fast benchmarks (≈0.02–0.07 s) carry ~±15% run-to-run variance; the parallel and
 ≥0.1 s ones are stable. **On memory Vire is at or below both** almost everywhere —
 consistently ~2 MB under C++ (no `libstdc++`/iostream baseline) and level with Rust — with
-two telling exceptions: **graph** (55 vs Rust's 30 MB) and **compiler** (20 vs 2 MB), the
-same two spots where the allocation/IR analysis below applies (Rust's Dijkstra keeps the
-graph tighter; Rust eliminates the short-lived AST allocation entirely). `json` shows Rust
-at 1 MB because it constant-folds the program away.
+one telling exception: **graph** (55 vs Rust's 30 MB — Rust's Dijkstra keeps the graph
+tighter). **compiler** (17 vs 2 MB) is the same shape as `json`: Rust constant-folds the
+input-free program away (it drops to 1–2 MB and ~0.006 s), so its RAM/time are an artifact,
+not an allocation win — `json` likewise shows Rust at 1 MB. Vire's compiler AST is now
+bulk-allocated in a per-iteration arena (see below), freed en bloc with no per-node RC.
 
 ## Honest reading
 
@@ -78,10 +79,16 @@ map/hash work at or below Rust/C++.
 - **raytracer (1.92× / 2.14×):** the hot loop indexes small `farray` sphere tables under
   a data-dependent branch; the residual is scalar FP scheduling + not-fully-elided checks
   in a divide-heavy inner loop. The most FP-bound whole program in the set.
-- **compiler (3.45× Rust):** an **allocation/pointer-chasing** case — Vire RC-manages every
-  heap AST `Node` (retain/release on the recursive build + eval traversal) where Rust's
-  `Box` is a bare move and C++ uses a pool. This is the RC tax on tree-shaped data that the
-  region/shape passes target but do not fully close for a freshly-built-and-walked AST.
+- **compiler (now 1.08× C++ — clang parity):** an **allocation/pointer-chasing** case (a
+  heap AST built by `parse()` and walked by `eval()` each iteration). Previously Vire
+  RC-managed every `Node` (retain/release on build + traversal) at 1.25× C++. An
+  **interprocedural loop-arena** now recognises that the whole AST an iteration builds —
+  across the `parse`/`eval` call boundary — dies with the iteration, so it is bump-allocated
+  in a per-iteration arena and freed **en bloc**: zero per-node RC, zero heap `malloc`.
+  The gate is soundness-critical (a wrong verdict = use-after-free); it is pinned in both
+  directions by [`tests/vire_interproc_arena.sh`](../../tests/vire_interproc_arena.sh). The
+  remaining gap **to Rust** (2.98×) is the same constant-fold artifact as `json`, not RC —
+  **against clang (same backend, no folding) Vire is at parity**.
 - **graph (1.61× Rust):** Dijkstra's binary-heap sift does many bounds-checked array
   swaps; Rust's `slice::swap` + its heap codegen is tighter here.
 - **pquicksort / regex / pipeline (1.1–1.25×):** the same in-place-sort / branchy residual

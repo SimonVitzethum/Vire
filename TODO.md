@@ -109,20 +109,26 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   plus the in-place-sort check model. This is deep-codegen tuning (instruction ordering,
   reducing live ranges at lowering), not a single fixable pass — low ROI vs the wins
   already banked (7 of 14 at/under Rust).
-- [ ] **Interprocedural escape/region for short-lived heap graphs** (the
-  `benchmarks/complex/compiler` case, 3.45× Rust, 20 vs 2 MB RAM). The heap AST is built in
-  `parse`, consumed in `eval`, dead by the next loop iteration — rustc/LLVM inline
-  `parse`+`eval`, prove the `Box` nodes non-escaping, and **eliminate the allocation**
-  (0.006 s, 2 MB). Vire heap-allocates each node (RC-freed, 0-live, but 20 MB peak and the
-  malloc/free is the cost). Ruled out: a node-pool/SoA rewrite is *slower* (0.040 vs 0.021
-  — extra array params + bounds checks + scattered access); the existing `capsule` arena
-  would work but is a Vire-only construct (unfair in a matched benchmark). The real fix is
-  **automatic interprocedural escape inference** proving every object (transitively)
-  allocated during one outer-loop iteration is unreachable after it → route them to a
-  per-iteration bump arena (bulk-free). This is the same lever named for NBody/Trees but
-  **whole-program and soundness-critical** (a wrong escape verdict = use-after-free, unlike
-  the leak-only failure of the type-shape analysis) — it needs its own careful build with
-  an adversarial escape-suite, not a rushed pass.
+- [x] **Interprocedural escape/region for short-lived heap graphs** (the
+  `benchmarks/complex/compiler` case — was 1.25× C++ / 20 MB, now **1.08× C++ (clang
+  parity) / 17 MB**). The heap AST is built in `parse`, consumed in `eval`, dead by the next
+  loop iteration. Vire previously RC-managed every node (retain/release on build + traversal).
+  **Shipped:** the loop-arena escape check (`while_arena_safe` in `crates/vire/src/lower.rs`)
+  is now **interprocedural**. Two context flags decide whether a control-flow statement
+  escapes the *arena iteration* rather than the enclosing function, so a callee's own
+  `return`/`break`/`continue` no longer disqualifies the arena — the arena is a thread-local
+  `arena_top`, so every allocation the iteration transitively performs (across the
+  `parse`/`eval` boundary) lands in it and is freed **en bloc** at the pop, with **zero
+  per-node RC and zero heap `malloc`**. The field/index store rule now checks the
+  *destination* element kind (a ref cannot be stored into an `Array[Int]` slot) resolved
+  through callee parameter annotations, so the scalar buffer writes in `gen`/`parse` stop
+  blocking promotion. **Soundness-critical** (a wrong escape verdict = use-after-free): pinned
+  in both directions — promote *and* decline — by [`tests/vire_interproc_arena.sh`](tests/vire_interproc_arena.sh),
+  which also covers two latent bugs this work closed (an outer-var store nested inside an
+  `if`, and a `break`/`continue` that skipped the pop — both previously slipped past the old
+  top-level-only check). Ruled out earlier: a node-pool/SoA rewrite is *slower* (0.040 s).
+  The residual gap **to Rust** is the same input-free constant-fold artifact as `json`, not
+  RC. Java oracle 65/65 and all 117 Vire suite cases stay green.
 
 ## Compile-time programming layer (macros + comptime + reflection, one typed AST)
 

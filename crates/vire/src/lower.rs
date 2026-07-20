@@ -1271,14 +1271,37 @@ impl<'a> FnLower<'a> {
     ///
     /// Safe if the body (transitively over user callees):
     ///  - allocates (otherwise no benefit),
-    ///  - writes NO field/index (mutating an existing object could
-    ///    store an arena reference to the outside; constructors do NOT count as
-    ///    field writes — they are calls on fresh objects),
+    ///  - writes NO field/index a *reference* (mutating an existing object with a
+    ///    ref could store an arena reference to the outside; constructors do NOT
+    ///    count as field writes — they are calls on fresh objects; a scalar store
+    ///    can never leak an arena pointer),
     ///  - calls NO mutator method (push/put/set/pop/add/insert),
-    ///  - contains NO `return`/`break`/`continue` (at body level),
+    ///  - performs NO `return`/`break`/`continue` that leaves the ARENA ITERATION
+    ///    (a control-flow exit that skips the en-bloc `jrt_arena_pop`),
     ///  - only calls user functions + constructors (no extern/builtin/lambda —
     ///    could capture a reference),
     ///  - assigns no ref to an outer (cross-iteration) variable.
+    ///
+    /// INTERPROCEDURAL PRECISION. The badness check recurses transitively through
+    /// user callees. Two context flags decide whether a control-flow statement
+    /// escapes the arena, so a callee's own `return`/`break`/`continue` does NOT
+    /// disqualify the arena — it returns to a caller that is still *inside* the
+    /// arena's dynamic extent (the arena is a thread-local `arena_top`, so every
+    /// allocation the iteration transitively performs lands in it and is freed en
+    /// bloc at the pop). This is what lets a factory→consume pattern (e.g. an AST
+    /// `parse()` handed to an `eval()` that uses `return`) run allocation-free:
+    ///  - `in_callee`: we are inside a called function's body, not the loop's own
+    ///    function. A `return` here is fine (control comes back within the arena);
+    ///    a `return` in the loop's own function bypasses the pop → forbidden.
+    ///    Outer-variable rebinding is only meaningful in the loop's own function
+    ///    (a callee cannot reach the loop function's locals — Vire has no closures
+    ///    capturing mutable outer state, and no mutable globals).
+    ///  - `in_loop`: we are inside a *nested* loop within the loop's own function.
+    ///    A `break`/`continue` there targets the nested loop, not our arena loop,
+    ///    so it does not skip our pop; at the arena-loop level it does → forbidden.
+    /// A field/index store of a possible ref is base-insensitive and stays
+    /// forbidden everywhere (including callees): it is the one way a callee could
+    /// make an arena object outlive the arena, so it is never relaxed.
     fn while_arena_safe(&self, body: &Block2) -> bool {
         let mut outer: std::collections::HashSet<String> = std::collections::HashSet::new();
         for s in &self.scopes {
@@ -1287,64 +1310,86 @@ impl<'a> FnLower<'a> {
             }
         }
         let mut seen = std::collections::HashSet::new();
-        if self.region_bad_block(body, true, &outer, &mut seen) {
+        if self.region_bad_block(body, false, false, None, &outer, &mut seen) {
             return false;
         }
         seen.clear();
         self.region_allocates_block(body, &mut seen)
     }
 
-    fn region_bad_block(&self, b: &Block2, top: bool, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
-        b.stmts.iter().any(|s| self.region_bad_stmt(s, top, outer, seen))
-            || b.tail.as_deref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
+    // `cur_fn`: the function whose body we are traversing — `None` for the loop's
+    // own function (resolve names via the live scope), `Some(fd)` inside a callee
+    // (resolve names via the callee's parameter annotations; a callee-local name is
+    // unknown → conservatively a ref). Used so `p[0] = p[0] + 1` on an `Array[Int]`
+    // parameter is seen as the scalar store it is, not a possible ref store.
+    fn region_bad_block(&self, b: &Block2, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+        b.stmts.iter().any(|s| self.region_bad_stmt(s, in_callee, in_loop, cur_fn, outer, seen))
+            || b.tail.as_deref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
     }
 
-    fn region_bad_stmt(&self, s: &Stmt, top: bool, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+    fn region_bad_stmt(&self, s: &Stmt, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
         match s {
-            Stmt::Return(..) => true,
-            Stmt::Break(_) | Stmt::Continue(_) => top, // leaves OUR arena iteration
+            // A `return` in the loop's OWN function bypasses the en-bloc pop (and
+            // may hand an arena ref to the caller) → forbidden. A `return` inside a
+            // callee returns to a caller still within the arena's dynamic extent →
+            // safe (the returned value's fate is re-checked at the call site).
+            Stmt::Return(..) => !in_callee,
+            // `break`/`continue` skip our pop only when they target the arena loop
+            // itself: i.e. in the loop's own function and not inside a nested loop.
+            Stmt::Break(_) | Stmt::Continue(_) => !in_callee && !in_loop,
             // `name = expr` is a Let (rebinding) in the Vire AST. If it re-binds an
             // OUTER variable (declared before the loop) with a ref, the ref escapes
             // beyond the iteration → forbidden. New body-local names
-            // (not in `outer`) are harmless (they die with the iteration).
+            // (not in `outer`) are harmless (they die with the iteration). Only
+            // meaningful in the loop's own function — a callee cannot reach the loop
+            // function's locals (no closures / mutable globals).
             Stmt::Let { name, value, .. } => {
                 // Rebinding an OUTER var with a ref escapes the iteration — unless the
                 // outer var is scalar-typed (no ref fits) or the value is provably scalar.
                 let outer_is_ref = self.lookup(name).map(|(_, t)| t == Ty::Ref).unwrap_or(true);
-                let escapes = top
+                let escapes = !in_callee
                     && outer.contains(name)
                     && outer_is_ref
-                    && value.as_ref().map(|v| self.expr_may_be_ref(v)).unwrap_or(false);
-                escapes || value.as_ref().map(|e| self.region_bad_expr(e, outer, seen)).unwrap_or(false)
+                    && value.as_ref().map(|v| self.expr_may_be_ref(v, cur_fn)).unwrap_or(false);
+                escapes || value.as_ref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
             }
             Stmt::Assign { target, value, .. } => {
                 let target_bad = match target {
-                    // Field/index mutation only leaks the arena if the WRITTEN VALUE can be
-                    // an arena pointer. A provably-scalar store (`a[i] = int`, `p.x = i*2`)
-                    // can never make an arena object outlive the arena — a scalar is not a
-                    // pointer — so it is safe regardless of whether the base escapes.
-                    // `expr_may_be_ref` is conservative (true when unsure), so `!…` means
-                    // "definitely scalar".
-                    Expr::Field { .. } | Expr::Index { .. } => self.expr_may_be_ref(value),
+                    // Index mutation `a[i] = v` can only make an arena object outlive the
+                    // arena if it stores a REFERENCE. Two independent proofs of "no ref
+                    // stored", either sufficient: (a) the array's element kind is a scalar
+                    // — a ref cannot be stored into an `Array[Int]` slot at all (the type
+                    // checker forbids it), regardless of `v`; or (b) `v` is provably scalar.
+                    // Both are base-insensitive → also fire inside callees (the one
+                    // relaxation-proof leak route: a heap ref stored into a long-lived
+                    // container). `region_index_scalar`/`expr_may_be_ref` are conservative.
+                    Expr::Index { base, .. } => !self.region_index_scalar(base, cur_fn) && self.expr_may_be_ref(value, cur_fn),
+                    // Field mutation `obj.f = v`: a scalar `v` cannot leak a ref. (Field
+                    // element-kind narrowing would need the object's class resolved here;
+                    // the value check is sound and covers the common cases.)
+                    Expr::Field { .. } => self.expr_may_be_ref(value, cur_fn),
                     // Ref to an outer variable (compound `x op= e`) → escapes. Safe if the
                     // outer variable is scalar-typed (a ref cannot be stored into an I64/F64
-                    // slot) or the written value is provably scalar.
+                    // slot) or the written value is provably scalar. Loop-function only.
                     Expr::Ident(n, _) => {
-                        top && outer.contains(n)
+                        !in_callee
+                            && outer.contains(n)
                             && self.lookup(n).map(|(_, t)| t == Ty::Ref).unwrap_or(true)
-                            && self.expr_may_be_ref(value)
+                            && self.expr_may_be_ref(value, cur_fn)
                     }
                     _ => false,
                 };
-                target_bad || self.region_bad_expr(value, outer, seen)
+                target_bad || self.region_bad_expr(value, in_callee, in_loop, cur_fn, outer, seen)
             }
-            Stmt::Expr(e) => self.region_bad_expr(e, outer, seen),
-            Stmt::While { cond, body, .. } => self.region_bad_expr(cond, outer, seen) || self.region_bad_block(body, false, outer, seen),
-            Stmt::For { iter, body, .. } => self.region_bad_expr(iter, outer, seen) || self.region_bad_block(body, false, outer, seen),
+            Stmt::Expr(e) => self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen),
+            // A nested loop within the SAME function: its body runs at `in_loop = true`
+            // so a `break`/`continue` there targets it, not our arena loop.
+            Stmt::While { cond, body, .. } => self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen),
+            Stmt::For { iter, body, .. } => self.region_bad_expr(iter, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen),
         }
     }
 
-    fn region_bad_expr(&self, e: &Expr, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+    fn region_bad_expr(&self, e: &Expr, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
         match e {
             Expr::Call { callee, args, .. } => {
                 let callee_bad = match callee.as_ref() {
@@ -1352,7 +1397,11 @@ impl<'a> FnLower<'a> {
                         if let Some(fd) = self.fn_defs.get(n) {
                             if seen.insert(n.clone()) {
                                 match &fd.body {
-                                    Some(b) => self.region_bad_block(b, false, outer, seen),
+                                    // Descend into the callee: `in_callee = true` (its
+                                    // return/break/continue no longer disqualify the
+                                    // arena), `in_loop = false` (a fresh loop nesting),
+                                    // `cur_fn = Some(fd)` (resolve names via ITS params).
+                                    Some(b) => self.region_bad_block(b, true, false, Some(fd), outer, seen),
                                     None => true, // only signature → opaque
                                 }
                             } else {
@@ -1367,26 +1416,26 @@ impl<'a> FnLower<'a> {
                     // Mutator method on a (possibly outer) object → could store.
                     _ => true,
                 };
-                callee_bad || args.iter().any(|a| self.region_bad_expr(a, outer, seen))
+                callee_bad || args.iter().any(|a| self.region_bad_expr(a, in_callee, in_loop, cur_fn, outer, seen))
             }
-            Expr::Unary { rhs, .. } => self.region_bad_expr(rhs, outer, seen),
-            Expr::Binary { lhs, rhs, .. } => self.region_bad_expr(lhs, outer, seen) || self.region_bad_expr(rhs, outer, seen),
-            Expr::Field { base, .. } => self.region_bad_expr(base, outer, seen),
-            Expr::Index { base, index, .. } => self.region_bad_expr(base, outer, seen) || self.region_bad_expr(index, outer, seen),
+            Expr::Unary { rhs, .. } => self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Binary { lhs, rhs, .. } => self.region_bad_expr(lhs, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Field { base, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Index { base, index, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(index, in_callee, in_loop, cur_fn, outer, seen),
             Expr::If { cond, then, elifs, els, .. } => {
-                self.region_bad_expr(cond, outer, seen)
-                    || self.region_bad_block(then, false, outer, seen)
-                    || elifs.iter().any(|(c, b)| self.region_bad_expr(c, outer, seen) || self.region_bad_block(b, false, outer, seen))
-                    || els.as_ref().map(|b| self.region_bad_block(b, false, outer, seen)).unwrap_or(false)
+                self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen)
+                    || self.region_bad_block(then, in_callee, in_loop, cur_fn, outer, seen)
+                    || elifs.iter().any(|(c, b)| self.region_bad_expr(c, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen))
+                    || els.as_ref().map(|b| self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
             }
             Expr::Match { scrutinee, arms, .. } => {
-                self.region_bad_expr(scrutinee, outer, seen)
-                    || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_bad_expr(g, outer, seen)).unwrap_or(false) || self.region_bad_expr(b, outer, seen))
+                self.region_bad_expr(scrutinee, in_callee, in_loop, cur_fn, outer, seen)
+                    || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_bad_expr(g, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false) || self.region_bad_expr(b, in_callee, in_loop, cur_fn, outer, seen))
             }
-            Expr::Block(b) => self.region_bad_block(b, false, outer, seen),
-            Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, outer, seen)),
-            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, outer, seen),
-            Expr::Range { start, end, .. } => self.region_bad_expr(start, outer, seen) || self.region_bad_expr(end, outer, seen),
+            Expr::Block(b) => self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, in_callee, in_loop, cur_fn, outer, seen)),
+            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Range { start, end, .. } => self.region_bad_expr(start, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(end, in_callee, in_loop, cur_fn, outer, seen),
             // Lambda/Comprehension/MapLit/Capsule: conservatively opaque (could capture/store outside).
             Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) | Expr::Capsule { .. } => true,
             _ => false,
@@ -1447,21 +1496,65 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Conservative: can the expression yield a reference? (For the
-    /// "ref to outer variable" escape check.) Only obviously scalar → false.
-    fn expr_may_be_ref(&self, e: &Expr) -> bool {
+    /// Conservative: can the expression yield a reference? (For the arena escape
+    /// check — "could this stored value be an arena pointer?".) Only obviously
+    /// scalar → false. `cur_fn` names the function whose body this expression lives
+    /// in, so names resolve against the right scope (see `region_bad_block`).
+    fn expr_may_be_ref(&self, e: &Expr, cur_fn: Option<&FnDef>) -> bool {
         match e {
             Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Unary { .. } => false,
             Expr::Binary { op, lhs, rhs, .. } => {
                 // String `+` yields Ref; other arithmetic/comparison/logic = scalar.
-                matches!(op, BinOp::Add) && (self.expr_may_be_ref(lhs) || self.expr_may_be_ref(rhs))
+                matches!(op, BinOp::Add) && (self.expr_may_be_ref(lhs, cur_fn) || self.expr_may_be_ref(rhs, cur_fn))
             }
-            Expr::Ident(n, _) => self.lookup(n).map(|(_, t)| t == Ty::Ref).unwrap_or(true),
+            Expr::Ident(n, _) => self.region_name_is_ref(n, cur_fn),
             Expr::Call { callee, .. } => match callee.as_ref() {
                 Expr::Ident(n, _) => self.is_alloc_name(n) || self.sigs.get(n).map(|s| s.ret == Ty::Ref).unwrap_or(true),
                 _ => true,
             },
+            // Indexing an array of scalar (non-ref) elements is definitely a scalar;
+            // anything we cannot prove scalar stays conservatively a ref.
+            Expr::Index { base, .. } => !self.region_index_scalar(base, cur_fn),
             _ => true,
+        }
+    }
+
+    /// Is `name` a reference-typed binding in the current region-check context?
+    /// Loop's own function (`cur_fn = None`) → live scope; callee → its parameter
+    /// annotations (a callee-local / unknown name → conservatively a ref). Sound
+    /// direction: `true` when unsure (blocks promotion, never allows a leak).
+    fn region_name_is_ref(&self, name: &str, cur_fn: Option<&FnDef>) -> bool {
+        match cur_fn {
+            None => self.lookup(name).map(|(_, t)| t == Ty::Ref).unwrap_or(true),
+            Some(fd) => match fd.sig.params.iter().find(|p| p.name == name) {
+                Some(p) => ty_of(p.ty.as_ref()) == Ty::Ref,
+                None => true,
+            },
+        }
+    }
+
+    /// Is `base` provably an array whose element kind is a scalar (non-ref)? Then
+    /// `base[i]` is definitely not a reference. Resolved from the live `local_arr`
+    /// (loop's own function) or the callee's `Array[T]` parameter annotation. Only
+    /// `ArrKind::Ref` is a reference element; everything else is scalar. Conservative
+    /// `false` (not-provably-scalar) whenever the base is not a resolvable array.
+    fn region_index_scalar(&self, base: &Expr, cur_fn: Option<&FnDef>) -> bool {
+        let Expr::Ident(n, _) = base else { return false };
+        match cur_fn {
+            None => self
+                .lookup(n)
+                .and_then(|(l, _)| self.local_arr.get(&l.0))
+                .map(|k| *k != ArrKind::Ref)
+                .unwrap_or(false),
+            Some(fd) => fd
+                .sig
+                .params
+                .iter()
+                .find(|p| &p.name == n)
+                .and_then(|p| p.ty.as_ref())
+                .filter(|t| t.name == "Array" || t.name == "array")
+                .map(|t| arrkind_of_name(t.args.first().map(|a| a.name.as_str()).unwrap_or("Int")) != ArrKind::Ref)
+                .unwrap_or(false),
         }
     }
 
