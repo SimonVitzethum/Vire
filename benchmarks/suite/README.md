@@ -5,16 +5,20 @@
 output equality. C++ = **clang++** (LLVM, like Vire) for a fair codegen
 comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 
-## Results (best-of-5, the same machine, freshly measured 2026-07)
-| Benchmark | Vire | Rust | clang++ | Vire/Rust | Vire/clang |
-|---|---|---|---|---|---|
-| bitmanip (popcount) | 0.229 | 0.231 | 0.230 | **0.99×** | **1.00×** |
-| matmul (256³ ikj) | 0.0059 | 0.0060 | 0.0065 | **0.98×** | **0.91×** |
-| nbody (2000, 20 steps) | 0.360 | 0.360 | 0.360 | **1.00×** | **1.00×** |
-| montecarlo (20M, LCG) | 0.052 | 0.052 | 0.053 | **1.00×** | **0.99×** |
-| vcall (dyn dispatch, 100M) | 0.212 | 0.212 | 0.480 | **1.00×** | **0.44×** |
-| sort (quicksort 2M) | 0.177 | 0.166 | 0.133 | 1.06× | 1.33× |
-| binsearch (10M lookups) | 0.681 | 0.661 | 0.874 | 1.03× | **0.78×** |
+## Results (best-of-5 time + peak RSS, the same machine, freshly measured 2026-07)
+| Benchmark | Vire | Rust | clang++ | Vire/Rust | Vire/clang | RAM V/R/C |
+|---|---|---|---|---|---|---|
+| bitmanip (popcount) | 0.229 | 0.231 | 0.230 | **0.99×** | **1.00×** | 1.8 / 1.9 / 3.8 MB |
+| matmul (256³ ikj) | 0.0059 | 0.0060 | 0.0065 | **0.98×** | **0.91×** | 3.6 / 3.4 / 5.0 MB |
+| nbody (2000, 20 steps) | 0.360 | 0.360 | 0.360 | **1.00×** | **1.00×** | 2.2 / 2.1 / 3.8 MB |
+| montecarlo (20M, LCG) | 0.052 | 0.052 | 0.053 | **1.00×** | **0.99×** | 1.8 / 1.9 / 3.8 MB |
+| vcall (dyn dispatch, 100M) | 0.212 | 0.212 | 0.480 | **1.00×** | **0.44×** | 1.8 / 1.9 / 3.8 MB |
+| sort (quicksort 2M) | 0.177 | 0.166 | 0.133 | 1.06× | 1.33× | 16.9 / 17.1 / 18.8 MB |
+| binsearch (10M lookups) | 0.681 | 0.661 | 0.874 | 1.03× | **0.78×** | 9.3 / 9.4 / 11.1 MB |
+
+**Memory (peak RSS):** Vire is at or below both on every row — ~2 MB under clang everywhere
+(no `libstdc++`/iostream baseline) and level with Rust, including the array-heavy `sort`
+(16.9 MB) and `binsearch` (9.3 MB). Lean runtime, no GC heap.
 
 **Average (this suite, Vire/Rust):** geometric mean **1.01×** — memory-safe Vire at Rust
 parity; every benchmark within ±6% of Rust and three (matmul, vcall, binsearch beat clang).

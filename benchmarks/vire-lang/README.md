@@ -4,15 +4,19 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 `rustc -O`; `clang++ -O2 -march=native`), best-of-3, outputs checked
 **bit-identical**. `./run.sh` reproduces.
 
-## Results (one machine, best-of-5, freshly measured 2026-07)
-| Bench | Kind | Vire | Rust | C++ | V/Rust | V/C++ |
-|---|---|---|---|---|---|---|
-| arith | compute loop | 1.506 s | 1.506 s | 1.507 s | **1.00×** | **1.00×** |
-| fib | recursion (fib 38) | 0.002 s | 0.131 s | 0.122 s | **0.02×** | **0.02×** |
-| struct | stack struct | 0.449 s | 0.501 s | 0.505 s | **0.90×** | **0.89×** |
-| **mandelbrot** | CLBG, float compute | 0.218 s | 0.213 s | 0.218 s | 1.02× | **1.00×** |
-| **binary-trees** | CLBG, alloc/GC | 0.325 s | 0.357 s | 0.251 s | **0.91×** | 1.29× |
-| **nsieve** (i64-matched) | CLBG, array | 0.626 s | 0.572 s | 0.601 s | 1.09× | 1.04× |
+## Results (one machine, best-of-5 time + peak RSS, freshly measured 2026-07)
+| Bench | Kind | Vire | Rust | C++ | V/Rust | V/C++ | RAM V/R/C |
+|---|---|---|---|---|---|---|---|
+| arith | compute loop | 1.506 s | 1.506 s | 1.507 s | **1.00×** | **1.00×** | 1.8 / 2.0 / 3.8 MB |
+| fib | recursion (fib 38) | 0.002 s | 0.131 s | 0.122 s | **0.02×** | **0.02×** | 1.8 / 1.9 / 3.8 MB |
+| struct | stack struct | 0.449 s | 0.501 s | 0.505 s | **0.90×** | **0.89×** | 1.6 / 1.9 / 3.9 MB |
+| **mandelbrot** | CLBG, float compute | 0.218 s | 0.213 s | 0.218 s | 1.02× | **1.00×** | 1.9 / 1.9 / 3.8 MB |
+| **binary-trees** | CLBG, alloc/GC | 0.325 s | 0.357 s | 0.251 s | **0.91×** | 1.29× | **5.7 / 5.8 / 7.8 MB** |
+| **nsieve** (i64-matched) | CLBG, array | 0.626 s | 0.572 s | 0.601 s | 1.09× | 1.04× | ~9 / ~9 / ~11 MB |
+
+**Memory (peak RSS):** at or below both on every row — ~2 MB under C++ (no
+`libstdc++`/iostream), level with Rust. Even **binary-trees** (pure alloc/GC) peaks at
+**5.7 MB, under both** — RC frees eagerly (0 live), no garbage-collected heap that grows.
 
 **Average:** across all 12 Vire benchmarks (this file + [../suite/](../suite/)),
 memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.00× (median 1.00×)** — at

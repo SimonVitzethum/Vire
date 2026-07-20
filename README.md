@@ -83,6 +83,11 @@ the affine `r*n+k`) and, where a check can't be elided, makes it as cheap as Rus
 noreturn abort when provably uncatchable) — **all fully memory-safe: a genuinely
 out-of-bounds access still throws**.
 
+**Memory (peak RSS)** is reported alongside time in every suite: Vire is **at or below
+both Rust and C++ on essentially every benchmark** — ~2 MB under clang everywhere (no
+`libstdc++`/iostream baseline), level with Rust, and even binary-trees (pure alloc/GC)
+peaks *under* both (RC frees eagerly, 0 live, no growing GC heap).
+
 Beyond single kernels, [benchmarks/complex/](benchmarks/complex/) runs **multi-algorithm
 workloads** (a generate→sort→search→histogram pipeline; integer k-means) and **fair
 fork/join multithreading** — parallel Monte-Carlo and Mandelbrot with **4 threads in
