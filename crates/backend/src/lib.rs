@@ -271,6 +271,12 @@ struct Ctx<'a> {
     static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Interprocedural instance-field write sets (+ opaque flag) for region inference.
     field_writes: BTreeMap<String, (BTreeSet<(String, String)>, bool)>,
+    /// Loop-vectorization control. `novec_id` = the shared
+    /// `!{!"llvm.loop.vectorize.enable", i1 false}` node; `loop_ids` maps
+    /// (function index, header block) of each divergent/call-bearing loop to its
+    /// distinct `!llvm.loop` node, attached to that loop's latch back-edge.
+    novec_id: usize,
+    loop_ids: std::collections::HashMap<(usize, usize), usize>,
     /// AOT hot path: metadata IDs of the two shared `branch_weights` nodes
     /// (then-hot, else-hot). Set from static loop estimation on `!prof` —
     /// LLVM then orders/optimizes hot paths itself.
@@ -548,8 +554,22 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     let bw_then = bw_base;
     let bw_else = bw_base + 1;
     let md_inv = bw_base + 2;
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, bw_then, bw_else, md_inv };
-    let mut dg = DebugGen::new(debug, md_inv + 1);
+    // Loop-vectorization control metadata IDs: the shared "disable" node, then a
+    // distinct `!llvm.loop` node per divergent/call-bearing loop. Allocated below
+    // `md_inv` and above the debug range so nothing collides.
+    let novec_id = md_inv + 1;
+    let mut loop_ids: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    let mut next_md = md_inv + 2;
+    for (fi, f) in program.functions.iter().enumerate() {
+        let mut hs: Vec<usize> = complex_loop_headers(f).into_iter().collect();
+        hs.sort();
+        for h in hs {
+            loop_ids.insert((fi, h), next_md);
+            next_md += 1;
+        }
+    }
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv };
+    let mut dg = DebugGen::new(debug, next_md);
     // Declaration line per function (for DISubprograms of both live and inlined
     // functions referenced by DebugLine inline stacks).
     let fn_lines: BTreeMap<String, u32> = program.functions.iter().map(|f| (f.name.clone(), f.line)).collect();
@@ -872,8 +892,8 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             matches!(st, Statement::InstanceOfPending { .. })
                 || matches!(st, Statement::Call { func, .. } if func == "jrt_take_pending")
         });
-    for f in &program.functions {
-        emit_function(w, &ctx, f, &mut dg, &fn_lines, uncatchable);
+    for (fi, f) in program.functions.iter().enumerate() {
+        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable);
     }
 
     // Thread trampoline: called by the runtime (pthread or synchronous),
@@ -943,6 +963,16 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     writeln!(w, "!{} = !{{!\"branch_weights\", i32 100, i32 3}}", ctx.bw_then).unwrap();
     writeln!(w, "!{} = !{{!\"branch_weights\", i32 3, i32 100}}", ctx.bw_else).unwrap();
     writeln!(w, "!{} = !{{}}", ctx.md_inv).unwrap();
+    // Loop-vectorization control nodes: shared "disable" property + one distinct,
+    // self-referential `!llvm.loop` node per complex loop (see complex_loop_headers).
+    if !ctx.loop_ids.is_empty() {
+        writeln!(w, "!{} = !{{!\"llvm.loop.vectorize.enable\", i1 false}}", ctx.novec_id).unwrap();
+        let mut ids: Vec<usize> = ctx.loop_ids.values().copied().collect();
+        ids.sort();
+        for id in ids {
+            writeln!(w, "!{id} = distinct !{{!{id}, !{}}}", ctx.novec_id).unwrap();
+        }
+    }
     dg.emit_tail(w);
 
     out
@@ -997,6 +1027,68 @@ fn loop_branch_bias(f: &Function) -> std::collections::HashMap<usize, bool> {
         }
     }
     bias
+}
+
+/// Loops whose latch should carry `!llvm.loop.vectorize.enable false`.
+///
+/// LLVM's cost model over-values vectorizing loops with **divergent control
+/// flow** (a data-dependent `if`) or a **call**: it vectorizes them with
+/// predication + shuffle/blend overhead that is a net loss (measured: a
+/// raytracer pixel loop is ~2× slower vectorized than scalar). Straight-line
+/// innermost loops — a matmul SAXPY, a distance accumulation — have neither and
+/// are left enabled, so they still vectorize. Bounds/null checks are emitted as
+/// backend-inline `br` (not IR `Terminator::Branch`), so they do NOT count here:
+/// only algorithm-level `if`/`match`/nested loops and calls do. Metadata-only →
+/// can never change program semantics, only codegen.
+///
+/// Reducible CFG (our lowering): an edge `u → v` with `v ≤ u` is a back edge
+/// (header `v`, latch `u`); the loop body is `(v, span_max[v]]`. A loop is
+/// "complex" if any body block (excluding the header's own condition test) has a
+/// call statement or a conditional terminator. Returns the set of complex headers.
+fn complex_loop_headers(f: &Function) -> std::collections::HashSet<usize> {
+    let succ = |bb: &BasicBlock| -> Vec<usize> {
+        match &bb.terminator {
+            Terminator::Goto(b) => vec![b.0 as usize],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+            Terminator::Switch { default, cases, .. } => {
+                let mut v: Vec<usize> = cases.iter().map(|(_, b)| b.0 as usize).collect();
+                v.push(default.0 as usize);
+                v
+            }
+            Terminator::Return(_) => vec![],
+        }
+    };
+    let mut span_max: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (u, bb) in f.blocks.iter().enumerate() {
+        for v in succ(bb) {
+            if v <= u {
+                let e = span_max.entry(v).or_insert(u);
+                if u > *e {
+                    *e = u;
+                }
+            }
+        }
+    }
+    let is_call = |st: &Statement| {
+        matches!(
+            st,
+            Statement::Call { .. } | Statement::CallGuarded { .. } | Statement::CallVirtual { .. } | Statement::CallPoly { .. }
+        )
+    };
+    let mut complex = std::collections::HashSet::new();
+    for (&v, &u) in &span_max {
+        // Body = blocks strictly after the header up to the latch. Excluding the
+        // header skips its loop-condition branch (every loop has one).
+        let divergent = (v + 1..=u).any(|b| {
+            let bb = &f.blocks[b];
+            matches!(bb.terminator, Terminator::Branch { .. } | Terminator::Switch { .. })
+                || bb.statements.iter().any(is_call)
+        });
+        if divergent {
+            complex.insert(v);
+        }
+    }
+    complex
 }
 
 /// Calls the <clinit> of `class`, but the superclass's first
@@ -1714,7 +1806,7 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
         .collect()
 }
 
-fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool) {
+fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool) {
     let ps: Vec<String> = f
         .params
         .iter()
@@ -1831,8 +1923,19 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_
         for st in &bb.statements {
             emit_statement(w, ctx, &mut e, st);
         }
+        // `!llvm.loop` metadata for a latch back-edge (target ≤ current) whose loop
+        // was classified complex (see complex_loop_headers). Disables the LLVM loop
+        // vectorizer for that loop; metadata-only, no semantic effect.
+        let loop_md = |target: usize| -> String {
+            if target <= bi {
+                if let Some(id) = ctx.loop_ids.get(&(fn_idx, target)) {
+                    return format!(", !llvm.loop !{id}");
+                }
+            }
+            String::new()
+        };
         match &bb.terminator {
-            Terminator::Goto(b) => writeln!(w, "  br label %bb{}", b.0).unwrap(),
+            Terminator::Goto(b) => writeln!(w, "  br label %bb{}{}", b.0, loop_md(b.0 as usize)).unwrap(),
             Terminator::Branch { cond, then_blk, else_blk } => {
                 let c = e.operand(w, cond);
                 let b = e.fresh();
@@ -1844,7 +1947,12 @@ fn emit_function(w: &mut String, ctx: &Ctx, f: &Function, dg: &mut DebugGen, fn_
                     Some(false) => format!(", !prof !{}", ctx.bw_else),
                     None => String::new(),
                 };
-                writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}{prof}", then_blk.0, else_blk.0).unwrap();
+                // A back-edge Branch latch (e.g. do-while) also carries the hint.
+                let lm = {
+                    let a = loop_md(then_blk.0 as usize);
+                    if a.is_empty() { loop_md(else_blk.0 as usize) } else { a }
+                };
+                writeln!(w, "  br i1 {b}, label %bb{}, label %bb{}{prof}{lm}", then_blk.0, else_blk.0).unwrap();
             }
             Terminator::Switch { value, default, cases } => {
                 let v = e.operand(w, value);
