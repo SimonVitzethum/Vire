@@ -1,0 +1,59 @@
+// Ray tracer: an 2400x2400 image, 4 spheres + 1 point light, diffuse shading.
+// Per pixel: primary ray, nearest-sphere intersection (quadratic + sqrt), surface
+// normal, Lambert term toward the light, quantized brightness. A float-heavy whole
+// program (no trig → bit-identical across languages; sqrt = the hardware `sqrtsd`).
+// Output: sum of quantized pixel brightness (0..255).
+fn main() {
+    mut w = 2400
+    mut h = 2400
+    mut scx = farray(4)  mut scy = farray(4)  mut scz = farray(4)  mut sr = farray(4)
+    scx[0] = 0.0        scy[0] = 0.0        scz[0] = 5.0   sr[0] = 1.0
+    scx[1] = 2.0        scy[1] = 0.0        scz[1] = 6.0   sr[1] = 1.2
+    scx[2] = 0.0 - 2.0  scy[2] = 1.0        scz[2] = 5.5   sr[2] = 0.8
+    scx[3] = 0.0        scy[3] = 0.0 - 1.0  scz[3] = 4.0   sr[3] = 0.6
+    mut lx = 5.0  mut ly = 5.0  mut lz = 0.0 - 2.0
+    mut total = 0
+    mut py = 0
+    while py < h {
+        mut px = 0
+        while px < w {
+            mut ddx = (px as Float) / (w as Float) - 0.5
+            mut ddy = (py as Float) / (h as Float) - 0.5
+            mut ddz = 1.0
+            mut rl = sqrt(ddx * ddx + ddy * ddy + ddz * ddz)
+            mut dx = ddx / rl  mut dy = ddy / rl  mut dz = ddz / rl
+            mut best = 1000000.0
+            mut hit = 0 - 1
+            mut s = 0
+            while s < 4 {
+                mut ocx = 0.0 - scx[s]  mut ocy = 0.0 - scy[s]  mut ocz = 0.0 - scz[s]
+                mut b = ocx * dx + ocy * dy + ocz * dz
+                mut c = ocx * ocx + ocy * ocy + ocz * ocz - sr[s] * sr[s]
+                mut disc = b * b - c
+                if disc > 0.0 {
+                    mut t = 0.0 - b - sqrt(disc)
+                    if t > 0.001 { if t < best { best = t  hit = s } }
+                }
+                s = s + 1
+            }
+            mut bright = 0
+            if hit >= 0 {
+                mut hx = dx * best  mut hy = dy * best  mut hz = dz * best
+                mut nx = hx - scx[hit]  mut ny = hy - scy[hit]  mut nz = hz - scz[hit]
+                mut nl = sqrt(nx * nx + ny * ny + nz * nz)
+                nx = nx / nl  ny = ny / nl  nz = nz / nl
+                mut ldx = lx - hx  mut ldy = ly - hy  mut ldz = lz - hz
+                mut ll = sqrt(ldx * ldx + ldy * ldy + ldz * ldz)
+                ldx = ldx / ll  ldy = ldy / ll  ldz = ldz / ll
+                mut diff = nx * ldx + ny * ldy + nz * ldz
+                if diff < 0.0 { diff = 0.0 }
+                bright = ((diff * 255.0) as Int)
+                if bright > 255 { bright = 255 }
+            }
+            total = total + bright
+            px = px + 1
+        }
+        py = py + 1
+    }
+    print(total)
+}

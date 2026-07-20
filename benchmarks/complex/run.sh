@@ -8,10 +8,10 @@ VIRE=../../target/release/vire
 export LC_ALL=C
 best() { m=999; for r in 1 2 3 4 5; do s=$(date +%s.%N); "$@" >/dev/null 2>&1; e=$(date +%s.%N); d=$(awk "BEGIN{print $e-$s}"); awk "BEGIN{exit !($d<$m)}" && m=$d; done; echo $m; }
 printf "%-13s %10s %10s %10s | %8s %8s  %s\n" Benchmark Vire Rust "C++" V/Rust V/C++ output
-for b in pipeline kmeans pmontecarlo pmandel; do
+for b in pipeline kmeans hashmap graph fft raytracer pquicksort pmontecarlo pmandel; do
   [ -f $b.vr ] || continue
   "$VIRE" build $b.vr -o /tmp/cx_$b 2>/dev/null
-  rustc -O -C target-cpu=native $b.rs -o /tmp/cx_${b}_r 2>/dev/null
+  rustc -O -C target-cpu=native -C llvm-args=-fp-contract=fast $b.rs -o /tmp/cx_${b}_r 2>/dev/null
   clang++ -O2 -march=native -pthread $b.cpp -o /tmp/cx_${b}_c 2>/dev/null
   ov=$(/tmp/cx_$b); orr=$(/tmp/cx_${b}_r); oc=$(/tmp/cx_${b}_c)
   match="OK"; { [ "$ov" = "$orr" ] && [ "$orr" = "$oc" ]; } || match="DIFF"

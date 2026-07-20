@@ -2652,6 +2652,22 @@ impl<'a> FnLower<'a> {
             }
         }
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
+        // `sqrt(x)` — floating-point square root. Lowers to `jrt_math_sqrt`, which the
+        // backend emits as the LLVM intrinsic `@llvm.sqrt.f64` (a single `sqrtsd`).
+        // The argument is coerced to `Float`.
+        if name == "sqrt" && lowered.len() == 1 {
+            let (a, at) = lowered.into_iter().next().unwrap();
+            let af = if at == Ty::F64 {
+                a
+            } else {
+                let f = self.new_local(Ty::F64);
+                self.emit(Statement::Assign(f, Rvalue::Convert(a)));
+                Operand::Copy(f)
+            };
+            let d = self.new_local(Ty::F64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_math_sqrt".into(), args: vec![af] });
+            return (Operand::Copy(d), Ty::F64);
+        }
         // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float) —
         // real bounds-checked/-elidable arrays (as opposed to the i64 list).
         if name == "array" || name == "farray" {

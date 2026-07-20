@@ -1,0 +1,101 @@
+// Graph algorithms on a generated fixed-degree digraph (200k nodes, 8 out-edges
+// each = 1.6M edges, integer weights): a BFS from node 0 (level sum) plus a
+// Dijkstra from node 0 with a binary min-heap (distance sum). Pointer-chasing +
+// cache + branch heavy. Output: BFS level-sum XORed-ish with the Dijkstra dist-sum.
+fn main() {
+    mut vn = 200000
+    mut deg = 8
+    mut m = vn * deg
+    mut dst = array(m)
+    mut wt = array(m)
+    mut seed = 2166136261
+    mut i = 0
+    while i < m {
+        seed = (seed * 1103515245 + 12345) % 2147483648  dst[i] = seed % vn
+        seed = (seed * 1103515245 + 12345) % 2147483648  wt[i] = seed % 100 + 1
+        i = i + 1
+    }
+    // BFS
+    mut level = array(vn)
+    i = 0
+    while i < vn { level[i] = 0 - 1  i = i + 1 }
+    mut queue = array(vn)
+    mut head = 0
+    mut tail = 0
+    level[0] = 0
+    queue[tail] = 0
+    tail = tail + 1
+    while head < tail {
+        mut u = queue[head]
+        head = head + 1
+        mut j = u * deg
+        mut je = j + deg
+        while j < je {
+            mut v = dst[j]
+            if level[v] < 0 { level[v] = level[u] + 1  queue[tail] = v  tail = tail + 1 }
+            j = j + 1
+        }
+    }
+    mut bsum = 0
+    i = 0
+    while i < vn { if level[i] > 0 { bsum = (bsum + level[i]) % 1000000007 }  i = i + 1 }
+    // Dijkstra with a binary min-heap of (dist, node)
+    mut dist = array(vn)
+    i = 0
+    while i < vn { dist[i] = 2000000000  i = i + 1 }
+    mut hd = array(m + 16)
+    mut hn = array(m + 16)
+    mut hs = 0
+    dist[0] = 0
+    hd[0] = 0
+    hn[0] = 0
+    hs = 1
+    while hs > 0 {
+        mut cd = hd[0]
+        mut cu = hn[0]
+        hs = hs - 1
+        hd[0] = hd[hs]
+        hn[0] = hn[hs]
+        mut p = 0
+        mut go = 1
+        while go == 1 {
+            mut l = p * 2 + 1
+            mut r = l + 1
+            mut sm = p
+            if l < hs { if hd[l] < hd[sm] { sm = l } }
+            if r < hs { if hd[r] < hd[sm] { sm = r } }
+            if sm == p { go = 0 } else {
+                mut td = hd[p]  hd[p] = hd[sm]  hd[sm] = td
+                mut tn = hn[p]  hn[p] = hn[sm]  hn[sm] = tn
+                p = sm
+            }
+        }
+        if cd <= dist[cu] {
+            mut j = cu * deg
+            mut je = j + deg
+            while j < je {
+                mut v = dst[j]
+                mut nd = cd + wt[j]
+                if nd < dist[v] {
+                    dist[v] = nd
+                    hd[hs] = nd  hn[hs] = v
+                    mut c = hs
+                    hs = hs + 1
+                    while c > 0 {
+                        mut par = (c - 1) / 2
+                        if hd[par] <= hd[c] { c = 0 } else {
+                            mut td = hd[par]  hd[par] = hd[c]  hd[c] = td
+                            mut tn = hn[par]  hn[par] = hn[c]  hn[c] = tn
+                            c = par
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+    }
+    mut dsum = 0
+    i = 0
+    while i < vn { if dist[i] < 2000000000 { dsum = (dsum + dist[i]) % 1000000007 }  i = i + 1 }
+    print(bsum * 1000 + dsum % 1000000007)
+}

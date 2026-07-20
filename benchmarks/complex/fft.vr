@@ -1,0 +1,64 @@
+// Number-Theoretic Transform (the integer FFT): an iterative radix-2 Cooley-Tukey
+// transform over Z_p (p = 998244353, root 3) on 2^20 points. Same butterfly
+// structure as a float FFT but with modular arithmetic — so it is bit-identical
+// across languages (a float FFT diverges on libm cos/sin) and the hot op is the
+// 64-bit modular multiply. Output: checksum of the transformed vector.
+fn modpow(b: Int, e: Int, m: Int) -> Int {
+    mut r = 1
+    mut bb = b % m
+    mut ee = e
+    while ee > 0 {
+        if ee % 2 == 1 { r = r * bb % m }
+        bb = bb * bb % m
+        ee = ee / 2
+    }
+    r
+}
+fn main() {
+    mut lg = 20
+    mut n = 1048576
+    mut md = 998244353
+    mut a = array(n)
+    mut seed = 123456789
+    mut i = 0
+    while i < n { seed = (seed * 1103515245 + 12345) % 2147483648  a[i] = seed % md  i = i + 1 }
+    // bit-reversal permutation
+    mut j = 0
+    i = 1
+    while i < n {
+        mut bit = n / 2
+        while j >= bit { j = j - bit  bit = bit / 2 }
+        j = j + bit
+        if i < j { mut t = a[i]  a[i] = a[j]  a[j] = t }
+        i = i + 1
+    }
+    // butterflies
+    mut len = 2
+    while len <= n {
+        mut wlen = modpow(3, (md - 1) / len, md)
+        i = 0
+        while i < n {
+            mut w = 1
+            mut k = 0
+            mut half = len / 2
+            while k < half {
+                mut u = a[i + k]
+                mut v = a[i + k + half] * w % md
+                mut s = u + v
+                if s >= md { s = s - md }
+                mut d = u - v
+                if d < 0 { d = d + md }
+                a[i + k] = s
+                a[i + k + half] = d
+                w = w * wlen % md
+                k = k + 1
+            }
+            i = i + len
+        }
+        len = len * 2
+    }
+    mut checksum = 0
+    i = 0
+    while i < n { checksum = (checksum + a[i] * (i % 97 + 1)) % 1000000007  i = i + 1 }
+    print(checksum)
+}

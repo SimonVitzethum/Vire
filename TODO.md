@@ -89,6 +89,13 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   field array) — closes part of the residual toward ~1.1×.
 - [ ] **(M0.3-v) Overflow default + `+%` culture** (enables vectorization) and
   **analysis caching** (compile time — M0.2 measured super-linear ~O(n^1.4)).
+- [ ] **Explicit SIMD for reductions LLVM won't auto-vectorize** (e.g. a *vectorized
+  argmin*: the `benchmarks/complex/kmeans` nearest-centroid loop is 0.55× Rust / 1.28× C++
+  after the two-pass restructure, but no compiler emits SIMD for the branchy argmin — a
+  hand-written vector distance-compute + horizontal-min-with-index would close the last
+  ~1.28× to C++). Needs a backend intrinsic path (emit `@llvm.vector.reduce.*` / explicit
+  `<N x i64>` ops) or a comptime SIMD library. Deferred — marginal gain over the current
+  parity; the two-pass restructure already got the bulk (2.2×).
 
 ## Compile-time programming layer (macros + comptime + reflection, one typed AST)
 

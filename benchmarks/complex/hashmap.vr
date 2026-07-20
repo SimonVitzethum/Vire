@@ -1,0 +1,50 @@
+// Open-addressing hash map (linear probing, tombstone delete) built from scratch.
+// Workload: insert 400k keys, 800k lookups (hit+miss), delete every 2nd key,
+// 800k lookups again. Combines hashing, probing and deletion. Output: value checksum.
+fn lookup(keys: Array[Int], vals: Array[Int], cap: Int, key: Int) -> Int {
+    mut idx = (key * 2654435761) % 2147483648 % cap
+    mut steps = 0
+    while steps < cap {
+        mut k = keys[idx]
+        if k == 0 { return 0 }
+        if k == key { return vals[idx] }
+        idx = idx + 1
+        if idx >= cap { idx = 0 }
+        steps = steps + 1
+    }
+    0
+}
+fn insert(keys: Array[Int], vals: Array[Int], cap: Int, key: Int, val: Int) {
+    mut idx = (key * 2654435761) % 2147483648 % cap
+    while keys[idx] > 0 { idx = idx + 1  if idx >= cap { idx = 0 } }
+    keys[idx] = key
+    vals[idx] = val
+}
+fn remove(keys: Array[Int], cap: Int, key: Int) {
+    mut idx = (key * 2654435761) % 2147483648 % cap
+    mut steps = 0
+    while steps < cap {
+        mut k = keys[idx]
+        if k == 0 { return }
+        if k == key { keys[idx] = 0 - 1  return }
+        idx = idx + 1
+        if idx >= cap { idx = 0 }
+        steps = steps + 1
+    }
+}
+fn main() {
+    mut cap = 1048576
+    mut keys = array(cap)
+    mut vals = array(cap)
+    mut n = 400000
+    mut i = 1
+    while i <= n { insert(keys, vals, cap, i, i * 3)  i = i + 1 }
+    mut checksum = 0
+    mut q = 1
+    while q <= 800000 { mut key = q * 7919 % 800000 + 1  checksum = (checksum + lookup(keys, vals, cap, key)) % 1000000007  q = q + 1 }
+    i = 2
+    while i <= n { remove(keys, cap, i)  i = i + 2 }
+    q = 1
+    while q <= 800000 { mut key = q * 7919 % 800000 + 1  checksum = (checksum + lookup(keys, vals, cap, key)) % 1000000007  q = q + 1 }
+    print(checksum)
+}
