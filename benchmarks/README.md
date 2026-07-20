@@ -6,6 +6,11 @@ Meaningful benchmarks across several areas, each in **Java** (→ FastLLVM),
 
 FastLLVM builds with `-march=native` (closed-world AOT on the target machine).
 
+Sibling suites: the single-kernel Vire↔Rust↔clang suites in [suite/](suite/) and
+[vire-lang/](vire-lang/), and **[complex/](complex/)** — multi-algorithm workloads
+(pipeline, k-means) and **fair fork/join multithreading** (parallel Monte-Carlo /
+Mandelbrot, 4 threads in every language).
+
 ## Areas
 
 | Benchmark | Area | Stresses |

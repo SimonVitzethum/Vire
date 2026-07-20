@@ -1,0 +1,50 @@
+// Parallel Mandelbrot escape-time checksum: 4 threads each own a horizontal band
+// of a 2000x2000 grid (maxit 200), summing per-pixel escape iterations into a
+// shared Atomic. The reduction is an integer sum → identical regardless of thread
+// scheduling; the float ops match C/Rust bit-for-bit → identical checksum.
+fn band(base: Int, total: Atomic) -> Int {
+    mut y = base * 500
+    mut yend = y + 500
+    mut sum = 0
+    while y < yend {
+        mut px = 0
+        while px < 2000 {
+            mut cr = (px as Float) * 3.0 / 2000.0 - 2.0
+            mut ci = (y as Float) * 3.0 / 2000.0 - 1.5
+            mut zr = 0.0
+            mut zi = 0.0
+            mut it = 0
+            mut done = 0
+            mut i = 0
+            while i < 200 {
+                if done == 0 {
+                    mut zr2 = zr * zr
+                    mut zi2 = zi * zi
+                    if zr2 + zi2 > 4.0 {
+                        done = 1
+                    } else {
+                        mut nzr = zr2 - zi2 + cr
+                        zi = 2.0 * zr * zi + ci
+                        zr = nzr
+                        it = it + 1
+                    }
+                }
+                i = i + 1
+            }
+            sum = sum + it
+            px = px + 1
+        }
+        y = y + 1
+    }
+    total.fetch_add(sum)
+    0
+}
+fn main() {
+    mut total = Atomic(0)
+    mut w0 = spawn band(0, total)
+    mut w1 = spawn band(1, total)
+    mut w2 = spawn band(2, total)
+    mut w3 = spawn band(3, total)
+    join(w0)  join(w1)  join(w2)  join(w3)
+    print(total.load())
+}

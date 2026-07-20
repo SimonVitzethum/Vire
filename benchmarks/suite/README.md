@@ -70,11 +70,10 @@ and 2.4× faster on dispatch; the residual is data-dependent bounds checks.**
 **Deliberately NOT exercised by these microbenchmarks** — and *why*, updated for the
 current language surface:
 
-- **Concurrency throughput** — Vire now HAS high-level, safe-by-construction
-  `spawn`/`join`/`Atomic`/`Mutex`/`Channel`/`parallel_for` (see `../../tests/
-  vire_threads.sh`, `../../examples/vire/threads_*.vr`), but there is **no contention/
-  scaling benchmark** here (thread-pool, work-stealing, parallel sort). Open: measure
-  real multi-thread scaling (M0.1c).
+- **Concurrency throughput** — now covered in **[../complex/](../complex/)**:
+  `spawn`/`join`/`Atomic` fork-join Monte-Carlo and Mandelbrot with **4 threads in Vire,
+  Rust, and C++**, measured **3.98× scaling on 4 cores** and at/ahead of Rust/C++
+  (pmontecarlo 0.97×). Still open there: a contended/work-stealing benchmark (M0.1c).
 - **Text processing** — `Str` methods (length/charAt/substring/indexOf/starts·endsWith/
   trim/lower/upper), `list()/map()/set()`, iterator adapters, and `@derive(Json)` output
   exist now, so simple string/collection kernels are expressible; still missing for a

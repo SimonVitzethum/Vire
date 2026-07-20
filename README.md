@@ -81,7 +81,14 @@ beating Rust** (a shape/freshness analysis drops the cycle collector for provabl
 tree-shaped types). The solver *proves* array indices in range (the `(lo+hi)/2` midpoint,
 the affine `r*n+k`) and, where a check can't be elided, makes it as cheap as Rust's (a
 noreturn abort when provably uncatchable) — **all fully memory-safe: a genuinely
-out-of-bounds access still throws**. See [TODO.md](TODO.md), [benchmarks/](benchmarks/).
+out-of-bounds access still throws**.
+
+Beyond single kernels, [benchmarks/complex/](benchmarks/complex/) runs **multi-algorithm
+workloads** (a generate→sort→search→histogram pipeline; integer k-means) and **fair
+fork/join multithreading** — parallel Monte-Carlo and Mandelbrot with **4 threads in
+Vire, Rust, and C++** (bit-identical output). The threading is real: `pmontecarlo` scales
+**3.98× on 4 cores** and Vire is at/ahead of Rust/C++ (0.97×) — `spawn`/`Atomic` add no
+overhead over raw `std::thread`. See [TODO.md](TODO.md), [benchmarks/](benchmarks/).
 
 ## Building & compiling programs
 

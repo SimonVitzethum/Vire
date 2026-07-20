@@ -1,0 +1,27 @@
+// Parallel Monte-Carlo: 4 threads each sample 25M points (integer LCG, unit
+// quarter-circle test), folding one partial hit-count into a shared Atomic.
+// Deterministic (per-thread seed fixed by base) → identical to the serial result.
+fn sample(base: Int, hits: Atomic) -> Int {
+    mut seed = base * 2654435761 + 1
+    mut count = 0
+    mut i = 0
+    while i < 25000000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        mut x = seed % 32768
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        mut y = seed % 32768
+        if x * x + y * y <= 1073676289 { count = count + 1 }
+        i = i + 1
+    }
+    hits.fetch_add(count)
+    0
+}
+fn main() {
+    mut hits = Atomic(0)
+    mut w0 = spawn sample(0, hits)
+    mut w1 = spawn sample(1, hits)
+    mut w2 = spawn sample(2, hits)
+    mut w3 = spawn sample(3, hits)
+    join(w0)  join(w1)  join(w2)  join(w3)
+    print(hits.load())
+}
