@@ -2578,17 +2578,11 @@ int64_t jrt_current_time_millis(void) {
  * via the pending model); INT_MIN / -1 is defined as INT_MIN. */
 #define ARITH_MSG "java.lang.ArithmeticException: / by zero"
 
-/* Checked integer division/remainder (variable divisor). These are `noinline`
- * on purpose: under `-flto` clang inlines them into the caller, and the
- * `INT_MIN/-1` guard combined with the surrounding `srem`/`sdiv` and the
- * caller's value-range facts triggered a downstream LLVM miscompile (a computed
- * array index came out wrong → spurious ArrayIndexOutOfBoundsException; found by
- * the differential fuzzer, tests/fuzz.sh). Keeping them out-of-line side-steps
- * the bad cross-inline optimization. Cost is negligible: constant divisors never
- * reach here (the backend emits native srem/magic-multiply, and constprop turns
- * `mut n = <const>` divisors into literals), so only genuinely runtime divisors
- * pay a call — which they already did before LTO inlining. */
-__attribute__((noinline)) int32_t jrt_idiv(int32_t a, int32_t b) {
+/* Checked integer division/remainder (variable divisor). Constant divisors never
+ * reach here — the backend emits native srem/magic-multiply, and constprop turns
+ * `mut n = <const>` divisors into literals — so only genuine runtime divisors pay
+ * the call. */
+int32_t jrt_idiv(int32_t a, int32_t b) {
     if (b == 0) {
         throw_runtime(&arith_exc_obj, ARITH_MSG);
         return 0;
@@ -2598,7 +2592,7 @@ __attribute__((noinline)) int32_t jrt_idiv(int32_t a, int32_t b) {
     return a / b;
 }
 
-__attribute__((noinline)) int32_t jrt_irem(int32_t a, int32_t b) {
+int32_t jrt_irem(int32_t a, int32_t b) {
     if (b == 0) {
         throw_runtime(&arith_exc_obj, ARITH_MSG);
         return 0;
@@ -2610,7 +2604,7 @@ __attribute__((noinline)) int32_t jrt_irem(int32_t a, int32_t b) {
 
 /* --- long/double --------------------------------------------------- */
 
-__attribute__((noinline)) int64_t jrt_ldiv(int64_t a, int64_t b) {
+int64_t jrt_ldiv(int64_t a, int64_t b) {
     if (b == 0) {
         throw_runtime(&arith_exc_obj, ARITH_MSG);
         return 0;
@@ -2620,7 +2614,7 @@ __attribute__((noinline)) int64_t jrt_ldiv(int64_t a, int64_t b) {
     return a / b;
 }
 
-__attribute__((noinline)) int64_t jrt_lrem(int64_t a, int64_t b) {
+int64_t jrt_lrem(int64_t a, int64_t b) {
     if (b == 0) {
         throw_runtime(&arith_exc_obj, ARITH_MSG);
         return 0;
