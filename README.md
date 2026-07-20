@@ -61,27 +61,84 @@ exit)** are the soundness oracle — the floor every optimization must keep gree
 Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, g++
 16, rustc 1.97, all `-O2 -flto -march=native`; measured 2026-07):
 
-| Benchmark | Vire vs clang++ | Notes |
-|---|---|---|
-| montecarlo | **0.99×** | compute-bound, parity |
-| nbody / bitmanip | **~1.00×** | at parity |
-| **vcall** | **0.42×** (2.4× faster) | solver devirtualization; = Rust, beats clang `virtual` |
-| **matmul** (256³ ikj) | **0.77×** (0.83× Rust) | ikj order → vectorized SAXPY; affine index elided |
-| **binsearch** (10M) | **1.06×** (= 1.00× Rust) | midpoint check *proved* redundant + elided — safely |
-| **sort** (quicksort 2M) | 1.14× (= 1.05× Rust) | uncatchable checks abort noreturn (Rust's structure) |
+| Benchmark | Vire vs Rust | Vire vs clang++ | Notes |
+|---|---|---|---|
+| montecarlo / nbody / bitmanip | **~1.00×** | **~1.00×** | compute-bound, parity |
+| **struct** (stack structs) | **0.90×** | **0.89×** | beats both |
+| **binary-trees** | **0.91×** | 1.29× | region inference + move-on-last-use |
+| **matmul** (256³ ikj) | **0.98×** | **0.91×** | ikj order → vectorized SAXPY; affine index elided |
+| **vcall** (dyn dispatch) | **1.00×** | **0.44×** (2.3× faster) | solver devirtualization; beats clang `virtual` |
+| **binsearch** (10M) | 1.03× | **0.78×** | midpoint check *proved* redundant + elided — safely |
+| **sort** (quicksort 2M) | 1.06× | 1.33× | uncatchable checks abort noreturn (Rust's structure) |
 
 Across the 12 Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
-memory-safe Vire vs memory-safe Rust is a **geometric-mean 0.97× (median 1.00×) — at
-Rust parity**, with **11 of 12 at or within ~5% of Rust** and several faster (matmul
-0.83× Rust, vcall 0.42× clang / = Rust, mandelbrot 0.84× Rust, struct 0.93×, nbody/
-binsearch/btree ≈ 1.0×). The solver *proves* array indices in range (the `(lo+hi)/2` midpoint, the affine
-`r*n+k`) and, where a check can't be elided, makes it as cheap as Rust's (a noreturn
-abort when provably uncatchable) — **all fully memory-safe: a genuinely out-of-bounds
-access still throws**. binary-trees reached parity via region inference + move-on-
-last-use RC elision. matmul now **beats both Rust (0.83×) and clang (0.77×)**: the
-cache-friendly ikj loop order makes the inner loop a vectorizable SAXPY (the same
-technique the Java-AOT path uses to beat Rust). See [TODO.md](TODO.md) and
-[benchmarks/suite/](benchmarks/suite/).
+memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.00× (median 1.00×) — at
+Rust parity**, with every benchmark within ~9% of Rust and several faster (struct 0.90×,
+binary-trees 0.91×, matmul 0.98×, vcall = Rust / 0.44× clang). On the **Java→native**
+oracle path the same backend takes **NBody 35.7× → 1.16×** (`Math.sqrt` now lowers to the
+`sqrtsd` intrinsic, not a 60-iteration Newton call) and **binary-trees 1.73× → 0.81×,
+beating Rust** (a shape/freshness analysis drops the cycle collector for provably
+tree-shaped types). The solver *proves* array indices in range (the `(lo+hi)/2` midpoint,
+the affine `r*n+k`) and, where a check can't be elided, makes it as cheap as Rust's (a
+noreturn abort when provably uncatchable) — **all fully memory-safe: a genuinely
+out-of-bounds access still throws**. See [TODO.md](TODO.md), [benchmarks/](benchmarks/).
+
+## Building & compiling programs
+
+The whole pipeline is one command. Optimization is on by default
+(`clang -O2 -flto -march=native`, closed-world AOT for the host CPU).
+
+```console
+$ vire build hello.vr -o hello     # compile to a native binary
+$ vire run hello.vr                # compile to a temp binary and run it
+```
+
+**Common flags** (all additive to the same solver + backend):
+
+| Flag | Effect |
+|---|---|
+| `-o FILE` | output path |
+| `--emit=obj\|asm\|llvm\|ir\|staticlib` | stop at a `.o` (one relocatable C-ABI object, incl. `main`), assembly, LLVM/mid IR, or a `.a` |
+| `--deps FILE` | write a Makefile/Ninja depfile (for incremental builds) |
+| `-I DIR` | include path for `native "c"` blocks / headers |
+| `--pkg NAME` | pull cflags+libs from **pkg-config** (first-class system deps) |
+| `-l NAME` / `--obj FILE` | link a library / a `.c`/`.cpp`/`.o`/`.a` (C/C++/Rust via the C ABI) |
+| `--target TRIPLE` | cross-compile (e.g. `x86_64-pc-windows-gnu`) |
+| `--log-level debug\|info\|warn\|error\|off` | build-time log threshold (below it = zero instructions) |
+| `--syntax FILE` | opt-in custom keyword spellings (also via an in-file `//!syntax: FILE`) |
+| `-g` / `--backtrace` | DWARF debug info (`.vr:line`) / native backtrace on an uncaught throw |
+
+FFI is source-level: `extern "C" header "h.h" { … }` auto-generates bindings from a C
+header at compile time; `native "c"/"c++"/"asm" """ … """` blocks are compiled and linked
+in automatically (and **proven memory-safe** by the vendored verifier, the sound
+replacement for `unsafe`).
+
+### With Meson
+
+A whole `.vr` program lowers to **one relocatable C-ABI object** (the runtime `main`
+included), so Meson links it like any C/C++/Rust object. Using only the stock Meson DSL
+(no plugin to install):
+
+```meson
+project('app', 'c', meson_version: '>=1.1.0')
+vire = find_program('vire')
+
+main_obj = custom_target('main.vr.o',
+  input: 'main.vr', output: 'main.vr.o',
+  command: [vire, 'build', '@INPUT@', '--emit=obj', '-o', '@OUTPUT@', '--deps', '@DEPFILE@'],
+  depfile: 'main.vr.o.d')                 # incremental: rebuilds on source/header change
+
+executable('app', 'util.c', objects: main_obj, link_args: ['-lm'])
+```
+
+```console
+$ meson setup builddir && ninja -C builddir && ./builddir/app
+```
+
+This links a Vire object with a C object (`-lm` because the runtime uses libm). Add
+`-pthread` if the program uses `spawn`, and system libraries via `--pkg`. An optional
+`import('vire')` module (`vire.executable()` / `vire.static_library()`) and a tested,
+runnable example are in [build-integration/meson/](build-integration/meson/).
 
 ## Documents
 

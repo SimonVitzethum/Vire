@@ -5,24 +5,25 @@
 output equality. C++ = **clang++** (LLVM, like Vire) for a fair codegen
 comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 
-## Results (best-of-5, the same machine, measured 2026-07)
-| Benchmark | Vire | Rust | clang++ | Vire/clang |
-|---|---|---|---|---|
-| bitmanip (popcount) | 0.187 | 0.188 | 0.187 | **1.00×** |
-| matmul (256³ ikj) | 0.0036 | 0.0043 | 0.0047 | **0.77×** |
-| nbody (2000, 20 steps) | 0.072 | 0.076 | 0.074 | **0.97×** |
-| montecarlo (20M, LCG) | 0.041 | 0.041 | 0.041 | **0.99×** |
-| vcall (dyn dispatch, 100M) | 0.115 | 0.115 | 0.276 | **0.41×** |
-| sort (quicksort 2M) | 0.128 | 0.122 | 0.112 | 1.14× |
-| binsearch (10M lookups) | 0.480 | 0.477 | 0.451 | **1.06×** |
+## Results (best-of-5, the same machine, freshly measured 2026-07)
+| Benchmark | Vire | Rust | clang++ | Vire/Rust | Vire/clang |
+|---|---|---|---|---|---|
+| bitmanip (popcount) | 0.229 | 0.231 | 0.230 | **0.99×** | **1.00×** |
+| matmul (256³ ikj) | 0.0059 | 0.0060 | 0.0065 | **0.98×** | **0.91×** |
+| nbody (2000, 20 steps) | 0.360 | 0.360 | 0.360 | **1.00×** | **1.00×** |
+| montecarlo (20M, LCG) | 0.052 | 0.052 | 0.053 | **1.00×** | **0.99×** |
+| vcall (dyn dispatch, 100M) | 0.212 | 0.212 | 0.480 | **1.00×** | **0.44×** |
+| sort (quicksort 2M) | 0.177 | 0.166 | 0.133 | 1.06× | 1.33× |
+| binsearch (10M lookups) | 0.681 | 0.661 | 0.874 | 1.03× | **0.78×** |
 
-**Average (this suite, Vire/Rust):** geometric mean **0.97×** (was 1.01× before the
-matmul ikj port) — memory-safe Vire is at/just under Rust parity here; every benchmark is
-within ±16% of Rust and three (matmul, nbody, vcall) are faster. **binsearch = 1.00× Rust** (the constant upper/lower-bound
-fixpoint proves the midpoint `0 ≤ (lo+hi)/2 ≤ n-1 < len` and elides the check, safely
-— a real OOB still throws); **sort = 1.05× Rust** (its uncatchable checks abort
-noreturn, Rust's structure); **matmul = 0.83× Rust / 0.77× clang** — beats both
-(cache-friendly ikj order → vectorized SAXPY inner loop, affine index elided).
+**Average (this suite, Vire/Rust):** geometric mean **1.01×** — memory-safe Vire at Rust
+parity; every benchmark within ±6% of Rust and three (matmul, vcall, binsearch beat clang).
+**matmul = 0.98× Rust / 0.91× clang** — the cache-friendly ikj order vectorizes (SAXPY
+inner loop) and the affine index is elided. **vcall = 0.44× clang** (2.3× faster —
+devirtualized). **binsearch = 0.78× clang** (the midpoint check `0 ≤ (lo+hi)/2 ≤ n-1 < len`
+is *proved* redundant and elided, safely — a real OOB still throws). **sort = 1.06× Rust**
+(uncatchable checks abort noreturn, Rust's structure; the explicit-stack quicksort is its
+last few % — a recursive `Array[Int]` param version measured *slower*, so it stays).
 
 ## Interpretation
 - **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).

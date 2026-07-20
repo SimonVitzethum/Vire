@@ -4,21 +4,21 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 `rustc -O`; `clang++ -O2 -march=native`), best-of-3, outputs checked
 **bit-identical**. `./run.sh` reproduces.
 
-## Results (one machine, best-of-3, measured 2026-07)
+## Results (one machine, best-of-5, freshly measured 2026-07)
 | Bench | Kind | Vire | Rust | C++ | V/Rust | V/C++ |
 |---|---|---|---|---|---|---|
-| arith | compute loop | 0.962 s | 0.952 s | 0.959 s | **1.01×** | **1.00×** |
-| fib | recursion (fib 38) | 0.002 s | 0.087 s | 0.081 s | **0.02×** | **0.02×** |
-| struct | stack struct | 0.290 s | 0.309 s | 0.331 s | **0.94×** | **0.88×** |
-| **mandelbrot** | CLBG, float compute | 0.127 s | 0.152 s | 0.127 s | **0.84×** | **1.00×** |
-| **binary-trees** | CLBG, alloc/GC | 0.190 s | 0.186 s | 0.154 s | **1.02×** | 1.23× |
-| **nsieve** (i64-matched) | CLBG, array | 0.393 s | 0.367 s | 0.388 s | **1.07×** | **1.01×** |
+| arith | compute loop | 1.506 s | 1.506 s | 1.507 s | **1.00×** | **1.00×** |
+| fib | recursion (fib 38) | 0.002 s | 0.131 s | 0.122 s | **0.02×** | **0.02×** |
+| struct | stack struct | 0.449 s | 0.501 s | 0.505 s | **0.90×** | **0.89×** |
+| **mandelbrot** | CLBG, float compute | 0.218 s | 0.213 s | 0.218 s | 1.02× | **1.00×** |
+| **binary-trees** | CLBG, alloc/GC | 0.325 s | 0.357 s | 0.251 s | **0.91×** | 1.29× |
+| **nsieve** (i64-matched) | CLBG, array | 0.626 s | 0.572 s | 0.601 s | 1.09× | 1.04× |
 
 **Average:** across all 12 Vire benchmarks (this file + [../suite/](../suite/)),
-memory-safe Vire vs memory-safe Rust is a **geometric-mean 0.97× (median 1.00×)** —
-at/just under Rust parity, improved from 1.01× by the matmul ikj port (0.83× Rust) —
-excluding the degenerate `fib` constant-fold (0.02×, a real but one-off closed-world
-win); including `fib` the geomean is ~0.70×.
+memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.00× (median 1.00×)** — at
+Rust parity — excluding the degenerate `fib` constant-fold (0.02×, a real but one-off
+closed-world win); including `fib` the geomean is ~0.70×. **struct 0.90× and binary-trees
+0.91× now beat Rust**; the rest sit within ±9%.
 
 ## Reading
 **Compute-bound = parity or better.** Scalar arithmetic, stack structs, nsieve, and
@@ -32,8 +32,8 @@ a compile-time constant → ~instant (0.002 s) vs 0.08 s for `rustc -O` / `clang
 which keep the recursion. Real, but on a constant-input microbenchmark — not a claim
 about general recursion throughput.
 
-**Allocation/GC-bound = now at Rust parity.** binary-trees (pure object allocation +
-freeing) is **1.02× Rust / 1.23× C++** — down from ~2.65× two snapshots ago. Region
+**Allocation/GC-bound = now beats Rust.** binary-trees (pure object allocation +
+freeing) is **0.91× Rust / 1.29× C++** — down from ~2.65× a few snapshots ago. Region
 inference (`language/M0.3`) removed the bulk of the RC tax, and **move-on-last-use**
 (this round) removed the ownership-transfer churn: an owned ref whose sole use is a
 field store or `return` hands its +1 to the store (no retain, no cleanup release) —
