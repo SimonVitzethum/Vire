@@ -58,8 +58,15 @@ class Gen:
         if r < 0.2:   return (f"(({lv} + {rv}) % {M})", f"(({lc} + {rc}) % {M})")
         if r < 0.4:   return (f"(({lv} - {rv} + {M}) % {M})", f"(({lc} - {rc} + {M}) % {M})")
         if r < 0.55:  return (f"(({lv} * {rv}) % {M})", f"(({lc} * {rc}) % {M})")
-        if r < 0.68:  return (f"({lv} / (({rv}) % {M} + 1))", f"({lc} / (({rc}) % {M} + 1))")
-        if r < 0.8:   return (f"({lv} % (({rv}) % {M} + 1))", f"({lc} % (({rc}) % {M} + 1))")
+        if r < 0.6:   return (f"({lv} / (({rv}) % {M} + 1))", f"({lc} / (({rc}) % {M} + 1))")
+        if r < 0.68:  return (f"({lv} % (({rv}) % {M} + 1))", f"({lc} % (({rc}) % {M} + 1))")
+        # bitwise + shifts — common miscompile sources. Operands stay in [0,M);
+        # shift counts masked to [0,15] so results are bounded and match C (Vire
+        # masks the shift count too), then wrapped back into range.
+        if r < 0.73:  return (f"(({lv} & {rv}) % {M})", f"(({lc} & {rc}) % {M})")
+        if r < 0.78:  return (f"(({lv} | {rv}) % {M})", f"(({lc} | {rc}) % {M})")
+        if r < 0.82:  return (f"(({lv} ^ {rv}) % {M})", f"(({lc} ^ {rc}) % {M})")
+        if r < 0.86:  return (f"(({lv} << (({rv}) & 15)) % {M})", f"(((int64_t)({lc}) << (({rc}) & 15)) % {M})")
         if r < 0.9:   # comparison → 0/1
             op = random.choice(["<", "<=", "==", "!="])
             return (f"(if {lv} {op} {rv} {{ 1 }} else {{ 0 }})", f"(({lc} {op} {rc}) ? 1 : 0)")

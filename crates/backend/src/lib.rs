@@ -2050,9 +2050,10 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 }
                 Rvalue::Binary(op, a, b) => {
                     let aty = operand_ty(e.f, a);
+                    let bty = operand_ty(e.f, b);
                     let av = e.operand(w, a);
                     let bv = e.operand(w, b);
-                    emit_binop(w, e, *op, aty, &av, &bv)
+                    emit_binop(w, e, *op, aty, bty, &av, &bv)
                 }
                 Rvalue::Convert(op) => {
                     let from = operand_ty(e.f, op);
@@ -2785,7 +2786,7 @@ fn call_args(w: &mut String, e: &mut FnEmitter, args: &[Operand]) -> String {
         .join(", ")
 }
 
-fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b: &str) -> String {
+fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, bty: Ty, a: &str, b: &str) -> String {
     let t = e.fresh();
     // Comparisons always yield i32 (0/1); operands are i32 or ptr
     // (long/double comparisons go through runtime lcmp/dcmp).
@@ -2835,18 +2836,32 @@ fn emit_binop(w: &mut String, e: &mut FnEmitter, op: BinOp, aty: Ty, a: &str, b:
 
     // int/long arithmetic. div/rem go through the runtime for both (not here).
     let ty = llty(aty);
-    // Mask shift amounts (JLS 15.19): & 31 (int) or & 63 (long); the
-    // amount is always int and is extended to i64 for long.
+    // Mask shift amounts (JLS 15.19): & 31 (int) or & 63 (long). The shift count
+    // must match the shifted value's width. On the Java path the count is always
+    // i32; in Vire `Int` is i64, so a computed count (`a << (b & 7)`) arrives as
+    // i64 — convert `bty` → the needed width before masking, either direction.
     let masked = |w: &mut String, e: &mut FnEmitter, b: &str| -> String {
         if aty == Ty::I64 {
-            let ext = e.fresh();
-            writeln!(w, "  {ext} = zext i32 {b} to i64").unwrap();
+            let ext = if bty == Ty::I64 {
+                b.to_string()
+            } else {
+                let x = e.fresh();
+                writeln!(w, "  {x} = zext i32 {b} to i64").unwrap();
+                x
+            };
             let m = e.fresh();
             writeln!(w, "  {m} = and i64 {ext}, 63").unwrap();
             m
         } else {
+            let cnt = if bty == Ty::I64 {
+                let x = e.fresh();
+                writeln!(w, "  {x} = trunc i64 {b} to i32").unwrap();
+                x
+            } else {
+                b.to_string()
+            };
             let m = e.fresh();
-            writeln!(w, "  {m} = and i32 {b}, 31").unwrap();
+            writeln!(w, "  {m} = and i32 {cnt}, 31").unwrap();
             m
         }
     };
