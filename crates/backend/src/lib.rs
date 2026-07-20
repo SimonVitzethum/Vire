@@ -838,6 +838,13 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     // failure block ends in `unreachable` and the load result stays a direct value.
     const COLD: &[&str] = &["jrt_throw_npe", "jrt_throw_bounds", "jrt_throw", "jrt_check_uncaught"];
     const COLD_NORETURN: &[&str] = &["jrt_throw_npe_fatal", "jrt_throw_bounds_fatal"];
+    // Fresh-allocation runtime helpers: their result is a brand-new object/array
+    // (slab, arena, or region — all distinct from every live pointer), exactly
+    // like `malloc`. Marking the return `noalias` lets LLVM prove distinct arrays
+    // (e.g. a graph's `dst`/`wt`/`hd`/`hn`) don't alias, so it can hoist/reorder
+    // their accesses — the same alias freedom Rust's allocator gives. Sound: each
+    // call yields a fresh region that aliases nothing pre-existing.
+    const NOALIAS_RET: &[&str] = &["jrt_alloc", "jrt_alloc_array", "jrt_region_array", "jrt_array_clone"];
     for (name, sig) in RUNTIME_DECLS {
         let (ret, params) = sig.split_once(' ').unwrap();
         let attr = if COLD_NORETURN.contains(name) {
@@ -847,7 +854,8 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
         } else {
             ""
         };
-        writeln!(w, "declare {ret} @{name}{params}{attr}").unwrap();
+        let ret_attr = if NOALIAS_RET.contains(name) { "noalias " } else { "" };
+        writeln!(w, "declare {ret_attr}{ret} @{name}{params}{attr}").unwrap();
     }
 
     // Declare functions that are called but not defined.
