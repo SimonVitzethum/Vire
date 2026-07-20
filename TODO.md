@@ -96,24 +96,33 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
   ~1.28× to C++). Needs a backend intrinsic path (emit `@llvm.vector.reduce.*` / explicit
   `<N x i64>` ops) or a comptime SIMD library. Deferred — marginal gain over the current
   parity; the two-pass restructure already got the bulk (2.2×).
-- [ ] **IR quality (the headline lever for the `benchmarks/complex/` losers).** Measured
-  on `raytracer` (1.9× Rust, **0% bounds cost** — pure codegen): for the *same* program
-  Vire's emitted IR yields **~1.5× more scalar FP ops (164 vs 107) and ~2.4× more register
-  spills (24 vs 10)** than rustc/clang, though all three share LLVM. Root cause is IR
-  *shape*, not the optimizer: Vire emits every local as an `alloca` (150 of them) with
-  store/reload traffic and fewer CSE'd temporaries, so LLVM's mem2reg/GVN start from a
-  worse position and register pressure is higher. Fixes: emit locals in near-SSA form
-  (fewer allocas / rely less on mem2reg), CSE/hoist within the front-end lowering, and cut
-  redundant `Convert`/move chains. This is the broad lever behind raytracer, graph (1.6×),
-  regex/pquicksort/pipeline (1.1–1.25×) — the residual after bounds/RC is IR quality.
+- [ ] **Codegen scheduling / register allocation (the `benchmarks/complex/` FP losers).**
+  Corrected finding (an earlier note here blamed "IR quality" off a misleading asm-region
+  count — retracted): Vire's emitted IR **optimizes fine**. Controlled check — the *same*
+  program through `opt -O2`: a scalar FP loop matches C exactly (fmul 2 vs 4, same
+  loads/allocas); `raytracer`'s whole module is comparable to clang (fmul 24 vs 27, fdiv
+  10=10, FMA formed in the backend for both); the i64→i32 index `trunc`/`sext` chains are
+  fully eliminated (post-opt trunc=0). So there is **no low-hanging IR-quality fruit**. The
+  residual on `raytracer` (1.9×), `graph` (1.6×), `regex`/`pquicksort`/`pipeline`
+  (1.1–1.25×) is the LLVM **backend** scheduling/register-allocation reacting to subtle IR
+  structure (measured: ~2× the stack spills of clang's binary on the raytracer inner loop),
+  plus the in-place-sort check model. This is deep-codegen tuning (instruction ordering,
+  reducing live ranges at lowering), not a single fixable pass — low ROI vs the wins
+  already banked (7 of 14 at/under Rust).
 - [ ] **Interprocedural escape/region for short-lived heap graphs** (the
-  `benchmarks/complex/compiler` case, 3.45× Rust). The heap AST is built in `parse`,
-  consumed in `eval`, dead by the next loop iteration — rustc/LLVM inline `parse`+`eval`,
-  prove the `Box` nodes non-escaping, and **eliminate the allocation** (0.006 s). Vire
-  heap-allocates each node (a node-pool/SoA rewrite measured *slower* — 0.040 s — from the
-  extra array params + bounds checks + scattered access, so pooling is not the fix). Needs
-  the **interprocedural escape/region inference** already named for NBody/Trees, extended
-  to a function-scoped object graph that dies per outer-loop iteration → bulk-free arena.
+  `benchmarks/complex/compiler` case, 3.45× Rust, 20 vs 2 MB RAM). The heap AST is built in
+  `parse`, consumed in `eval`, dead by the next loop iteration — rustc/LLVM inline
+  `parse`+`eval`, prove the `Box` nodes non-escaping, and **eliminate the allocation**
+  (0.006 s, 2 MB). Vire heap-allocates each node (RC-freed, 0-live, but 20 MB peak and the
+  malloc/free is the cost). Ruled out: a node-pool/SoA rewrite is *slower* (0.040 vs 0.021
+  — extra array params + bounds checks + scattered access); the existing `capsule` arena
+  would work but is a Vire-only construct (unfair in a matched benchmark). The real fix is
+  **automatic interprocedural escape inference** proving every object (transitively)
+  allocated during one outer-loop iteration is unreachable after it → route them to a
+  per-iteration bump arena (bulk-free). This is the same lever named for NBody/Trees but
+  **whole-program and soundness-critical** (a wrong escape verdict = use-after-free, unlike
+  the leak-only failure of the type-shape analysis) — it needs its own careful build with
+  an adversarial escape-suite, not a rushed pass.
 
 ## Compile-time programming layer (macros + comptime + reflection, one typed AST)
 
