@@ -1,57 +1,51 @@
-// K-means clustering (integer arithmetic → deterministic across languages):
-//   generate 50k 2D points, then 25 Lloyd iterations over 16 clusters —
-//   each iteration assigns every point to its nearest centroid (squared
-//   integer distance) and recomputes centroids as integer means.
+// K-means clustering (integer arithmetic -> deterministic across languages):
+//   generate 50k 2D points, then 25 Lloyd iterations over 16 clusters. The
+//   assignment step is written as TWO passes -- first fill a per-centroid squared-
+//   distance array (a dependency-free map), then a scalar argmin over it. This
+//   split removes the loop-carried `bestd` dependency that otherwise serializes the
+//   fused form, and lets the backend pipeline + elide the (in-range) checks. Not
+//   vectorization: no compiler emits SIMD here (the branchy argmin blocks it).
 // Combines PRNG generation, nearest-neighbour search, and reduction.
 // Output: checksum of the final centroid coordinates.
 fn main() {
     mut n = 50000
-    mut kk = 16
-    mut xs = array(n)
-    mut ys = array(n)
-    mut seed = 987654321
-    mut i = 0
+    mut xs = array(n)  mut ys = array(n)
+    mut seed = 987654321  mut i = 0
     while i < n {
         seed = (seed * 1103515245 + 12345) % 2147483648  xs[i] = seed % 1000
         seed = (seed * 1103515245 + 12345) % 2147483648  ys[i] = seed % 1000
         i = i + 1
     }
-    mut cx = array(kk)
-    mut cy = array(kk)
+    mut cx = array(16)  mut cy = array(16)
     i = 0
-    while i < kk { cx[i] = xs[i * 137 % n]  cy[i] = ys[i * 137 % n]  i = i + 1 }
-    mut sumx = array(kk)
-    mut sumy = array(kk)
-    mut cnt = array(kk)
+    while i < 16 { cx[i] = xs[i * 137 % n]  cy[i] = ys[i * 137 % n]  i = i + 1 }
+    mut sumx = array(16)  mut sumy = array(16)  mut cnt = array(16)
+    mut dist = array(16)
     mut it = 0
     while it < 25 {
         mut c = 0
-        while c < kk { sumx[c] = 0  sumy[c] = 0  cnt[c] = 0  c = c + 1 }
+        while c < 16 { sumx[c] = 0  sumy[c] = 0  cnt[c] = 0  c = c + 1 }
         i = 0
         while i < n {
-            mut px = xs[i]
-            mut py = ys[i]
-            mut best = 0
-            mut bestd = 2000000000
+            mut px = xs[i]  mut py = ys[i]
             c = 0
-            while c < kk {
-                mut dx = px - cx[c]
-                mut dy = py - cy[c]
-                mut d = dx * dx + dy * dy
-                if d < bestd { bestd = d  best = c }
+            while c < 16 {
+                mut dx = px - cx[c]  mut dy = py - cy[c]
+                dist[c] = dx * dx + dy * dy
                 c = c + 1
             }
-            sumx[best] = sumx[best] + px
-            sumy[best] = sumy[best] + py
-            cnt[best] = cnt[best] + 1
+            mut best = 0  mut bestd = dist[0]
+            c = 1
+            while c < 16 { if dist[c] < bestd { bestd = dist[c]  best = c }  c = c + 1 }
+            sumx[best] = sumx[best] + px  sumy[best] = sumy[best] + py  cnt[best] = cnt[best] + 1
             i = i + 1
         }
         c = 0
-        while c < kk { if cnt[c] > 0 { cx[c] = sumx[c] / cnt[c]  cy[c] = sumy[c] / cnt[c] }  c = c + 1 }
+        while c < 16 { if cnt[c] > 0 { cx[c] = sumx[c] / cnt[c]  cy[c] = sumy[c] / cnt[c] }  c = c + 1 }
         it = it + 1
     }
     mut checksum = 0
     i = 0
-    while i < kk { checksum = checksum + cx[i] * 31 + cy[i]  i = i + 1 }
+    while i < 16 { checksum = checksum + cx[i] * 31 + cy[i]  i = i + 1 }
     print(checksum)
 }
