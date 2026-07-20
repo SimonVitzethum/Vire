@@ -68,18 +68,27 @@ RC-on-stable-statics eliminated (72×→39×) and inline-checked (visible `load`
 array access. The residual 1.46× is the last interprocedural step: propagate `nb=5` and
 the static array lengths into `advance` so its 5×5 loops fully unroll and register-allocate.
 
-### Trees (1.68×, was 3.2×) — mostly closed by region inference
-`Node` references `Node` → the type-reference graph is cyclic → the
-(conservative, type-based) acyclicity analysis kept the cycle collector, which
-buffers candidates per decref. **Region inference (`language/M0.3`) has since
-removed most of this tax — 3.2×→1.68× C++.** The residual is the last RC/collector
-bookkeeping on the tree nodes the region pass does not yet prove tree-shaped
-(acyclic); a full **structure/shape analysis** would drop the collector entirely
-(as it already does for type-acyclic programs) and reach the RC-lean ceiling.
+### Trees (1.74× Rust) — precise diagnosis
+`Node` references `Node` → the type-reference graph is cyclic → the (conservative,
+type-based) acyclicity analysis keeps the cycle collector. Measured detail: **construction
+retains are already zero** (move-on-last-use fires on the Java path too — `n.l = make(d-1)`
+moves the fresh subtree in with no retain); the residual **1.74×** is that **every
+`release` goes through the possible-root *buffering* path because `Node` is a cyclic
+type**, even though a tree's decrefs all go straight to 0. Rust's `Box` drop pays none of
+this. Dropping the collector for `Node` needs proving it is **tree-shaped (never cyclic)**.
+A naive "self-ref fields are only assigned freshly-allocated values" test is **unsound** —
+verified with an adversarial `a.next=b; b.next=a` where *both* values are fresh `New`s yet
+form a cycle; the collector is genuinely required there (0-live only with it). The sound
+condition is **fresh AND linear (the value's sole use is the store, a move)**, applied
+interprocedurally (`make` returns fresh) — a real shape/freshness analysis, deferred
+rather than rushed (soundness first). The **Vire path already reaches 1.02× Rust** on the
+same workload via region inference, so the technique exists; wiring the equivalent onto
+the Java frontend is the remaining step.
 
-## Common denominator of the remaining case
-Matmul is now closed (affine elision + noreturn checks); Trees is largely closed by
-region inference (shape analysis is the last step). **NBody** alone remains clearly
-open — it needs interprocedural static-array-length + loop-bound constants so its
-checks elide. The *infrastructure* (GVN, escape, acyclicity, region inference, affine
-bounds, pending/noreturn elision) is in place — a targeted extension, not a new build.
+## Status of the remaining cases
+Matmul closed (affine elision + noreturn checks). **NBody closed** to 1.46× (the real fix
+was `Math.sqrt`→`sqrtsd`, not bounds); the last ~0.4× is interprocedural `nb`/length
+const-prop so `advance`'s 5×5 loops unroll. **Trees** at 1.74× needs the sound
+shape/freshness analysis above (the Vire path already hits 1.02× via region inference).
+The infrastructure (GVN, escape, acyclicity, region inference, affine bounds,
+pending/noreturn elision, sqrt intrinsic) is in place — targeted extensions, not new builds.
