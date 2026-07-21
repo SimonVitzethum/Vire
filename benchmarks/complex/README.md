@@ -41,20 +41,20 @@ reproduces both.
 
 | Benchmark | Vire | Rust | C++ | V/Rust | V/C++ | RAM V/R/C |
 |---|---|---|---|---|---|---|
-| **hashmap** | 0.043 s | 0.044 s | 0.042 s | **0.98×** | 1.04× | 17 / 17 / 19 MB |
-| graph | 0.061 s | 0.039 s | 0.053 s | 1.58× | 1.15× | **55 / 30 / 56 MB** |
-| **matrix** (SIMD) | 0.033 s | 0.036 s | 0.035 s | **0.93×** | **0.95×** | 7 / 7 / 9 MB |
-| **fft** (NTT) | 0.047 s | 0.080 s | 0.078 s | **0.58×** | **0.60×** | 9 / 9 / 11 MB |
-| raytracer | 0.326 s | 0.170 s | 0.152 s | 1.92× | 2.14× | **1 / 1 / 3 MB** |
-| compression | 0.033 s | 0.027 s | 0.032 s | 1.23× | 1.03× | 34 / 34 / 35 MB |
-| compiler | 0.018 s | *(0.006 — folded)* | 0.017 s | *n/a* | **1.08×** | 17 / 2 / 18 MB |
-| json | 0.022 s | *(0.002 — folded)* | 0.022 s | *n/a* | **0.99×** | 32 / 1 / 33 MB |
-| regex | 0.209 s | 0.186 s | 0.178 s | 1.12× | 1.17× | 1 / 1 / 3 MB |
-| pipeline | 0.021 s | 0.018 s | 0.018 s | 1.15× | 1.15× | 3 / 3 / 5 MB |
-| **kmeans** | 0.034 s | 0.044 s | 0.027 s | **0.77×** | 1.26× | 2 / 2 / 4 MB |
-| **pmontecarlo** (4 thr) | 0.174 s | 0.194 s | 0.194 s | **0.90×** | **0.90×** | 1 / 1 / 3 MB |
-| **pmandel** (4 thr) | 0.233 s | 0.215 s | 0.216 s | 1.08× | 1.08× | 2 / 1 / 3 MB |
-| pquicksort (4 thr) | 0.117 s | 0.094 s | 0.096 s | 1.24× | 1.21× | 31 / 31 / 33 MB |
+| **hashmap** | 0.040 s | 0.040 s | 0.040 s | **1.00×** | **0.99×** | 17 / 17 / 19 MB |
+| graph | 0.064 s | 0.039 s | 0.058 s | 1.64× | 1.09× | **55 / 30 / 56 MB** |
+| **matrix** (SIMD) | 0.036 s | 0.035 s | 0.034 s | 1.05× | 1.07× | 7 / 7 / 9 MB |
+| **fft** (NTT) | 0.079 s | 0.080 s | 0.078 s | **0.99×** | 1.02× | 9 / 9 / 11 MB |
+| **raytracer** | 0.164 s | 0.170 s | 0.152 s | **0.97×** | 1.08× | **1 / 1 / 3 MB** |
+| compression | 0.034 s | 0.028 s | 0.033 s | 1.20× | 1.03× | 34 / 34 / 35 MB |
+| compiler | 0.018 s | *(0.006 — folded)* | 0.017 s | *n/a* | **1.06×** | 17 / 2 / 18 MB |
+| json | 0.023 s | *(0.002 — folded)* | 0.024 s | *n/a* | **0.96×** | 32 / 1 / 33 MB |
+| regex | 0.206 s | 0.186 s | 0.178 s | 1.11× | 1.15× | 1 / 1 / 3 MB |
+| pipeline | 0.020 s | 0.018 s | 0.018 s | 1.14× | 1.15× | 3 / 3 / 5 MB |
+| **kmeans** | 0.035 s | 0.063 s | 0.027 s | **0.56×** | 1.30× | 2 / 2 / 4 MB |
+| **pmontecarlo** (4 thr) | 0.187 s | 0.194 s | 0.194 s | **0.97×** | **0.96×** | 1 / 1 / 3 MB |
+| pmandel (4 thr) | 0.234 s | 0.216 s | 0.215 s | 1.08× | 1.09× | 1 / 1 / 3 MB |
+| pquicksort (4 thr) | 0.117 s | 0.095 s | 0.096 s | 1.23× | 1.22× | 31 / 31 / 33 MB |
 
 Fast benchmarks (≈0.02–0.07 s) carry ~±15% run-to-run variance; the parallel and
 ≥0.1 s ones are stable. **On memory Vire is at or below both** almost everywhere —
@@ -75,10 +75,13 @@ bulk-allocated in a per-iteration arena (see below), freed en bloc with no per-n
 The shared LLVM backend + solver (bounds elision, devirt, region/RC) lands compute and
 map/hash work at or below Rust/C++.
 
+**raytracer — won (0.97× Rust, was 1.92×).** LLVM's loop vectorizer was packing the
+*divergent* pixel loop (per-pixel hit/no-hit branches → predication + shuffle/blend
+overhead), a ~2× net loss. The backend now emits `!llvm.loop.vectorize.enable false` on
+loops whose body has a call or a conditional (`complex_loop_headers`) — straight-line
+innermost loops (matmul SAXPY) stay vectorized. Scalar codegen here matches Rust.
+
 **Where Vire lags, and why (honest):**
-- **raytracer (1.92× / 2.14×):** the hot loop indexes small `farray` sphere tables under
-  a data-dependent branch; the residual is scalar FP scheduling + not-fully-elided checks
-  in a divide-heavy inner loop. The most FP-bound whole program in the set.
 - **compiler (now 1.08× C++ — clang parity):** an **allocation/pointer-chasing** case (a
   heap AST built by `parse()` and walked by `eval()` each iteration). Previously Vire
   RC-managed every `Node` (retain/release on build + traversal) at 1.25× C++. An
