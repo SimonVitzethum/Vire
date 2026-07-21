@@ -193,6 +193,11 @@ memory-safety verifier) under the **Apache License 2.0**
 - **Invisible memory** — stack/heap/RC decided by the solver; `&` optional.
 - **Concurrency safe by construction** — channels (CSP) + `Mutex`/`Atomic`; the
   solver rejects shared bare mutable state.
+- **GPU kernels** — a `@gpu fn k(i: Int, …)` runs data-parallel on the GPU
+  (single-source: NVPTX → PTX → CUDA Driver-API launch), with the thread index
+  injected like a `parallel_for` worker `(i, …)`. Up to **16× vs CPU** on an
+  RTX 5070, bit-exact for integer kernels. See
+  [language/GPU-KERNELS.md](language/GPU-KERNELS.md).
 - **C native** — `extern "C"`/header bindings; C++/Rust via the C ABI. Meson
   first-class.
 
