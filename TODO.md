@@ -22,6 +22,44 @@ kernels lag (sort 1.37×, binsearch 1.16×) — data-dependent bounds checks (se
 
 ## Performance
 
+### Follow-ups from the perf + fuzzer session (2026-07-21)
+
+See [memory `vire-perf-fuzz-session`] for context.
+
+- [x] ~~**#1 distinct-array alias metadata** (`!alias.scope`/`!noalias`).~~ **RULED
+  OUT — measured.** `noalias` on the allocator returns already tells LLVM distinct
+  arrays don't alias, and an A/B (with vs without that attribute) is **identical**
+  on graph/sort/compression/pquicksort (e.g. graph 0.067 vs 0.066). These are
+  **latency/scheduling-bound** (dependent chains: the Dijkstra heap sift, the LZ4
+  hash lookup, the quicksort partition), not aliasing-bound — so per-access alias
+  metadata adds nothing while carrying real miscompile risk. Not worth building.
+
+Queued:
+
+- [ ] **RC inline in the backend (retain/release as IR, not runtime calls).**
+  Today `jrt_retain`/`jrt_release` are calls inlined only via runtime `-flto`.
+  Emitting the refcount inc/dec directly in the IR would (a) let the program's own
+  `-O2` optimize them (alloc/RC-heavy code like binary-trees), and (b) allow
+  **dropping runtime-LTO entirely** → removes the whole cross-module LTO
+  miscompile risk class at the root (the `!invariant.load` bug was one instance;
+  the vtable load is a latent second — see below). Bigger change; principled.
+- [ ] **Vtable load still carries `!invariant.load`** (backend.rs ~2157/2198).
+  Same unsound calloc-then-write pattern as the array length that caused the LTO
+  OOB miscompiles — the header is calloc'd (vtable=0) then written. Not
+  demonstrated-broken (the fuzzer has no objects/virtual calls), but latent.
+  Fix soundly (drop it, or `!invariant.group`/TBAA) before it bites under LTO.
+  **Correctness, not perf.**
+- [ ] **graph (1.64× Rust) deep-dive.** RAM 55 vs Rust 30 MB — Vire touches ~2×
+  the memory (cache pressure); find which arrays are fully touched. The Dijkstra
+  binary-heap sift is branchy pointer-chasing (bounds only 12%, not vectorizable);
+  try **PGO** (`--pgo-gen/--pgo-use`, already built) on its data-dependent heap
+  branches — measure whether it beats 0% here (regular branches saw ~0%).
+- [ ] **Expand the differential fuzzer** (tests/fuzz_gen.py) — floats (carefully,
+  fp-contract-matched), nested statement control-flow, break/continue, strings.
+  Adding bitwise/shifts this round exposed a shift miscompile + the LTO OOB class.
+- [ ] **sort 1.15× / pquicksort 1.23×:** residual is the check model + the
+  explicit-stack quicksort (a recursive `Array` param version measured slower).
+
 - [~] **#1 Relational bounds elision — headline.** Foundation in
   [crates/solver/src/bounds.rs](crates/solver/src/bounds.rs) (Div/Sub syms, subtract
   axiom, transitive lt, const-length midpoint). **Landed this round:** a constant
