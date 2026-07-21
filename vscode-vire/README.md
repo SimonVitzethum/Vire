@@ -37,11 +37,11 @@ Language support and native debugging for the **Vire** programming language
 
 ```sh
 # language features work out of the box (the wasm is committed). To rebuild it:
-sh editors/vscode-vire/build-wasm.sh   # needs: rustup target add wasm32-wasip1
+sh vscode-vire/build-wasm.sh   # needs: rustup target add wasm32-wasip1
 # for Build/Run/Debug also build the native compiler:
 cargo build --release -p vire
 # then point VS Code at the extension folder:
-code --extensionDevelopmentPath=editors/vscode-vire   # or symlink into ~/.vscode/extensions
+code --extensionDevelopmentPath=vscode-vire   # or symlink into ~/.vscode/extensions
 ```
 
 Set the compiler path in Settings (`vire.path`) if `vire` is not on `PATH`
@@ -79,7 +79,7 @@ you can step into helpers.
 ## Packaging & install
 
 ```sh
-cd editors/vscode-vire
+cd vscode-vire
 npx @vscode/vsce package            # produces vire-0.1.0.vsix (bundles the wasm)
 code --install-extension vire-0.1.0.vsix
 ```

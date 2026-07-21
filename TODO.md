@@ -322,7 +322,7 @@ embedded in the binary → launched via the CUDA Driver API (libcuda). Kernels l
 in `Program::gpu_kernels` (out of `functions`, so no host solver/RTA/inliner
 touches them); the backend emits device IR + a C launch stub per kernel. Intrinsics
 `gpu_gid/gpu_gsize/tid/bid/bdim/gdim`. Design adapted from NVlabs/cuda-oxide
-(Apache-2.0, `third_party/cuda-oxide`). Docs: [language/GPU-KERNELS.md]. Guarded by
+(Apache-2.0, `crates/cuda-oxide`). Docs: [language/GPU-KERNELS.md]. Guarded by
 `tests/vire_gpu.sh` (integer bit-exact vs CPU + error path). Measured **16× vs CPU**
 at high intensity on an RTX 5070 ([benchmarks/gpu/]). Separate GPU track — the CPU
 suite stays bit-identical.
@@ -462,19 +462,23 @@ Real-workload dogfooding: a MoE-inference emulator in Vire (YARN quantizer, EXPF
 gate/up/SwiGLU/down, top-k router, GPU matvec) — see
 `~/Schreibtisch/MoE Hardware/baby-loom-sim/`. Mostly smooth; two rough edges:
 
-- [x] **Lowering bug: `lowering: call target M2: only named functions`.** ~~Triggered in a
-  multi-function module by a helper returning `Int` via a **trailing cast expression**
-  `fn roundf(x: Float) -> Int { … (y as Int) }` and/or a **nested user-call as an argument**
-  `clampi(roundf(v), lo, hi)`.~~ **NO LONGER REPRODUCES (verified 2026-07-21).** Reverting
-  BOTH workarounds in the real `yarn_expffn.vr` (trailing `y as Int` return + nested
-  `clampi(roundf(w[..]/scale), …)`) now builds (exit 0) and runs correctly; isolated repros
-  (trailing cast after an `if`, nested user-call inside a `while`) also build+run. Resolved by
-  this session's `farray`/lowering changes (param array-kind registration + `farray[i]=<int>`
-  int→f64 store coercion, done for the `@gpu` work). Workarounds in baby-loom can be removed.
-- [x] **Ergonomics: `farray` allocation in a helper fn.** ~~`mut h = farray(dff)` inside a
-  helper produced the same lowering error.~~ **FIXED** — `mut h = farray(n)  h[0] = 1.0` in a
-  non-`main` helper now builds+runs (same root cause as above). Local array allocation works in
-  any fn.
+- [x] **FIXED — root cause was a PARSER call-adjacency ambiguity, not lowering.** The symptom
+  `lowering: call target M2: only named functions` was collateral: `parse_postfix` bound a `(`
+  as a call-arg list to *any* preceding expression, even across whitespace/newline. Because Vire
+  separates same-line statements at expression boundaries (Go-like NL terminators, but multiple
+  stmts per physical line), a tail like `mut y = x + 0.5  (y as Int)` parsed as the **call**
+  `(x+0.5)(y as Int)` — callee not an `Ident` → the M2 error. Same for `if …else… (e)` (if is an
+  expression) and any `value  (…)` on one line. **Fix:** in `parse_postfix`
+  ([crates/vire/src/parser.rs](crates/vire/src/parser.rs) `Tok::LParen` arm) a `(` forms a call
+  only when **adjacent** to the callee (`toks[pos-1].span.1 == toks[pos].span.0`); otherwise it
+  starts a new parenthesised-expression statement. `f(x)` = call, `f (x)` = two stmts. Verified:
+  the whole corpus uses `f(x)` (all 83 `ident (` hits are in comments), so no real call regresses.
+  Vire suites green (types/iter/heap/str/generics/infer/comptime/derive/itemmacro/gpu/threads/log
+  = 109/109). Repros `bugA` (trailing cast) and `3  (a)` now build+run; baby-loom workarounds removed.
+- [x] **`farray` allocation in a helper fn — same root cause.** `mut h = farray(dff)` in a
+  non-`main` helper only failed because a *later* line (`… (y as Int)` / a stray `value (…)`)
+  poisoned whole-program lowering. With the parser fix, `mut h = farray(n)  h[0] = 1.0` in any
+  fn builds+runs. Not a real allocation restriction.
 
 **Worked well (no action):** `farray`/`array` params with in-place writes through helpers;
 nested `while`; `if/else` statements; `%`, casts, Float arithmetic; **`@gpu` kernels with

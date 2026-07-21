@@ -39,7 +39,8 @@ members = [
 ]
 # Vendored upstream source with its own workspace — kept for reference/attribution
 # (Apache-2.0), NOT built by us. Excluded so cargo does not descend into it.
-exclude = ["third_party/cuda-oxide"]
+# Refresh it with `sh crates/cuda-oxide/update.sh`.
+exclude = ["crates/cuda-oxide"]
 
 [workspace.package]
 edition = "2021"

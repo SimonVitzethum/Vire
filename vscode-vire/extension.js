@@ -198,32 +198,60 @@ const BUILTINS = [
     ['gpu_bdim', 'gpu_bdim() — blockDim.x'], ['gpu_gdim', 'gpu_gdim() — gridDim.x'],
 ];
 
-// Methods offered after `.` — the runtime methods on the built-in collections
-// and strings (the receiver's exact type isn't tracked, so offer the union).
-const METHODS = [
-    ['len', 'length'], ['push', 'list: append'], ['pop', 'list: remove last'],
-    ['get', 'list/map: element'], ['set', 'list: assign'], ['contains', 'membership'],
-    ['clear', 'empty the collection'], ['put', 'map: insert'], ['has', 'map: key present'],
-    ['remove', 'map/set: delete'], ['add', 'set: insert'],
-    ['charAt', 'str: char at index'], ['indexOf', 'str: find'], ['substring', 'str: slice'],
-    ['upper', 'str: uppercase'], ['lower', 'str: lowercase'], ['trim', 'str: strip'],
-    ['startsWith', 'str: prefix?'], ['endsWith', 'str: suffix?'], ['equals', 'str: equality'],
-    ['fetch_add', 'Atomic: add + return old'], ['load', 'Atomic: read'],
-    ['lock', 'Mutex'], ['unlock', 'Mutex'], ['send', 'Channel'], ['recv', 'Channel'],
-];
+// Methods per receiver kind (name → [method, doc]).
+const METHODS_BY_KIND = {
+    list: [['push', 'append'], ['pop', 'remove last'], ['len', 'length'], ['get', 'element at i'], ['set', 'assign i'], ['contains', 'membership'], ['clear', 'empty']],
+    map: [['put', 'insert k→v'], ['get', 'value for key'], ['has', 'key present?'], ['remove', 'delete key'], ['len', 'size']],
+    set: [['add', 'insert'], ['contains', 'membership'], ['remove', 'delete'], ['len', 'size']],
+    str: [['len', 'length'], ['charAt', 'char at index'], ['indexOf', 'find'], ['substring', 'slice'], ['upper', 'uppercase'], ['lower', 'lowercase'], ['trim', 'strip'], ['startsWith', 'prefix?'], ['endsWith', 'suffix?'], ['equals', 'equality'], ['compareTo', 'ordering'], ['hashCode', 'hash']],
+    array: [['len', 'length']],
+    Atomic: [['fetch_add', 'add + return old'], ['load', 'read'], ['add', 'add'], ['get', 'read']],
+    Mutex: [['lock', 'acquire'], ['unlock', 'release'], ['get', 'read'], ['set', 'write']],
+    Channel: [['send', 'enqueue'], ['recv', 'blocking dequeue']],
+};
+
+// Heuristic receiver kind of `name`: how it was constructed / its param type in
+// the visible text (`mut xs = list()`, `a: farray`, a string literal, …).
+function receiverKind(document, name) {
+    const text = document.getText();
+    let m;
+    const ctor = new RegExp(`\\b${name}\\s*=\\s*(list|map|set|array|farray|Atomic|Mutex|Channel)\\s*\\(`);
+    if ((m = ctor.exec(text))) {
+        const k = m[1];
+        return k === 'farray' || k === 'array' ? 'array' : k;
+    }
+    const strAssign = new RegExp(`\\b${name}\\s*=\\s*"`);
+    if (strAssign.test(text)) return 'str';
+    const param = new RegExp(`\\b${name}\\s*:\\s*(Str|list|map|set|array|farray|Atomic|Mutex|Channel|List|Map|Set|Array)\\b`);
+    if ((m = param.exec(text))) {
+        const k = m[1].toLowerCase();
+        return k === 'farray' || k === 'array' ? 'array' : k;
+    }
+    return null;
+}
 
 const completionProvider = {
     provideCompletionItems(document, position) {
         const CI = vscode.CompletionItemKind;
         const prefix = document.lineAt(position.line).text.slice(0, position.character);
 
-        // After `.` → method completion.
-        if (/\.[A-Za-z0-9_]*$/.test(prefix)) {
-            return METHODS.map(([n, doc]) => {
+        // After `RECEIVER.` → methods, filtered by the receiver's kind if known.
+        const dot = /([A-Za-z_][A-Za-z0-9_]*)\s*\.[A-Za-z0-9_]*$/.exec(prefix);
+        if (dot) {
+            const kind = receiverKind(document, dot[1]);
+            const methods = kind && METHODS_BY_KIND[kind]
+                ? METHODS_BY_KIND[kind]
+                : Object.values(METHODS_BY_KIND).flat();   // unknown receiver → union
+            const seen = new Set();
+            const out = [];
+            for (const [n, doc] of methods) {
+                if (seen.has(n)) continue;
+                seen.add(n);
                 const it = new vscode.CompletionItem(n, CI.Method);
-                it.detail = doc;
-                return it;
-            });
+                it.detail = kind ? `${kind}.${n} — ${doc}` : doc;
+                out.push(it);
+            }
+            return out;
         }
         // Type position: after `:` (annotation) or `->` (return type) → types only.
         if (/(:|->)\s*[A-Za-z0-9_]*$/.test(prefix)) {
@@ -249,6 +277,64 @@ const completionProvider = {
             out.push(it);
         }
         return out;
+    }
+};
+
+// --------------------------- signature help ----------------------------
+
+// The call enclosing `position`: walk back to the nearest unmatched `(`, read
+// the callee name, and count top-level commas after it (the active parameter).
+function enclosingCall(document, position) {
+    const text = document.getText().slice(0, document.offsetAt(position));
+    let depth = 0, activeParam = 0, i = text.length - 1;
+    for (; i >= 0; i--) {
+        const ch = text[i];
+        if (ch === ')' || ch === ']') depth++;
+        else if (ch === '[') { if (depth > 0) depth--; }
+        else if (ch === '(') { if (depth === 0) break; depth--; }
+        else if (ch === ',' && depth === 0) activeParam++;
+    }
+    if (i < 0) return null;
+    const m = /([A-Za-z_][A-Za-z0-9_]*)\s*$/.exec(text.slice(0, i));
+    return m ? { name: m[1], activeParam } : null;
+}
+
+// Split a parameter list on top-level commas (types may contain `[...]`).
+function splitTopLevel(s) {
+    const out = [];
+    let depth = 0, start = 0;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (c === '[' || c === '(') depth++;
+        else if (c === ']' || c === ')') depth--;
+        else if (c === ',' && depth === 0) { out.push(s.slice(start, i).trim()); start = i + 1; }
+    }
+    const last = s.slice(start).trim();
+    if (last) out.push(last);
+    return out;
+}
+
+const signatureHelpProvider = {
+    provideSignatureHelp(document, position) {
+        const call = enclosingCall(document, position);
+        if (!call) return null;
+        const sym = (docSymbols.get(document.uri.toString()) || []).find(s => s.name === call.name && s.kind === 'function');
+        if (!sym) return null;
+        const open = sym.signature.indexOf('(');
+        let depth = 0, close = -1;
+        for (let k = open; k < sym.signature.length; k++) {
+            if (sym.signature[k] === '(') depth++;
+            else if (sym.signature[k] === ')') { depth--; if (depth === 0) { close = k; break; } }
+        }
+        if (open < 0 || close < 0) return null;
+        const params = splitTopLevel(sym.signature.slice(open + 1, close));
+        const info = new vscode.SignatureInformation(sym.signature);
+        info.parameters = params.map(p => new vscode.ParameterInformation(p));
+        const help = new vscode.SignatureHelp();
+        help.signatures = [info];
+        help.activeSignature = 0;
+        help.activeParameter = Math.min(call.activeParam, Math.max(0, params.length - 1));
+        return help;
     }
 };
 
@@ -381,6 +467,7 @@ function activate(context) {
         vscode.languages.registerDefinitionProvider('vire', definitionProvider),
         vscode.languages.registerDocumentSymbolProvider('vire', symbolProvider),
         vscode.languages.registerCompletionItemProvider('vire', completionProvider, '.'),
+        vscode.languages.registerSignatureHelpProvider('vire', signatureHelpProvider, '(', ','),
         vscode.languages.registerCodeActionsProvider('vire', codeActionProvider, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }),
     );
 

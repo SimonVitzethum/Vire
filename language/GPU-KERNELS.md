@@ -10,7 +10,7 @@ The design is adapted from [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-ox
 (Apache-2.0; single-source Rust→PTX). Vire already owns the pipeline it needs
 (Vire → shared IR → LLVM IR → codegen), so `@gpu` reuses it: a kernel becomes an
 `nvptx64` LLVM module compiled with `llc -march=nvptx64`. See
-[`third_party/cuda-oxide/NOTICE.md`](../third_party/cuda-oxide/NOTICE.md).
+[`crates/cuda-oxide/NOTICE.md`](../crates/cuda-oxide/NOTICE.md).
 
 ## Example
 
