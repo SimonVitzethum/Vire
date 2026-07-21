@@ -11,8 +11,23 @@ backend → `clang -O2 -flto -march=native`. `vire build`/`vire run` produce nat
 binaries. Traits (vtable dispatch + devirtualization), arrays, structs/records,
 generics-by-inlining, `match`/sum types, `Result`/`Option` + `?`, `comptime if`,
 `list()`/`map()` collections, and `log.*` compile-time-filtered logging all work.
-Soundness floor: the Java heap-balance oracle stays **65/65** and the Vire suite
-**63/63** after every change.
+Soundness floor: the Java heap-balance oracle stays **65/65** and the Vire heap
+suite (`tests/vire_heap.sh`, now **15/15** incl. the capsule deep-copy cases) plus
+all `tests/vire_*.sh` stay green after every change.
+
+**Shipped since (this session):**
+- **`@gpu` kernels** → NVPTX/PTX → CUDA launch (single-source, up to 16× vs CPU;
+  bit-exact for integer kernels). See [language/GPU-KERNELS.md](language/GPU-KERNELS.md).
+- **`capsule` deep-copy in/out** — arrays AND arbitrary concrete structs/graphs
+  (cycles + sharing handled via a vtable copy slot + copymap), fault-contained,
+  0-live. See [language/M0.2-CAPSULE-ARENA.md](language/M0.2-CAPSULE-ARENA.md).
+- **VS Code extension + native debugger + LSP** ([vscode-vire/](../vscode-vire/)):
+  highlighting, diagnostics/hover/go-to-def/completion/quick-fixes via a wasm-compiled
+  frontend (no toolchain), and breakpoints + local-variable inspection via DWARF + lldb-dap.
+- **Cross-compilation**: `--target x86_64-pc-windows-gnu` → a running `.exe`; BSD to
+  an object; macOS needs the SDK. See [language/CROSS-COMPILE.md](language/CROSS-COMPILE.md).
+- **Faster builds**: cached runtime bitcode (~4× smaller builds) + parallel inline-block
+  verification, both lossless.
 
 Performance vs clang++ 22: compute at/above Rust level (montecarlo 0.96×,
 nbody/bitmanip ~1.0×), virtual dispatch **2.4× faster** (vcall 0.42×, devirt). Array

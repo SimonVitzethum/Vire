@@ -11,7 +11,7 @@ PEAKRSS=/tmp/peakrss
 med() { local b="$1"; shift; local best=999; for r in 1 2 3; do local s=$(date +%s.%N); "$b" "$@" >/dev/null 2>&1; local e=$(date +%s.%N); local d=$(awk "BEGIN{print $e-$s}"); best=$(awk "BEGIN{print ($d<$best)?$d:$best}"); done; echo "$best"; }
 rss() { "$PEAKRSS" "$1" 2>"$T/rk" >/dev/null; awk "BEGIN{printf \"%.1f\", $(cat "$T/rk")/1024}"; }   # peak RSS in MB
 printf "%-8s %9s %9s %9s  %8s %8s | %6s %6s %6s\n" "bench" "Vire" "Rust" "C++" "V/Rust" "V/C++" "RAM-V" "RAM-R" "RAM-C"
-for b in arith fib struct mandelbrot btree; do
+for b in arith fib struct mandelbrot btree nsieve; do
   $VIRE build -o $T/${b}_v $b.vr 2>/dev/null
   rustc -O -o $T/${b}_r $b.rs 2>/dev/null
   clang++ -O2 -march=native -o $T/${b}_c $b.cpp 2>/dev/null

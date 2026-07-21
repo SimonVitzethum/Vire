@@ -4,7 +4,10 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 `rustc -O`; `clang++ -O2 -march=native`), best-of-3, outputs checked
 **bit-identical**. `./run.sh` reproduces.
 
-## Results (one machine, best-of-5 time + peak RSS, freshly measured 2026-07)
+`./run.sh` runs all six (arith, fib, struct, mandelbrot, btree, **nsieve**) and
+checks outputs bit-identical.
+
+## Results (one machine, best-of-3 time + peak RSS, measured 2026-07)
 | Bench | Kind | Vire | Rust | C++ | V/Rust | V/C++ | RAM V/R/C |
 |---|---|---|---|---|---|---|---|
 | arith | compute loop | 1.506 s | 1.506 s | 1.507 s | **1.00×** | **1.00×** | 1.8 / 2.0 / 3.8 MB |

@@ -51,8 +51,13 @@ native binaries today.
 | **LLVM backend** (`crates/backend`) — textual IR + clang `-O2 -flto -march=native`; TBAA, `!invariant.load`, branch weights, cold error paths; hosted/freestanding/threads | built |
 | **Runtime** (`crates/driver`) — RC + Bacon–Rajan cycle collector, slab allocator, packed 16-byte header | built |
 | **GPU kernels** (`@gpu`) — single-source device functions → NVPTX (`llc`) → PTX → CUDA Driver-API launch; up to **16× vs CPU** on an RTX 5070, bit-exact for integer kernels | built — [language/GPU-KERNELS.md](language/GPU-KERNELS.md), [benchmarks/gpu/](benchmarks/gpu/) |
+| **Tooling** — VS Code extension (syntax highlighting, `vire check` diagnostics, hover, go-to-definition, completion, quick fixes — via the **frontend compiled to WebAssembly**, so it needs no toolchain) + **native debugging** (breakpoints, stepping, call stack, **local variables**) via `--debug` DWARF + lldb-dap | built — [vscode-vire/](vscode-vire/) |
+| **Cross-compilation** (`--target`) — **Windows** produces a working `.exe` (MinGW + LLD); BSD compiles to an object; macOS needs the SDK. The runtime is portable C | built — [language/CROSS-COMPILE.md](language/CROSS-COMPILE.md) |
 
-The backend was developed and hardened via a **Java-bytecode front-end prototype**
+The backend emits `-O2 -flto` and caches the runtime bitcode + verifies inline
+`@c`/`@asm` blocks in parallel, so incremental `vire build` is fast (a small
+build ≈ 0.12 s). The backend was developed and hardened via a **Java-bytecode
+front-end prototype**
 (the `fastjavac` path), whose **65 heap-balance regression tests (0 live objects at
 exit)** are the soundness oracle — the floor every optimization must keep green. See
 [DESIGN.md](DESIGN.md) and [benchmarks/](benchmarks/).
@@ -199,6 +204,10 @@ memory-safety verifier) under the **Apache License 2.0**
 - **Invisible memory** — stack/heap/RC decided by the solver; `&` optional.
 - **Concurrency safe by construction** — channels (CSP) + `Mutex`/`Atomic`; the
   solver rejects shared bare mutable state.
+- **`capsule`** — a fault-containment sandbox: body allocations go into a private
+  arena freed en bloc (RC-/collector-free). Inputs are **deep-copied in**, results
+  **deep-copied out** (arrays and arbitrary structs/graphs, cycles + sharing
+  handled), so a bug in the body can't touch the caller's data.
 - **GPU kernels** — a `@gpu fn k(i: Int, …)` runs data-parallel on the GPU
   (single-source: NVPTX → PTX → CUDA Driver-API launch), with the thread index
   injected like a `parallel_for` worker `(i, …)`. Up to **16× vs CPU** on an
