@@ -11,6 +11,8 @@ use crate::diag::{line_col, Level};
 /// `{"diagnostics":[{line,col,severity,message}],"symbols":[{name,kind,line,col,signature}]}`.
 pub fn analyze_json(src: &str, _file: &str) -> String {
     let mut diags: Vec<(usize, usize, &'static str, String)> = Vec::new();
+    // Per-expression inferred types (start line/col, end line/col, type name).
+    let mut types: Vec<(usize, usize, usize, usize, &'static str)> = Vec::new();
     let push_span = |diags: &mut Vec<_>, level: &Level, span: crate::diag::Span, msg: &str| {
         let (line, col) = line_col(src, span.0);
         let sev = if *level == Level::Warning { "warning" } else { "error" };
@@ -54,8 +56,20 @@ pub fn analyze_json(src: &str, _file: &str) -> String {
         }
         // Inference/lowering only make sense once expansion succeeded.
         if diags.iter().all(|(_, _, s, _)| *s != "error") {
-            for e in crate::infer_module(&mut module) {
+            // Typed inference: conflicts become diagnostics, and every expression's
+            // inferred type feeds editor hover.
+            let (conflicts, exprtypes) = crate::infer_module_typed(&mut module);
+            for e in conflicts {
                 push_plain(&mut diags, &e);
+            }
+            for (span, ty) in exprtypes {
+                let name = ty.name();
+                if name == "?" || name == "Unit" {
+                    continue; // no useful hover for unknown/void
+                }
+                let (sl, sc) = line_col(src, span.0);
+                let (el, ec) = line_col(src, span.1);
+                types.push((sl, sc, el, ec, name));
             }
             for e in crate::eval_comptime(&mut module) {
                 push_plain(&mut diags, &e);
@@ -68,7 +82,7 @@ pub fn analyze_json(src: &str, _file: &str) -> String {
         }
     }
 
-    emit_json(&diags, &symbols)
+    emit_json(&diags, &symbols, &types)
 }
 
 /// A top-level definition: name, kind, source location, display signature.
@@ -156,7 +170,7 @@ fn json_escape(s: &str) -> String {
     o
 }
 
-fn emit_json(diags: &[(usize, usize, &'static str, String)], symbols: &[Symbol]) -> String {
+fn emit_json(diags: &[(usize, usize, &'static str, String)], symbols: &[Symbol], types: &[(usize, usize, usize, usize, &'static str)]) -> String {
     let mut s = String::from("{\"diagnostics\":[");
     for (i, (line, col, sev, msg)) in diags.iter().enumerate() {
         if i > 0 {
@@ -173,6 +187,13 @@ fn emit_json(diags: &[(usize, usize, &'static str, String)], symbols: &[Symbol])
             "{{\"name\":\"{}\",\"kind\":\"{}\",\"line\":{},\"col\":{},\"signature\":\"{}\"}}",
             json_escape(&sym.name), sym.kind, sym.line, sym.col, json_escape(&sym.signature)
         ));
+    }
+    s.push_str("],\"types\":[");
+    for (i, (sl, sc, el, ec, name)) in types.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{{\"sl\":{sl},\"sc\":{sc},\"el\":{el},\"ec\":{ec},\"type\":\"{name}\"}}"));
     }
     s.push_str("]}");
     s

@@ -86,6 +86,7 @@ function analyze(src, name) {
 
 let diagnostics;
 const docSymbols = new Map();   // uri -> [{name, kind, line, col, signature}]
+const docTypes = new Map();     // uri -> [{sl, sc, el, ec, type}] (1-based, end exclusive)
 const debounceTimers = new Map();
 
 function refresh(doc) {
@@ -93,6 +94,7 @@ function refresh(doc) {
     const res = analyze(doc.getText(), path.basename(doc.fileName));
     if (!res) return;
     docSymbols.set(doc.uri.toString(), res.symbols || []);
+    docTypes.set(doc.uri.toString(), res.types || []);
     const items = (res.diagnostics || []).map(d => {
         const l = Math.max(0, d.line - 1), c = Math.max(0, d.col - 1);
         const sev = d.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
@@ -119,13 +121,41 @@ function symbolAt(document, position) {
     return (docSymbols.get(document.uri.toString()) || []).find(s => s.name === word) || null;
 }
 
+// Smallest inferred-type range covering `position` (0-based). Entries are
+// 1-based with an exclusive end.
+function typeAt(document, position) {
+    const types = docTypes.get(document.uri.toString()) || [];
+    const L = position.line + 1, C = position.character + 1;
+    let best = null, bestSize = Infinity;
+    for (const t of types) {
+        const afterStart = L > t.sl || (L === t.sl && C >= t.sc);
+        const beforeEnd = L < t.el || (L === t.el && C < t.ec);
+        if (afterStart && beforeEnd) {
+            const size = (t.el - t.sl) * 1e6 + (t.ec - t.sc);
+            if (size < bestSize) { bestSize = size; best = t; }
+        }
+    }
+    return best;
+}
+
 const hoverProvider = {
     provideHover(document, position) {
+        // A named definition (function/type/…) wins — show its signature.
         const s = symbolAt(document, position);
-        if (!s) return null;
-        const md = new vscode.MarkdownString();
-        md.appendCodeblock(s.signature, 'vire');
-        return new vscode.Hover(md);
+        if (s) {
+            const md = new vscode.MarkdownString();
+            md.appendCodeblock(s.signature, 'vire');
+            return new vscode.Hover(md);
+        }
+        // Otherwise show the inferred type of the expression under the cursor.
+        const t = typeAt(document, position);
+        if (t) {
+            const range = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
+            const md = new vscode.MarkdownString();
+            md.appendCodeblock(`${document.getText(range) || 'expr'}: ${t.type}`, 'vire');
+            return new vscode.Hover(md, range);
+        }
+        return null;
     }
 };
 
@@ -168,10 +198,43 @@ const BUILTINS = [
     ['gpu_bdim', 'gpu_bdim() — blockDim.x'], ['gpu_gdim', 'gpu_gdim() — gridDim.x'],
 ];
 
+// Methods offered after `.` — the runtime methods on the built-in collections
+// and strings (the receiver's exact type isn't tracked, so offer the union).
+const METHODS = [
+    ['len', 'length'], ['push', 'list: append'], ['pop', 'list: remove last'],
+    ['get', 'list/map: element'], ['set', 'list: assign'], ['contains', 'membership'],
+    ['clear', 'empty the collection'], ['put', 'map: insert'], ['has', 'map: key present'],
+    ['remove', 'map/set: delete'], ['add', 'set: insert'],
+    ['charAt', 'str: char at index'], ['indexOf', 'str: find'], ['substring', 'str: slice'],
+    ['upper', 'str: uppercase'], ['lower', 'str: lowercase'], ['trim', 'str: strip'],
+    ['startsWith', 'str: prefix?'], ['endsWith', 'str: suffix?'], ['equals', 'str: equality'],
+    ['fetch_add', 'Atomic: add + return old'], ['load', 'Atomic: read'],
+    ['lock', 'Mutex'], ['unlock', 'Mutex'], ['send', 'Channel'], ['recv', 'Channel'],
+];
+
 const completionProvider = {
-    provideCompletionItems(document) {
-        const out = [];
+    provideCompletionItems(document, position) {
         const CI = vscode.CompletionItemKind;
+        const prefix = document.lineAt(position.line).text.slice(0, position.character);
+
+        // After `.` → method completion.
+        if (/\.[A-Za-z0-9_]*$/.test(prefix)) {
+            return METHODS.map(([n, doc]) => {
+                const it = new vscode.CompletionItem(n, CI.Method);
+                it.detail = doc;
+                return it;
+            });
+        }
+        // Type position: after `:` (annotation) or `->` (return type) → types only.
+        if (/(:|->)\s*[A-Za-z0-9_]*$/.test(prefix)) {
+            const out = TYPES.map(t => new vscode.CompletionItem(t, CI.Class));
+            for (const s of docSymbols.get(document.uri.toString()) || []) {
+                if (s.kind === 'type' || s.kind === 'trait') out.push(new vscode.CompletionItem(s.name, CI.Struct));
+            }
+            return out;
+        }
+        // Default: keywords + builtins + this file's definitions.
+        const out = [];
         for (const k of KEYWORDS) out.push(new vscode.CompletionItem(k, CI.Keyword));
         for (const t of TYPES) out.push(new vscode.CompletionItem(t, CI.Class));
         for (const [n, doc] of BUILTINS) {
@@ -179,7 +242,6 @@ const completionProvider = {
             it.detail = doc;
             out.push(it);
         }
-        // The document's own definitions, with their signatures.
         for (const s of docSymbols.get(document.uri.toString()) || []) {
             const kind = s.kind === 'type' ? CI.Struct : s.kind === 'trait' ? CI.Interface : s.kind === 'const' ? CI.Constant : CI.Function;
             const it = new vscode.CompletionItem(s.name, kind);
@@ -309,7 +371,7 @@ function activate(context) {
         vscode.workspace.onDidOpenTextDocument(d => refresh(d)),
         vscode.workspace.onDidSaveTextDocument(d => refresh(d)),
         vscode.workspace.onDidChangeTextDocument(e => scheduleRefresh(e.document, 300)),
-        vscode.workspace.onDidCloseTextDocument(d => { diagnostics.delete(d.uri); docSymbols.delete(d.uri.toString()); }),
+        vscode.workspace.onDidCloseTextDocument(d => { diagnostics.delete(d.uri); docSymbols.delete(d.uri.toString()); docTypes.delete(d.uri.toString()); }),
     );
     // Analyze all already-open .vr docs on activation.
     for (const d of vscode.workspace.textDocuments) refresh(d);
@@ -318,7 +380,7 @@ function activate(context) {
         vscode.languages.registerHoverProvider('vire', hoverProvider),
         vscode.languages.registerDefinitionProvider('vire', definitionProvider),
         vscode.languages.registerDocumentSymbolProvider('vire', symbolProvider),
-        vscode.languages.registerCompletionItemProvider('vire', completionProvider),
+        vscode.languages.registerCompletionItemProvider('vire', completionProvider, '.'),
         vscode.languages.registerCodeActionsProvider('vire', codeActionProvider, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }),
     );
 
