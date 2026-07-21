@@ -1336,6 +1336,10 @@ fn build_or_run(args: &[String]) {
         match &target {
             Some(t) => {
                 cmd.arg("-target").arg(t);
+                // Cross-compiling with `-flto`: the target's default linker (e.g.
+                // MinGW's `ld`) can't consume LLVM bitcode. LLD handles LTO for
+                // ELF/PE/Mach-O, so use it for every cross target.
+                cmd.arg("-fuse-ld=lld");
             }
             None => {
                 cmd.arg("-march=native");

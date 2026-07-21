@@ -13,10 +13,10 @@
 use crate::ast::{Attr, Item, Module};
 
 /// The set of recognised platform names (an unknown name in `@when` is an error).
-const KNOWN: &[&str] = &["linux", "macos", "windows", "unix"];
+const KNOWN: &[&str] = &["linux", "macos", "windows", "unix", "freebsd"];
 
 /// Resolve the target OS: from a `--target` triple if given, else the host OS.
-/// Returns one of "linux" / "macos" / "windows" (the canonical names).
+/// Returns "linux" / "macos" / "windows" / "freebsd" (canonical names).
 pub fn target_os(target: Option<&str>) -> &'static str {
     if let Some(t) = target {
         let t = t.to_ascii_lowercase();
@@ -29,6 +29,9 @@ pub fn target_os(target: Option<&str>) -> &'static str {
         if t.contains("linux") {
             return "linux";
         }
+        if t.contains("freebsd") || t.contains("openbsd") || t.contains("netbsd") || t.contains("dragonfly") {
+            return "freebsd";
+        }
         // Unknown triple → fall through to the host.
     }
     match std::env::consts::OS {
@@ -39,10 +42,10 @@ pub fn target_os(target: Option<&str>) -> &'static str {
 }
 
 /// Does a single `@when` argument match the resolved target OS?
-/// `unix` matches the unix family (linux + macos), the rest match by name.
+/// `unix` matches the unix family (linux/macos/freebsd), the rest match by name.
 fn arg_matches(arg: &str, os: &str) -> bool {
     match arg {
-        "unix" => os == "linux" || os == "macos",
+        "unix" => os == "linux" || os == "macos" || os == "freebsd",
         other => other == os,
     }
 }

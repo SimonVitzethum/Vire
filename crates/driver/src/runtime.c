@@ -2558,6 +2558,23 @@ double jrt_math_sqrt(double x) {
 __attribute__((weak)) int64_t jrt_platform_time_ns(void) { return 0; }
 int64_t jrt_nano_time(void) { return jrt_platform_time_ns(); }
 int64_t jrt_current_time_millis(void) { return jrt_platform_time_ns() / 1000000; }
+#elif defined(_WIN32)
+/* Windows has no POSIX clock_gettime (mingw would need clock_gettime64):
+ * use QueryPerformanceCounter (monotonic) + the FILETIME epoch (wall clock). */
+#include <windows.h>
+int64_t jrt_nano_time(void) {
+    LARGE_INTEGER freq, ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    return (int64_t)((ctr.QuadPart / freq.QuadPart) * 1000000000LL
+                     + ((ctr.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart);
+}
+int64_t jrt_current_time_millis(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime; /* 100ns since 1601 */
+    return (int64_t)((t - 116444736000000000ULL) / 10000ULL);           /* → ms since 1970 */
+}
 #else
 #include <time.h>
 int64_t jrt_nano_time(void) {
