@@ -315,6 +315,32 @@ Feature sequence on top:
 
 ---
 
+## GPU kernels (`@gpu`) — built 2026-07-21
+
+Single-source device functions: `@gpu fn` → nvptx64 LLVM module → PTX (`llc`) →
+embedded in the binary → launched via the CUDA Driver API (libcuda). Kernels live
+in `Program::gpu_kernels` (out of `functions`, so no host solver/RTA/inliner
+touches them); the backend emits device IR + a C launch stub per kernel. Intrinsics
+`gpu_gid/gpu_gsize/tid/bid/bdim/gdim`. Design adapted from NVlabs/cuda-oxide
+(Apache-2.0, `third_party/cuda-oxide`). Docs: [language/GPU-KERNELS.md]. Guarded by
+`tests/vire_gpu.sh` (integer bit-exact vs CPU + error path). Measured **16× vs CPU**
+at high intensity on an RTX 5070 ([benchmarks/gpu/]). Separate GPU track — the CPU
+suite stays bit-identical.
+
+Follow-ups (open):
+- [ ] **Read-only array analysis** — skip the D2H copyback (and possibly H2D) for
+  arrays a kernel only reads; v1 treats every array arg as in/out.
+- [ ] **Explicit launch config** — let a kernel/call choose block size / 2-D & 3-D
+  grids and shared memory, instead of the fixed `block=256, grid=ceil(N/256)`.
+- [ ] **Sub-word + Ref arrays on device**, `Array<F32>` scalars, and device-side
+  math intrinsics (sqrt/exp via `@llvm.nvvm.*`).
+- [ ] **Persistent context / async** — reuse device buffers across launches, and a
+  non-synchronous launch path (v1 syncs every launch; GPU+threads is out of scope).
+- [ ] **Fair Rust-GPU baseline** — build cuda-oxide (needs its rustc backend
+  toolchain) to fill the Vire-GPU vs Rust-GPU column in benchmarks/gpu.
+- [x] Host `farray[i] = <int>` now coerces int→f64 (was invalid IR) — seeds float
+  kernels cleanly.
+
 ## Features 1–8 (open parts only)
 
 ### [1] Multithreading, safe by construction

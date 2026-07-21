@@ -127,9 +127,9 @@ impl Parser {
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
-            // `@derive(...)`/`@when(...)` introduce a declaration item (other `@…` stay
-            // expressions/script statements, e.g. inline `@c`/`@asm` blocks).
-            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive" || n == "when"))
+            // `@derive(...)`/`@when(...)`/`@gpu` introduce a declaration item (other
+            // `@…` stay expressions/script statements, e.g. inline `@c`/`@asm` blocks).
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if n == "derive" || n == "when" || n == "gpu"))
             // `name!(…)` — an item-macro invocation.
             || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }

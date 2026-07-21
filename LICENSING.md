@@ -5,7 +5,8 @@ This repository is under **two licenses**, split by directory:
 | Part | License | Text |
 |---|---|---|
 | **CSolver** — everything under [`crates/csolver/`](crates/csolver/) (the vendored memory-safety verifier: `csolver-*` crates) | **Apache License 2.0** | [`crates/csolver/LICENSE`](crates/csolver/LICENSE) |
-| **Everything else** — the Vire front-end, shared IR/solver/backend, the Java driver, runtime, benchmarks, docs, and build integration | **GNU GPL v3.0 or later** | [`LICENSE`](LICENSE) |
+| **cuda-oxide attribution** — [`third_party/cuda-oxide/`](third_party/cuda-oxide/): upstream Apache-2.0 license preserved as attribution for the `@gpu` *design* adaptation (no upstream source is compiled here) | **Apache License 2.0** | [`third_party/cuda-oxide/LICENSE`](third_party/cuda-oxide/LICENSE) |
+| **Everything else** — the Vire front-end, shared IR/solver/backend, the Java driver, runtime (incl. the original GPU launch runtime + NVPTX emitter), benchmarks, docs, and build integration | **GNU GPL v3.0 or later** | [`LICENSE`](LICENSE) |
 
 ## What this means
 

@@ -1,0 +1,19 @@
+// Same computation on the CPU (plain Vire), for the GPU-vs-CPU comparison.
+fn heavy(n: Int, out: array) {
+    mut i = 0
+    while i < n {
+        mut x = i
+        mut k = 0
+        while k < 2000 { x = (x * 1103515245 + 12345) & 2147483647  k = k + 1 }
+        out[i] = x
+        i = i + 1
+    }
+}
+fn main() {
+    mut out = array(2000000)
+    heavy(2000000, out)
+    mut s = 0
+    mut i = 0
+    while i < 2000000 { s = s + out[i]  i = i + 1 }
+    print(s)
+}

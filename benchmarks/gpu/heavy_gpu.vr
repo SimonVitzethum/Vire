@@ -1,0 +1,20 @@
+// Compute-heavy element-wise kernel on the GPU: per element, 2000 LCG steps.
+// Integer math → bit-exact vs the CPU version (benchmarks/gpu/heavy_cpu.vr).
+@gpu
+fn heavy(n: Int, out: array) {
+    mut i = gpu_gid()
+    if i < n {
+        mut x = i
+        mut k = 0
+        while k < 2000 { x = (x * 1103515245 + 12345) & 2147483647  k = k + 1 }
+        out[i] = x
+    }
+}
+fn main() {
+    mut out = array(2000000)
+    heavy(2000000, out)
+    mut s = 0
+    mut i = 0
+    while i < 2000000 { s = s + out[i]  i = i + 1 }
+    print(s)
+}

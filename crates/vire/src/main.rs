@@ -15,6 +15,33 @@ mod cverify;
 const RUNTIME_C: &str = include_str!("../../driver/src/runtime.c");
 // Built-in Python bridge: allows Python libs from pure Vire (no user C).
 const PYBRIDGE_C: &str = include_str!("pybridge.c");
+// Host-side CUDA Driver-API runtime for `@gpu` kernels (see language/GPU-KERNELS.md).
+const GPU_RUNTIME_C: &str = include_str!("../../driver/src/gpu_runtime.c");
+
+/// Emits `text` as a sequence of adjacent C string literals, one per line (so the
+/// PTX embeds as `const char jrt_gpu_ptx[] = "...\n" "...\n";`). Escapes `\`, `"`.
+fn c_string_literal(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        out.push('"');
+        for ch in line.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03o}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push_str("\"\n");
+    }
+    if out.is_empty() {
+        out.push_str("\"\"");
+    }
+    out
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -928,6 +955,73 @@ fn build_or_run(args: &[String]) {
         eprintln!("writing to {}: {e}", build_dir.display());
         exit(1);
     }
+    // === GPU (@gpu kernels): NVPTX device module → PTX → embedded + launch stubs ===
+    // A `@gpu` function is compiled to an nvptx64 LLVM module, turned into PTX by
+    // `llc`, embedded as a C string, and paired with a generated launch stub whose
+    // symbol matches the kernel name (so the host `call @<name>` links to it). The
+    // whole thing links against libcuda. See language/GPU-KERNELS.md.
+    let mut gpu_paths: Vec<PathBuf> = Vec::new();
+    let want_gpu = !program.gpu_kernels.is_empty();
+    if want_gpu {
+        let dev_ll = match fastllvm_backend::emit_ptx(&program) {
+            Ok(Some(s)) => s,
+            Ok(None) => String::new(),
+            Err(errs) => {
+                for e in &errs {
+                    eprintln!("error: {e}");
+                }
+                exit(1);
+            }
+        };
+        let dev_ll_path = build_dir.join("gpu_device.ll");
+        let dev_ptx_path = build_dir.join("gpu_device.ptx");
+        if let Err(e) = std::fs::write(&dev_ll_path, &dev_ll) {
+            eprintln!("writing device IR: {e}");
+            exit(1);
+        }
+        // sm_90 PTX: the CUDA driver JIT-compiles it forward onto the actual GPU
+        // (PTX is forward-compatible), so this build is not tied to one GPU arch.
+        let llc = Command::new("llc")
+            .args(["-march=nvptx64", "-mcpu=sm_90", "-O3"])
+            .arg(&dev_ll_path)
+            .arg("-o")
+            .arg(&dev_ptx_path)
+            .status();
+        match llc {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("llc (NVPTX) failed ({s}); device IR in {}", dev_ll_path.display());
+                exit(1);
+            }
+            Err(e) => {
+                eprintln!("llc not executable (need an LLVM build with the NVPTX target): {e}");
+                exit(1);
+            }
+        }
+        let ptx = match std::fs::read_to_string(&dev_ptx_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("reading generated PTX: {e}");
+                exit(1);
+            }
+        };
+        let stubs = fastllvm_backend::emit_gpu_stubs(&program).unwrap_or_default();
+        let mut gpu_c = String::new();
+        gpu_c.push_str("/* Generated: embedded PTX + @gpu launch stubs + jrt_gpu_* runtime. */\n");
+        gpu_c.push_str("const char jrt_gpu_ptx[] =\n");
+        gpu_c.push_str(&c_string_literal(&ptx));
+        gpu_c.push_str(";\n\n");
+        gpu_c.push_str(&stubs);
+        gpu_c.push_str(GPU_RUNTIME_C);
+        let gpu_c_path = build_dir.join("gpu_gen.c");
+        if let Err(e) = std::fs::write(&gpu_c_path, &gpu_c) {
+            eprintln!("writing GPU glue: {e}");
+            exit(1);
+        }
+        gpu_paths.push(gpu_c_path);
+        // Link the CUDA driver library.
+        link_libs.push("cuda".into());
+    }
     // Enqueue the built-in Python bridge as a (Python) native block → it goes through
     // the same auto-include/link path as a user `native "python"` block.
     if want_py_bridge {
@@ -1191,6 +1285,13 @@ fn build_or_run(args: &[String]) {
     cmd.args(&pkg_cflags);
     for p in &native_paths {
         cmd.arg(p);
+    }
+    // GPU glue: the CUDA driver header path + the generated PTX/stubs/runtime file.
+    if want_gpu {
+        cmd.arg("-I/opt/cuda/include");
+        for p in &gpu_paths {
+            cmd.arg(p);
+        }
     }
     if want_cpp {
         link_libs.push("stdc++".into()); // C++ blocks need the C++ stdlib

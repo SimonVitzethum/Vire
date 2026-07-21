@@ -24,6 +24,9 @@ use std::fmt::Write;
 
 use fastllvm_ir::*;
 
+mod nvptx;
+pub use nvptx::{emit_gpu_stubs, emit_ptx};
+
 fn llty(ty: Ty) -> &'static str {
     match ty {
         Ty::I32 => "i32",

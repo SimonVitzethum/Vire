@@ -576,7 +576,17 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             }
             match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
                 Ok((func, mono, insts)) => {
-                    prog.functions.push(func);
+                    // `@gpu` → a device kernel: kept out of `functions` so the host
+                    // solver passes/RTA/inliner never touch it. The backend emits it
+                    // as NVPTX device IR + a C host launch stub (see GpuKernel).
+                    if is_gpu_fn(f) {
+                        let param_arr = gpu_param_arr(f);
+                        // Launch count N = the first scalar-integer parameter.
+                        let launch_param = func.params.iter().position(|t| matches!(t, Ty::I32 | Ty::I64)).unwrap_or(0);
+                        prog.gpu_kernels.push(fastllvm_ir::GpuKernel { func, param_arr, launch_param });
+                    } else {
+                        prog.functions.push(func);
+                    }
                     mono_queue.extend(mono);
                     all_insts.extend(insts);
                 }
@@ -1692,7 +1702,14 @@ impl<'a> FnLower<'a> {
                     if self.class_of_operand(&arr).as_deref() == Some("$List") {
                         self.emit(Statement::Call { dest: None, func: "vire_list_set".into(), args: vec![arr, to_i64(idx), to_i64(v)] });
                     } else if let Some(kind) = self.arr_of_operand(&arr) {
-                        if kind == ArrKind::Long && vt != Ty::I64 {
+                        if (kind == ArrKind::Double || kind == ArrKind::Float) && (vt == Ty::I32 || vt == Ty::I64) {
+                            // `xs[i] = <int>` into a float array → widen int to the
+                            // element's float value type (i2d/i2f), else the store's
+                            // value/element types would mismatch.
+                            let d = self.new_local(kind.value_ty());
+                            self.emit(Statement::Assign(d, Rvalue::Convert(v)));
+                            v = Operand::Copy(d);
+                        } else if kind == ArrKind::Long && vt != Ty::I64 {
                             v = to_i64(v);
                         }
                         let idx32 = self.to_i32(idx);
@@ -2627,6 +2644,18 @@ impl<'a> FnLower<'a> {
                 return (Operand::ConstI64(0), Ty::I64);
             }
         };
+        // GPU kernel intrinsics — only meaningful inside a `@gpu` function; the
+        // backend NVPTX emitter maps `__gpu_*` to `@llvm.nvvm.read.ptx.sreg.*`.
+        // `gpu_gid()` = global thread index (blockIdx.x*blockDim.x + threadIdx.x);
+        // `gpu_gsize()` = total thread count (gridDim.x*blockDim.x, for grid-stride
+        // loops); tid/bid/bdim/gdim expose the raw dimensions. All are nullary and
+        // yield an Int. Used in host code they become unresolved symbols at link
+        // time (documented in language/GPU-KERNELS.md).
+        if let Some(sym) = gpu_intrinsic_sym(&name) {
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: sym.into(), args: vec![] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // Buffer-capture intrinsics for inline C/asm blocks: `@arraydata(a)` yields the
         // raw data pointer (past the 16-byte object header), `@arraylen(a)` the element
         // count. Together they pass a Vire array to a `native "c"` block as a proven
@@ -3421,6 +3450,11 @@ fn lower_fn(
         } else if let Some(pt) = p.ty.as_ref().filter(|pt| pt.name == "Array" || pt.name == "array") {
             arr_kind = Some(pt.args.first().map(|a| arrkind_of_name(&a.name)).unwrap_or(ArrKind::Long));
             (Ty::Ref, None)
+        } else if p.ty.as_ref().is_some_and(|pt| pt.name == "farray") {
+            // `a: farray` — the builtin float(f64) array (element = Double), so
+            // `a[i]`/`a[i] = v`/`a.len()` lower to real float array accesses.
+            arr_kind = Some(ArrKind::Double);
+            (Ty::Ref, None)
         } else if let Some(pt) = p.ty.as_ref().filter(|pt| !pt.args.is_empty() && fl.generic_ptypes.contains_key(&pt.name)) {
             // Annotated generic type `b: Box[Int]` → instance `Box$Int`, so that
             // field accesses in the body find the concrete layout.
@@ -3484,6 +3518,45 @@ fn lower_fn(
         mono,
         local_inst,
     ))
+}
+
+/// A `@gpu`-annotated function is compiled as a GPU device kernel (see
+/// language/GPU-KERNELS.md), not as a host function.
+fn is_gpu_fn(f: &FnDef) -> bool {
+    f.attrs.iter().any(|a| a.name == "gpu")
+}
+
+/// Maps a GPU thread-index intrinsic call name to its reserved backend symbol
+/// (`__gpu_*`), or `None` if `name` is not a GPU intrinsic.
+fn gpu_intrinsic_sym(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "gpu_gid" => "__gpu_gid",       // global thread index (1-D)
+        "gpu_gsize" => "__gpu_gsize",   // total thread count (grid stride)
+        "gpu_tid" => "__gpu_tid",       // threadIdx.x
+        "gpu_bid" => "__gpu_bid",       // blockIdx.x
+        "gpu_bdim" => "__gpu_bdim",     // blockDim.x
+        "gpu_gdim" => "__gpu_gdim",     // gridDim.x
+        _ => return None,
+    })
+}
+
+/// Per-parameter array element kind (`Some(k)` for an array param, `None` for a
+/// scalar) from a `@gpu` function signature — drives the device pointer element
+/// type and the host copy element size.
+fn gpu_param_arr(f: &FnDef) -> Vec<Option<ArrKind>> {
+    f.sig
+        .params
+        .iter()
+        .map(|p| {
+            let t = p.ty.as_ref()?;
+            match t.name.as_str() {
+                "Array" | "array" => Some(arrkind_of_name(t.args.first().map(|a| a.name.as_str()).unwrap_or("Int"))),
+                // `farray` — the builtin float(f64) array; element = Double.
+                "farray" => Some(ArrKind::Double),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Higher-order template? True if a parameter is used as a call target in the

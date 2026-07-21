@@ -301,9 +301,29 @@ pub struct ClassInfo {
     pub has_clinit: bool,
 }
 
+/// A GPU kernel: a `@gpu`-annotated Vire function that is NOT lowered as a host
+/// function. It lives here — outside `Program::functions` — so the host solver
+/// passes, RTA, and the inliner never touch it (no RC, no bounds checks, no
+/// arena on the device). The backend emits it twice: once as NVPTX device IR
+/// (→ PTX via `llc`) and once as a generated C host launch stub whose symbol is
+/// exactly `func.name`, so a host `Call { func: name }` links straight to it.
+#[derive(Debug, Clone)]
+pub struct GpuKernel {
+    pub func: Function,
+    /// Per-parameter array element kind (`Some(k)` if the param is an array,
+    /// `None` for a scalar). Drives the device pointer element type and the
+    /// host H2D/D2H copy element size.
+    pub param_arr: Vec<Option<ArrKind>>,
+    /// Index of the scalar-integer parameter used as the launch thread count N
+    /// (the runtime launches N threads; the kernel guards `if gid < N`).
+    pub launch_param: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub functions: Vec<Function>,
+    /// `@gpu` kernels (device code + host launch stubs), see [`GpuKernel`].
+    pub gpu_kernels: Vec<GpuKernel>,
     pub classes: Vec<ClassInfo>,
     /// String literal pool; `Operand::ConstStr` indexes into this.
     pub strings: Vec<String>,

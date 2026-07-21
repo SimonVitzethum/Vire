@@ -1,0 +1,22 @@
+// GPU integer-saxpy: y[i] = a*x[i] + y[i], run on the GPU via @gpu.
+@gpu
+fn saxpy(n: Int, a: Int, x: array, y: array) {
+    mut i = gpu_gid()
+    if i < n {
+        y[i] = a * x[i] + y[i]
+    }
+}
+
+fn main() {
+    mut x = array(1000)
+    mut y = array(1000)
+    mut i = 0
+    while i < 1000 { x[i] = i  y[i] = 2 * i  i = i + 1 }
+    saxpy(1000, 3, x, y)
+    // expected: y[i] = 3*i + 2*i = 5*i
+    mut ok = 1
+    mut j = 0
+    while j < 1000 { if y[j] != 5 * j { ok = 0 } j = j + 1 }
+    print(ok)      // expect 1
+    print(y[7])    // expect 35
+}
