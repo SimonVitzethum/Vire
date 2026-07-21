@@ -432,6 +432,53 @@ fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir:
     }
 }
 
+/// Verify all native `@c`/`@asm` blocks, in PARALLEL when there is more than one.
+/// Each proof is independent — a separate `clang -emit-llvm` on its own
+/// `native_{i}.verify.ll` plus a functional CSolver run, with only the atomic,
+/// content-addressed PASS cache shared — so they run on a bounded worker pool
+/// (≤ CPU count). Results are reported in block order and the build exits on the
+/// FIRST rejection, so the diagnostics are deterministic regardless of scheduling.
+fn verify_blocks_parallel(jobs: &[(usize, PathBuf, String, &'static str, String)], build_dir: &std::path::Path) {
+    if jobs.is_empty() {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let n = jobs.len();
+    let results: Vec<Mutex<Option<Result<bool, String>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+    let nthreads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(n);
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| loop {
+                let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    break;
+                }
+                let (i, path, code, ext, _abi) = &jobs[idx];
+                let r = verify_native_block(path, code, ext, build_dir, *i);
+                *results[idx].lock().unwrap() = Some(r);
+            });
+        }
+    });
+    for (idx, (i, _p, _c, _e, abi)) in jobs.iter().enumerate() {
+        match results[idx].lock().unwrap().take().expect("verify job not run") {
+            Ok(cached) => eprintln!(
+                "verify: native \"{abi}\" block {i}: PASS (proven memory-safe{})",
+                if cached { ", cached" } else { "" }
+            ),
+            Err(report) => {
+                eprintln!(
+                    "error: native \"{abi}\" block {i} is not provably memory-safe \
+                     (rejected instead of trusted like `unsafe`):\n{report}\n       \
+                     Close the proof with a contract/`@assume`, or opt out with `--noverify`."
+                );
+                exit(1);
+            }
+        }
+    }
+}
+
 /// Python include path + lib name via `python3`/sysconfig (for `native "python"`).
 fn python_config() -> Option<(String, String)> {
     let out = Command::new("python3")
@@ -1198,6 +1245,10 @@ fn build_or_run(args: &[String]) {
     let mut native_paths: Vec<PathBuf> = Vec::new();
     let mut want_cpp = false;
     let mut want_python = false;
+    // Blocks that need the memory-safety proof: (block index, path, code, ext, abi).
+    // Collected here, then verified in PARALLEL below (each proof is an independent
+    // clang `-emit-llvm` + a functional CSolver run over its own `.verify.ll`).
+    let mut verify_jobs: Vec<(usize, PathBuf, String, &'static str, String)> = Vec::new();
     for (i, (abi, code)) in native_blocks.iter().enumerate() {
         let a = abi.to_ascii_lowercase();
         // Compiler-generated glue (`c-glue`, e.g. the `spawn` shim): compiled as C
@@ -1226,23 +1277,11 @@ fn build_or_run(args: &[String]) {
         // replacement for a blind `unsafe`. A block that cannot be proven safe is a
         // compile error, not a runtime hazard. `--noverify` opts out.
         if !noverify && !glue && (ext == "c" || ext == "s") {
-            match verify_native_block(&p, code, ext, &build_dir, i) {
-                Ok(cached) => eprintln!(
-                    "verify: native \"{abi}\" block {i}: PASS (proven memory-safe{})",
-                    if cached { ", cached" } else { "" }
-                ),
-                Err(report) => {
-                    eprintln!(
-                        "error: native \"{abi}\" block {i} is not provably memory-safe \
-                         (rejected instead of trusted like `unsafe`):\n{report}\n       \
-                         Close the proof with a contract/`@assume`, or opt out with `--noverify`."
-                    );
-                    exit(1);
-                }
-            }
+            verify_jobs.push((i, p.clone(), code.clone(), ext, abi.clone()));
         }
         native_paths.push(p);
     }
+    verify_blocks_parallel(&verify_jobs, &build_dir);
     // Python: include path + libpython automatically (from python3/sysconfig).
     let mut py_include: Option<String> = None;
     if want_python {
