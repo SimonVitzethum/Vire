@@ -2,7 +2,7 @@
     "name": "vire",
     "displayName": "Vire",
     "description": "Language support and debugging for the Vire programming language (.vr).",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "publisher": "vire-lang",
     "license": "GPL-3.0-or-later",
     "engines": { "vscode": "^1.75.0" },

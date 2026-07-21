@@ -1,6 +1,7 @@
 //! Vire — front-end (lexer, parser, AST). Lowering to `crates/ir` follows
 //! (language/FRONTEND-PLAN.md). Backend/solver remain unchanged.
 
+pub mod analyze;
 pub mod ast;
 pub mod cblock;
 pub mod comptime;

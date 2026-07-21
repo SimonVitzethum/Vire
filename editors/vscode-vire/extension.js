@@ -1,10 +1,11 @@
 // Vire VS Code extension.
 //
-// Language intelligence (diagnostics, hover, go-to-definition) runs the bundled
-// **WebAssembly** build of the Vire frontend (wasm/vire-check.wasm) via Node's
-// built-in WASI — so it works on Windows/macOS/Linux with NO native toolchain.
-// The native `vire` compiler is only needed for Build/Run and debugging (which
-// require clang/lldb anyway).
+// Language intelligence (diagnostics, hover, go-to-definition, completion, quick
+// fixes) comes from the Vire frontend's JSON analysis `{ diagnostics, symbols }`.
+// It runs the native `vire check --json` when a `vire` binary is available
+// (fast, reliable), and otherwise falls back to the BUNDLED WebAssembly frontend
+// (wasm/vire-check.wasm) via Node's WASI — so it also works on any machine with
+// no toolchain. The native `vire` is additionally needed for Build/Run/Debug.
 'use strict';
 const vscode = require('vscode');
 const cp = require('child_process');
@@ -16,53 +17,75 @@ function virePath() {
     return vscode.workspace.getConfiguration('vire').get('path', 'vire');
 }
 
-// ----------------------------- wasm frontend ---------------------------
+// ----------------------------- analysis backends -----------------------
 
-let wasmModule = null; // compiled WebAssembly.Module (cached)
+let wasmModule = null;
 let WASI = null;
+let nativeBroken = false;   // set once native `vire` proves unavailable
+let extPath = '';
 
 function loadWasm(context) {
+    extPath = context.extensionPath;
     try {
         WASI = require('node:wasi').WASI;
-        const bytes = fs.readFileSync(path.join(context.extensionPath, 'wasm', 'vire-check.wasm'));
-        wasmModule = new WebAssembly.Module(bytes);
-        return true;
+        wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(extPath, 'wasm', 'vire-check.wasm')));
     } catch (e) {
-        console.error('Vire: failed to load bundled wasm frontend:', e);
-        return false;
+        console.error('Vire: bundled wasm frontend unavailable:', e && e.message);
     }
 }
 
-// Run the wasm frontend over `src`; returns { diagnostics, symbols } or null.
-function analyze(src, name) {
-    if (!wasmModule || !WASI) return null;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vire-wasm-'));
-    const inF = path.join(dir, 'in.vr');
-    const outF = path.join(dir, 'out.json');
+// Native `vire check --json <tmpfile>` over the current (unsaved) buffer.
+function analyzeNative(src) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vire-chk-'));
+    const f = path.join(dir, 'buf.vr');
     try {
-        fs.writeFileSync(inF, src);
-        fs.writeFileSync(outF, '');
-        const stdin = fs.openSync(inF, 'r');
-        const stdout = fs.openSync(outF, 'w');
-        const wasi = new WASI({ version: 'preview1', args: ['vire-check', name || 'file.vr', '--json'], stdin, stdout, returnOnExit: true });
-        const inst = new WebAssembly.Instance(wasmModule, wasi.getImportObject());
-        wasi.start(inst);
-        fs.closeSync(stdin);
-        fs.closeSync(stdout);
-        const txt = fs.readFileSync(outF, 'utf8').trim();
-        return txt ? JSON.parse(txt) : { diagnostics: [], symbols: [] };
+        fs.writeFileSync(f, src);
+        const out = cp.execFileSync(virePath(), ['check', '--json', f], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] });
+        return JSON.parse(out.trim());
     } catch (e) {
-        console.error('Vire: wasm analyze failed:', e);
+        // execFileSync throws on non-zero exit too, but check --json always exits 0;
+        // a throw here means the binary is missing/not runnable → fall back to wasm.
+        if (e && (e.code === 'ENOENT' || e.code === 'EACCES')) nativeBroken = true;
+        else if (e && e.stdout) { try { return JSON.parse(e.stdout.toString().trim()); } catch (_) { } }
         return null;
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { }
     }
 }
 
+function analyzeWasm(src, name) {
+    if (!wasmModule || !WASI) return null;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vire-wasm-'));
+    const inF = path.join(dir, 'in.vr'), outF = path.join(dir, 'out.json');
+    try {
+        fs.writeFileSync(inF, src);
+        fs.writeFileSync(outF, '');
+        const stdin = fs.openSync(inF, 'r'), stdout = fs.openSync(outF, 'w');
+        const wasi = new WASI({ version: 'preview1', args: ['vire-check', name || 'file.vr', '--json'], stdin, stdout, returnOnExit: true });
+        wasi.start(new WebAssembly.Instance(wasmModule, wasi.getImportObject()));
+        fs.closeSync(stdin); fs.closeSync(stdout);
+        const txt = fs.readFileSync(outF, 'utf8').trim();
+        return txt ? JSON.parse(txt) : { diagnostics: [], symbols: [] };
+    } catch (e) {
+        console.error('Vire: wasm analyze failed:', e && e.message);
+        return null;
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { }
+    }
+}
+
+function analyze(src, name) {
+    if (!nativeBroken) {
+        const r = analyzeNative(src);
+        if (r) return r;
+    }
+    return analyzeWasm(src, name);
+}
+
 // ----------------------------- diagnostics -----------------------------
 
 let diagnostics;
-const docSymbols = new Map();   // uri.toString() -> [{name, kind, line, col, signature}]
+const docSymbols = new Map();   // uri -> [{name, kind, line, col, signature}]
 const debounceTimers = new Map();
 
 function refresh(doc) {
@@ -70,16 +93,14 @@ function refresh(doc) {
     const res = analyze(doc.getText(), path.basename(doc.fileName));
     if (!res) return;
     docSymbols.set(doc.uri.toString(), res.symbols || []);
-    if (vscode.workspace.getConfiguration('vire').get('checkOnSave', true)) {
-        const items = (res.diagnostics || []).map(d => {
-            const l = Math.max(0, d.line - 1), c = Math.max(0, d.col - 1);
-            const sev = d.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
-            return new vscode.Diagnostic(new vscode.Range(l, c, l, c + 1), d.message, sev);
-        });
-        diagnostics.set(doc.uri, items);
-    } else {
-        diagnostics.set(doc.uri, []);
-    }
+    const items = (res.diagnostics || []).map(d => {
+        const l = Math.max(0, d.line - 1), c = Math.max(0, d.col - 1);
+        const sev = d.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
+        const diag = new vscode.Diagnostic(new vscode.Range(l, c, l, c + 1), d.message, sev);
+        diag.source = 'vire';
+        return diag;
+    });
+    diagnostics.set(doc.uri, items);
 }
 
 function scheduleRefresh(doc, delay) {
@@ -95,8 +116,7 @@ function symbolAt(document, position) {
     const range = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
     if (!range) return null;
     const word = document.getText(range);
-    const syms = docSymbols.get(document.uri.toString()) || [];
-    return syms.find(s => s.name === word) || null;
+    return (docSymbols.get(document.uri.toString()) || []).find(s => s.name === word) || null;
 }
 
 const hoverProvider = {
@@ -113,23 +133,118 @@ const definitionProvider = {
     provideDefinition(document, position) {
         const s = symbolAt(document, position);
         if (!s) return null;
-        const pos = new vscode.Position(Math.max(0, s.line - 1), Math.max(0, s.col - 1));
-        return new vscode.Location(document.uri, pos);
+        return new vscode.Location(document.uri, new vscode.Position(Math.max(0, s.line - 1), Math.max(0, s.col - 1)));
     }
 };
 
 const symbolProvider = {
     provideDocumentSymbols(document) {
-        const syms = docSymbols.get(document.uri.toString()) || [];
-        const kind = k => k === 'type' ? vscode.SymbolKind.Struct
-            : k === 'trait' ? vscode.SymbolKind.Interface
-                : k === 'const' ? vscode.SymbolKind.Constant
-                    : vscode.SymbolKind.Function;
-        return syms.map(s => {
+        const kind = k => k === 'type' ? vscode.SymbolKind.Struct : k === 'trait' ? vscode.SymbolKind.Interface : k === 'const' ? vscode.SymbolKind.Constant : vscode.SymbolKind.Function;
+        return (docSymbols.get(document.uri.toString()) || []).map(s => {
             const pos = new vscode.Position(Math.max(0, s.line - 1), Math.max(0, s.col - 1));
-            const range = new vscode.Range(pos, pos);
-            return new vscode.SymbolInformation(s.name, kind(s.kind), '', new vscode.Location(document.uri, range));
+            return new vscode.SymbolInformation(s.name, kind(s.kind), '', new vscode.Location(document.uri, new vscode.Range(pos, pos)));
         });
+    }
+};
+
+// ------------------------------ completion -----------------------------
+
+const KEYWORDS = ['fn', 'type', 'trait', 'impl', 'mut', 'const', 'use', 'pub', 'extern', 'unsafe', 'macro', 'comptime',
+    'match', 'if', 'elif', 'else', 'while', 'for', 'in', 'break', 'continue', 'return', 'spawn', 'capsule', 'native',
+    'and', 'or', 'not', 'as', 'true', 'false', 'self', 'Self'];
+const TYPES = ['Int', 'Float', 'Bool', 'Str', 'Void', 'Array', 'Map', 'List', 'Set', 'Option', 'Result',
+    'Atomic', 'Mutex', 'Channel', 'array', 'farray', 'list', 'map', 'set', 'F32', 'F64', 'I32', 'I64'];
+const BUILTINS = [
+    ['print', 'print(value) — write a value + newline'],
+    ['array', 'array(n) — new Int array of length n'],
+    ['farray', 'farray(n) — new Float array of length n'],
+    ['list', 'list() — growable list'],
+    ['map', 'map() — hash map'],
+    ['set', 'set() — hash set'],
+    ['parallel_for', 'parallel_for(n, shared, worker) — fork/join over 0..n'],
+    ['gpu_gid', 'gpu_gid() — global GPU thread index (inside @gpu)'],
+    ['gpu_gsize', 'gpu_gsize() — total GPU thread count (grid stride)'],
+    ['gpu_tid', 'gpu_tid() — threadIdx.x'], ['gpu_bid', 'gpu_bid() — blockIdx.x'],
+    ['gpu_bdim', 'gpu_bdim() — blockDim.x'], ['gpu_gdim', 'gpu_gdim() — gridDim.x'],
+];
+
+const completionProvider = {
+    provideCompletionItems(document) {
+        const out = [];
+        const CI = vscode.CompletionItemKind;
+        for (const k of KEYWORDS) out.push(new vscode.CompletionItem(k, CI.Keyword));
+        for (const t of TYPES) out.push(new vscode.CompletionItem(t, CI.Class));
+        for (const [n, doc] of BUILTINS) {
+            const it = new vscode.CompletionItem(n, CI.Function);
+            it.detail = doc;
+            out.push(it);
+        }
+        // The document's own definitions, with their signatures.
+        for (const s of docSymbols.get(document.uri.toString()) || []) {
+            const kind = s.kind === 'type' ? CI.Struct : s.kind === 'trait' ? CI.Interface : s.kind === 'const' ? CI.Constant : CI.Function;
+            const it = new vscode.CompletionItem(s.name, kind);
+            it.detail = s.signature;
+            out.push(it);
+        }
+        return out;
+    }
+};
+
+// ---------------------- quick fixes (autocorrect) ----------------------
+
+function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    const d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+    for (let j = 0; j <= n; j++) d[0][j] = j;
+    for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++)
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[m][n];
+}
+
+// Candidate names known in the file: its symbols + parameters/locals in scope +
+// the builtins/types. Used to propose "did you mean X?" corrections.
+function knownNames(document) {
+    const names = new Set([...TYPES, ...BUILTINS.map(b => b[0])]);
+    for (const s of docSymbols.get(document.uri.toString()) || []) names.add(s.name);
+    const text = document.getText();
+    let m;
+    const re = /\b(?:mut\s+)?([a-z_][A-Za-z0-9_]*)\b/g;
+    while ((m = re.exec(text))) names.add(m[1]);
+    return [...names];
+}
+
+const codeActionProvider = {
+    provideCodeActions(document, range, context) {
+        const actions = [];
+        for (const diag of context.diagnostics) {
+            if (diag.source !== 'vire') continue;
+            // "unknown variable: X" / "X has no method Y" / "... `X` ..." → suggest a close name.
+            const m = /unknown (?:variable|function|type)[:]?\s*`?([A-Za-z_][A-Za-z0-9_]*)`?/.exec(diag.message)
+                || /`([A-Za-z_][A-Za-z0-9_]*)`/.exec(diag.message);
+            if (!m) continue;
+            const bad = m[1];
+            const cands = knownNames(document)
+                .filter(n => n !== bad)
+                .map(n => [n, levenshtein(bad.toLowerCase(), n.toLowerCase())])
+                .filter(([, d]) => d <= Math.max(1, Math.floor(bad.length / 3)))
+                .sort((a, b) => a[1] - b[1])
+                .slice(0, 3);
+            // Locate the bad identifier on the diagnostic's line.
+            const lineText = document.lineAt(diag.range.start.line).text;
+            const idx = lineText.indexOf(bad);
+            const wordRange = idx >= 0
+                ? new vscode.Range(diag.range.start.line, idx, diag.range.start.line, idx + bad.length)
+                : diag.range;
+            for (const [name] of cands) {
+                const fix = new vscode.CodeAction(`Change to \`${name}\``, vscode.CodeActionKind.QuickFix);
+                fix.edit = new vscode.WorkspaceEdit();
+                fix.edit.replace(document.uri, wordRange, name);
+                fix.diagnostics = [diag];
+                fix.isPreferred = cands.length > 0 && name === cands[0][0];
+                actions.push(fix);
+            }
+        }
+        return actions;
     }
 };
 
@@ -188,24 +303,23 @@ class VireDebugAdapterFactory {
 function activate(context) {
     diagnostics = vscode.languages.createDiagnosticCollection('vire');
     context.subscriptions.push(diagnostics);
-
-    const haveWasm = loadWasm(context);
-    if (!haveWasm) {
-        vscode.window.showWarningMessage('Vire: bundled wasm frontend missing — diagnostics/hover disabled. (Build it with editors/vscode-vire/build-wasm.sh.)');
-    }
+    loadWasm(context);
 
     context.subscriptions.push(
         vscode.workspace.onDidOpenTextDocument(d => refresh(d)),
         vscode.workspace.onDidSaveTextDocument(d => refresh(d)),
-        vscode.workspace.onDidChangeTextDocument(e => scheduleRefresh(e.document, 350)),
+        vscode.workspace.onDidChangeTextDocument(e => scheduleRefresh(e.document, 300)),
         vscode.workspace.onDidCloseTextDocument(d => { diagnostics.delete(d.uri); docSymbols.delete(d.uri.toString()); }),
     );
-    if (vscode.window.activeTextEditor) refresh(vscode.window.activeTextEditor.document);
+    // Analyze all already-open .vr docs on activation.
+    for (const d of vscode.workspace.textDocuments) refresh(d);
 
     context.subscriptions.push(
         vscode.languages.registerHoverProvider('vire', hoverProvider),
         vscode.languages.registerDefinitionProvider('vire', definitionProvider),
         vscode.languages.registerDocumentSymbolProvider('vire', symbolProvider),
+        vscode.languages.registerCompletionItemProvider('vire', completionProvider),
+        vscode.languages.registerCodeActionsProvider('vire', codeActionProvider, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }),
     );
 
     context.subscriptions.push(

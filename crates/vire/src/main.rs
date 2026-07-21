@@ -409,6 +409,12 @@ fn check(args: &[String]) {
             exit(1);
         }
     };
+    // `--json`: emit `{diagnostics, symbols}` for the editor (same output as the
+    // wasm frontend). Always exit 0 so the editor reads the payload.
+    if args.iter().any(|a| a == "--json") {
+        println!("{}", vire::analyze::analyze_json(&src, path));
+        return;
+    }
     let emit_span = |level: &vire::diag::Level, span: vire::diag::Span, msg: &str| {
         let (line, col) = vire::diag::line_col(&src, span.0);
         let sev = match level {

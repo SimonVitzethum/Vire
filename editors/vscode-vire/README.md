@@ -7,12 +7,15 @@ Language support and native debugging for the **Vire** programming language
 
 - **Syntax highlighting** — keywords, types, `@gpu`/`@derive` attributes, strings,
   numbers, operators, function definitions/calls (TextMate grammar).
-- **Language intelligence — no toolchain needed** — diagnostics (type/parse/
-  lowering errors as you type), **hover** (function/type signatures),
-  **go-to-definition**, and the **outline / document symbols**. These run the
-  **bundled WebAssembly build of the Vire frontend** (`wasm/vire-check.wasm`) via
-  Node's built-in WASI, so they work on **Windows, macOS, and Linux with nothing
-  installed** — no `vire` binary, no clang.
+- **Language intelligence** — **diagnostics** (parse/type/lowering errors
+  underlined as you type, shown in the Problems panel), **hover** (function/type
+  signatures), **go-to-definition**, **completion** (keywords, builtin
+  types/functions, and the file's own functions/types with signatures),
+  **quick fixes** ("Change to `print`" for a near-miss name), and the **outline**.
+  These come from the Vire frontend's JSON analysis: the native `vire check
+  --json` when a `vire` binary is configured, otherwise the **bundled WebAssembly
+  frontend** (`wasm/vire-check.wasm`) via Node's WASI — so they work on
+  **Windows/macOS/Linux with no toolchain** either way.
 - **Native debugging** — set breakpoints in `.vr` files, step, inspect the call
   stack **and local variables**. The extension compiles the file with `--debug`
   (DWARF, incl. `DILocalVariable` for locals) and drives
