@@ -284,6 +284,10 @@ struct Ctx<'a> {
     arr_len_tbaa: usize,
     arr_data_ty: usize,
     arr_data_tbaa: usize,
+    /// Vtable TBAA (offset 8): disjoint node so the vtable load hoists past field
+    /// and element stores; NOT !invariant.load (calloc-then-write unsoundness).
+    vt_ty: usize,
+    vt_tbaa: usize,
     /// AOT hot path: metadata IDs of the two shared `branch_weights` nodes
     /// (then-hot, else-hot). Set from static loop estimation on `!prof` —
     /// LLVM then orders/optimizes hot paths itself.
@@ -571,12 +575,20 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     let arr_len_tbaa = md_inv + 2;
     let arr_data_ty = md_inv + 3;
     let arr_data_tbaa = md_inv + 4;
+    // Vtable TBAA (offset 8): a third disjoint node. The vtable pointer is written
+    // once by the allocator/constructor and never after — but it is NOT tagged
+    // `!invariant.load` (unsound: the slot is calloc'd to 0 then written, so under
+    // -flto an invariant load could observe the stale 0 = a null vtable, exactly
+    // the class of miscompile the array-length version caused). A normal load with
+    // its own TBAA node lets LLVM still hoist/CSE it past field/element stores.
+    let vt_ty = md_inv + 5;
+    let vt_tbaa = md_inv + 6;
     // Loop-vectorization control metadata IDs: the shared "disable" node, then a
     // distinct `!llvm.loop` node per divergent/call-bearing loop. Allocated below
     // `md_inv` and above the debug range so nothing collides.
-    let novec_id = md_inv + 5;
+    let novec_id = md_inv + 7;
     let mut loop_ids: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
-    let mut next_md = md_inv + 6;
+    let mut next_md = md_inv + 8;
     for (fi, f) in program.functions.iter().enumerate() {
         let mut hs: Vec<usize> = complex_loop_headers(f).into_iter().collect();
         hs.sort();
@@ -585,7 +597,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             next_md += 1;
         }
     }
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv, arr_len_ty, arr_len_tbaa, arr_data_ty, arr_data_tbaa };
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv, arr_len_ty, arr_len_tbaa, arr_data_ty, arr_data_tbaa, vt_ty, vt_tbaa };
     let mut dg = DebugGen::new(debug, next_md);
     // Declaration line per function (for DISubprograms of both live and inlined
     // functions referenced by DebugLine inline stacks).
@@ -926,7 +938,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     if let Some(slot) = ctx.vtable_index("java/lang/Runnable", "run", "()V") {
         writeln!(w, "define void @jrt_invoke_runnable(ptr %r) {{").unwrap();
         writeln!(w, "  %vtp = getelementptr ptr, ptr %r, i64 {VTABLE_WORD}").unwrap();
-        writeln!(w, "  %vt = load ptr, ptr %vtp, !invariant.load !{}", ctx.md_inv).unwrap();
+        writeln!(w, "  %vt = load ptr, ptr %vtp, !tbaa !{}", ctx.vt_tbaa).unwrap();
         writeln!(w, "  %sp = getelementptr ptr, ptr %vt, i64 {slot}").unwrap();
         writeln!(w, "  %fn = load ptr, ptr %sp").unwrap();
         writeln!(w, "  call void %fn(ptr %r)").unwrap();
@@ -984,6 +996,8 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     writeln!(w, "!{} = !{{!{}, !{}, i64 0}}", ctx.arr_len_tbaa, ctx.arr_len_ty, ctx.arr_len_ty).unwrap();
     writeln!(w, "!{} = !{{!\"arr.data\", !0}}", ctx.arr_data_ty).unwrap();
     writeln!(w, "!{} = !{{!{}, !{}, i64 0}}", ctx.arr_data_tbaa, ctx.arr_data_ty, ctx.arr_data_ty).unwrap();
+    writeln!(w, "!{} = !{{!\"vtable\", !0}}", ctx.vt_ty).unwrap();
+    writeln!(w, "!{} = !{{!{}, !{}, i64 0}}", ctx.vt_tbaa, ctx.vt_ty, ctx.vt_ty).unwrap();
     // AOT hot path: the two shared branch_weights nodes (100:3 / 3:100).
     if ctx.tbaa.is_empty() {
         writeln!(w).unwrap();
@@ -1265,6 +1279,8 @@ struct FnEmitter<'a> {
     /// Array TBAA tags: length loads / element accesses (disjoint).
     arr_len_tbaa: usize,
     arr_data_tbaa: usize,
+    /// Vtable TBAA tag (offset 8).
+    vt_tbaa: usize,
 }
 
 impl FnEmitter<'_> {
@@ -1939,7 +1955,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let moved = moved_locals(f, &borrowed, &borrow, &imm);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, marker_locs, cur_loc: default_loc };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, vt_tbaa: ctx.vt_tbaa, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -2177,7 +2193,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
-            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !invariant.load !{}", e.md_inv).unwrap();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !tbaa !{}", e.vt_tbaa).unwrap();
             let slotp = e.fresh();
             writeln!(w, "  {slotp} = getelementptr ptr, ptr {vt}, i64 {slot}").unwrap();
             let fnp = e.fresh();
@@ -2218,7 +2234,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let vtp = e.fresh();
             writeln!(w, "  {vtp} = getelementptr ptr, ptr {recv}, i64 {VTABLE_WORD}").unwrap();
             let vt = e.fresh();
-            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !invariant.load !{}", e.md_inv).unwrap();
+            writeln!(w, "  {vt} = load ptr, ptr {vtp}, !tbaa !{}", e.vt_tbaa).unwrap();
             // Cascade: one vtable comparison per class → direct call; the
             // last target is the else branch (closed world: the receiver is
             // guaranteed to be one of the instantiated target classes).
@@ -2767,7 +2783,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
 fn store_vtable(w: &mut String, e: &mut FnEmitter, obj: &str, class: &str) {
     let vtp = e.fresh();
     writeln!(w, "  {vtp} = getelementptr ptr, ptr {obj}, i64 {VTABLE_WORD}").unwrap();
-    writeln!(w, "  store ptr @vt.{}, ptr {vtp}", sanitize(class)).unwrap();
+    writeln!(w, "  store ptr @vt.{}, ptr {vtp}, !tbaa !{}", sanitize(class), e.vt_tbaa).unwrap();
 }
 
 /// Writes `val` into a local. For ref locals the owning-slot

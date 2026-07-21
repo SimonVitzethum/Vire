@@ -50,7 +50,7 @@ Queued:
   robustness while keeping `-flto`/perf and covering ALL programs — strictly
   better.** Do NOT re-attempt the RC-inline rebuild without a way to keep LTO's
   inlining of the *other* hot runtime helpers.
-- [ ] **Vtable load still carries `!invariant.load`** (backend.rs ~2157/2198).
+- [x] **Vtable load `!invariant.load` fixed.** (backend.rs)
   Same unsound calloc-then-write pattern as the array length that caused the LTO
   OOB miscompiles — the header is calloc'd (vtable=0) then written. Not
   demonstrated-broken (the fuzzer has no objects/virtual calls), but latent.
