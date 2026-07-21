@@ -36,6 +36,9 @@ members = [
     "crates/csolver/report",
     "crates/csolver/cli",
 ]
+# Vendored upstream source with its own workspace — kept for reference/attribution
+# (Apache-2.0), NOT built by us. Excluded so cargo does not descend into it.
+exclude = ["third_party/cuda-oxide"]
 
 [workspace.package]
 edition = "2021"

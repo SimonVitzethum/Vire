@@ -1,0 +1,47 @@
+---
+name: fmt
+
+# Runs as a job of the top-level CI workflow (.github/workflows/ci.yml),
+# which is the single push/pull_request entry point. Concurrency is governed
+# by CI's own group, so this workflow declares none of its own.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly-2026-04-03 but does not list
+      # rustfmt as a component. Add it explicitly so `cargo fmt` resolves
+      # against the same nightly the rest of CI uses.
+      - name: Install rustfmt for the pinned nightly
+        run: rustup component add rustfmt
+
+      - name: Check root workspace formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check rustc-codegen-cuda formatting
+        run: cargo fmt --all -- --check
+        working-directory: crates/rustc-codegen-cuda
+
+      - name: Check example crate formatting
+        run: |
+          set -euo pipefail
+          # `cargo fmt --all` also formats local path dependencies. Running it
+          # per example repeatedly reformats the large shared workspaces.
+          shopt -s globstar nullglob
+          manifests=(crates/rustc-codegen-cuda/examples/**/Cargo.toml)
+          ((${#manifests[@]} > 0))
+          for manifest in "${manifests[@]}"; do
+            example_dir="$(dirname "$manifest")"
+            echo "::group::cargo fmt --check ($example_dir)"
+            cargo fmt --manifest-path "$manifest" -- --check
+            echo "::endgroup::"
+          done

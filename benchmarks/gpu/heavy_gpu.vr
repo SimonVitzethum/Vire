@@ -1,8 +1,8 @@
 // Compute-heavy element-wise kernel on the GPU: per element, 2000 LCG steps.
-// Integer math → bit-exact vs the CPU version (benchmarks/gpu/heavy_cpu.vr).
+// `i` (param 0) is the injected global thread index. Integer math → bit-exact
+// vs the CPU version (benchmarks/gpu/heavy_cpu.vr).
 @gpu
-fn heavy(n: Int, out: array) {
-    mut i = gpu_gid()
+fn heavy(i: Int, n: Int, out: array) {
     if i < n {
         mut x = i
         mut k = 0

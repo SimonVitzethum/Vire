@@ -440,7 +440,11 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
         if let Item::Fn(f) = it {
-            let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
+            // A `@gpu` kernel's PUBLIC signature drops parameter 0 (the injected
+            // global thread index): callers pass only params 1.. , exactly like a
+            // `parallel_for` worker `(i, …)` whose `i` is supplied by the launcher.
+            let skip = if is_gpu_fn(f) { 1 } else { 0 };
+            let ps = f.sig.params.iter().skip(skip).map(|p| ty_of(p.ty.as_ref())).collect();
             sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
         }
         // extern "C" { fn name(...) -> T }: C-ABI function, directly under its
@@ -580,9 +584,18 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                     // solver passes/RTA/inliner never touch it. The backend emits it
                     // as NVPTX device IR + a C host launch stub (see GpuKernel).
                     if is_gpu_fn(f) {
+                        // Param 0 is the injected global thread index (Int), like a
+                        // `parallel_for` worker `(i, …)`. Callers pass params 1.. .
+                        if !matches!(func.params.first(), Some(Ty::I32 | Ty::I64)) {
+                            errs.push(format!("@gpu kernel `{}`: the first parameter must be the thread index (Int)", func.name));
+                        }
                         let param_arr = gpu_param_arr(f);
-                        // Launch count N = the first scalar-integer parameter.
-                        let launch_param = func.params.iter().position(|t| matches!(t, Ty::I32 | Ty::I64)).unwrap_or(0);
+                        // Launch count N = the first caller-provided scalar-int param
+                        // (index >= 1); the kernel guards `if i < n`.
+                        let launch_param = func.params.iter().enumerate().skip(1).find(|(_, t)| matches!(t, Ty::I32 | Ty::I64)).map(|(i, _)| i).unwrap_or(0);
+                        if launch_param == 0 {
+                            errs.push(format!("@gpu kernel `{}`: needs an Int count parameter after the index (the launch size N)", func.name));
+                        }
                         prog.gpu_kernels.push(fastllvm_ir::GpuKernel { func, param_arr, launch_param });
                     } else {
                         prog.functions.push(func);

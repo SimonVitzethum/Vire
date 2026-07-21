@@ -14,10 +14,13 @@ The design is adapted from [NVlabs/cuda-oxide](https://github.com/NVlabs/cuda-ox
 
 ## Example
 
+A `@gpu` kernel reads just like a [`parallel_for`](../examples/vire/threads_parallel_for.vr)
+worker: its **first parameter is the thread index**, supplied by the launcher —
+you don't pass it. Callers pass only the parameters after it.
+
 ```vire
 @gpu
-fn saxpy(n: Int, a: Int, x: array, y: array) {
-    mut i = gpu_gid()          // global thread index
+fn saxpy(i: Int, n: Int, a: Int, x: array, y: array) {
     if i < n {                 // guard: you own the bounds on the device
         y[i] = a * x[i] + y[i]
     }
@@ -28,33 +31,51 @@ fn main() {
     mut y = array(1000)
     mut i = 0
     while i < 1000 { x[i] = i  y[i] = 2 * i  i = i + 1 }
-    saxpy(1000, 3, x, y)       // ← runs on the GPU
+    saxpy(1000, 3, x, y)       // ← runs on the GPU; `i` is injected, n=1000
     print(y[7])                // 35
 }
 ```
 
+`saxpy(1000, 3, x, y)` supplies `n, a, x, y` (params 1..); the index `i` is
+injected per thread. The first supplied argument (`n = 1000`) is the launch size.
+
 Build/run needs an NVIDIA GPU, the CUDA toolkit (`libcuda`, headers under
 `/opt/cuda/include`), and an LLVM with the NVPTX target (`llc`).
 
-## Thread-index intrinsics
+## Thread index & intrinsics
 
-Nullary, return `Int`, valid only inside a `@gpu` function (they lower to
-`@llvm.nvvm.read.ptx.sreg.*`):
+The kernel's **parameter 0 is the global 1-D thread index** (an `Int`,
+`blockIdx.x*blockDim.x + threadIdx.x`), injected by the launcher — the usual way
+to get your index. For advanced kernels (grid-stride loops, 1-D block/grid
+queries) these nullary intrinsics are also available inside a `@gpu` function
+(they lower to `@llvm.nvvm.read.ptx.sreg.*`):
 
 | intrinsic     | meaning                                            |
 |---------------|----------------------------------------------------|
-| `gpu_gid()`   | global 1-D thread index = `blockIdx*blockDim + threadIdx` |
+| `gpu_gid()`   | same as parameter 0: global 1-D index              |
 | `gpu_gsize()` | total thread count = `gridDim*blockDim` (grid-stride loops) |
 | `gpu_tid()`   | `threadIdx.x`                                      |
 | `gpu_bid()`   | `blockIdx.x`                                       |
 | `gpu_bdim()`  | `blockDim.x`                                       |
 | `gpu_gdim()`  | `gridDim.x`                                        |
 
+Grid-stride example (`gpu_gsize()` still works with the injected index):
+
+```vire
+@gpu
+fn fill(i: Int, n: Int, out: array) {
+    mut j = i
+    while j < n { out[j] = j  j = j + gpu_gsize() }
+}
+```
+
 ## Calling convention & launch
 
-- The kernel is called with ordinary Vire syntax. The **first scalar-integer
-  parameter is the launch size N**: the runtime launches N threads
-  (`block = 256`, `grid = ceil(N/256)`). Your kernel guards `if gpu_gid() < N`.
+- Parameter 0 (the thread index) is injected; callers pass params 1.. , exactly
+  like a `parallel_for` worker `(i, …)`. A kernel needs `(index: Int, count:
+  Int, …)`: the **first caller-supplied `Int` is the launch size N**, and the
+  runtime launches N threads (`block = 256`, `grid = ceil(N/256)`). Your kernel
+  guards `if i < n`.
 - **Array parameters** (`array` = `Int`/i64, `farray` = `Float`/f64,
   `Array<T>`) are uploaded to device memory before the launch and copied back
   after (v1 treats every array as in/out). Scalars are passed by value.

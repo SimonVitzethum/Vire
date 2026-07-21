@@ -27,11 +27,15 @@ The following cuda-oxide concepts have direct Vire counterparts:
 
 ## Source
 
-**No cuda-oxide source code is compiled into or redistributed by this
-repository.** cuda-oxide is a `rustc` codegen backend and cannot be used as a
-library by Vire's C-hosted runtime; only its *design* is referenced. This
-directory preserves the upstream Apache-2.0 license text as attribution for
-that design reuse, per the courtesy of the Apache-2.0 NOTICE convention.
+The **full upstream cuda-oxide source tree is vendored in this directory**
+(everything except `.git`), redistributed under its Apache-2.0 license (see
+[`LICENSE`](LICENSE)). It is kept for **reference and attribution only** and is
+**not built**: the repository's workspace `Cargo.toml` lists
+`exclude = ["third_party/cuda-oxide"]`, so `cargo` never descends into it, and
+none of its code is compiled into or linked by any Vire artifact. cuda-oxide is
+a `rustc` codegen backend (with its own workspace and pinned toolchain) and
+cannot be used as a library by Vire's C-hosted runtime; only its *design* is
+adapted.
 
 The Vire GPU implementation itself (`crates/backend` NVPTX emitter + C launch
 stubs, `crates/driver/src/gpu_runtime.c`, `crates/vire` `@gpu` lowering) is

@@ -60,8 +60,7 @@ reject() {
 
 ok saxpy "$(printf '1\n35')" <<'EOF'
 @gpu
-fn saxpy(n: Int, a: Int, x: array, y: array) {
-    mut i = gpu_gid()
+fn saxpy(i: Int, n: Int, a: Int, x: array, y: array) {
     if i < n { y[i] = a * x[i] + y[i] }
 }
 fn main() {
@@ -80,8 +79,7 @@ EOF
 
 ok fscale "$(printf '6\n14')" <<'EOF'
 @gpu
-fn scale(n: Int, k: Float, x: farray) {
-    mut i = gpu_gid()
+fn scale(i: Int, n: Int, k: Float, x: farray) {
     if i < n { x[i] = k * x[i] }
 }
 fn main() {
@@ -94,10 +92,26 @@ fn main() {
 }
 EOF
 
+# gpu_gsize() intrinsic still available for grid-stride kernels.
+ok stride "$(printf '499500')" <<'EOF'
+@gpu
+fn fill(i: Int, n: Int, out: array) {
+    mut j = i
+    while j < n { out[j] = j  j = j + gpu_gsize() }
+}
+fn main() {
+    mut out = array(1000)
+    fill(1000, out)
+    mut s = 0
+    mut i = 0
+    while i < 1000 { s = s + out[i]  i = i + 1 }
+    print(s)
+}
+EOF
+
 reject badcall "not supported on the device" <<'EOF'
 @gpu
-fn k(n: Int, x: array) {
-    mut i = gpu_gid()
+fn k(i: Int, n: Int, x: array) {
     if i < n { print(i)  x[i] = i }
 }
 fn main() { mut x = array(4)  k(4, x)  print(x[1]) }

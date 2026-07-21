@@ -130,22 +130,47 @@ impl Dev<'_> {
             self.errs.push(format!("@gpu kernel `{name}` must return () / Void"));
         }
         let nparams = self.f.params.len();
-        // Signature.
+        // Signature: parameter 0 is the injected global thread index — NOT a PTX
+        // parameter — so the device signature is params 1.. (matching the host
+        // launch stub, which passes only those).
         write!(self.w, "define ptx_kernel void @{name}(").unwrap();
-        for i in 0..nparams {
-            if i > 0 {
+        let mut first = true;
+        for i in 1..nparams {
+            if !first {
                 self.w.push_str(", ");
             }
+            first = false;
             let ty = self.local_ty(i);
             write!(self.w, "{ty} %a{i}").unwrap();
         }
         self.w.push_str(") {\nentry:\n");
-        // Alloca every local; store incoming params.
+        // Alloca every local.
         for l in 0..self.f.locals.len() {
             let ty = self.local_ty(l);
             writeln!(self.w, "  %slot{l} = alloca {ty}").unwrap();
         }
-        for i in 0..nparams {
+        // slot0 = global thread index (blockIdx.x*blockDim.x + threadIdx.x).
+        if nparams >= 1 {
+            let cta = self.fresh();
+            writeln!(self.w, "  {cta} = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()").unwrap();
+            let ntid = self.fresh();
+            writeln!(self.w, "  {ntid} = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()").unwrap();
+            let tid = self.fresh();
+            writeln!(self.w, "  {tid} = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()").unwrap();
+            let m = self.fresh();
+            writeln!(self.w, "  {m} = mul i32 {cta}, {ntid}").unwrap();
+            let g = self.fresh();
+            writeln!(self.w, "  {g} = add i32 {m}, {tid}").unwrap();
+            if self.f.locals[0] == Ty::I64 {
+                let g64 = self.fresh();
+                writeln!(self.w, "  {g64} = sext i32 {g} to i64").unwrap();
+                writeln!(self.w, "  store i64 {g64}, ptr %slot0").unwrap();
+            } else {
+                writeln!(self.w, "  store i32 {g}, ptr %slot0").unwrap();
+            }
+        }
+        // Store the real (caller-provided) params 1.. into their slots.
+        for i in 1..nparams {
             let ty = self.local_ty(i);
             writeln!(self.w, "  store {ty} %a{i}, ptr %slot{i}").unwrap();
         }
@@ -491,44 +516,51 @@ pub fn emit_gpu_stubs(program: &Program) -> Option<String> {
     for k in &program.gpu_kernels {
         let name = &k.func.name;
         let n = k.func.params.len();
-        // Signature.
+        // Parameter 0 is the injected thread index — supplied on the device, NOT by
+        // the host — so the stub signature and the launch marshal params 1.. only.
         write!(w, "void {name}(").unwrap();
-        if n == 0 {
+        if n <= 1 {
             w.push_str("void");
         }
-        for i in 0..n {
-            if i > 0 {
+        let mut first = true;
+        for i in 1..n {
+            if !first {
                 w.push_str(", ");
             }
+            first = false;
             let is_arr = k.param_arr.get(i).copied().flatten().is_some();
             write!(w, "{} p{i}", c_param_ty(k.func.params[i], is_arr)).unwrap();
         }
         w.push_str(") {\n");
         w.push_str("  jrt_gpu_ensure();\n");
         writeln!(w, "  void* _fn = jrt_gpu_func(\"{name}\");").unwrap();
-        // Launch thread count.
+        // Launch thread count = the first caller-provided int param (index >= 1).
         writeln!(w, "  int64_t _n = (int64_t)p{};", k.launch_param).unwrap();
         // Upload array arguments (H2D). `data = arr+32`, `bytes = len*elemsize`.
-        for i in 0..n {
+        for i in 1..n {
             if let Some(kind) = k.param_arr.get(i).copied().flatten() {
                 let sz = kind.size();
                 writeln!(w, "  int64_t _b{i} = jrt_gpu_arrlen(p{i}) * {sz};").unwrap();
                 writeln!(w, "  void* _d{i} = jrt_gpu_upload((char*)p{i} + 32, _b{i});").unwrap();
             }
         }
-        // Kernel parameter array (addresses of scalars / device pointers).
-        writeln!(w, "  void* _params[{}];", n.max(1)).unwrap();
-        for i in 0..n {
+        // Kernel parameter array (addresses of scalars / device pointers), in the
+        // order of the device signature (params 1..).
+        let nkp = n.saturating_sub(1);
+        writeln!(w, "  void* _params[{}];", nkp.max(1)).unwrap();
+        let mut slot = 0;
+        for i in 1..n {
             if k.param_arr.get(i).copied().flatten().is_some() {
-                writeln!(w, "  _params[{i}] = &_d{i};").unwrap();
+                writeln!(w, "  _params[{slot}] = &_d{i};").unwrap();
             } else {
-                writeln!(w, "  _params[{i}] = &p{i};").unwrap();
+                writeln!(w, "  _params[{slot}] = &p{i};").unwrap();
             }
+            slot += 1;
         }
-        writeln!(w, "  jrt_gpu_launch(_fn, _n, _params, {n});").unwrap();
+        writeln!(w, "  jrt_gpu_launch(_fn, _n, _params, {nkp});").unwrap();
         // Copy back all array arguments (D2H) and free. v1: every array is treated
         // as in/out (simple + correct); a future read-only analysis can skip these.
-        for i in 0..n {
+        for i in 1..n {
             if k.param_arr.get(i).copied().flatten().is_some() {
                 writeln!(w, "  jrt_gpu_download((char*)p{i} + 32, _d{i}, _b{i});").unwrap();
                 writeln!(w, "  jrt_gpu_free(_d{i});").unwrap();

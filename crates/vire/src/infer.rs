@@ -135,6 +135,15 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
     let mut u = Unifier::new();
     // Per-expression type record (type variables; resolved to concrete at the end).
     let mut rec: HashMap<Span, T> = HashMap::new();
+    // `@gpu` kernel names (param 0 = injected thread index, dropped at call sites).
+    let gpu_fns: std::collections::HashSet<String> = m
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Fn(f) if f.attrs.iter().any(|a| a.name == "gpu") => Some(f.sig.name.clone()),
+            _ => None,
+        })
+        .collect();
     // 1. Create global signature variables (annotated → concrete, otherwise fresh).
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
@@ -181,6 +190,7 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
                 let mut cx = Ctx {
                     u: &mut u,
                     sigs: &sigs,
+                    gpu: &gpu_fns,
                     scopes: vec![HashMap::new()],
                     ret: sig.ret,
                     types: &mut rec,
@@ -278,6 +288,10 @@ fn ty_name(t: T) -> &'static str {
 struct Ctx<'a> {
     u: &'a mut Unifier,
     sigs: &'a HashMap<String, Sig>,
+    /// Names of `@gpu` kernels: at a call site their parameter 0 (the injected
+    /// thread index) is not passed by the caller, so the call's args unify with
+    /// `sig.params[1..]`. The body still binds all params (index included).
+    gpu: &'a std::collections::HashSet<String>,
     scopes: Vec<HashMap<String, T>>,
     ret: T,
     /// Typed-AST side-table being populated: span → (unresolved) type variable.
@@ -421,7 +435,10 @@ impl<'a> Ctx<'a> {
                         return T::Void;
                     }
                     if let Some(sig) = self.sigs.get(n) {
-                        for (at, pt) in arg_ts.iter().zip(&sig.params) {
+                        // `@gpu` kernels: skip param 0 (the injected thread index) —
+                        // the caller passes only params 1.. .
+                        let skip = if self.gpu.contains(n) { 1 } else { 0 };
+                        for (at, pt) in arg_ts.iter().zip(sig.params.iter().skip(skip)) {
                             self.u.unify(*at, *pt);
                         }
                         return sig.ret;
