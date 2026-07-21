@@ -331,6 +331,71 @@ fn cache_add(key: u64) {
     }
 }
 
+/// Precompile `runtime.c` to LLVM bitcode once per (content, `-D` flags, target,
+/// clang version) and cache it. The runtime is identical every build, yet its
+/// `-O2 -flto -c` bitcode generation is ~80% of a small build's wall time. The LTO
+/// link consumes this cached bitcode EXACTLY as if it had compiled `runtime.c`
+/// inline — same bitcode in, same link-time optimization out — so this is lossless.
+/// Returns the cached object, or `None` to fall back to compiling from source (any
+/// error, e.g. a stale/unwritable cache, is silently non-fatal).
+fn cached_runtime_object(threads: bool, backtrace: bool, no_cycles: bool, no_rc: bool, thin_lto: bool, target: Option<&str>) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = base.join("vire");
+    std::fs::create_dir_all(&dir).ok()?;
+    // A clang upgrade must not reuse stale bitcode → fold its version into the key.
+    let clangver = Command::new("clang")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "rtbc-v1".hash(&mut h);
+    RUNTIME_C.hash(&mut h);
+    (threads, backtrace, no_cycles, no_rc, thin_lto).hash(&mut h);
+    target.unwrap_or("native").hash(&mut h);
+    clangver.hash(&mut h);
+    let key = h.finish();
+    let obj = dir.join(format!("runtime-{key:016x}.o"));
+    if obj.exists() {
+        return Some(obj);
+    }
+    // Cache miss: compile runtime.c → bitcode object with the matching flags.
+    let rt_src = dir.join("runtime-src.c");
+    std::fs::write(&rt_src, RUNTIME_C).ok()?;
+    let mut c = Command::new("clang");
+    c.arg("-O2").arg(if thin_lto { "-flto=thin" } else { "-flto" }).arg("-c").arg(&rt_src);
+    c.args(["-ffunction-sections", "-fdata-sections"]);
+    if threads {
+        c.arg("-DFASTLLVM_THREADS").arg("-pthread");
+    }
+    if backtrace {
+        c.arg("-DFASTLLVM_BACKTRACE");
+    }
+    if no_cycles {
+        c.arg("-DFASTLLVM_NO_CYCLES");
+    }
+    if no_rc {
+        c.arg("-DFASTLLVM_NO_RC");
+    }
+    if let Some(t) = target {
+        c.arg("-target").arg(t);
+    }
+    // Atomic publish: compile to a temp then rename, so a concurrent build never
+    // observes a half-written object.
+    let tmp = dir.join(format!("runtime-{key:016x}.{}.tmp.o", std::process::id()));
+    let ok = c.arg("-o").arg(&tmp).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    std::fs::rename(&tmp, &obj).ok()?;
+    Some(obj)
+}
+
 fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize) -> Result<bool, String> {
     let assume = assume_set(code)?;
     let key = cache_key(ext, code);
@@ -1327,7 +1392,17 @@ fn build_or_run(args: &[String]) {
         cmd.arg("-O0").arg(&ll_path).arg(&rt_path);
         cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
     } else {
-        cmd.arg("-O2").arg(&ll_path).arg(&rt_path);
+        // Runtime bitcode cache: `runtime.c` is identical every build, so reuse its
+        // cached `-flto` bitcode instead of recompiling it (~80% of a small build's
+        // time). Lossless — the LTO link optimizes it exactly as if from source.
+        // Skipped under PGO (the runtime must share the program's instrumentation).
+        let rt_cached = if pgo_gen || pgo_use.is_some() {
+            None
+        } else {
+            cached_runtime_object(want_threads || threads_flag, backtrace_flag, acyclic || force_no_cycles, force_no_rc, thin_lto, target.as_deref())
+        };
+        let rt_input = rt_cached.as_deref().unwrap_or_else(|| rt_path.as_path());
+        cmd.arg("-O2").arg(&ll_path).arg(rt_input);
         cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
         // ThinLTO (parallel, low memory) for huge programs; otherwise full LTO.
         cmd.arg(if thin_lto { "-flto=thin" } else { "-flto" });

@@ -485,6 +485,41 @@ nested `while`; `if/else` statements; `%`, casts, Float arithmetic; **`@gpu` ker
 `farray` params + a `while`-loop reduction ran bit-exact vs CPU** (matvec, 128/128 rows). The
 whole `vire run` pipeline (incl. NVPTX→CUDA) was reliable for a non-trivial numeric workload.
 
+## Cross-compilation (see language/CROSS-COMPILE.md)
+
+Measured from a Linux host. **Windows works** now (`--target x86_64-pc-windows-gnu`
+→ running `.exe`, via the `_WIN32` time branch + `-fuse-ld=lld`). Follow-ups:
+
+- [ ] **macOS cross-compile** — needs the macOS SDK (not redistributable). Wire up
+  [osxcross](https://github.com/tpoechtrager/osxcross): detect an `OSXCROSS_ROOT`/
+  SDK and pass `--sysroot` + the right `-target` (`arm64-apple-macos`,
+  `x86_64-apple-darwin`) so `runtime.c` compiles against Darwin headers instead of
+  falling back to the host's Linux `stdio.h`. The runtime code itself is already
+  portable; only the SDK is missing.
+- [ ] **FreeBSD/BSD full build** — object emit works today; add sysroot handling
+  (`--sysroot <freebsd-root>`) so linking an executable succeeds here rather than
+  needing to link on the target. `@when(freebsd)`/unix-family gating already
+  resolves (platform.rs).
+- [ ] **aarch64 targets** — verify `aarch64-pc-windows-gnu` (llvm-mingw) and
+  `aarch64-unknown-linux-gnu` end to end (untested; codegen should already work).
+- [ ] Windows **threads** produce a `.exe` (winpthreads) but execution under wine
+  was flaky — verify on real Windows.
+
+## Compile-speed follow-ups (see below / this session)
+
+- [x] **Cache the runtime bitcode — DONE.** `runtime.c` is identical every build yet
+  its `-O2 -flto -c` bitcode gen was **~0.4 s — ~80% of a small build**. Now
+  precompiled to a cached `.o` in `~/.cache/vire/` keyed by (content, `-D` flags,
+  target, clang version) and fed to the LTO link (main.rs `cached_runtime_object`).
+  Lossless — same bitcode in → same LTO out (all vire suites green incl. heap 0-live,
+  Java oracle 65/65, outputs identical). **Measured: empty build 0.48 s → 0.12 s,
+  no-inline 0.51 s → 0.14 s (~4×).** Skipped under PGO (runtime shares the program's
+  instrumentation) and under `-g`/freestanding (no `-flto`).
+- [ ] **Parallelize native-block verification.** Cold `@c`/`@asm` verification
+  (clang `-emit-llvm` + CSolver symbolic exec) runs sequentially per block; the
+  content-addressed PASS cache already makes warm builds instant, but multi-block
+  cold builds could verify blocks concurrently (CSolver is a library call).
+
 ## Non-goals (deliberate)
 Runtime `eval`/reflection · dynamic loading of unknown code · C-text preprocessor ·
 deadlock-freedom guarantee · "all" C++/Rust libraries beyond the C-ABI boundary.
