@@ -251,6 +251,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     // via `__tag`. (Space = sum of all variants; simple, fits the flat
     // class model. A more compact union follows later.)
     let mut types: HashMap<String, Layout> = HashMap::new();
+    // (type name, field name) → element kind, for array-typed struct fields.
+    let mut field_arr: HashMap<(String, String), ArrKind> = HashMap::new();
     let mut variants: HashMap<String, VariantInfo> = HashMap::new();
     // Generic product types (`type Box[T] { value: T }`): do NOT register
     // directly as a class (fields reference T). Instead monomorphized per used
@@ -301,6 +303,13 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                     .iter()
                     .map(|f| (f.name.clone(), ty_of(Some(&f.ty)), class_of(Some(&f.ty))))
                     .collect();
+                // Record array-typed fields' element kind, so `x.field[i]` in the
+                // body knows how to index it (a plain GetField only yields a `Ref`).
+                for f in &t.fields {
+                    if let Some(k) = field_arrkind(&f.ty) {
+                        field_arr.insert((t.name.clone(), f.name.clone()), k);
+                    }
+                }
                 types.insert(t.name.clone(), layout);
             } else {
                 let mut layout: Layout = vec![("__tag".into(), Ty::I64, None)];
@@ -578,7 +587,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // higher-order template → only inline (defunctionalization)
             }
-            match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
+            match lower_fn(f, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
                 Ok((func, mono, insts, names)) => {
                     prog.debug_local_names.insert(func.name.clone(), names);
                     // `@gpu` → a device kernel: kept out of `functions` so the host
@@ -611,7 +620,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
+        match lower_fn(meth, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
@@ -660,7 +669,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
-        match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
+        match lower_fn(&inst, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
@@ -885,6 +894,9 @@ struct FnLower<'a> {
     sigs: &'a HashMap<String, Sig>,
     /// User type layouts (name → fields) for New/GetField.
     types: &'a HashMap<String, Layout>,
+    /// (type, field) → element kind for array-typed struct fields, so
+    /// `x.field[i]` can lower to a real bounds-checked array access.
+    field_arr: &'a HashMap<(String, String), ArrKind>,
     /// Variant registry (variant name → info) for construction + match.
     variants: &'a HashMap<String, VariantInfo>,
     /// Generic functions (name → info) for call monomorphization.
@@ -2082,6 +2094,12 @@ impl<'a> FnLower<'a> {
                 let d = self.new_local(fty);
                 if let Some(rt) = rtarget {
                     self.local_class.insert(d.0, rt);
+                }
+                // Array-typed field → tag the result local with its element kind so
+                // `x.field[i]` / `x.field[i] = v` / `x.field.len()` lower to real
+                // bounds-checked accesses (a bare GetField only knows `Ref`).
+                if let Some(k) = self.field_arr.get(&(class.clone(), name.clone())).copied() {
+                    self.local_arr.insert(d.0, k);
                 }
                 self.emit(Statement::GetField { dest: d, obj, class, field: name.clone() });
                 (Operand::Copy(d), fty)
@@ -3477,6 +3495,7 @@ fn lower_fn(
     f: &FnDef,
     sigs: &HashMap<String, Sig>,
     types: &HashMap<String, Layout>,
+    field_arr: &HashMap<(String, String), ArrKind>,
     variants: &HashMap<String, VariantInfo>,
     generics: &HashMap<String, GInfo>,
     trait_methods: &HashMap<String, Vec<(String, String, Vec<Ty>, Ty)>>,
@@ -3506,6 +3525,7 @@ fn lower_fn(
         cur: 0,
         scopes: vec![HashMap::new()],
         sigs,
+        field_arr,
         types,
         variants,
         generics,
@@ -3822,6 +3842,16 @@ fn log_threshold() -> i32 {
 
 /// Element-type name in an array parameter (`Array[Int]`) → array element kind.
 /// `Int`/`Long` = i64 slots (like `array(n)`), `Float` = f64 (like `farray(n)`).
+/// Element kind of an array-typed annotation (`array`/`Array[T]`/`farray`), else
+/// `None`. Used to tag array struct fields so `x.field[i]` can index them.
+fn field_arrkind(t: &Type) -> Option<ArrKind> {
+    match t.name.as_str() {
+        "array" | "Array" => Some(arrkind_of_name(t.args.first().map(|a| a.name.as_str()).unwrap_or("Int"))),
+        "farray" => Some(ArrKind::Double),
+        _ => None,
+    }
+}
+
 fn arrkind_of_name(n: &str) -> ArrKind {
     match n {
         "Float" | "F64" | "Double" => ArrKind::Double,

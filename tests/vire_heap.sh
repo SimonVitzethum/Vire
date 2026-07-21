@@ -263,6 +263,23 @@ fn main() {
 }
 EOF
 
+# --- capsule struct with an ARRAY FIELD: deep-copy recurses into the field's array
+#     (via vtable dispatch), so mutating buf.data in the body leaves the caller's
+#     array intact. total=105 (100+2+3), caller d[0] stays 1 → 106; 0-live ---
+case_ capsule_struct_arrayfield 106 <<'EOF'
+type Buf { n: Int  data: array }
+fn main() {
+    mut d = array(3)
+    d[0]=1 d[1]=2 d[2]=3
+    mut buf = Buf(3, d)
+    mut total = capsule(buf) {
+        buf.data[0] = 100
+        buf.data[0] + buf.data[1] + buf.data[2]
+    }
+    print(total + d[0])
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
