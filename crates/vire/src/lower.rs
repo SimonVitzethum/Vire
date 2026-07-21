@@ -579,7 +579,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                 continue; // higher-order template → only inline (defunctionalization)
             }
             match lower_fn(f, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
-                Ok((func, mono, insts)) => {
+                Ok((func, mono, insts, names)) => {
+                    prog.debug_local_names.insert(func.name.clone(), names);
                     // `@gpu` → a device kernel: kept out of `functions` so the host
                     // solver passes/RTA/inliner never touch it. The backend emits it
                     // as NVPTX device IR + a C host launch stub (see GpuKernel).
@@ -611,7 +612,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
         match lower_fn(meth, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
-            Ok((func, mono, insts)) => {
+            Ok((func, mono, insts, names)) => {
+                prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
                 mono_queue.extend(mono);
                 all_insts.extend(insts);
@@ -659,7 +661,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
         match lower_fn(&inst, &sigs, &types, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
-            Ok((func, mono, insts)) => {
+            Ok((func, mono, insts, names)) => {
+                prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
                 mono_queue.extend(mono);
                 all_insts.extend(insts);
@@ -873,6 +876,9 @@ fn guess_expr_ty(e: &Expr) -> Ty {
 
 struct FnLower<'a> {
     locals: Vec<Ty>,
+    /// Source name of each local (parallel to `locals`; `None` for temporaries).
+    /// Collected for debug builds → `DILocalVariable`/`#dbg_declare`.
+    local_names: Vec<Option<String>>,
     blocks: Vec<BasicBlock>,
     cur: usize,
     scopes: Vec<HashMap<String, (Local, Ty)>>,
@@ -935,6 +941,7 @@ struct FnLower<'a> {
 impl<'a> FnLower<'a> {
     fn new_local(&mut self, ty: Ty) -> Local {
         self.locals.push(ty);
+        self.local_names.push(None);
         Local((self.locals.len() - 1) as u32)
     }
     fn intern(&mut self, s: &str) -> u32 {
@@ -965,6 +972,13 @@ impl<'a> FnLower<'a> {
         None
     }
     fn bind(&mut self, name: &str, l: Local, t: Ty) {
+        // Remember the source name (first binding wins; shadowing keeps the
+        // outer name for debug display, which is close enough for inspection).
+        if let Some(slot) = self.local_names.get_mut(l.0 as usize) {
+            if slot.is_none() && !name.is_empty() {
+                *slot = Some(name.to_string());
+            }
+        }
         self.scopes.last_mut().unwrap().insert(name.to_string(), (l, t));
     }
     /// Layout of a class — user type OR instantiated generic type.
@@ -3408,7 +3422,7 @@ fn lower_fn(
     sym: Option<&str>,
     line: u32,
     line_starts: &[usize],
-) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>), Vec<String>> {
+) -> Result<(Function, Vec<(String, Vec<String>)>, HashMap<String, Layout>, Vec<Option<String>>), Vec<String>> {
     let ret = guess_ret_ty(f);
     let name = match sym {
         Some(s) => s.to_string(),
@@ -3417,6 +3431,7 @@ fn lower_fn(
     };
     let mut fl = FnLower {
         locals: Vec::new(),
+        local_names: Vec::new(),
         blocks: Vec::new(),
         cur: 0,
         scopes: vec![HashMap::new()],
@@ -3518,6 +3533,7 @@ fn lower_fn(
     }
     let mono = fl.mono;
     let local_inst = fl.local_inst;
+    let local_names = fl.local_names;
     Ok((
         Function {
             name,
@@ -3530,6 +3546,7 @@ fn lower_fn(
         },
         mono,
         local_inst,
+        local_names,
     ))
 }
 

@@ -61,6 +61,10 @@ fn main() {
         audit(&args[1..]);
         return;
     }
+    if args[0] == "check" {
+        check(&args[1..]);
+        return;
+    }
     if args.len() < 2 {
         eprintln!("Usage: vire (parse|lex) FILE.vr");
         exit(2);
@@ -389,6 +393,97 @@ fn python_config() -> Option<(String, String)> {
 ///      `// syntax: FILE`), resolved relative to the source file's directory.
 /// Absent both → default (standard) keywords. A requested-but-unreadable/invalid config
 /// is a hard error (never a silent fallback).
+/// `vire check FILE.vr` — front-end only (parse → desugar → infer → lower),
+/// printing each diagnostic as `FILE:line:col: severity: message` for editor
+/// integration. Lex/parse diagnostics carry precise spans; stage errors without a
+/// span are reported at 1:1. Prints nothing and exits 0 when the file is clean.
+fn check(args: &[String]) {
+    let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("Usage: vire check FILE.vr");
+        exit(2);
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("{path}:1:1: error: {e}");
+            exit(1);
+        }
+    };
+    let emit_span = |level: &vire::diag::Level, span: vire::diag::Span, msg: &str| {
+        let (line, col) = vire::diag::line_col(&src, span.0);
+        let sev = match level {
+            vire::diag::Level::Error => "error",
+            vire::diag::Level::Warning => "warning",
+        };
+        println!("{path}:{line}:{col}: {sev}: {msg}");
+    };
+    let emit_plain = |msg: &str| println!("{path}:1:1: error: {msg}");
+    let mut had_error = false;
+
+    // Parse (default or in-file `//!syntax:` grammar).
+    let syntax = load_syntax(&src, path, None);
+    let (mut module, diags) = vire::parse_with_syntax(&src, syntax);
+    for d in &diags {
+        if d.level == vire::diag::Level::Error {
+            had_error = true;
+        }
+        emit_span(&d.level, d.span, &d.msg);
+    }
+    if had_error {
+        exit(1);
+    }
+    // Desugars + expansions, in the same order as `build`.
+    let os = vire::platform::target_os(None);
+    for e in vire::apply_platform_cfg(&mut module, os) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    for e in vire::desugar_cblocks(&mut module) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    let (spawn_errs, _) = vire::desugar_spawn(&mut module);
+    for e in spawn_errs {
+        had_error = true;
+        emit_plain(&e);
+    }
+    for e in vire::expand_item_macros(&mut module) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    if let Err(errs) = vire::expand_macros(&mut module) {
+        for e in errs {
+            had_error = true;
+            emit_plain(&e);
+        }
+    }
+    for e in vire::derive_expand(&mut module) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    if had_error {
+        exit(1);
+    }
+    // Inference → comptime → lowering (the errors editors most want to see).
+    for e in vire::infer_module(&mut module) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    for e in vire::eval_comptime(&mut module) {
+        had_error = true;
+        emit_plain(&e);
+    }
+    if let Err(errs) = vire::lower_module_src(&module, "") {
+        for e in errs {
+            had_error = true;
+            emit_plain(&e);
+        }
+    }
+    if had_error {
+        exit(1);
+    }
+}
+
 fn load_syntax(src: &str, src_path: &str, explicit: Option<&str>) -> vire::Syntax {
     let src_dir = std::path::Path::new(src_path).parent().unwrap_or_else(|| std::path::Path::new("."));
     let cfg = if let Some(f) = explicit {

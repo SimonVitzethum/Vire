@@ -456,6 +456,31 @@ Attach: LLVM debug metadata (backend extension), panic model.
 - [ ] **Overflow default**: checked also in release, wrapping only explicit
   ([REFERENCE.md](language/REFERENCE.md) §3.1).
 
+## External usage findings — Baby-LOOM emulator (2026-07-21)
+
+Real-workload dogfooding: a MoE-inference emulator in Vire (YARN quantizer, EXPFFN
+gate/up/SwiGLU/down, top-k router, GPU matvec) — see
+`~/Schreibtisch/MoE Hardware/baby-loom-sim/`. Mostly smooth; two rough edges:
+
+- [x] **Lowering bug: `lowering: call target M2: only named functions`.** ~~Triggered in a
+  multi-function module by a helper returning `Int` via a **trailing cast expression**
+  `fn roundf(x: Float) -> Int { … (y as Int) }` and/or a **nested user-call as an argument**
+  `clampi(roundf(v), lo, hi)`.~~ **NO LONGER REPRODUCES (verified 2026-07-21).** Reverting
+  BOTH workarounds in the real `yarn_expffn.vr` (trailing `y as Int` return + nested
+  `clampi(roundf(w[..]/scale), …)`) now builds (exit 0) and runs correctly; isolated repros
+  (trailing cast after an `if`, nested user-call inside a `while`) also build+run. Resolved by
+  this session's `farray`/lowering changes (param array-kind registration + `farray[i]=<int>`
+  int→f64 store coercion, done for the `@gpu` work). Workarounds in baby-loom can be removed.
+- [x] **Ergonomics: `farray` allocation in a helper fn.** ~~`mut h = farray(dff)` inside a
+  helper produced the same lowering error.~~ **FIXED** — `mut h = farray(n)  h[0] = 1.0` in a
+  non-`main` helper now builds+runs (same root cause as above). Local array allocation works in
+  any fn.
+
+**Worked well (no action):** `farray`/`array` params with in-place writes through helpers;
+nested `while`; `if/else` statements; `%`, casts, Float arithmetic; **`@gpu` kernels with
+`farray` params + a `while`-loop reduction ran bit-exact vs CPU** (matvec, 128/128 rows). The
+whole `vire run` pipeline (incl. NVPTX→CUDA) was reliable for a non-trivial numeric workload.
+
 ## Non-goals (deliberate)
 Runtime `eval`/reflection · dynamic loading of unknown code · C-text preprocessor ·
 deadlock-freedom guarantee · "all" C++/Rust libraries beyond the C-ABI boundary.

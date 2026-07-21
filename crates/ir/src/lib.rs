@@ -324,6 +324,10 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// `@gpu` kernels (device code + host launch stubs), see [`GpuKernel`].
     pub gpu_kernels: Vec<GpuKernel>,
+    /// Debug builds only: function name → source name of each local (indexed by
+    /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
+    /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.
+    pub debug_local_names: std::collections::HashMap<String, Vec<Option<String>>>,
     pub classes: Vec<ClassInfo>,
     /// String literal pool; `Operand::ConstStr` indexes into this.
     pub strings: Vec<String>,

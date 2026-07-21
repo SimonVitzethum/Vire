@@ -424,7 +424,9 @@ struct DebugGen {
     locs: std::collections::HashMap<(u32, usize, usize), usize>,
     /// DISubprogram dedup: function name → metadata id.
     subs: std::collections::HashMap<String, usize>,
-    /// Metadata definitions (DISubprogram + DILocation), emitted at the end.
+    /// DIBasicType dedup: local type → metadata id.
+    btypes: std::collections::HashMap<Ty, usize>,
+    /// Metadata definitions (DISubprogram + DILocation + variables), emitted at the end.
     defs: Vec<String>,
 }
 impl DebugGen {
@@ -438,8 +440,41 @@ impl DebugGen {
             on, file, dir, base, next: base + 6,
             locs: std::collections::HashMap::new(),
             subs: std::collections::HashMap::new(),
+            btypes: std::collections::HashMap::new(),
             defs: Vec::new(),
         }
+    }
+    /// DIBasicType for a scalar local type (deduped). Ref → a generic pointer.
+    fn basic_type(&mut self, ty: Ty) -> usize {
+        if let Some(&id) = self.btypes.get(&ty) {
+            return id;
+        }
+        let id = self.next;
+        self.next += 1;
+        self.btypes.insert(ty, id);
+        let def = match ty {
+            Ty::I64 => "!DIBasicType(name: \"Int\", size: 64, encoding: DW_ATE_signed)".to_string(),
+            Ty::I32 => "!DIBasicType(name: \"Bool\", size: 32, encoding: DW_ATE_signed)".to_string(),
+            Ty::F64 => "!DIBasicType(name: \"Float\", size: 64, encoding: DW_ATE_float)".to_string(),
+            Ty::F32 => "!DIBasicType(name: \"F32\", size: 32, encoding: DW_ATE_float)".to_string(),
+            // References print as an opaque address (the pointer value).
+            Ty::Ref => "!DIBasicType(name: \"ref\", size: 64, encoding: DW_ATE_address)".to_string(),
+            Ty::Void => "!DIBasicType(name: \"void\", size: 0, encoding: DW_ATE_unsigned)".to_string(),
+        };
+        self.defs.push(format!("!{id} = {def}"));
+        id
+    }
+    /// A DILocalVariable (`arg` > 0 marks it the n-th parameter). Returns its id.
+    fn local_var(&mut self, name: &str, arg: usize, sub: usize, line: u32, ty_id: usize) -> usize {
+        let id = self.next;
+        self.next += 1;
+        let l = if line == 0 { 1 } else { line };
+        let argf = if arg > 0 { format!(", arg: {arg}") } else { String::new() };
+        self.defs.push(format!(
+            "!{id} = !DILocalVariable(name: \"{}\"{argf}, scope: !{sub}, file: !{f}, line: {l}, type: !{ty_id})",
+            escape_md(name), f = self.file_id(),
+        ));
+        id
     }
     fn file_id(&self) -> usize { self.base }
     fn cu_id(&self) -> usize { self.base + 1 }
@@ -933,7 +968,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
                 || matches!(st, Statement::Call { func, .. } if func == "jrt_take_pending")
         });
     for (fi, f) in program.functions.iter().enumerate() {
-        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable);
+        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name));
     }
 
     // Thread trampoline: called by the runtime (pthread or synchronous),
@@ -1856,7 +1891,7 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
         .collect()
 }
 
-fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool) {
+fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool, local_names: Option<&Vec<Option<String>>>) {
     let ps: Vec<String> = f
         .params
         .iter()
@@ -1891,6 +1926,21 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     writeln!(w, "entry:").unwrap();
     for (i, ty) in f.locals.iter().enumerate() {
         writeln!(w, "  %l{i} = alloca {}", llty(*ty)).unwrap();
+    }
+    // Debug: associate each named local's alloca with a DILocalVariable so
+    // gdb/lldb can inspect it. Parameters (index < n_params) are marked `arg`.
+    if dg.on {
+        if let (Some(names), Some(loc)) = (local_names, default_loc) {
+            let sub = dg.subprogram(&f.name, f.line);
+            let np = f.params.len();
+            for (i, ty) in f.locals.iter().enumerate() {
+                let Some(Some(name)) = names.get(i) else { continue };
+                let bt = dg.basic_type(*ty);
+                let arg = if i < np { i + 1 } else { 0 };
+                let var = dg.local_var(name, arg, sub, f.line, bt);
+                writeln!(w, "    #dbg_declare(ptr %l{i}, !{var}, !DIExpression(), !{loc})").unwrap();
+            }
+        }
     }
     // Ref locals must be null before the first (cleanup) load, so that the
     // bulk release at the function end dereferences no garbage.

@@ -1,0 +1,113 @@
+{
+    "name": "vire",
+    "displayName": "Vire",
+    "description": "Language support and debugging for the Vire programming language (.vr).",
+    "version": "0.1.0",
+    "publisher": "vire-lang",
+    "license": "GPL-3.0-or-later",
+    "engines": { "vscode": "^1.75.0" },
+    "categories": ["Programming Languages", "Debuggers", "Snippets"],
+    "main": "./extension.js",
+    "activationEvents": [
+        "onLanguage:vire",
+        "onDebugResolve:vire"
+    ],
+    "contributes": {
+        "languages": [
+            {
+                "id": "vire",
+                "aliases": ["Vire", "vire"],
+                "extensions": [".vr"],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "vire",
+                "scopeName": "source.vire",
+                "path": "./syntaxes/vire.tmLanguage.json"
+            }
+        ],
+        "snippets": [
+            { "language": "vire", "path": "./snippets/vire.json" }
+        ],
+        "commands": [
+            { "command": "vire.build", "title": "Vire: Build File", "category": "Vire" },
+            { "command": "vire.run", "title": "Vire: Run File", "category": "Vire" }
+        ],
+        "configuration": {
+            "title": "Vire",
+            "properties": {
+                "vire.path": {
+                    "type": "string",
+                    "default": "vire",
+                    "description": "Path to the `vire` compiler binary (e.g. target/release/vire)."
+                },
+                "vire.checkOnSave": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Type-check the file with `vire check` on save and show diagnostics."
+                }
+            }
+        },
+        "breakpoints": [
+            { "language": "vire" }
+        ],
+        "debuggers": [
+            {
+                "type": "vire",
+                "label": "Vire (native, lldb-dap)",
+                "languages": ["vire"],
+                "configurationAttributes": {
+                    "launch": {
+                        "required": ["program"],
+                        "properties": {
+                            "program": {
+                                "type": "string",
+                                "description": "Path to the .vr source file to compile (--debug) and debug.",
+                                "default": "${file}"
+                            },
+                            "args": {
+                                "type": "array",
+                                "description": "Command-line arguments passed to the program.",
+                                "default": []
+                            },
+                            "stopOnEntry": {
+                                "type": "boolean",
+                                "description": "Stop at the program entry point.",
+                                "default": false
+                            },
+                            "cwd": {
+                                "type": "string",
+                                "description": "Working directory.",
+                                "default": "${workspaceFolder}"
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "type": "vire",
+                        "request": "launch",
+                        "name": "Vire: Debug current file",
+                        "program": "${file}",
+                        "stopOnEntry": false
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "Vire: Debug current file",
+                        "description": "Compile the current .vr with --debug and debug it (lldb-dap).",
+                        "body": {
+                            "type": "vire",
+                            "request": "launch",
+                            "name": "Vire: Debug current file",
+                            "program": "^\"\\${file}\"",
+                            "stopOnEntry": false
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+}

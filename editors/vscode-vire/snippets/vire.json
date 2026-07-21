@@ -1,0 +1,59 @@
+{
+    "function": {
+        "prefix": "fn",
+        "body": ["fn ${1:name}(${2:args}) -> ${3:Int} {", "\t$0", "}"],
+        "description": "Function definition"
+    },
+    "main": {
+        "prefix": "main",
+        "body": ["fn main() {", "\t$0", "}"],
+        "description": "main entry point"
+    },
+    "gpu kernel": {
+        "prefix": "gpu",
+        "body": [
+            "@gpu",
+            "fn ${1:kernel}(i: Int, n: Int, ${2:x: array}) {",
+            "\tif i < n {",
+            "\t\t$0",
+            "\t}",
+            "}"
+        ],
+        "description": "@gpu kernel (param 0 = injected thread index)"
+    },
+    "type product": {
+        "prefix": "type",
+        "body": ["type ${1:Name} {", "\t${2:field}: ${3:Int}", "}"],
+        "description": "Product type"
+    },
+    "type sum": {
+        "prefix": "enum",
+        "body": ["type ${1:Name} {", "\t${2:Variant}", "\t${3:Other}(${4:Int})", "}"],
+        "description": "Sum type (variants)"
+    },
+    "match": {
+        "prefix": "match",
+        "body": ["match ${1:expr} {", "\t${2:Pattern} => ${3:value}", "\t_ => ${4:default}", "}"],
+        "description": "match expression"
+    },
+    "while": {
+        "prefix": "while",
+        "body": ["while ${1:cond} {", "\t$0", "}"],
+        "description": "while loop"
+    },
+    "for": {
+        "prefix": "for",
+        "body": ["for ${1:i} in ${2:0}..${3:n} {", "\t$0", "}"],
+        "description": "for-in-range loop"
+    },
+    "trait": {
+        "prefix": "trait",
+        "body": ["trait ${1:Name} {", "\tfn ${2:method}(self) -> ${3:Int}", "}"],
+        "description": "trait definition"
+    },
+    "impl": {
+        "prefix": "impl",
+        "body": ["impl ${1:Trait} for ${2:Type} {", "\t$0", "}"],
+        "description": "impl block"
+    }
+}
