@@ -291,6 +291,7 @@ static void slab_free(void *p) {
 
 void jrt_noop_drop(void *p);
 void jrt_noop_trace(void *p, void (*visit)(void *));
+void *jrt_noop_copy(void *src, void *map); /* deep-copy vtable slot-3 stub */
 void *jrt_alloc(int64_t size);
 void jrt_retain(void *p);
 void jrt_throw_npe(void);
@@ -915,10 +916,11 @@ JStr *jrt_float_to_str(float f) {
 /* --- StringBuilder (runtime-backed) ---------------------------------
  * Growable byte buffer; RC-managed object with its own drop function
  * (frees the buffer). append(X) returns this (chaining). */
-void (*jrt_sb_vtable[3])(void) = {
+void (*jrt_sb_vtable[4])(void) = {
     (void (*)(void))jrt_sb_drop,
     (void (*)(void))jrt_noop_trace,
     (void (*)(void))0, /* no type descriptor */
+    (void (*)(void))jrt_noop_copy, /* deep-copy (slot 3) */
 };
 typedef struct {
     int64_t refcount;
@@ -1899,7 +1901,7 @@ void jrt_throw(void *e) {
  * immortal headers (refcount -1) with a no-op vtable without a
  * type descriptor. Caught by catch-all (catch Exception / RuntimeException);
  * their message survives until the uncaught output. */
-void *jrt_sentinel_vtable[3] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, NULL};
+void *jrt_sentinel_vtable[4] = {(void *)jrt_noop_drop, (void *)jrt_noop_trace, NULL, (void *)jrt_noop_copy};
 static JObjHeader arith_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader npe_exc_obj = {-1, jrt_sentinel_vtable};
 static JObjHeader bounds_exc_obj = {-1, jrt_sentinel_vtable};
@@ -2483,6 +2485,100 @@ void *jrt_arena_export_array(void *src, int64_t elem_size) {
 #endif
     jrt_memcpy((JArray *)d + 1, (JArray *)s + 1, (size_t)s->length * (size_t)elem_size);
     return d;
+}
+
+/* ===== Deep copy (capsule struct in/out) — Phase 1 foundation ==========
+ * A transient pointer→pointer map (original object → its copy) lets a deep copy
+ * TERMINATE on cycles and keep sharing (a DAG stays a DAG, not exploded). Open
+ * addressing, power-of-two capacity; created + freed per deep copy. */
+typedef struct { void *key; void *val; } JCopyEnt;
+typedef struct { JCopyEnt *ents; int64_t cap; int64_t len; } JCopyMap;
+
+static int64_t copymap_slot(void *p, int64_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)p;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return (int64_t)(h & (uint64_t)(cap - 1));
+}
+void *jrt_copymap_new(void) {
+    JCopyMap *m = (JCopyMap *)malloc(sizeof(JCopyMap));
+    m->cap = 64;
+    m->len = 0;
+    m->ents = (JCopyEnt *)calloc((size_t)m->cap, sizeof(JCopyEnt));
+    return m;
+}
+void jrt_copymap_free(void *mp) {
+    JCopyMap *m = (JCopyMap *)mp;
+    free(m->ents);
+    free(m);
+}
+void *jrt_copymap_get(void *mp, void *key) {
+    JCopyMap *m = (JCopyMap *)mp;
+    int64_t i = copymap_slot(key, m->cap);
+    while (m->ents[i].key) {
+        if (m->ents[i].key == key) return m->ents[i].val;
+        i = (i + 1) & (m->cap - 1);
+    }
+    return NULL;
+}
+static void copymap_grow(JCopyMap *m);
+void jrt_copymap_put(void *mp, void *key, void *val) {
+    JCopyMap *m = (JCopyMap *)mp;
+    if ((m->len + 1) * 4 >= m->cap * 3) copymap_grow(m);
+    int64_t i = copymap_slot(key, m->cap);
+    while (m->ents[i].key) {
+        if (m->ents[i].key == key) {
+            m->ents[i].val = val;
+            return;
+        }
+        i = (i + 1) & (m->cap - 1);
+    }
+    m->ents[i].key = key;
+    m->ents[i].val = val;
+    m->len++;
+}
+static void copymap_grow(JCopyMap *m) {
+    int64_t oc = m->cap;
+    JCopyEnt *oe = m->ents;
+    m->cap *= 2;
+    m->ents = (JCopyEnt *)calloc((size_t)m->cap, sizeof(JCopyEnt));
+    m->len = 0;
+    for (int64_t i = 0; i < oc; i++)
+        if (oe[i].key) jrt_copymap_put(m, oe[i].key, oe[i].val);
+    free(oe);
+}
+
+/* Identity copy — the Phase-2 vtable slot-3 stub, replaced by a generated
+ * per-class `copy.<C>` in Phase 3. Signature matches: (src, map) -> copy. */
+void *jrt_noop_copy(void *src, void *map) {
+    (void)map;
+    return src;
+}
+
+/* Deep-copy driver: build the map, run the per-type copy fn (taken by the caller
+ * from the object's vtable slot 3), free the map, return the root's copy.
+ * `_arena` keeps the active arena as the destination (capsule copy-IN); `_heap`
+ * bypasses it so the copy lands on the RC heap and survives the pop (copy-OUT). */
+typedef void *(*JCopyFn)(void *, void *);
+void *jrt_deep_copy_arena(void *root, void *copyfn) {
+    if (!root) return NULL;
+    void *m = jrt_copymap_new();
+    void *r = ((JCopyFn)copyfn)(root, m);
+    jrt_copymap_free(m);
+    return r;
+}
+void *jrt_deep_copy_heap(void *root, void *copyfn) {
+    if (!root) return NULL;
+    void *m = jrt_copymap_new();
+#ifndef FASTLLVM_FREESTANDING
+    Arena *saved = arena_top;
+    arena_top = NULL; /* destination = RC heap, not the arena */
+    void *r = ((JCopyFn)copyfn)(root, m);
+    arena_top = saved;
+#else
+    void *r = ((JCopyFn)copyfn)(root, m);
+#endif
+    jrt_copymap_free(m);
+    return r;
 }
 
 /* System.arraycopy: element-size/ref-correct (elem_size + ref vtable in the

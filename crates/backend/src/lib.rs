@@ -231,6 +231,12 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_array_ref_trace", "void (ptr, ptr)"),
     ("jrt_noop_drop", "void (ptr)"),
     ("jrt_noop_trace", "void (ptr, ptr)"),
+    // Deep copy (capsule struct in/out): vtable slot-3 stub + copymap + drivers.
+    ("jrt_noop_copy", "ptr (ptr, ptr)"),
+    ("jrt_deep_copy_arena", "ptr (ptr, ptr)"),
+    ("jrt_deep_copy_heap", "ptr (ptr, ptr)"),
+    ("jrt_copymap_get", "ptr (ptr, ptr)"),
+    ("jrt_copymap_put", "void (ptr, ptr, ptr)"),
 ];
 
 fn array_vtable(kind: ArrKind) -> &'static str {
@@ -250,8 +256,9 @@ const HEADER_SLOTS: usize = 2;
 /// Word offset of the vtable pointer in the header (for ptr getelementptr).
 const VTABLE_WORD: usize = 1;
 /// Vtable slot 0 = drop, slot 1 = trace (cycle collector), slot 2 =
-/// type descriptor (instanceof); interface/virtual methods from slot 3 on.
-const VTABLE_METHOD_OFFSET: usize = 3;
+/// type descriptor (instanceof), slot 3 = deep-copy (capsule struct in/out);
+/// interface/virtual methods from slot 4 on.
+const VTABLE_METHOD_OFFSET: usize = 4;
 /// Vtable slot of the type descriptor.
 const VTABLE_TYPEDESC_SLOT: usize = 2;
 
@@ -699,8 +706,8 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     writeln!(w, "%arr.int = type {{ i64, ptr, i64, i64, [0 x i32] }}").unwrap();
     writeln!(w, "%arr.ref = type {{ i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
     // Arrays have no type descriptor (slot 2 = null → instanceof false).
-    writeln!(w, "@vt.array.int = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
-    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [3 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null]").unwrap();
+    writeln!(w, "@vt.array.int = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
+    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [4 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
     writeln!(w).unwrap();
 
     // Type descriptors for instanceof: { ptr super, ptr name }. The chain
@@ -826,6 +833,9 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             format!("ptr @drop.{}", sanitize(class)),
             format!("ptr @trace.{}", sanitize(class)),
             format!("ptr @td.{}", sanitize(class)),
+            // Slot 3: deep-copy (capsule struct in/out). Identity stub for now
+            // (Phase 2); Phase 3 replaces it with a generated `copy.<class>`.
+            "ptr @jrt_noop_copy".to_string(),
         ];
         // jrt_* symbols are runtime functions (external), considered valid.
         let sym_entry = |sym: Option<String>| match sym {
@@ -866,7 +876,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     // null type descriptor); string method dispatch does not exist in Vire yet.
     // The class-name constants (@jclassname.*) are also @jstr → String vtable.
     if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
-        writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [3 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null]").unwrap();
+        writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
     }
     writeln!(w).unwrap();
 
