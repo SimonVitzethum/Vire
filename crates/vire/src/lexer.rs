@@ -171,10 +171,15 @@ impl<'a> Lexer<'a> {
         let body = String::from_utf8_lossy(&self.src[body_start..self.pos]).into_owned();
         self.pos += 1; // closing '}'
         let sp = Span(start, self.pos);
-        // Emit @LANG("""body""", cap1, cap2, …).
-        out.push(Token { tok: Tok::At, span: sp });
-        out.push(Token { tok: Tok::Ident(lang.into()), span: sp });
-        out.push(Token { tok: Tok::LParen, span: sp });
+        // Emit @LANG("""body""", cap1, cap2, …). The `LANG` ident and the `(` MUST get
+        // ADJACENT spans (ident end == paren start) or the parser's call-adjacency
+        // rule (a `(` is a call only when it touches the callee) would not treat this
+        // as a call — so use the real source offsets of `LANG` and `(` here.
+        let lang_at = start + "inline:".len(); // byte offset of `c`/`asm`
+        let paren_at = lang_at + lang.len(); // byte offset of `(`
+        out.push(Token { tok: Tok::At, span: Span(start, lang_at) });
+        out.push(Token { tok: Tok::Ident(lang.into()), span: Span(lang_at, paren_at) });
+        out.push(Token { tok: Tok::LParen, span: Span(paren_at, paren_at + 1) });
         out.push(Token { tok: Tok::Str(body), span: sp });
         for cap in caps_raw.split(',').map(|c| c.trim()).filter(|c| !c.is_empty()) {
             out.push(Token { tok: Tok::Comma, span: sp });
