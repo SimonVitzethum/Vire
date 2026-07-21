@@ -36,13 +36,20 @@ See [memory `vire-perf-fuzz-session`] for context.
 
 Queued:
 
-- [ ] **RC inline in the backend (retain/release as IR, not runtime calls).**
-  Today `jrt_retain`/`jrt_release` are calls inlined only via runtime `-flto`.
-  Emitting the refcount inc/dec directly in the IR would (a) let the program's own
-  `-O2` optimize them (alloc/RC-heavy code like binary-trees), and (b) allow
-  **dropping runtime-LTO entirely** → removes the whole cross-module LTO
-  miscompile risk class at the root (the `!invariant.load` bug was one instance;
-  the vtable load is a latent second — see below). Bigger change; principled.
+- [x] ~~**RC inline in the backend (retain/release as IR, not runtime calls).**~~
+  **BUILT then REVERTED — measured not worth it.** A prototype emitted acyclic
+  `jrt_retain`/`jrt_release` as `internal alwaysinline` IR (fast path + a runtime
+  `jrt_drop_at_zero` cold call) and dropped `-flto` for the acyclic mode. It was
+  **correct** (Java 65/65, vire_heap 9/9, all suites — the inline inc/dec is
+  sound), but the payoff failed on two counts: (1) **dropping `-flto` regresses
+  perf** — retain/release aren't the only LTO-inlined hot runtime helpers (struct
+  −18%; hashmap noise-level), so the robustness gain costs real time; (2) it only
+  covers **acyclic** programs — btree/compiler have self-referential types
+  (`Node.l: Node`) so the solver won't prove them acyclic → they keep `-flto` and
+  the latent risk anyway. **The direct metadata fix (next item) achieves the same
+  robustness while keeping `-flto`/perf and covering ALL programs — strictly
+  better.** Do NOT re-attempt the RC-inline rebuild without a way to keep LTO's
+  inlining of the *other* hot runtime helpers.
 - [ ] **Vtable load still carries `!invariant.load`** (backend.rs ~2157/2198).
   Same unsound calloc-then-write pattern as the array length that caused the LTO
   OOB miscompiles — the header is calloc'd (vtable=0) then written. Not
