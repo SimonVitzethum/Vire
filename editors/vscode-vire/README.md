@@ -1,7 +1,7 @@
 # Vire for VS Code
 
-Language support and native debugging for the [Vire](../../README.md) programming
-language (`.vr`).
+Language support and native debugging for the **Vire** programming language
+(`.vr`).
 
 ## Features
 
@@ -73,11 +73,16 @@ parameters** work. Note: debug builds compile at `-O0` (no LTO/inlining) so line
 info and variables stay precise; small functions are still not inlined there, so
 you can step into helpers.
 
-## Packaging
+## Packaging & install
 
 ```sh
-npm install -g @vscode/vsce
-cd editors/vscode-vire && vsce package      # produces vire-0.1.0.vsix
+cd editors/vscode-vire
+npx @vscode/vsce package            # produces vire-0.1.0.vsix (bundles the wasm)
+code --install-extension vire-0.1.0.vsix
 ```
+
+The `.vsix` is self-contained (grammar, snippets, and the wasm frontend), so on
+Windows/macOS/Linux the language features work immediately after install; only
+Build/Run/Debug additionally need the native `vire` compiler on `PATH`.
 
 License: GPL-3.0-or-later (same as the Vire toolchain).
