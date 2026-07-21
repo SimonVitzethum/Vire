@@ -10,6 +10,7 @@ members = [
     "crates/ir",         # shared mid-level IR (lowering target)
     "crates/solver",     # shared: devirt/escape/RC/bounds
     "crates/backend",    # shared: LLVM emission
+    "crates/vire-wasm",  # frontend-only diagnostics CLI (wasm32-wasip1) for the VS Code extension
     # --- Bootstrap (Java→IR): backend soundness oracle + M0 measurement base,
     #     removed per FRONTEND-PLAN §"Java retirement criteria" ---
     "crates/classfile",

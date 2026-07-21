@@ -1,0 +1,18 @@
+[package]
+name = "vire-wasm"
+license = "GPL-3.0-or-later"
+edition = "2021"
+version = "0.1.0"
+
+# Frontend-only diagnostics CLI, built for wasm32-wasip1 and bundled in the VS
+# Code extension so `check`/LSP work on Windows/macOS/Linux with no native
+# toolchain. Depends on the vire library WITHOUT its `native` feature, so the
+# LLVM backend + CSolver verifier (neither wasm-friendly nor needed for
+# analysis) are excluded.
+[[bin]]
+name = "vire-check"
+path = "src/main.rs"
+
+[dependencies]
+vire = { path = "../vire", default-features = false }
+fastllvm-ir = { path = "../ir" }

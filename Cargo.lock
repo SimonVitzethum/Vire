@@ -197,3 +197,11 @@ dependencies = [
  "fastllvm-ir",
  "fastllvm-solver",
 ]
+
+[[package]]
+name = "vire-wasm"
+version = "0.1.0"
+dependencies = [
+ "fastllvm-ir",
+ "vire",
+]

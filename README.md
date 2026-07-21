@@ -170,10 +170,12 @@ runnable example are in [build-integration/meson/](build-integration/meson/).
 - **[language/PARSER.md](language/PARSER.md)** — parser/front-end build plan.
 - **[language/examples/](language/examples/)** — example programs across areas and
   features.
-- **[editors/vscode-vire/](editors/vscode-vire/)** — VS Code extension: syntax
-  highlighting, `vire check` diagnostics, snippets, and native debugging
-  (breakpoints, stepping, call stack, **local variables**) via `--debug` DWARF +
-  lldb-dap.
+- **[editors/vscode-vire/](editors/vscode-vire/)** — VS Code extension. Language
+  intelligence (diagnostics, hover, go-to-definition, outline) runs the **frontend
+  compiled to WebAssembly** (`crates/vire-wasm`), so it works on **Windows/macOS/
+  Linux with no toolchain installed**. Plus syntax highlighting, snippets, and
+  native debugging (breakpoints, stepping, call stack, **local variables**) via
+  `--debug` DWARF + lldb-dap.
 - **[benchmarks/](benchmarks/)** — benchmark suite (Java/Rust/C++), runner, analysis.
 - **[LICENSING.md](LICENSING.md)** — dual license: CSolver (`crates/csolver/`) under
   Apache-2.0, everything else under GPL-3.0-or-later.

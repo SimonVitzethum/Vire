@@ -11,12 +11,31 @@ path = "src/main.rs"
 [dependencies]
 fastllvm-ir = { path = "../ir" }
 fastllvm-solver = { path = "../solver" }
-fastllvm-backend = { path = "../backend" }
-# Vendored CSolver memory-safety verifier, called as a library (structured verdicts)
-# to gate inline C/asm blocks. See language/VERIFIED-C-ASM.md.
-csolver-core = { path = "../csolver/core" }
-csolver-ir = { path = "../csolver/ir" }
-csolver-llvm = { path = "../csolver/llvm" }
-csolver-asm = { path = "../csolver/asm" }
-csolver-verifier = { path = "../csolver/verifier" }
-csolver-report = { path = "../csolver/report" }
+# The LLVM backend + CSolver verifier are used ONLY by the `vire` binary
+# (main.rs / cverify.rs), never by the library (frontend: parse→infer→lower).
+# They are OPTIONAL behind the default `native` feature so the frontend can be
+# built for wasm (see crates/vire-wasm) without them — CSolver assumes 64-bit
+# usize and does not compile to wasm32, and the backend only generates text that
+# the native driver hands to clang/llc.
+fastllvm-backend = { path = "../backend", optional = true }
+csolver-core = { path = "../csolver/core", optional = true }
+csolver-ir = { path = "../csolver/ir", optional = true }
+csolver-llvm = { path = "../csolver/llvm", optional = true }
+csolver-asm = { path = "../csolver/asm", optional = true }
+csolver-verifier = { path = "../csolver/verifier", optional = true }
+csolver-report = { path = "../csolver/report", optional = true }
+
+[features]
+# `native` = the full compiler (LLVM backend emission + inline-C/asm verification),
+# required by the `vire` binary. Off → frontend-only (lex/parse/infer/lower/check),
+# which is what the wasm build uses.
+default = ["native"]
+native = [
+    "dep:fastllvm-backend",
+    "dep:csolver-core",
+    "dep:csolver-ir",
+    "dep:csolver-llvm",
+    "dep:csolver-asm",
+    "dep:csolver-verifier",
+    "dep:csolver-report",
+]
