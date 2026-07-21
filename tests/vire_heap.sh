@@ -163,6 +163,58 @@ fn main() {
 }
 EOF
 
+# --- capsule deep-copy-OUT: a primitive-array result is copied out of the arena to
+#     the RC heap and survives the pop; everything stays 0-live ---
+case_ capsule_array_out 30 <<'EOF'
+fn main() {
+    mut r = capsule() {
+        mut a = array(5)
+        mut i = 0
+        while i < 5 { a[i] = i * i  i = i + 1 }
+        a
+    }
+    mut s = 0
+    mut j = 0
+    while j < 5 { s = s + r[j]  j = j + 1 }
+    print(s)
+}
+EOF
+
+# --- capsule deep-copy-IN: the array input is deep-copied into the arena, so a body
+#     mutation must NOT touch the caller's original (containment) — 100*(1+2+3+4)=1000,
+#     and the caller's xs[0] stays 1 ---
+case_ capsule_array_in 1010 <<'EOF'
+fn main() {
+    mut xs = array(4)
+    xs[0]=1 xs[1]=2 xs[2]=3 xs[3]=4
+    mut total = capsule(xs) {
+        mut i = 0
+        while i < 4 { xs[i] = xs[i] * 100  i = i + 1 }
+        mut s = 0
+        mut j = 0
+        while j < 4 { s = s + xs[j]  j = j + 1 }
+        s
+    }
+    mut check = xs[0] + xs[1] + xs[2] + xs[3]
+    print(total + check)
+}
+EOF
+
+# --- capsule in+out: read the isolated input copy, build + return a new array ---
+case_ capsule_array_io 30 <<'EOF'
+fn main() {
+    mut src = array(4)
+    src[0]=1 src[1]=2 src[2]=3 src[3]=4
+    mut out = capsule(src) {
+        mut r = array(4)
+        mut i = 0
+        while i < 4 { r[i] = src[i] * src[i]  i = i + 1 }
+        r
+    }
+    print(out[0] + out[1] + out[2] + out[3])
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

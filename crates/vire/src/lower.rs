@@ -2232,14 +2232,23 @@ impl<'a> FnLower<'a> {
             // object pointer survives the arena → isolation + fault containment without
             // deep copy. Object-in/-out (deep copy) remains open.
             Expr::Capsule { inputs, body, .. } => {
+                // Classify inputs. Scalars pass by value. A primitive-array input
+                // (`array`/`farray`) is DEEP-COPIED into the arena so the body works
+                // on an isolated copy (containment: a body bug can't touch the
+                // caller's data). Object/struct inputs and arrays-of-objects still
+                // need general deep-copy → rejected for now.
+                let mut array_inputs: Vec<(String, Local, ArrKind)> = Vec::new();
                 for (nm, _borrowed) in inputs {
-                    if let Some((_, Ty::Ref)) = self.lookup(nm) {
-                        self.errs.push(format!(
-                            "capsule: object input `{nm}` not yet allowed — the isolation \
-                             needs deep-copy-in (not yet implemented). Until then only \
-                             scalar inputs (Int/Float/Bool), otherwise the containment guarantee \
-                             would be a lie."
-                        ));
+                    if let Some((l, Ty::Ref)) = self.lookup(nm) {
+                        match self.local_arr.get(&l.0).copied() {
+                            Some(kind) if kind != ArrKind::Ref => array_inputs.push((nm.clone(), l, kind)),
+                            Some(_) => self.errs.push(format!(
+                                "capsule: input `{nm}` is an array of objects — deep-copy-in currently supports only primitive arrays (array/farray)"
+                            )),
+                            None => self.errs.push(format!(
+                                "capsule: object input `{nm}` not yet supported — deep-copy-in currently handles primitive arrays (array/farray) only"
+                            )),
+                        }
                     }
                 }
                 // `return` in the body would skip arena_pop (arena leak) →
@@ -2250,35 +2259,71 @@ impl<'a> FnLower<'a> {
                 }
                 self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
                 let saved_loops = std::mem::take(&mut self.loops);
-                let body_locals_start = self.locals.len(); // from here on: body locals
+                self.scopes.push(HashMap::new());
+                let body_locals_start = self.locals.len(); // arena locals from here on
+                // Deep-copy each primitive-array input INTO the arena (jrt_array_clone
+                // routes to the arena while it is active) and shadow the name so the
+                // body sees the isolated copy; the caller's original is untouched.
+                for (nm, l, kind) in &array_inputs {
+                    let copy = self.new_local(Ty::Ref);
+                    self.emit(Statement::Call {
+                        dest: Some(copy),
+                        func: "jrt_array_clone".into(),
+                        args: vec![Operand::Copy(*l), Operand::ConstI64(kind.size() as i64), Operand::ConstI32(0)],
+                    });
+                    self.local_arr.insert(copy.0, *kind);
+                    self.bind(nm, copy, Ty::Ref);
+                }
                 let (val, ty) = self.lower_block_val(body);
+                self.scopes.pop();
                 self.loops = saved_loops;
-                if ty == Ty::Ref {
-                    self.errs.push(
-                        "capsule: object result not yet allowed — that needs deep-copy-out \
-                         (otherwise dangling into the freed arena). Until then only a scalar result."
-                            .into(),
-                    );
-                }
-                // Capture the scalar result first (register/const, survives the pop).
-                let res = self.new_local(if ty == Ty::Void { Ty::I64 } else { ty });
-                if ty != Ty::Void {
-                    self.emit(Statement::Assign(res, Rvalue::Use(val)));
-                }
-                // All ref locals created in the body point into the arena. After the
-                // pop the memory is gone; but the backend releases ref locals at
-                // function end (reads the header → use-after-free). Therefore set them to
-                // null BEFORE the pop → jrt_release(null) is a no-op.
-                for idx in body_locals_start..self.locals.len() {
+                // Result: a scalar is captured into a register (survives the pop); a
+                // primitive-array result is DEEP-COPIED OUT to the RC heap so it
+                // outlives the arena. Other object results still need deep-copy-out.
+                let null_end = self.locals.len();
+                let (result_op, result_ty): (Operand, Ty) = if ty == Ty::Ref {
+                    match self.arr_of_operand(&val) {
+                        Some(kind) if kind != ArrKind::Ref => {
+                            let out = self.new_local(Ty::Ref);
+                            self.emit(Statement::Call {
+                                dest: Some(out),
+                                func: "jrt_arena_export_array".into(),
+                                args: vec![val.clone(), Operand::ConstI64(kind.size() as i64)],
+                            });
+                            self.local_arr.insert(out.0, kind);
+                            (Operand::Copy(out), Ty::Ref)
+                        }
+                        Some(_) => {
+                            self.errs.push("capsule: array-of-objects result not supported — deep-copy-out handles primitive arrays only".into());
+                            (Operand::ConstNull, Ty::Ref)
+                        }
+                        None => {
+                            self.errs.push("capsule: object result not supported — deep-copy-out currently handles primitive arrays (array/farray) only".into());
+                            (Operand::ConstNull, Ty::Ref)
+                        }
+                    }
+                } else {
+                    let res = self.new_local(if ty == Ty::Void { Ty::I64 } else { ty });
+                    if ty != Ty::Void {
+                        self.emit(Statement::Assign(res, Rvalue::Use(val)));
+                    }
+                    (Operand::Copy(res), ty)
+                };
+                // All ref locals created inside the arena (input copies + body) point
+                // into the arena. After the pop that memory is gone, but the backend
+                // releases ref locals at function end (reads the header → UAF). Set them
+                // to null BEFORE the pop → jrt_release(null) is a no-op. The exported
+                // heap result (created after `null_end`) is spared — it must survive.
+                for idx in body_locals_start..null_end {
                     if self.locals[idx] == Ty::Ref {
                         self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
                     }
                 }
                 self.emit(Statement::Call { dest: None, func: "jrt_arena_pop".into(), args: vec![] });
-                if ty == Ty::Void {
+                if result_ty == Ty::Void {
                     (Operand::ConstI64(0), Ty::Void)
                 } else {
-                    (Operand::Copy(res), ty)
+                    (result_op, result_ty)
                 }
             }
             Expr::Range { .. } => {

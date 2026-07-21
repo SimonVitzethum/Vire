@@ -175,6 +175,7 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_fastore", "void (ptr, i32, float)"),
     ("jrt_arraylen", "i32 (ptr)"),
     ("jrt_array_clone", "ptr (ptr, i64, i32)"),
+    ("jrt_arena_export_array", "ptr (ptr, i64)"),
     ("jrt_arraycopy", "void (ptr, i32, ptr, i32, i32)"),
     ("jrt_enum_valueof", "ptr (ptr, ptr)"),
     ("jrt_throwable_message", "ptr (ptr)"),
@@ -911,7 +912,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     // (e.g. a graph's `dst`/`wt`/`hd`/`hn`) don't alias, so it can hoist/reorder
     // their accesses — the same alias freedom Rust's allocator gives. Sound: each
     // call yields a fresh region that aliases nothing pre-existing.
-    const NOALIAS_RET: &[&str] = &["jrt_alloc", "jrt_alloc_array", "jrt_region_array", "jrt_array_clone"];
+    const NOALIAS_RET: &[&str] = &["jrt_alloc", "jrt_alloc_array", "jrt_region_array", "jrt_array_clone", "jrt_arena_export_array"];
     for (name, sig) in RUNTIME_DECLS {
         let (ret, params) = sig.split_once(' ').unwrap();
         let attr = if COLD_NORETURN.contains(name) {

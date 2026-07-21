@@ -2466,6 +2466,25 @@ void *jrt_array_clone(void *arr, int64_t elem_size, int32_t is_ref) {
     return p;
 }
 
+/* Deep-copy a PRIMITIVE (non-ref) array OUT of the capsule arena to the RC heap,
+ * so a capsule's array result survives jrt_arena_pop. The destination is forced
+ * onto the real heap (the active arena is bypassed for it) and returned as a
+ * normal RC object (refcount=1, tracked live); the source is the arena array. */
+void *jrt_arena_export_array(void *src, int64_t elem_size) {
+    if (!src) return NULL;
+    JArray *s = (JArray *)src;
+#ifndef FASTLLVM_FREESTANDING
+    Arena *saved = arena_top;
+    arena_top = NULL; /* destination goes to the RC heap, not the arena */
+    JArray *d = (JArray *)jrt_alloc_array(s->length, elem_size, s->vtable);
+    arena_top = saved;
+#else
+    JArray *d = (JArray *)jrt_alloc_array(s->length, elem_size, s->vtable);
+#endif
+    jrt_memcpy((JArray *)d + 1, (JArray *)s + 1, (size_t)s->length * (size_t)elem_size);
+    return d;
+}
+
 /* System.arraycopy: element-size/ref-correct (elem_size + ref vtable in the
  * header). Overlap-safe (memmove semantics); ref arrays retain the
  * source before freeing the destination. Errors abort (not catchable). */
