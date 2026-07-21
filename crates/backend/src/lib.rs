@@ -277,6 +277,13 @@ struct Ctx<'a> {
     /// distinct `!llvm.loop` node, attached to that loop's latch back-edge.
     novec_id: usize,
     loop_ids: std::collections::HashMap<(usize, usize), usize>,
+    /// Array TBAA nodes: `arr_len_tbaa` tags length loads, `arr_data_tbaa` tags
+    /// element loads/stores (disjoint siblings → no alias; `*_ty` are their type
+    /// nodes). Lets LLVM hoist the length load out of element-writing loops.
+    arr_len_ty: usize,
+    arr_len_tbaa: usize,
+    arr_data_ty: usize,
+    arr_data_tbaa: usize,
     /// AOT hot path: metadata IDs of the two shared `branch_weights` nodes
     /// (then-hot, else-hot). Set from static loop estimation on `!prof` —
     /// LLVM then orders/optimizes hot paths itself.
@@ -554,12 +561,22 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     let bw_then = bw_base;
     let bw_else = bw_base + 1;
     let md_inv = bw_base + 2;
+    // Array TBAA: the length field (offset 16) and the element data (offset 32+)
+    // are disjoint sibling nodes under the root, so LLVM knows an element store
+    // never clobbers the length — it can hoist the (loop-invariant) length load
+    // out of element-writing loops. Recovers the hoisting that the unsound
+    // `!invariant.load` used to give, soundly. Different objects' elements share
+    // one node (MayAlias, conservative); length vs elements never alias.
+    let arr_len_ty = md_inv + 1;
+    let arr_len_tbaa = md_inv + 2;
+    let arr_data_ty = md_inv + 3;
+    let arr_data_tbaa = md_inv + 4;
     // Loop-vectorization control metadata IDs: the shared "disable" node, then a
     // distinct `!llvm.loop` node per divergent/call-bearing loop. Allocated below
     // `md_inv` and above the debug range so nothing collides.
-    let novec_id = md_inv + 1;
+    let novec_id = md_inv + 5;
     let mut loop_ids: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
-    let mut next_md = md_inv + 2;
+    let mut next_md = md_inv + 6;
     for (fi, f) in program.functions.iter().enumerate() {
         let mut hs: Vec<usize> = complex_loop_headers(f).into_iter().collect();
         hs.sort();
@@ -568,7 +585,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             next_md += 1;
         }
     }
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv };
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv, arr_len_ty, arr_len_tbaa, arr_data_ty, arr_data_tbaa };
     let mut dg = DebugGen::new(debug, next_md);
     // Declaration line per function (for DISubprograms of both live and inlined
     // functions referenced by DebugLine inline stacks).
@@ -953,17 +970,20 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
         writeln!(w, "}}").unwrap();
     }
 
-    // TBAA metadata tree: root !0, one type node + access tag per field.
-    if !ctx.tbaa.is_empty() {
-        writeln!(w, "\n!0 = !{{!\"fastllvm-tbaa\"}}").unwrap();
-        let mut fields: Vec<(&(String, String), &usize)> = ctx.tbaa.iter().collect();
-        fields.sort_by_key(|(_, n)| **n);
-        for ((owner, field), tag) in fields {
-            let tynode = tag - 1;
-            writeln!(w, "!{tynode} = !{{!\"fld.{}.{}\", !0}}", sanitize(owner), sanitize(field)).unwrap();
-            writeln!(w, "!{tag} = !{{!{tynode}, !{tynode}, i64 0}}").unwrap();
-        }
+    // TBAA metadata tree: root !0, one type node + access tag per field, plus the
+    // two array nodes (length / element data). Root always emitted (arrays use it).
+    writeln!(w, "\n!0 = !{{!\"fastllvm-tbaa\"}}").unwrap();
+    let mut fields: Vec<(&(String, String), &usize)> = ctx.tbaa.iter().collect();
+    fields.sort_by_key(|(_, n)| **n);
+    for ((owner, field), tag) in fields {
+        let tynode = tag - 1;
+        writeln!(w, "!{tynode} = !{{!\"fld.{}.{}\", !0}}", sanitize(owner), sanitize(field)).unwrap();
+        writeln!(w, "!{tag} = !{{!{tynode}, !{tynode}, i64 0}}").unwrap();
     }
+    writeln!(w, "!{} = !{{!\"arr.len\", !0}}", ctx.arr_len_ty).unwrap();
+    writeln!(w, "!{} = !{{!{}, !{}, i64 0}}", ctx.arr_len_tbaa, ctx.arr_len_ty, ctx.arr_len_ty).unwrap();
+    writeln!(w, "!{} = !{{!\"arr.data\", !0}}", ctx.arr_data_ty).unwrap();
+    writeln!(w, "!{} = !{{!{}, !{}, i64 0}}", ctx.arr_data_tbaa, ctx.arr_data_ty, ctx.arr_data_ty).unwrap();
     // AOT hot path: the two shared branch_weights nodes (100:3 / 3:100).
     if ctx.tbaa.is_empty() {
         writeln!(w).unwrap();
@@ -1242,6 +1262,9 @@ struct FnEmitter<'a> {
     /// Metadata ID for `!invariant.load` (immutable loads: array length,
     /// vtable). Lets LLVM hoist/CSE across loops.
     md_inv: usize,
+    /// Array TBAA tags: length loads / element accesses (disjoint).
+    arr_len_tbaa: usize,
+    arr_data_tbaa: usize,
 }
 
 impl FnEmitter<'_> {
@@ -1916,7 +1939,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let moved = moved_locals(f, &borrowed, &borrow, &imm);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, marker_locs, cur_loc: default_loc };
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -2495,7 +2518,7 @@ fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: 
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
-    writeln!(w, "  {raw} = load {}, ptr {ep}", arr_store_ty(k)).unwrap();
+    writeln!(w, "  {raw} = load {}, ptr {ep}, !tbaa !{}", arr_store_ty(k), e.arr_data_tbaa).unwrap();
     // Extend narrow types to i32 (byte/short signed, bool/char unsigned).
     match k {
         ArrKind::Byte | ArrKind::Short => {
@@ -2529,7 +2552,7 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
         }
         _ => v.to_string(),
     };
-    writeln!(w, "  store {} {sv}, ptr {ep}", arr_store_ty(k)).unwrap();
+    writeln!(w, "  store {} {sv}, ptr {ep}, !tbaa !{}", arr_store_ty(k), e.arr_data_tbaa).unwrap();
 }
 
 /// Neutral value (LLVM literal) for the error branch of a checked load.
@@ -2580,7 +2603,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
         let lenp = e.fresh();
         writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
         let len = e.fresh();
-        writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+        writeln!(w, "  {len} = load i64, ptr {lenp}, !tbaa !{}", e.arr_len_tbaa).unwrap();
         let idx = e.fresh();
         writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
         let oob = e.fresh();
@@ -2597,7 +2620,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
         let ep = e.fresh();
         writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
         let raw = e.fresh();
-        writeln!(w, "  {raw} = load {sty}, ptr {ep}").unwrap();
+        writeln!(w, "  {raw} = load {sty}, ptr {ep}, !tbaa !{}", e.arr_data_tbaa).unwrap();
         return extend(w, e, &raw);
     }
     let (npe, ck, bd, ld, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
@@ -2615,7 +2638,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}, !tbaa !{}", e.arr_len_tbaa).unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
@@ -2632,7 +2655,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
     let ep = e.fresh();
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     let raw = e.fresh();
-    writeln!(w, "  {raw} = load {sty}, ptr {ep}").unwrap();
+    writeln!(w, "  {raw} = load {sty}, ptr {ep}, !tbaa !{}", e.arr_data_tbaa).unwrap();
     let ext = extend(w, e, &raw);
     writeln!(w, "  br label %{cont}").unwrap();
     writeln!(w, "{cont}:").unwrap();
@@ -2678,7 +2701,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
         let lenp = e.fresh();
         writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
         let len = e.fresh();
-        writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+        writeln!(w, "  {len} = load i64, ptr {lenp}, !tbaa !{}", e.arr_len_tbaa).unwrap();
         let idx = e.fresh();
         writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
         let oob = e.fresh();
@@ -2695,7 +2718,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
         let ep = e.fresh();
         writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
         let sv = trunc_val(w, e);
-        writeln!(w, "  store {sty} {sv}, ptr {ep}").unwrap();
+        writeln!(w, "  store {sty} {sv}, ptr {ep}, !tbaa !{}", e.arr_data_tbaa).unwrap();
         return;
     }
     let (npe, ck, bd, st, cont) = (e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label(), e.fresh_label());
@@ -2711,7 +2734,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let lenp = e.fresh();
     writeln!(w, "  {lenp} = getelementptr i8, ptr {a}, i64 16").unwrap();
     let len = e.fresh();
-    writeln!(w, "  {len} = load i64, ptr {lenp}").unwrap();
+    writeln!(w, "  {len} = load i64, ptr {lenp}, !tbaa !{}", e.arr_len_tbaa).unwrap();
     let idx = e.fresh();
     writeln!(w, "  {idx} = sext i32 {i} to i64").unwrap();
     let oob = e.fresh();
@@ -2735,7 +2758,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
         }
         _ => v.to_string(),
     };
-    writeln!(w, "  store {sty} {sv}, ptr {ep}").unwrap();
+    writeln!(w, "  store {sty} {sv}, ptr {ep}, !tbaa !{}", e.arr_data_tbaa).unwrap();
     writeln!(w, "  br label %{cont}").unwrap();
     writeln!(w, "{cont}:").unwrap();
 }
