@@ -2233,21 +2233,17 @@ impl<'a> FnLower<'a> {
             // deep copy. Object-in/-out (deep copy) remains open.
             Expr::Capsule { inputs, body, .. } => {
                 // Classify inputs. Scalars pass by value. A primitive-array input
-                // (`array`/`farray`) is DEEP-COPIED into the arena so the body works
-                // on an isolated copy (containment: a body bug can't touch the
-                // caller's data). Object/struct inputs and arrays-of-objects still
-                // need general deep-copy → rejected for now.
+                // takes the flat clone path; any other ref (struct/graph, string,
+                // ref-array) takes the GENERAL deep-copy (jrt_deep_copy_arena, which
+                // dispatches per object via vtable slot 3). Either way the body works
+                // on an isolated copy → a body bug can't touch the caller's data.
                 let mut array_inputs: Vec<(String, Local, ArrKind)> = Vec::new();
+                let mut object_inputs: Vec<(String, Local)> = Vec::new();
                 for (nm, _borrowed) in inputs {
                     if let Some((l, Ty::Ref)) = self.lookup(nm) {
                         match self.local_arr.get(&l.0).copied() {
                             Some(kind) if kind != ArrKind::Ref => array_inputs.push((nm.clone(), l, kind)),
-                            Some(_) => self.errs.push(format!(
-                                "capsule: input `{nm}` is an array of objects — deep-copy-in currently supports only primitive arrays (array/farray)"
-                            )),
-                            None => self.errs.push(format!(
-                                "capsule: object input `{nm}` not yet supported — deep-copy-in currently handles primitive arrays (array/farray) only"
-                            )),
+                            _ => object_inputs.push((nm.clone(), l)),
                         }
                     }
                 }
@@ -2274,6 +2270,25 @@ impl<'a> FnLower<'a> {
                     self.local_arr.insert(copy.0, *kind);
                     self.bind(nm, copy, Ty::Ref);
                 }
+                // Struct/graph/string/ref-array inputs: general deep-copy into the
+                // arena (jrt_deep_copy_arena dispatches per object via vtable slot 3;
+                // cycles + sharing handled by the copymap). Preserve the local's
+                // array-kind/class so the body accesses the copy the same way.
+                for (nm, l) in &object_inputs {
+                    let copy = self.new_local(Ty::Ref);
+                    self.emit(Statement::Call {
+                        dest: Some(copy),
+                        func: "jrt_deep_copy_arena".into(),
+                        args: vec![Operand::Copy(*l)],
+                    });
+                    if let Some(k) = self.local_arr.get(&l.0).copied() {
+                        self.local_arr.insert(copy.0, k);
+                    }
+                    if let Some(c) = self.local_class.get(&l.0).cloned() {
+                        self.local_class.insert(copy.0, c);
+                    }
+                    self.bind(nm, copy, Ty::Ref);
+                }
                 let (val, ty) = self.lower_block_val(body);
                 self.scopes.pop();
                 self.loops = saved_loops;
@@ -2293,13 +2308,23 @@ impl<'a> FnLower<'a> {
                             self.local_arr.insert(out.0, kind);
                             (Operand::Copy(out), Ty::Ref)
                         }
-                        Some(_) => {
-                            self.errs.push("capsule: array-of-objects result not supported — deep-copy-out handles primitive arrays only".into());
-                            (Operand::ConstNull, Ty::Ref)
-                        }
-                        None => {
-                            self.errs.push("capsule: object result not supported — deep-copy-out currently handles primitive arrays (array/farray) only".into());
-                            (Operand::ConstNull, Ty::Ref)
+                        // struct/graph/string/ref-array result → general deep-copy OUT
+                        // to the RC heap (survives the pop). Vtable dispatch + copymap.
+                        _ => {
+                            let cls = self.class_of_operand(&val);
+                            let out = self.new_local(Ty::Ref);
+                            self.emit(Statement::Call {
+                                dest: Some(out),
+                                func: "jrt_deep_copy_heap".into(),
+                                args: vec![val.clone()],
+                            });
+                            if let Some(k) = self.arr_of_operand(&val) {
+                                self.local_arr.insert(out.0, k);
+                            }
+                            if let Some(c) = cls {
+                                self.local_class.insert(out.0, c);
+                            }
+                            (Operand::Copy(out), Ty::Ref)
                         }
                     }
                 } else {

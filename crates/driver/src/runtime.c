@@ -2547,35 +2547,91 @@ static void copymap_grow(JCopyMap *m) {
     free(oe);
 }
 
-/* Identity copy — the Phase-2 vtable slot-3 stub, replaced by a generated
- * per-class `copy.<C>` in Phase 3. Signature matches: (src, map) -> copy. */
+/* Identity copy — the Phase-2 vtable slot-3 stub, still used by internal objects
+ * (StringBuilder, exception sentinels) that user capsules never deep-copy. */
 void *jrt_noop_copy(void *src, void *map) {
     (void)map;
     return src;
 }
 
-/* Deep-copy driver: build the map, run the per-type copy fn (taken by the caller
- * from the object's vtable slot 3), free the map, return the root's copy.
- * `_arena` keeps the active arena as the destination (capsule copy-IN); `_heap`
- * bypasses it so the copy lands on the RC heap and survives the pop (copy-OUT). */
 typedef void *(*JCopyFn)(void *, void *);
-void *jrt_deep_copy_arena(void *root, void *copyfn) {
+
+/* Deep-copy ANY ref value by dispatching through its own vtable slot 3 (the
+ * per-type copy fn). Null → null. On a map hit (a shared sub-graph or a cycle)
+ * the existing copy is returned with an extra reference (a no-op on the immortal
+ * arena copies); otherwise the type's copy fn allocates a fresh copy (refcount 1,
+ * consumed by the field/array slot that stores it). Cycle-safe because each copy
+ * fn registers itself in the map BEFORE recursing into its fields. */
+void *jrt_deep_copy_ref(void *obj, void *map) {
+    if (!obj) return NULL;
+    void *existing = jrt_copymap_get(map, obj);
+    if (existing) {
+        jrt_retain(existing);
+        return existing;
+    }
+    void **hdr = (void **)obj; /* hdr[1] = vtable (word 1 = offset 8) */
+    void **vt = (void **)hdr[1];
+    JCopyFn fn = (JCopyFn)vt[3]; /* vtable slot 3 = deep-copy */
+    return fn(obj, map);
+}
+
+/* Copy fn for a PRIMITIVE array (vtable slot 3 of @vt.array.int): duplicate the
+ * length*elem_size bytes; nothing is shared with the source. */
+void *jrt_copy_array_prim(void *src, void *map) {
+    JArray *s = (JArray *)src;
+    JArray *d = (JArray *)jrt_alloc_array(s->length, s->elem_size, s->vtable);
+    jrt_copymap_put(map, src, d);
+    jrt_memcpy((JArray *)d + 1, (JArray *)s + 1, (size_t)s->length * (size_t)s->elem_size);
+    return d;
+}
+
+/* Copy fn for a REF array (vtable slot 3 of @vt.array.ref): each element is deep
+ * copied through its own vtable (recursion + sharing via the map). */
+void *jrt_copy_array_ref(void *src, void *map) {
+    JArray *s = (JArray *)src;
+    JArray *d = (JArray *)jrt_alloc_array(s->length, s->elem_size, s->vtable);
+    jrt_copymap_put(map, src, d); /* before recursion → cycles terminate */
+    void **se = (void **)((JArray *)s + 1);
+    void **de = (void **)((JArray *)d + 1);
+    for (int64_t i = 0; i < s->length; i++) {
+        de[i] = jrt_deep_copy_ref(se[i], map);
+    }
+    return d;
+}
+
+/* Copy fn for a String (vtable slot 3 of @vt.java_lang_String): duplicate the
+ * bytes into a fresh RC string, keeping the source's vtable. */
+void *jrt_copy_string(void *src, void *map) {
+    JStr *s = (JStr *)src;
+    JStr *d = (JStr *)jrt_alloc((int64_t)sizeof(JStr) + s->len);
+    d->vtable = s->vtable;
+    d->len = s->len;
+    jrt_memcpy(d->bytes, s->bytes, (size_t)s->len);
+    jrt_copymap_put(map, src, d);
+    return d;
+}
+
+/* Deep-copy driver: build the map, dispatch on the root (vtable slot 3), free the
+ * map, return the root's copy. `_arena` keeps the active arena as the destination
+ * (capsule copy-IN); `_heap` bypasses it so the copy lands on the RC heap and
+ * survives the pop (copy-OUT). */
+void *jrt_deep_copy_arena(void *root) {
     if (!root) return NULL;
     void *m = jrt_copymap_new();
-    void *r = ((JCopyFn)copyfn)(root, m);
+    void *r = jrt_deep_copy_ref(root, m);
     jrt_copymap_free(m);
     return r;
 }
-void *jrt_deep_copy_heap(void *root, void *copyfn) {
+void *jrt_deep_copy_heap(void *root) {
     if (!root) return NULL;
     void *m = jrt_copymap_new();
 #ifndef FASTLLVM_FREESTANDING
     Arena *saved = arena_top;
     arena_top = NULL; /* destination = RC heap, not the arena */
-    void *r = ((JCopyFn)copyfn)(root, m);
+    void *r = jrt_deep_copy_ref(root, m);
     arena_top = saved;
 #else
-    void *r = ((JCopyFn)copyfn)(root, m);
+    void *r = jrt_deep_copy_ref(root, m);
 #endif
     jrt_copymap_free(m);
     return r;

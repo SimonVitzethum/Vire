@@ -215,6 +215,54 @@ fn main() {
 }
 EOF
 
+# --- capsule STRUCT deep-copy in+out: the input graph is copied into the arena
+#     (mutating it can't reach the caller's), and a struct result is copied out to
+#     the RC heap. out.x=110, out.y=40, caller p.x stays 10 → 160; 0-live ---
+case_ capsule_struct_io 160 <<'EOF'
+type P { x: Int  y: Int }
+fn main() {
+    mut p = P(10, 20)
+    mut out = capsule(p) {
+        p.x = p.x + 100
+        mut q = P(p.x, p.y * 2)
+        q
+    }
+    print(out.x + out.y + p.x)
+}
+EOF
+
+# --- capsule struct CYCLE: a self-referential result is deep-copied out to the
+#     heap; the copied cycle must be collected (0-live) and preserve the self-link ---
+case_ capsule_struct_cycle 16 <<'EOF'
+type Node { v: Int  next: Node }
+fn main() {
+    mut a = Node(7, null)
+    a.next = a
+    mut out = capsule(a) {
+        mut b = Node(a.v + 1, null)
+        b.next = b
+        b
+    }
+    print(out.v + out.next.v)
+}
+EOF
+
+# --- capsule struct SHARING: two fields alias one node → the deep copy must keep
+#     them shared (one copy via the map), so a mutation shows through both ---
+case_ capsule_struct_share 30 <<'EOF'
+type Node { v: Int  next: Node }
+type Pair { a: Node  b: Node }
+fn main() {
+    mut shared = Node(5, null)
+    mut p = Pair(shared, shared)
+    mut r = capsule(p) {
+        p.a.v = p.a.v + 10
+        p.a.v + p.b.v
+    }
+    print(r)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

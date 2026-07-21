@@ -231,11 +231,14 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_array_ref_trace", "void (ptr, ptr)"),
     ("jrt_noop_drop", "void (ptr)"),
     ("jrt_noop_trace", "void (ptr, ptr)"),
-    // Deep copy (capsule struct in/out): vtable slot-3 stub + copymap + drivers.
+    // Deep copy (capsule struct in/out): vtable slot-3 fns + copymap + drivers.
     ("jrt_noop_copy", "ptr (ptr, ptr)"),
-    ("jrt_deep_copy_arena", "ptr (ptr, ptr)"),
-    ("jrt_deep_copy_heap", "ptr (ptr, ptr)"),
-    ("jrt_copymap_get", "ptr (ptr, ptr)"),
+    ("jrt_deep_copy_ref", "ptr (ptr, ptr)"),
+    ("jrt_copy_array_prim", "ptr (ptr, ptr)"),
+    ("jrt_copy_array_ref", "ptr (ptr, ptr)"),
+    ("jrt_copy_string", "ptr (ptr, ptr)"),
+    ("jrt_deep_copy_arena", "ptr (ptr)"),
+    ("jrt_deep_copy_heap", "ptr (ptr)"),
     ("jrt_copymap_put", "void (ptr, ptr, ptr)"),
 ];
 
@@ -706,8 +709,8 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     writeln!(w, "%arr.int = type {{ i64, ptr, i64, i64, [0 x i32] }}").unwrap();
     writeln!(w, "%arr.ref = type {{ i64, ptr, i64, i64, [0 x ptr] }}").unwrap();
     // Arrays have no type descriptor (slot 2 = null → instanceof false).
-    writeln!(w, "@vt.array.int = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
-    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [4 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
+    writeln!(w, "@vt.array.int = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_copy_array_prim]").unwrap();
+    writeln!(w, "@vt.array.ref = internal unnamed_addr constant [4 x ptr] [ptr @jrt_array_ref_drop, ptr @jrt_array_ref_trace, ptr null, ptr @jrt_copy_array_ref]").unwrap();
     writeln!(w).unwrap();
 
     // Type descriptors for instanceof: { ptr super, ptr name }. The chain
@@ -833,9 +836,9 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             format!("ptr @drop.{}", sanitize(class)),
             format!("ptr @trace.{}", sanitize(class)),
             format!("ptr @td.{}", sanitize(class)),
-            // Slot 3: deep-copy (capsule struct in/out). Identity stub for now
-            // (Phase 2); Phase 3 replaces it with a generated `copy.<class>`.
-            "ptr @jrt_noop_copy".to_string(),
+            // Slot 3: deep-copy (capsule struct in/out) — the generated per-class
+            // `copy.<class>` walks fields and recurses via jrt_deep_copy_ref.
+            format!("ptr @copy.{}", sanitize(class)),
         ];
         // jrt_* symbols are runtime functions (external), considered valid.
         let sym_entry = |sym: Option<String>| match sym {
@@ -876,7 +879,7 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     // null type descriptor); string method dispatch does not exist in Vire yet.
     // The class-name constants (@jclassname.*) are also @jstr → String vtable.
     if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
-        writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_noop_copy]").unwrap();
+        writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_copy_string]").unwrap();
     }
     writeln!(w).unwrap();
 
@@ -905,6 +908,38 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             writeln!(w, "  call void %visit(ptr %v{k})").unwrap();
         }
         writeln!(w, "  ret void").unwrap();
+        writeln!(w, "}}").unwrap();
+    }
+    writeln!(w).unwrap();
+
+    // Deep-copy functions (vtable slot 3) — capsule struct in/out. Allocate a
+    // fresh instance (arena if active, else heap — chosen by the driver), set its
+    // vtable, register it in the map BEFORE copying (so cycles/sharing resolve to
+    // this in-progress copy), then copy scalar fields directly and ref fields via
+    // `jrt_deep_copy_ref`, which dispatches on each field value's OWN vtable slot 3
+    // (→ nested structs, arrays, strings, and polymorphic values all copy right).
+    for class in &instantiated {
+        let sn = ctx.struct_name(class);
+        writeln!(w, "define internal ptr @copy.{}(ptr %src, ptr %map) {{", sanitize(class)).unwrap();
+        writeln!(w, "  %new = call ptr @jrt_alloc(i64 ptrtoint (ptr getelementptr ({sn}, ptr null, i32 1) to i64))").unwrap();
+        writeln!(w, "  %vtp = getelementptr ptr, ptr %new, i64 {VTABLE_WORD}").unwrap();
+        writeln!(w, "  store ptr @vt.{}, ptr %vtp", sanitize(class)).unwrap();
+        writeln!(w, "  call void @jrt_copymap_put(ptr %map, ptr %src, ptr %new)").unwrap();
+        for (k, (_owner, _name, ty)) in ctx.flatten_fields(class).iter().enumerate() {
+            let slot = k + HEADER_SLOTS;
+            writeln!(w, "  %sp{k} = getelementptr {sn}, ptr %src, i32 0, i32 {slot}").unwrap();
+            writeln!(w, "  %np{k} = getelementptr {sn}, ptr %new, i32 0, i32 {slot}").unwrap();
+            if *ty == Ty::Ref {
+                writeln!(w, "  %fv{k} = load ptr, ptr %sp{k}").unwrap();
+                writeln!(w, "  %fc{k} = call ptr @jrt_deep_copy_ref(ptr %fv{k}, ptr %map)").unwrap();
+                writeln!(w, "  store ptr %fc{k}, ptr %np{k}").unwrap();
+            } else {
+                let lt = llty(*ty);
+                writeln!(w, "  %fv{k} = load {lt}, ptr %sp{k}").unwrap();
+                writeln!(w, "  store {lt} %fv{k}, ptr %np{k}").unwrap();
+            }
+        }
+        writeln!(w, "  ret ptr %new").unwrap();
         writeln!(w, "}}").unwrap();
     }
     writeln!(w).unwrap();
