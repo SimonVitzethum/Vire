@@ -6,7 +6,8 @@
  *                            buffer), same centroid readback.
  * The graphics pipeline reads positions from a vertex buffer (attribute Location 0);
  * `jrt_vk_triangle`/`jrt_vk_window` upload the built-in corners, `jrt_vk_mesh`
- * uploads Vire data. Shader SPIR-V is Vire-authored (crates/vire/src/shader.rs +
+ * uploads Vire data, `jrt_vk_mesh_c` adds a per-vertex color (Location 1, read via
+ * attr_color()). Shader SPIR-V is Vire-authored (crates/vire/src/shader.rs +
  * crates/backend/src/spirv.rs). See language/GPU-VULKAN.md. Vendor-neutral.
  */
 #define GLFW_INCLUDE_VULKAN
@@ -41,11 +42,11 @@ static VkShaderModule shmod(VkDevice d, const uint32_t *code, size_t n) {
  * with Vire-supplied geometry. */
 static const float DEFAULT_TRI[6] = { 0.0f,-0.6f,  0.6f,0.6f,  -0.6f,0.6f };
 
-/* Upload `nverts` interleaved (x,y) f32 positions into a host-visible vertex
- * buffer. Returns 1 on success (out params set), 0 on failure. */
-static int make_vbuf(VkDevice dev, VkPhysicalDevice pd, const float *xy, uint32_t nverts,
+/* Upload `nfloats` f32 values (interleaved vertex attributes) into a host-visible
+ * vertex buffer. Returns 1 on success (out params set), 0 on failure. */
+static int make_vbuf(VkDevice dev, VkPhysicalDevice pd, const float *data, uint32_t nfloats,
                      VkBuffer *out_buf, VkDeviceMemory *out_mem) {
-    VkDeviceSize sz = (VkDeviceSize)nverts * 2 * sizeof(float); if(sz==0) sz=8;
+    VkDeviceSize sz = (VkDeviceSize)nfloats * sizeof(float); if(sz==0) sz=8;
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=sz,.usage=VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
     if(vkCreateBuffer(dev,&bi,0,out_buf)!=VK_SUCCESS) return 0;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev,*out_buf,&mr);
@@ -55,24 +56,28 @@ static int make_vbuf(VkDevice dev, VkPhysicalDevice pd, const float *xy, uint32_
     if(vkAllocateMemory(dev,&ma,0,out_mem)!=VK_SUCCESS) return 0;
     vkBindBufferMemory(dev,*out_buf,*out_mem,0);
     void *p; if(vkMapMemory(dev,*out_mem,0,sz,0,&p)!=VK_SUCCESS) return 0;
-    memcpy(p, xy, (size_t)nverts*2*sizeof(float)); vkUnmapMemory(dev,*out_mem);
+    memcpy(p, data, (size_t)nfloats*sizeof(float)); vkUnmapMemory(dev,*out_mem);
     return 1;
 }
 
 /* The one shared piece: build the triangle graphics pipeline for a render pass +
  * extent. Layout is empty (no descriptors); shaders are the embedded SPIR-V. */
-static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout) {
+static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, int colored) {
     VkShaderModule vs=shmod(dev,VK_TRI_VERT,VK_TRI_VERT_N*4), fs=shmod(dev,VK_TRI_FRAG,VK_TRI_FRAG_N*4);
     if(!vs||!fs) return 0;
     VkPipelineShaderStageCreateInfo st[2]={
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vs,.pName="main"},
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
-    /* One vertex buffer at binding 0: interleaved (x,y) f32, attribute Location 0. */
-    VkVertexInputBindingDescription vbind={.binding=0,.stride=2*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription vattr={.location=0,.binding=0,.format=VK_FORMAT_R32G32_SFLOAT,.offset=0};
+    /* Vertex buffer at binding 0. Position-only: (x,y) f32 at Location 0, stride 8.
+     * Colored (vk_mesh_c): + a per-vertex color (r,g,b) at Location 1, offset 8,
+     * stride 20 — read in the vertex shader via attr_color(). */
+    VkVertexInputBindingDescription vbind={.binding=0,.stride=(colored?5:2)*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vattr[2]={
+        {.location=0,.binding=0,.format=VK_FORMAT_R32G32_SFLOAT,.offset=0},
+        {.location=1,.binding=0,.format=VK_FORMAT_R32G32B32_SFLOAT,.offset=2*sizeof(float)}};
     VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount=1,.pVertexBindingDescriptions=&vbind,
-        .vertexAttributeDescriptionCount=1,.pVertexAttributeDescriptions=&vattr};
+        .vertexAttributeDescriptionCount=(uint32_t)(colored?2:1),.pVertexAttributeDescriptions=vattr};
     VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkViewport vp={0,0,(float)w,(float)h,0,1}; VkRect2D sc={{0,0},{w,h}};
     VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
@@ -118,7 +123,7 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
 /* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
  *      image, read back; returns the centroid pixel packed as 0xRRGGBB (so callers
  *      can check the @fragment color), or -1 on failure ---- */
-static int64_t render_headless(const float *xy, uint32_t nverts) {
+static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -146,8 +151,8 @@ static int64_t render_headless(const float *xy, uint32_t nverts) {
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return 0;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl); if(!pipe) return 0;
-    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,xy,nverts,&vbuf,&vmem)) return 0;
+    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,fpv==5); if(!pipe) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*fpv,&vbuf,&vmem)) return 0;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
@@ -183,22 +188,30 @@ static int64_t render_headless(const float *xy, uint32_t nverts) {
 }
 
 /* The default triangle, from the compile-time corner buffer. */
-int64_t jrt_vk_triangle(void) { return render_headless(DEFAULT_TRI, 3); }
+int64_t jrt_vk_triangle(void) { return render_headless(DEFAULT_TRI, 3, 2); }
 
-/* vk_mesh(verts): render Vire-supplied geometry — `verts` is a flat [Float] array of
- * interleaved (x,y) clip-space positions (2 per vertex), f64 in Vire. Converts to
- * f32, uploads a vertex buffer, renders headless, and returns the centroid pixel
- * (0xRRGGBB) so the Vire caller can verify. Proves the geometry comes from Vire data,
- * not the built-in corners — the bridge to GPU-driven meshlets. */
-int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) {
-    if(!verts || nfloats < 6 || (nfloats & 1)) return -1;   /* need >=3 vertices (x,y pairs) */
-    uint32_t nverts=(uint32_t)(nfloats/2);
-    float *xy=malloc((size_t)nfloats*sizeof(float)); if(!xy) return -1;
-    for(int64_t i=0;i<nfloats;i++) xy[i]=(float)verts[i];
-    int64_t r=render_headless(xy, nverts);
-    free(xy);
+/* Shared body for the mesh builtins: convert `nfloats` f64 values to f32, render a
+ * triangle list of `nverts` vertices (`fpv` floats each), return the centroid pixel. */
+static int64_t mesh_render(const double *verts, int64_t nfloats, uint32_t fpv) {
+    if(!verts || nfloats < (int64_t)(3*fpv) || (nfloats % fpv)!=0) return -1;   /* need >=3 vertices */
+    uint32_t nverts=(uint32_t)(nfloats/fpv);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    int64_t r=render_headless(f, nverts, fpv);
+    free(f);
     return r;
 }
+
+/* vk_mesh(verts): render Vire-supplied geometry — `verts` is a flat [Float] array of
+ * interleaved (x,y) clip-space positions (2 per vertex), f64 in Vire. Proves the
+ * geometry comes from Vire data, not the built-in corners. */
+int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) { return mesh_render(verts, nfloats, 2); }
+
+/* vk_mesh_c(verts): per-vertex attributes — `verts` interleaves (x,y, r,g,b), 5 per
+ * vertex. The vertex shader reads the color at Location 1 via attr_color(); typically
+ * `out_color(attr_color())` forwards it, so each vertex carries its own color and the
+ * rasterizer interpolates (the classic RGB-corner triangle). Typed stage I/O. */
+int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render(verts, nfloats, 5); }
 
 /* ---- windowed: open a window and present the triangle (frames=0: until closed) ---- */
 int64_t jrt_vk_window(int64_t frames) {
@@ -252,8 +265,8 @@ int64_t jrt_vk_window(int64_t frames) {
     uint32_t nimg=0; vkGetSwapchainImagesKHR(dev,sw,&nimg,0);
     VkImage *imgs=malloc(nimg*sizeof*imgs); vkGetSwapchainImagesKHR(dev,sw,&nimg,imgs);
     VkRenderPass rp=build_rp(dev,sf.format,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR); if(!rp) return 0;
-    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl); if(!pipe) return 0;
-    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,3,&vbuf,&vmem)) return 0;
+    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0); if(!pipe) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,6,&vbuf,&vmem)) return 0;
 
     VkImageView *views=malloc(nimg*sizeof*views); VkFramebuffer *fbs=malloc(nimg*sizeof*fbs);
     VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};

@@ -2814,13 +2814,17 @@ impl<'a> FnLower<'a> {
         // array of interleaved (x,y) clip-space positions. Passed as a proven
         // (data-ptr, elem-count) pair (jrt_array_data past the header + array length),
         // exactly like the @arraydata/@arraylen bridge. Returns the centroid pixel.
-        if name == "vk_mesh" {
+        // vk_mesh: position-only geometry (jrt_vk_mesh). vk_mesh_c: per-vertex
+        // attributes — the [Float] interleaves (x,y, r,g,b), read in the @vertex via
+        // attr_color() (jrt_vk_mesh_c). Both pass the proven (data-ptr, count) pair.
+        if name == "vk_mesh" || name == "vk_mesh_c" {
+            let sym = if name == "vk_mesh_c" { "jrt_vk_mesh_c" } else { "jrt_vk_mesh" };
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);
             self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
             let len = self.array_len_i64(arr);
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh".into(), args: vec![Operand::Copy(ptr), len] });
+            self.emit(Statement::Call { dest: Some(d), func: sym.into(), args: vec![Operand::Copy(ptr), len] });
             return (Operand::Copy(d), Ty::I64);
         }
         if let Some((sym, ret)) = gpu_intrinsic_typed(&name) {

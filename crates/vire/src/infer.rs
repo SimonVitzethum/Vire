@@ -450,7 +450,7 @@ impl<'a> Ctx<'a> {
                         "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window"
-                        | "vk_mesh" => return T::I64,
+                        | "vk_mesh" | "vk_mesh_c" => return T::I64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {

@@ -41,6 +41,7 @@ struct Cx {
     uses_fragcoord: bool,       // `frag_x/frag_y/frag_coord` → declare gl_FragCoord
     emits_varying: bool,        // vertex `out_color(vec3)` → declare the Location-0 Output
     uses_varying: bool,         // fragment `in_color()` → declare the Location-0 Input
+    uses_attr_color: bool,      // vertex `attr_color()` → per-vertex color attribute (Location 1)
     n: u32,
 }
 
@@ -91,6 +92,18 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpCompositeExtract %float {fc} {comp}").unwrap();
                     return Ok((id, Ty::Float));
+                }
+                // Per-vertex color attribute (vertex stage only): read the vec3 the
+                // vertex buffer supplies at Location 1 (`vk_mesh_c` interleaves it after
+                // the x,y position). Typically forwarded with `out_color(attr_color())`.
+                if name == "attr_color" {
+                    if !args.is_empty() {
+                        return Err("shader: attr_color() takes no arguments".into());
+                    }
+                    self.uses_attr_color = true;
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v3float %col_in").unwrap();
+                    return Ok((id, Ty::Vec(3)));
                 }
                 // Varying input: the interpolated per-vertex color the `@vertex`
                 // stage wrote with `out_color(...)` (Location 0, a vec3).
@@ -252,6 +265,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         uses_fragcoord: false,
         emits_varying: false,
         uses_varying: false,
+        uses_attr_color: false,
         n: 0,
     };
     cx.env.insert(param, ("%pos".to_string(), Ty::Vec(2)));
@@ -269,6 +283,20 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     } else {
         ("", "", "")
     };
+    // `attr_color()` adds a per-vertex color Input attribute at Location 1 (the
+    // vertex buffer must be the colored layout — `vk_mesh_c`).
+    let (attr_iface, attr_dec, attr_decl) = if cx.uses_attr_color {
+        (
+            " %col_in",
+            "               OpDecorate %col_in Location 1\n",
+            "      %in3ptr = OpTypePointer Input %v3float\n     %col_in = OpVariable %in3ptr Input\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    let vary_iface = format!("{vary_iface}{attr_iface}");
+    let vary_dec = format!("{vary_dec}{attr_dec}");
+    let vary_decl = format!("{vary_decl}{attr_decl}");
     Ok(format!(
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450
@@ -318,6 +346,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         uses_fragcoord: false,
         emits_varying: false,
         uses_varying: false,
+        uses_attr_color: false,
         n: 0,
     };
     let (out, ty) = cx.block_output(body)?;

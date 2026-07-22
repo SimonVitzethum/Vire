@@ -388,12 +388,17 @@ Staged (each stage runnable):
   attribute; the old `gl_VertexIndex` built-in array is gone). Verified: the default
   corners as Vire data render identically to `vk_triangle`, and an off-screen mesh
   makes the centroid the clear color (`tests/vire_vulkan.sh vire_mesh_buffer`;
-  `examples/vire/vulkan_mesh.vr` draws a quad with a per-vertex varying). *Remaining:*
-  (a) real `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local);
-  (b) **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
-  builtins (normalize/dot/mix…); (c) **per-vertex attributes beyond position** (color/
-  normal/uv in the vertex buffer) + index buffers — the last mile to typed stage I/O
-  for VM meshlets (geometry + per-vertex data now both flow from Vire).
+  `examples/vire/vulkan_mesh.vr` draws a quad with a per-vertex varying). *Per-vertex
+  attributes DONE:* `vk_mesh_c(verts)` interleaves (x,y, r,g,b) per vertex; the
+  `@vertex` reads its own color from the buffer via `attr_color()` (attribute Location
+  1, added to the vertex-input state + shader interface only when used) and forwards
+  it as a varying — the classic RGB-corner triangle, where the centroid samples all
+  three channels blended (`tests/vire_vulkan.sh vire_mesh_attr_color`;
+  `examples/vire/vulkan_rgb.vr`). Geometry AND per-vertex data now both flow from
+  Vire — this is the typed stage I/O VM builds on. *Remaining:* (a) real
+  `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local); (b)
+  **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
+  builtins (normalize/dot/mix…); (c) index buffers + more attribute types (normal/uv).
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

@@ -1,0 +1,31 @@
+// Vire @vulkan — the classic RGB triangle: a per-vertex COLOR attribute.
+//
+//   vire run examples/vire/vulkan_rgb.vr
+//
+// `vk_mesh_c(verts)` uploads a vertex buffer that interleaves (x,y, r,g,b) per
+// vertex. The @vertex shader reads its own color from the buffer with attr_color()
+// (attribute Location 1), and forwards it as a varying; the rasterizer interpolates
+// it; the @fragment paints it. So a red top corner, a green corner, and a blue
+// corner blend into a smooth rainbow across the face — geometry AND per-vertex data
+// both authored in Vire. This is the typed stage I/O that GPU-driven meshlets build
+// on. Vendor-neutral (any Vulkan GPU). See language/GPU-VULKAN.md.
+
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(attr_color())            // forward this vertex's color to the fragment
+    vec4(pos.x, pos.y, 0.0, 1.0)       // position straight to clip space
+}
+
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)              // the interpolated per-vertex color
+}
+
+fn main() {
+    // Three vertices, each (x, y,  r, g, b): red top, green bottom-right, blue bottom-left.
+    mut tri = [0.0, -0.6, 1.0, 0.0, 0.0, 0.6, 0.6, 0.0, 1.0, 0.0, -0.6, 0.6, 0.0, 0.0, 1.0]
+    mut px = vk_mesh_c(tri)
+    print(px / 65536)       // red   at the centroid — a blend of all three corners
+    print((px / 256) % 256) // green at the centroid
+    print(px % 256)         // blue  at the centroid
+}

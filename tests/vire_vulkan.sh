@@ -169,6 +169,34 @@ fn main() {
 }
 EOF
 
+# Per-vertex color attributes: vk_mesh_c(verts) interleaves (x,y, r,g,b) per vertex.
+# The @vertex reads its own color via attr_color() (vertex-buffer Location 1) and
+# forwards it as a varying; the fragment paints the interpolated result. The classic
+# RGB triangle: red/green/blue corners. At the centroid ALL THREE channels are
+# present (each 40..160) — only possible if three pure per-vertex colors interpolate
+# (a flat or position-derived color cannot). Typed stage I/O: geometry + attributes
+# from Vire.
+case_ vire_mesh_attr_color <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(attr_color())
+    vec4(pos.x, pos.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut tri = [0.0, -0.6, 1.0, 0.0, 0.0, 0.6, 0.6, 0.0, 1.0, 0.0, -0.6, 0.6, 0.0, 0.0, 1.0]
+    mut px = vk_mesh_c(tri)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 40 { if r < 160 { if g > 40 { if g < 160 { if b > 40 { if b < 160 {
+        ok = 1 } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
