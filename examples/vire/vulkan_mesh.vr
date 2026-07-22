@@ -1,0 +1,33 @@
+// Vire @vulkan — geometry from Vire DATA (a vertex buffer), with a per-vertex
+// varying color. This combines the two pieces that GPU-driven meshlets need:
+// vertex data authored in Vire, and per-vertex attributes flowing to the fragment.
+//
+//   vire run examples/vire/vulkan_mesh.vr
+//
+// `vk_mesh(verts)` uploads a flat [Float] of interleaved (x,y) clip-space positions
+// as a Vulkan vertex buffer (2 floats per vertex, triangle list) and renders it
+// headless, returning the centroid pixel packed as 0xRRGGBB. The @vertex shader
+// reads each position from the buffer (attribute Location 0), transforms it, and
+// emits a per-vertex color; the rasterizer interpolates it; the @fragment paints it.
+// Nothing is hard-coded in the pipeline — the shape is the Vire array below.
+// Vendor-neutral (any Vulkan GPU). See language/GPU-VULKAN.md.
+
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(vec3(pos.x + 0.5, pos.y + 0.5, 0.15))   // color from corner position
+    vec4(pos.x, pos.y, 0.0, 1.0)                       // position straight to clip space
+}
+
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)                              // the interpolated per-vertex color
+}
+
+fn main() {
+    // A quad = two triangles = 6 vertices (x,y interleaved), all authored here.
+    mut quad = [-0.6, -0.6, 0.6, -0.6, 0.6, 0.6, -0.6, -0.6, 0.6, 0.6, -0.6, 0.6]
+    mut px = vk_mesh(quad)
+    print(px / 65536)      // red   at the centroid
+    print((px / 256) % 256) // green at the centroid
+    print(px % 256)        // blue  at the centroid (the constant 0.15 channel)
+}

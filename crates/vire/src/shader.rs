@@ -272,44 +272,27 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     Ok(format!(
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Vertex %main \"main\" %out %gl_VertexIndex %P{vary_iface}
+               OpEntryPoint Vertex %main \"main\" %out %pos_in{vary_iface}
                OpDecorate %glpv Block
                OpMemberDecorate %glpv 0 BuiltIn Position
-               OpDecorate %gl_VertexIndex BuiltIn VertexIndex
+               OpDecorate %pos_in Location 0
 {vary_dec}       %void = OpTypeVoid
        %fnty = OpTypeFunction %void
       %float = OpTypeFloat 32
     %v2float = OpTypeVector %float 2
     %v3float = OpTypeVector %float 3
     %v4float = OpTypeVector %float 4
-       %uint = OpTypeInt 32 0
-     %uint_3 = OpConstant %uint 3
-        %arr = OpTypeArray %v2float %uint_3
-       %parr = OpTypePointer Private %arr
-          %P = OpVariable %parr Private
-         %f0 = OpConstant %float 0
-        %fn6 = OpConstant %float -0.6
-         %f6 = OpConstant %float 0.6
-         %f1 = OpConstant %float 1
-         %p0 = OpConstantComposite %v2float %f0 %fn6
-         %p1 = OpConstantComposite %v2float %f6 %f6
-         %p2 = OpConstantComposite %v2float %fn6 %f6
-       %pini = OpConstantComposite %arr %p0 %p1 %p2
        %glpv = OpTypeStruct %v4float
      %outptr = OpTypePointer Output %glpv
         %out = OpVariable %outptr Output
+      %inptr = OpTypePointer Input %v2float
+     %pos_in = OpVariable %inptr Input
         %int = OpTypeInt 32 1
       %int_0 = OpConstant %int 0
-      %inptr = OpTypePointer Input %int
-%gl_VertexIndex = OpVariable %inptr Input
-     %pv2ptr = OpTypePointer Private %v2float
      %ov4ptr = OpTypePointer Output %v4float
 {vary_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-               OpStore %P %pini
-        %idx = OpLoad %int %gl_VertexIndex
-         %pp = OpAccessChain %pv2ptr %P %idx
-        %pos = OpLoad %v2float %pp
+        %pos = OpLoad %v2float %pos_in
 {body}         %gp = OpAccessChain %ov4ptr %out %int_0
                OpStore %gp {out}
                OpReturn

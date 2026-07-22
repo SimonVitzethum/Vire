@@ -141,6 +141,34 @@ fn main() {
 }
 EOF
 
+# Vertex-buffer geometry: vk_mesh(verts) renders a triangle from Vire DATA (a flat
+# [Float] of interleaved x,y), not the built-in corners. (1) The default corners as
+# Vire data render identically to vk_triangle (green centroid) — proving the vertex
+# buffer path. (2) Shifting every x by +3 moves the triangle off-screen, so the
+# centroid becomes the dark clear color — proving the Vire data drives the geometry.
+# The bridge to GPU-driven meshlets (per-vertex data now comes from Vire).
+case_ vire_mesh_buffer <<'EOF'
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.8, 0.3, 1.0) }
+fn main() {
+    mut tri = [0.0, -0.6, 0.6, 0.6, -0.6, 0.6]
+    mut a = vk_mesh(tri)
+    mut ar = a / 65536
+    mut ag = (a / 256) % 256
+    mut ab = a % 256
+    mut off = [3.0, -0.6, 3.6, 0.6, 2.4, 0.6]
+    mut b = vk_mesh(off)
+    mut br = b / 65536
+    mut bg = (b / 256) % 256
+    mut bb = b % 256
+    mut ok = 0
+    if ar < 90 { if ag > 150 { if ab > 30 { if ab < 120 {   // (1) Vire data == built-in
+      if br < 40 { if bg < 40 { if bb < 40 {                 // (2) off-screen → clear
+        ok = 1 } } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

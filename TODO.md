@@ -380,12 +380,20 @@ Staged (each stage runnable):
   (Output/Input decorated + added to each entry-point interface only when used). A
   Gouraud triangle (corner colors from position) gives centroid r≈128, g≈152 with
   g≠r, proving interpolation a flat fragment cannot produce (`tests/vire_vulkan.sh
-  vire_varying_color`; `examples/vire/vulkan_varying.vr`). *Remaining:* (a) real
-  `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local); (b)
-  **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
-  builtins (normalize/dot/mix…); (c) **vertex-buffer** geometry from Vire data (today
-  the corners are the fixed built-in array) + typed stage I/O — the bridge to VM
-  meshlets (now that varyings carry per-vertex data between stages).
+  vire_varying_color`; `examples/vire/vulkan_varying.vr`). *Vertex buffers DONE:* the
+  pipeline reads positions from a vertex buffer (attribute Location 0), and
+  `vk_mesh(verts)` renders Vire-authored geometry — a flat `[Float]` of interleaved
+  (x,y) uploaded as f32, drawn as a triangle list. The `@vertex` reads each position
+  from the buffer (both the default and Vire `@vertex` shaders unified on the
+  attribute; the old `gl_VertexIndex` built-in array is gone). Verified: the default
+  corners as Vire data render identically to `vk_triangle`, and an off-screen mesh
+  makes the centroid the clear color (`tests/vire_vulkan.sh vire_mesh_buffer`;
+  `examples/vire/vulkan_mesh.vr` draws a quad with a per-vertex varying). *Remaining:*
+  (a) real `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local);
+  (b) **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
+  builtins (normalize/dot/mix…); (c) **per-vertex attributes beyond position** (color/
+  normal/uv in the vertex buffer) + index buffers — the last mile to typed stage I/O
+  for VM meshlets (geometry + per-vertex data now both flow from Vire).
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

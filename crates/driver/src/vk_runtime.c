@@ -2,10 +2,12 @@
  *   jrt_vk_triangle()      — headless render + pixel self-verify (CI, no display).
  *   jrt_vk_window(frames)  — open a window, present the triangle (frames=0: until
  *                            closed). Needs a display + GLFW.
- * A compile-time-fixed graphics pipeline (positions from gl_VertexIndex, no vertex
- * buffers); bootstrap SPIR-V embedded below (glslc). The single-source Vire->SPIR-V
- * shader path + the `frame { clear; draw }` surface are the next milestones.
- * See language/GPU-VULKAN.md. Vendor-neutral (any Vulkan GPU).
+ *   jrt_vk_mesh(verts,n)   — headless render of Vire-supplied geometry (a vertex
+ *                            buffer), same centroid readback.
+ * The graphics pipeline reads positions from a vertex buffer (attribute Location 0);
+ * `jrt_vk_triangle`/`jrt_vk_window` upload the built-in corners, `jrt_vk_mesh`
+ * uploads Vire data. Shader SPIR-V is Vire-authored (crates/vire/src/shader.rs +
+ * crates/backend/src/spirv.rs). See language/GPU-VULKAN.md. Vendor-neutral.
  */
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -13,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 #define CK(x) do { if((x)!=VK_SUCCESS) return 0; } while(0)
 
@@ -33,6 +36,29 @@ static VkShaderModule shmod(VkDevice d, const uint32_t *code, size_t n) {
     VkShaderModule m; return vkCreateShaderModule(d,&ci,0,&m)==VK_SUCCESS?m:0;
 }
 
+/* The default triangle, in clip space — supplied to the vertex stage as a vertex
+ * buffer (the vertex shader reads attribute Location 0). `vk_mesh` replaces this
+ * with Vire-supplied geometry. */
+static const float DEFAULT_TRI[6] = { 0.0f,-0.6f,  0.6f,0.6f,  -0.6f,0.6f };
+
+/* Upload `nverts` interleaved (x,y) f32 positions into a host-visible vertex
+ * buffer. Returns 1 on success (out params set), 0 on failure. */
+static int make_vbuf(VkDevice dev, VkPhysicalDevice pd, const float *xy, uint32_t nverts,
+                     VkBuffer *out_buf, VkDeviceMemory *out_mem) {
+    VkDeviceSize sz = (VkDeviceSize)nverts * 2 * sizeof(float); if(sz==0) sz=8;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=sz,.usage=VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
+    if(vkCreateBuffer(dev,&bi,0,out_buf)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev,*out_buf,&mr);
+    uint32_t t=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if(t==~0u) return 0;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=t};
+    if(vkAllocateMemory(dev,&ma,0,out_mem)!=VK_SUCCESS) return 0;
+    vkBindBufferMemory(dev,*out_buf,*out_mem,0);
+    void *p; if(vkMapMemory(dev,*out_mem,0,sz,0,&p)!=VK_SUCCESS) return 0;
+    memcpy(p, xy, (size_t)nverts*2*sizeof(float)); vkUnmapMemory(dev,*out_mem);
+    return 1;
+}
+
 /* The one shared piece: build the triangle graphics pipeline for a render pass +
  * extent. Layout is empty (no descriptors); shaders are the embedded SPIR-V. */
 static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout) {
@@ -41,7 +67,12 @@ static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint
     VkPipelineShaderStageCreateInfo st[2]={
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vs,.pName="main"},
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
-    VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    /* One vertex buffer at binding 0: interleaved (x,y) f32, attribute Location 0. */
+    VkVertexInputBindingDescription vbind={.binding=0,.stride=2*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vattr={.location=0,.binding=0,.format=VK_FORMAT_R32G32_SFLOAT,.offset=0};
+    VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount=1,.pVertexBindingDescriptions=&vbind,
+        .vertexAttributeDescriptionCount=1,.pVertexAttributeDescriptions=&vattr};
     VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkViewport vp={0,0,(float)w,(float)h,0,1}; VkRect2D sc={{0,0},{w,h}};
     VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
@@ -71,20 +102,23 @@ static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) {
     VkRenderPassCreateInfo ci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=1,.pAttachments=&att,.subpassCount=1,.pSubpasses=&sub,.dependencyCount=1,.pDependencies=&dep};
     VkRenderPass rp=0; vkCreateRenderPass(dev,&ci,0,&rp); return rp;
 }
-static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe, uint32_t w, uint32_t h) {
+static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
+                     uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts) {
     VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&bi);
     VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
     VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{w,h}},.clearValueCount=1,.pClearValues=&clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
-    vkCmdDraw(cmd,3,1,0,0);
+    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
+    vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
 }
 
-/* ---- headless: render to an image, read back; returns the centroid pixel packed
- *      as 0xRRGGBB (so callers can check the @fragment color), or -1 on failure ---- */
-int64_t jrt_vk_triangle(void) {
+/* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
+ *      image, read back; returns the centroid pixel packed as 0xRRGGBB (so callers
+ *      can check the @fragment color), or -1 on failure ---- */
+static int64_t render_headless(const float *xy, uint32_t nverts) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -113,6 +147,7 @@ int64_t jrt_vk_triangle(void) {
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl); if(!pipe) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,xy,nverts,&vbuf,&vmem)) return 0;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
@@ -125,7 +160,7 @@ int64_t jrt_vk_triangle(void) {
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
     VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
-    rec_draw(cmd,rp,fb,pipe,W,H);
+    rec_draw(cmd,rp,fb,pipe,W,H,vbuf,nverts);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
     vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
     CK(vkEndCommandBuffer(cmd));
@@ -140,10 +175,29 @@ int64_t jrt_vk_triangle(void) {
     int corner_clear = tl[0]<60 && tl[1]<60 && tl[2]<60;
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
     vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
     return corner_clear ? packed : -1;
+}
+
+/* The default triangle, from the compile-time corner buffer. */
+int64_t jrt_vk_triangle(void) { return render_headless(DEFAULT_TRI, 3); }
+
+/* vk_mesh(verts): render Vire-supplied geometry — `verts` is a flat [Float] array of
+ * interleaved (x,y) clip-space positions (2 per vertex), f64 in Vire. Converts to
+ * f32, uploads a vertex buffer, renders headless, and returns the centroid pixel
+ * (0xRRGGBB) so the Vire caller can verify. Proves the geometry comes from Vire data,
+ * not the built-in corners — the bridge to GPU-driven meshlets. */
+int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) {
+    if(!verts || nfloats < 6 || (nfloats & 1)) return -1;   /* need >=3 vertices (x,y pairs) */
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *xy=malloc((size_t)nfloats*sizeof(float)); if(!xy) return -1;
+    for(int64_t i=0;i<nfloats;i++) xy[i]=(float)verts[i];
+    int64_t r=render_headless(xy, nverts);
+    free(xy);
+    return r;
 }
 
 /* ---- windowed: open a window and present the triangle (frames=0: until closed) ---- */
@@ -199,6 +253,7 @@ int64_t jrt_vk_window(int64_t frames) {
     VkImage *imgs=malloc(nimg*sizeof*imgs); vkGetSwapchainImagesKHR(dev,sw,&nimg,imgs);
     VkRenderPass rp=build_rp(dev,sf.format,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR); if(!rp) return 0;
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl); if(!pipe) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,3,&vbuf,&vmem)) return 0;
 
     VkImageView *views=malloc(nimg*sizeof*views); VkFramebuffer *fbs=malloc(nimg*sizeof*fbs);
     VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
@@ -211,7 +266,7 @@ int64_t jrt_vk_window(int64_t frames) {
         CK(vkCreateImageView(dev,&iv,0,&views[i]));
         VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&views[i],.width=W,.height=H,.layers=1};
         CK(vkCreateFramebuffer(dev,&fbi,0,&fbs[i]));
-        rec_draw(cmds[i],rp,fbs[i],pipe,W,H); CK(vkEndCommandBuffer(cmds[i]));
+        rec_draw(cmds[i],rp,fbs[i],pipe,W,H,vbuf,3); CK(vkEndCommandBuffer(cmds[i]));
     }
     VkSemaphoreCreateInfo semi={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,.flags=VK_FENCE_CREATE_SIGNALED_BIT};
@@ -234,6 +289,7 @@ int64_t jrt_vk_window(int64_t frames) {
     vkDeviceWaitIdle(dev);
     for(uint32_t i=0;i<nimg;i++){ vkDestroyFramebuffer(dev,fbs[i],0); vkDestroyImageView(dev,views[i],0); }
     vkDestroySemaphore(dev,avail,0); vkDestroySemaphore(dev,done,0); vkDestroyFence(dev,inflight,0);
+    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
     vkDestroyCommandPool(dev,cp,0); vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroySwapchainKHR(dev,sw,0); vkDestroyDevice(dev,0);
     vkDestroySurfaceKHR(inst,surf,0); vkDestroyInstance(inst,0);

@@ -2810,6 +2810,19 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_window".into(), args: vec![arg] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_mesh(verts): render Vire-supplied geometry — `verts` is a flat [Float]
+        // array of interleaved (x,y) clip-space positions. Passed as a proven
+        // (data-ptr, elem-count) pair (jrt_array_data past the header + array length),
+        // exactly like the @arraydata/@arraylen bridge. Returns the centroid pixel.
+        if name == "vk_mesh" {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh".into(), args: vec![Operand::Copy(ptr), len] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if let Some((sym, ret)) = gpu_intrinsic_typed(&name) {
             let lowered: Vec<Operand> = args.iter().map(|a| self.lower_expr(a).0).collect();
             if ret == Ty::Void {
