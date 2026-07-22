@@ -36,6 +36,7 @@ fn new_cx() -> Cx {
         uses_varying: false,
         uses_attr_color: false,
         uses_glsl: false,
+        uses_push_constant: false,
         n: 0,
     }
 }
@@ -82,6 +83,7 @@ struct Cx {
     uses_varying: bool,         // fragment `in_color()` → declare the Location-0 Input
     uses_attr_color: bool,      // vertex `attr_color()` → per-vertex color attribute (Location 1)
     uses_glsl: bool,            // a GLSL.std.450 builtin (sqrt/normalize/dot/…) → import the set
+    uses_push_constant: bool,   // task `cull_plane()` → a vec4 push constant (the frustum plane)
     n: u32,
 }
 
@@ -169,6 +171,20 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v3float %col_in").unwrap();
                     return Ok((id, Ty::Vec(3)));
+                }
+                // Push constant: the frustum plane (nx,ny,nz,d) the host supplies for
+                // `@task` culling — read as a vec4. The stage declares the push-constant
+                // block only when this is used (currently the task stage).
+                if name == "cull_plane" {
+                    if !args.is_empty() {
+                        return Err("shader: cull_plane() takes no arguments".into());
+                    }
+                    self.uses_push_constant = true;
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_pc_v4float %pcv %pc_i0").unwrap();
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v4float {p}").unwrap();
+                    return Ok((id, Ty::Vec(4)));
                 }
                 // Varying input: the interpolated per-vertex color the `@vertex`
                 // stage wrote with `out_color(...)` (Location 0, a vec3).
@@ -589,19 +605,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         .first()
         .map(|p| p.name.clone())
         .ok_or("shader: `@vertex fn` needs a Vec2 position parameter")?;
-    let mut cx = Cx {
-        consts: String::new(),
-        vars: String::new(),
-        body: String::new(),
-        const_cache: HashMap::new(),
-        env: HashMap::new(),
-        uses_fragcoord: false,
-        emits_varying: false,
-        uses_varying: false,
-        uses_attr_color: false,
-        uses_glsl: false,
-        n: 0,
-    };
+    let mut cx = new_cx();
     // The position attribute is loaded into `%pos` by the preamble; bind the param to
     // a Function-storage variable so the body can read (and even reassign) it.
     cx.bind(&param, "%pos", Ty::Vec(2));
@@ -683,19 +687,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
 /// Compile an `@fragment fn` to SPIR-V assembly, or an error message.
 pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     let body = f.body.as_ref().ok_or("shader: `@fragment` fn has no body")?;
-    let mut cx = Cx {
-        consts: String::new(),
-        vars: String::new(),
-        body: String::new(),
-        const_cache: HashMap::new(),
-        env: HashMap::new(),
-        uses_fragcoord: false,
-        emits_varying: false,
-        uses_varying: false,
-        uses_attr_color: false,
-        uses_glsl: false,
-        n: 0,
-    };
+    let mut cx = new_cx();
     let (out, ty) = cx.block_value(body)?;
     if ty != Ty::Vec(4) {
         return Err("shader: the fragment output must be a Vec4".into());
@@ -899,41 +891,99 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
 }
 
 /// Compile a Vire `@task fn` (amplification shader) to a SPIR-V task shader. The body
-/// dispatches mesh workgroups with `emit_mesh_tasks(n)` (an integer count) — the GPU
-/// decides how many meshlets run, the basis for GPU culling. One `emit_mesh_tasks`
-/// terminates the shader (SPIR-V 1.4).
+/// dispatches mesh workgroups with `emit_mesh_tasks(arg)` — the GPU decides how many
+/// meshlets run, the basis for GPU culling. `arg` is either an integer literal (a
+/// fixed count) or a boolean (`emit 1 if true, 0 if false`, via `OpSelect`), so a
+/// frustum test like `emit_mesh_tasks(dot(cull_plane(), center) > -r)` culls the
+/// meshlet on the GPU. `let` bindings may share work. Terminates in `OpEmitMeshTasksEXT`
+/// (SPIR-V 1.4).
 pub fn compile_task(f: &FnDef) -> Result<String, String> {
     let body = f.body.as_ref().ok_or("shader: `@task` fn has no body")?;
-    let mut count: Option<i64> = None;
+    let mut cx = new_cx();
+    let mut count_op: Option<String> = None;   // the emit count operand (a %uint id)
+    let mut uints: BTreeSet<i64> = BTreeSet::new();
+    uints.insert(0);
+    uints.insert(1);
+
     let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
     for st in body.stmts.iter().chain(tail_stmt.iter()) {
         match st {
+            Stmt::Let { name, value: Some(v), .. } => {
+                let (id, ty) = cx.expr(v)?;
+                cx.bind(name, &id, ty);
+            }
             Stmt::Expr(Expr::Call { callee, args, .. })
                 if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "emit_mesh_tasks") =>
             {
-                if args.len() != 1 { return Err("shader: emit_mesh_tasks(n)".into()); }
-                count = Some(int_lit(&args[0])?);
+                if args.len() != 1 { return Err("shader: emit_mesh_tasks(arg)".into()); }
+                if count_op.is_some() {
+                    return Err("shader: `@task` calls emit_mesh_tasks once".into());
+                }
+                // Integer literal → a fixed count; a boolean → select 1/0 (GPU cull).
+                if let Ok(k) = int_lit(&args[0]) {
+                    uints.insert(k);
+                    count_op = Some(format!("%u_{k}"));
+                } else {
+                    let (cond, ty) = cx.expr(&args[0])?;
+                    if ty != Ty::Bool {
+                        return Err("shader: emit_mesh_tasks(arg) — arg must be an integer or a bool".into());
+                    }
+                    let sel = cx.id("t");
+                    writeln!(cx.body, "{sel} = OpSelect %uint {cond} %u_1 %u_0").unwrap();
+                    count_op = Some(sel);
+                }
             }
-            _ => return Err("shader: `@task` supports a single emit_mesh_tasks(n)".into()),
+            _ => return Err("shader: `@task` supports `let` and one emit_mesh_tasks(arg)".into()),
         }
     }
-    let n = count.ok_or("shader: `@task` must call emit_mesh_tasks(n)")?;
+    let count_op = count_op.ok_or("shader: `@task` must call emit_mesh_tasks(arg)")?;
+    let mut const_decls = String::new();
+    for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    // The push-constant block (the frustum plane) — declared only when `cull_plane()`
+    // is used. SPIR-V 1.4 requires every global in the entry-point interface.
+    let (pc_iface, pc_decor, pc_decl) = if cx.uses_push_constant {
+        (
+            " %pcv",
+            "               OpDecorate %pcblock Block\n               OpMemberDecorate %pcblock 0 Offset 0\n",
+            "     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n      %pc_i0 = OpConstant %int 0\n",
+        )
+    } else {
+        ("", "", "")
+    };
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint TaskEXT %main \"main\"
+{glsl_import}               OpMemoryModel Logical GLSL450
+               OpEntryPoint TaskEXT %main \"main\"{pc_iface}
                OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
-       %void = OpTypeVoid
+{pc_decor}       %void = OpTypeVoid
        %fnty = OpTypeFunction %void
        %uint = OpTypeInt 32 0
-        %u_1 = OpConstant %uint 1
-        %u_n = OpConstant %uint {n}
-       %main = OpFunction %void None %fnty
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
+{const_decls}{pc_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-               OpEmitMeshTasksEXT %u_n %u_1 %u_1
+{vars}{body}               OpEmitMeshTasksEXT {count_op} %u_1 %u_1
                OpFunctionEnd
 ",
-        n = n
+        glsl_import = glsl_import,
+        pc_iface = pc_iface,
+        pc_decor = pc_decor,
+        pc_decl = pc_decl,
+        const_decls = const_decls,
+        consts = cx.consts,
+        vars = cx.vars,
+        body = cx.body,
+        count_op = count_op,
     ))
 }

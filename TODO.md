@@ -424,10 +424,15 @@ Staged (each stage runnable):
   amplification stage that dispatches meshlet workgroups. Verified: a Vire-authored
   triangle takes the fragment color, and `emit_mesh_tasks(0)` **culls** it (centroid →
   clear) — GPU-gated geometry (`tests/vire_vulkan.sh vire_mesh_authored`/
-  `vire_task_cull`; `examples/vire/vulkan_meshlet_authored.vr`). *Remaining:* GPU
-  frustum/backface/cone culling logic in `@task` (needs push-constants/uniforms for
-  the camera); per-vertex mesh attributes (color/normal) → fragment; a Vire `@compute`
-  meshlet builder (partition + cone data); `vkCmdDrawMeshTasksIndirectCountEXT` +
+  `vire_task_cull`; `examples/vire/vulkan_meshlet_authored.vr`). *GPU frustum culling
+  DONE:* the host passes a frustum plane to `vk_mesh_shader(nx,ny,nz,d)`, delivered to
+  the `@task` shader as a **push constant** (`cull_plane()`); the task shader tests the
+  meshlet's bounding-sphere center on the GPU (`dot` + compare → `emit_mesh_tasks(bool)`
+  lowers to `OpSelect` 1/0). The same meshlet renders or is culled purely from the
+  camera data (`tests/vire_vulkan.sh vire_task_gpu_cull`; `examples/vire/vulkan_cull.vr`).
+  *Remaining:* backface/cone culling (per-meshlet cone axis from a builder); per-vertex
+  mesh attributes (color/normal) → fragment; a Vire `@compute` meshlet builder
+  (partition + cone data); many meshlets via `vkCmdDrawMeshTasksIndirectCountEXT` +
   bindless GPU scene buffers (typed Vire structs). One Vire program = the whole
   GPU-driven renderer (builder + cull + draw + scene data), normally GLSL/HLSL + C++
   + a mesh toolchain.

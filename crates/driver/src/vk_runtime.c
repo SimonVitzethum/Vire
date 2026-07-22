@@ -123,7 +123,12 @@ static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w,
     VkPipelineMultisampleStateCreateInfo msi={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
-    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    /* A 16-byte push constant (the frustum plane) for the amplification/task cull.
+     * The range's stages must be a subset of the pipeline's — include TASK only when
+     * a task stage exists, else the mesh stage. */
+    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
+    VkPushConstantRange pcr={.stageFlags=pcStages,.offset=0,.size=16};
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=nst,.pStages=st,
         .pViewportState=&vps,.pRasterizationState=&rs,.pMultisampleState=&msi,.pColorBlendState=&cb,
@@ -255,9 +260,11 @@ int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render
  * triangle itself — no vertex buffer, no vertex stage — dispatched with
  * vkCmdDrawMeshTasksEXT over VK_EXT_mesh_shader. Renders headless and returns the
  * centroid pixel (0xRRGGBB), or -2 if no device here supports mesh shaders (so the
- * caller/test can skip cleanly), or -1 on failure. */
-int64_t jrt_vk_mesh_shader(void) {
+ * caller/test can skip cleanly), or -1 on failure. The four args are a frustum plane
+ * (nx,ny,nz,d) pushed as a 16-byte push constant for the @task cull. */
+int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     enum { W=256, H=256 };
+    float plane[4]={(float)px_,(float)py_,(float)pz_,(float)pw_};
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
     VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
@@ -315,6 +322,8 @@ int64_t jrt_vk_mesh_shader(void) {
     VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
+    vkCmdPushConstants(cmd,pl,pcStages,0,16,plane);   /* the frustum plane for @task cull */
     draw_mesh(cmd,1,1,1);                    /* one task workgroup → one meshlet */
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};

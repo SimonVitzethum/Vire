@@ -351,6 +351,43 @@ fn main() {
 }
 EOF
 
+# GPU frustum culling in the @task shader: the host pushes a frustum plane
+# (cull_plane()), the task shader tests the meshlet's bounding-sphere center on the
+# GPU (dot + compare → OpSelect emit 1/0). The SAME meshlet renders (plane (0,0,1,0)
+# → d=0, visible) or is culled (plane (0,0,1,-2) → d=-2, behind) purely from the
+# camera data — the basis for GPU-driven culling. -2 → skip where no mesh device.
+case_ vire_task_gpu_cull <<'EOF'
+@task
+fn ts() {
+    mut plane = cull_plane()
+    mut center = vec4(0.0, 0.0, 0.0, 1.0)
+    mut d = dot(plane, center)
+    emit_mesh_tasks(d > 0.0 - 0.6)
+}
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.6, 0.1, 1.0) }
+fn main() {
+    mut vis = vk_mesh_shader(0.0, 0.0, 1.0, 0.0)
+    mut cul = vk_mesh_shader(0.0, 0.0, 1.0, 0.0 - 2.0)
+    mut ok = 0
+    if vis == -2 { ok = 1 }
+    if vis > 0 {
+        if vis / 65536 > 200 {          // visible → orange
+            if cul / 65536 < 40 { ok = 1 }   // culled → dark clear
+        }
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

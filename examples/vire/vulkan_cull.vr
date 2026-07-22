@@ -1,0 +1,39 @@
+// Vire @vulkan — GPU frustum culling in the @task (amplification) shader.
+//
+//   vire run examples/vire/vulkan_cull.vr
+//
+// The host passes a frustum plane (nx,ny,nz,d) to vk_mesh_shader(...); it arrives in
+// the @task shader as a push constant via cull_plane(). The task shader tests the
+// meshlet's bounding-sphere center against the plane ON THE GPU (a dot product + a
+// comparison) and emits the meshlet only if it is not fully behind — the decision
+// that, at scale, keeps invisible geometry off the rasterizer entirely. The same
+// meshlet is drawn or culled purely from the camera data. Returns -2 where the device
+// lacks mesh shaders. See language/GPU-VULKAN.md.
+
+@task
+fn ts() {
+    mut plane = cull_plane()               // frustum plane from the host
+    mut center = vec4(0.0, 0.0, 0.0, 1.0)  // meshlet bounding-sphere center (homogeneous)
+    mut d = dot(plane, center)             // signed distance
+    emit_mesh_tasks(d > 0.0 - 0.6)         // emit 1 meshlet if visible (radius 0.6), else 0
+}
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.6, 0.1, 1.0) }
+
+fn main() {
+    // A plane through the origin keeps the meshlet; pushing it far behind culls it.
+    mut visible = vk_mesh_shader(0.0, 0.0, 1.0, 0.0)
+    mut culled  = vk_mesh_shader(0.0, 0.0, 1.0, 0.0 - 2.0)
+    print(visible / 65536)   // ~229 (orange) — rendered
+    print(culled / 65536)    // ~20 (clear)   — culled on the GPU
+}

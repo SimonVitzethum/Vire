@@ -2813,12 +2813,19 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
-        // vk_mesh_shader(): the GPU-driven mesh pipeline (VK_EXT_mesh_shader) — a mesh
-        // shader emits the triangle itself; returns the centroid pixel, or -2 if the
-        // device has no mesh-shader support (so the caller can skip).
+        // vk_mesh_shader([nx, ny, nz, d]): the GPU-driven mesh pipeline
+        // (VK_EXT_mesh_shader) — a mesh shader emits the geometry itself. The optional
+        // four args are a frustum plane pushed for the `@task` cull (`cull_plane()`);
+        // the no-arg form pushes a permissive plane (everything visible). Returns the
+        // centroid pixel, or -2 if the device has no mesh-shader support.
         if name == "vk_mesh_shader" {
+            let plane: Vec<Operand> = if args.len() == 4 {
+                args.iter().map(|a| self.lower_expr(a).0).collect()
+            } else {
+                vec![Operand::ConstF64(0.0), Operand::ConstF64(0.0), Operand::ConstF64(0.0), Operand::ConstF64(1.0)]
+            };
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh_shader".into(), args: vec![] });
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh_shader".into(), args: plane });
             return (Operand::Copy(d), Ty::I64);
         }
         // vk_window(frames): open a window and present the triangle. frames=0 loops
