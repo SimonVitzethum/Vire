@@ -1237,10 +1237,17 @@ typedef struct Arena {
     struct Arena *prev;
     ArenaChunk *chunk;
 } Arena;
+#define ARENA_CHUNK_DEFAULT (1u << 16) /* 64 KiB standard chunk */
+#define ARENA_POOL_MAX 64              /* recycle up to 64 chunks (≈4 MiB) per thread */
+
 #ifdef FASTLLVM_THREADS
 static _Thread_local Arena *arena_top = NULL; /* one region stack per thread */
+static _Thread_local ArenaChunk *arena_pool = NULL; /* recycled 64 KiB chunks */
+static _Thread_local int arena_pool_count = 0;
 #else
 static Arena *arena_top = NULL;
+static ArenaChunk *arena_pool = NULL; /* free-list of recycled default chunks */
+static int arena_pool_count = 0;
 #endif
 
 void jrt_arena_push(void) {
@@ -1255,7 +1262,18 @@ void jrt_arena_pop(void) {
     ArenaChunk *c = a->chunk;
     while (c) {
         ArenaChunk *p = c->prev;
-        free(c);
+        /* Recycle standard chunks into a capped pool instead of returning them to
+         * the OS: turns the pop from an O(chunks) free() burst into O(chunks)
+         * pointer splices, and lets the next capsule reuse the memory (removes the
+         * per-arena malloc + zeroing fixed cost). Oversized/overflow chunks are
+         * still freed so the pool stays bounded. */
+        if (c->cap == ARENA_CHUNK_DEFAULT && arena_pool_count < ARENA_POOL_MAX) {
+            c->prev = arena_pool;
+            arena_pool = c;
+            arena_pool_count++;
+        } else {
+            free(c);
+        }
         c = p;
     }
     arena_top = a->prev;
@@ -1265,14 +1283,23 @@ static void *arena_alloc(size_t size) {
     size = (size + 15u) & ~(size_t)15u;
     ArenaChunk *c = arena_top->chunk;
     if (!c || c->used + size > c->cap) {
-        size_t cap = size > (1u << 16) ? size : (1u << 16);
-        /* NO eager memset of the whole chunk: that would force an extra
-         * write pass over 64 KB (page faults), whereas calloc hands out zero pages
-         * lazily. Instead each object is zeroed individually (below). */
-        ArenaChunk *nc = (ArenaChunk *)malloc(sizeof(ArenaChunk) + cap);
+        ArenaChunk *nc;
+        if (size <= ARENA_CHUNK_DEFAULT && arena_pool) {
+            /* Reuse a recycled chunk (cap is exactly ARENA_CHUNK_DEFAULT ≥ size). */
+            nc = arena_pool;
+            arena_pool = nc->prev;
+            arena_pool_count--;
+            nc->used = 0;
+        } else {
+            size_t cap = size > ARENA_CHUNK_DEFAULT ? size : ARENA_CHUNK_DEFAULT;
+            /* NO eager memset of the whole chunk: that would force an extra
+             * write pass over 64 KB (page faults), whereas calloc hands out zero pages
+             * lazily. Instead each object is zeroed individually (below). */
+            nc = (ArenaChunk *)malloc(sizeof(ArenaChunk) + cap);
+            nc->used = 0;
+            nc->cap = cap;
+        }
         nc->prev = c;
-        nc->used = 0;
-        nc->cap = cap;
         arena_top->chunk = nc;
         c = nc;
     }

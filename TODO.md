@@ -67,9 +67,10 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   - Extends a proven mechanism: thread-local `arena_top`, `while_arena_safe`
     interprocedural escape check, `tests/vire_interproc_arena.sh`, 0-live oracle all
     already exist — this generalizes the trigger from explicit `capsule` to inferred.
-  - **Also lower arena fixed costs** (larger chunks, chunk recycling across
-    regions) — M0.2 measured the arena *loses* below ~2.5M nodes purely on
-    chunk-alloc/zeroing fixed costs; fixing that widens the win to smaller N.
+  - **Arena fixed costs — chunk recycling DONE** (`jrt_arena_pop`/`arena_alloc`):
+    standard 64 KiB chunks are recycled through a capped per-thread free-list instead
+    of `free()`d at each pop — removes the O(chunks) free burst (a latency spike) and
+    the per-capsule chunk malloc. (Larger-chunk tuning still open.)
   - **Soundness-critical** (a wrong escape verdict = use-after-free): pin promote
     *and* decline in both directions with new cases in
     `tests/vire_interproc_arena.sh` before enabling by default.
