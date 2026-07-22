@@ -37,9 +37,42 @@ fn new_cx() -> Cx {
         uses_attr_color: false,
         uses_glsl: false,
         uses_push_constant: false,
-        uses_scene: false,
+        uses_ssbo: false,
+        uses_workgroup_id: false,
+        uses_payload: false,
         n: 0,
     }
+}
+
+/// Build the (entry-point interface, decorations, type/var decls) for the GPU-driven
+/// resources a stage touches — the scene SSBO (binding 0), gl_WorkGroupID, the
+/// task→mesh payload, and the frustum push constant. Shared by `@mesh` and `@task` so
+/// both declare them identically (SPIR-V 1.4 requires every global in the interface).
+/// `%i_0` (int 0) and `%v3uint` must already be declared by the caller's preamble.
+fn resource_decls(ssbo: bool, wgid: bool, payload: bool, push: bool) -> (String, String, String) {
+    let mut iface = String::new();
+    let mut decor = String::new();
+    let mut decl = String::new();
+    if wgid {
+        iface.push_str(" %gl_WorkGroupID");
+        decor.push_str("               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId\n");
+        decl.push_str("%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input\n");
+    }
+    if ssbo {
+        iface.push_str(" %scene");
+        decor.push_str("               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 NonWritable\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene NonWritable\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n");
+        decl.push_str("%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n");
+    }
+    if payload {
+        iface.push_str(" %pl");
+        decl.push_str("    %Payload = OpTypeStruct %uint\n%_ptr_pl_Payload = OpTypePointer TaskPayloadWorkgroupEXT %Payload\n         %pl = OpVariable %_ptr_pl_Payload TaskPayloadWorkgroupEXT\n%_ptr_pl_uint = OpTypePointer TaskPayloadWorkgroupEXT %uint\n");
+    }
+    if push {
+        iface.push_str(" %pcv");
+        decor.push_str("               OpDecorate %pcblock Block\n               OpMemberDecorate %pcblock 0 Offset 0\n");
+        decl.push_str("     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n");
+    }
+    (iface, decor, decl)
 }
 
 /// A shader value type: a float scalar, an N-component float vector, or a bool
@@ -85,7 +118,9 @@ struct Cx {
     uses_attr_color: bool,      // vertex `attr_color()` → per-vertex color attribute (Location 1)
     uses_glsl: bool,            // a GLSL.std.450 builtin (sqrt/normalize/dot/…) → import the set
     uses_push_constant: bool,   // task `cull_plane()` → a vec4 push constant (the frustum plane)
-    uses_scene: bool,           // mesh `meshlet_offset()` → an SSBO indexed by gl_WorkGroupID
+    uses_ssbo: bool,            // `meshlet_offset()`/`culled_offset()` → the scene SSBO (binding 0)
+    uses_workgroup_id: bool,    // read gl_WorkGroupID (meshlet_offset, emit_visible)
+    uses_payload: bool,         // task→mesh payload (the surviving meshlet index)
     n: u32,
 }
 
@@ -181,13 +216,33 @@ impl Cx {
                     if !args.is_empty() {
                         return Err("shader: meshlet_offset() takes no arguments".into());
                     }
-                    self.uses_scene = true;
+                    self.uses_ssbo = true;
+                    self.uses_workgroup_id = true;
                     let wid = self.id("t");
                     writeln!(self.body, "{wid} = OpLoad %v3uint %gl_WorkGroupID").unwrap();
                     let wx = self.id("t");
                     writeln!(self.body, "{wx} = OpCompositeExtract %uint {wid} 0").unwrap();
                     let p = self.id("t");
                     writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {wx}").unwrap();
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
+                    return Ok((id, Ty::Vec(2)));
+                }
+                // Culled scene read (mesh stage, fused cull path): the offset of the
+                // meshlet THIS mesh workgroup was launched for — `scene[payload.idx]`,
+                // where the @task wrote the surviving meshlet's index into the payload.
+                if name == "culled_offset" {
+                    if !args.is_empty() {
+                        return Err("shader: culled_offset() takes no arguments".into());
+                    }
+                    self.uses_ssbo = true;
+                    self.uses_payload = true;
+                    let ip = self.id("t");
+                    writeln!(self.body, "{ip} = OpAccessChain %_ptr_pl_uint %pl %i_0").unwrap();
+                    let idx = self.id("t");
+                    writeln!(self.body, "{idx} = OpLoad %uint {ip}").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {idx}").unwrap();
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
@@ -201,7 +256,7 @@ impl Cx {
                     }
                     self.uses_push_constant = true;
                     let p = self.id("t");
-                    writeln!(self.body, "{p} = OpAccessChain %_ptr_pc_v4float %pcv %pc_i0").unwrap();
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_pc_v4float %pcv %i_0").unwrap();
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v4float {p}").unwrap();
                     return Ok((id, Ty::Vec(4)));
@@ -855,17 +910,10 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
     for i in &ints { writeln!(const_decls, "%i_{i} = OpConstant %int {i}").unwrap(); }
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    // The per-meshlet scene buffer (SSBO, binding 0) + gl_WorkGroupID — declared only
-    // when `meshlet_offset()` is used, so one dispatch draws N meshlets from Vire data.
-    let (scene_iface, scene_decor, scene_decl) = if cx.uses_scene {
-        (
-            " %gl_WorkGroupID %scene",
-            "               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId\n               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 NonWritable\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene NonWritable\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n",
-            "%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input\n%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n",
-        )
-    } else {
-        ("", "", "")
-    };
+    // The GPU-driven resources this mesh stage touches (scene SSBO, gl_WorkGroupID for
+    // the plain scene path, or the task payload for the fused-cull path).
+    let (scene_iface, scene_decor, scene_decl) =
+        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, cx.uses_payload, false);
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
@@ -935,23 +983,40 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
     let body = f.body.as_ref().ok_or("shader: `@task` fn has no body")?;
     let mut cx = new_cx();
     let mut count_op: Option<String> = None;   // the emit count operand (a %uint id)
+    let mut emit_payload = false;              // emit_visible → pass the payload to mesh
     let mut uints: BTreeSet<i64> = BTreeSet::new();
     uints.insert(0);
     uints.insert(1);
 
     let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
     for st in body.stmts.iter().chain(tail_stmt.iter()) {
+        let emit_call = |n: &str| n == "emit_mesh_tasks" || n == "emit_visible";
         match st {
             Stmt::Let { name, value: Some(v), .. } => {
                 let (id, ty) = cx.expr(v)?;
                 cx.bind(name, &id, ty);
             }
             Stmt::Expr(Expr::Call { callee, args, .. })
-                if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "emit_mesh_tasks") =>
+                if matches!(callee.as_ref(), Expr::Ident(n, _) if emit_call(n)) =>
             {
-                if args.len() != 1 { return Err("shader: emit_mesh_tasks(arg)".into()); }
+                let fname = match callee.as_ref() { Expr::Ident(n, _) => n.as_str(), _ => unreachable!() };
+                if args.len() != 1 { return Err(format!("shader: {fname}(arg)")); }
                 if count_op.is_some() {
-                    return Err("shader: `@task` calls emit_mesh_tasks once".into());
+                    return Err("shader: `@task` emits once".into());
+                }
+                // `emit_visible` writes THIS workgroup's index into the task payload so
+                // the surviving mesh workgroup knows which meshlet it is (GPU cull).
+                if fname == "emit_visible" {
+                    emit_payload = true;
+                    cx.uses_workgroup_id = true;
+                    cx.uses_payload = true;
+                    let wid = cx.id("t");
+                    writeln!(cx.body, "{wid} = OpLoad %v3uint %gl_WorkGroupID").unwrap();
+                    let wx = cx.id("t");
+                    writeln!(cx.body, "{wx} = OpCompositeExtract %uint {wid} 0").unwrap();
+                    let pp = cx.id("t");
+                    writeln!(cx.body, "{pp} = OpAccessChain %_ptr_pl_uint %pl %i_0").unwrap();
+                    writeln!(cx.body, "OpStore {pp} {wx}").unwrap();
                 }
                 // Integer literal → a fixed count; a boolean → select 1/0 (GPU cull).
                 if let Ok(k) = int_lit(&args[0]) {
@@ -960,38 +1025,30 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
                 } else {
                     let (cond, ty) = cx.expr(&args[0])?;
                     if ty != Ty::Bool {
-                        return Err("shader: emit_mesh_tasks(arg) — arg must be an integer or a bool".into());
+                        return Err(format!("shader: {fname}(arg) — arg must be an integer or a bool"));
                     }
                     let sel = cx.id("t");
                     writeln!(cx.body, "{sel} = OpSelect %uint {cond} %u_1 %u_0").unwrap();
                     count_op = Some(sel);
                 }
             }
-            _ => return Err("shader: `@task` supports `let` and one emit_mesh_tasks(arg)".into()),
+            _ => return Err("shader: `@task` supports `let` and one emit_mesh_tasks/emit_visible(arg)".into()),
         }
     }
-    let count_op = count_op.ok_or("shader: `@task` must call emit_mesh_tasks(arg)")?;
-    let mut const_decls = String::new();
+    let count_op = count_op.ok_or("shader: `@task` must call emit_mesh_tasks/emit_visible(arg)")?;
+    let payload_op = if emit_payload { " %pl" } else { "" };
+    let mut const_decls = String::from("        %i_0 = OpConstant %int 0\n");
     for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    // The push-constant block (the frustum plane) — declared only when `cull_plane()`
-    // is used. SPIR-V 1.4 requires every global in the entry-point interface.
-    let (pc_iface, pc_decor, pc_decl) = if cx.uses_push_constant {
-        (
-            " %pcv",
-            "               OpDecorate %pcblock Block\n               OpMemberDecorate %pcblock 0 Offset 0\n",
-            "     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n      %pc_i0 = OpConstant %int 0\n",
-        )
-    } else {
-        ("", "", "")
-    };
+    let (res_iface, res_decor, res_decl) =
+        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, cx.uses_payload, cx.uses_push_constant);
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
 {glsl_import}               OpMemoryModel Logical GLSL450
-               OpEntryPoint TaskEXT %main \"main\"{pc_iface}
+               OpEntryPoint TaskEXT %main \"main\"{res_iface}
                OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
-{pc_decor}       %void = OpTypeVoid
+{res_decor}       %void = OpTypeVoid
        %fnty = OpTypeFunction %void
        %uint = OpTypeInt 32 0
         %int = OpTypeInt 32 1
@@ -999,25 +1056,27 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
     %v2float = OpTypeVector %float 2
     %v3float = OpTypeVector %float 3
     %v4float = OpTypeVector %float 4
+     %v3uint = OpTypeVector %uint 3
        %bool = OpTypeBool
    %pf_float = OpTypePointer Function %float
  %pf_v2float = OpTypePointer Function %v2float
  %pf_v3float = OpTypePointer Function %v3float
  %pf_v4float = OpTypePointer Function %v4float
     %pf_bool = OpTypePointer Function %bool
-{const_decls}{pc_decl}{consts}       %main = OpFunction %void None %fnty
+{const_decls}{res_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-{vars}{body}               OpEmitMeshTasksEXT {count_op} %u_1 %u_1
+{vars}{body}               OpEmitMeshTasksEXT {count_op} %u_1 %u_1{payload_op}
                OpFunctionEnd
 ",
         glsl_import = glsl_import,
-        pc_iface = pc_iface,
-        pc_decor = pc_decor,
-        pc_decl = pc_decl,
+        res_iface = res_iface,
+        res_decor = res_decor,
+        res_decl = res_decl,
         const_decls = const_decls,
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,
         count_op = count_op,
+        payload_op = payload_op,
     ))
 }

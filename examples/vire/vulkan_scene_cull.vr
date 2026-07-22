@@ -1,0 +1,40 @@
+// Vire @vulkan — a GPU-driven cull renderer: scene buffer + per-meshlet culling.
+//
+//   vire run examples/vire/vulkan_scene_cull.vr
+//
+// The whole batch of meshlets is a Vire array (their (x,y) offsets), uploaded to a
+// GPU storage buffer. One indirect dispatch launches one @task workgroup per meshlet;
+// each task reads its meshlet's center (meshlet_offset), tests it against the frustum
+// plane the host pushed (cull_plane), and emits the meshlet ONLY if it is visible —
+// writing the surviving meshlet's index into the task payload. The @mesh workgroup
+// then draws scene[payload.idx] (culled_offset). So invisible meshlets never reach
+// the rasterizer, and the decision is made entirely on the GPU from the camera plane.
+// This is the core of a GPU-driven renderer. See language/GPU-VULKAN.md.
+
+@task
+fn ts() {
+    mut o = meshlet_offset()                       // this meshlet's center from the scene
+    mut plane = cull_plane()                       // frustum plane from the host
+    mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))   // signed distance
+    emit_visible(d > 0.0 - 0.2)                    // emit only if in front (radius 0.2)
+}
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()                        // scene[payload.idx] — the survivor
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 { vec4(0.4, 0.7, 0.9, 1.0) }
+
+fn main() {
+    mut scene = [0.0 - 0.5, 0.0, 0.5, 0.0]         // a left and a right meshlet
+    // Plane facing +x through the origin: the left meshlet (x=-0.5) is culled.
+    mut mask = vk_mesh_scene_cull(scene, 1.0, 0.0, 0.0, 0.0)
+    print(mask)                                    // 2 = only the right quarter drawn
+}

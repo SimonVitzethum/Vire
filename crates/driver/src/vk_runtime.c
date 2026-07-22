@@ -263,7 +263,7 @@ int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render
  * offset via meshlet_offset() (scene[gl_WorkGroupID.x]). Returns a 2-bit mask: bit 0 if
  * the left quarter is drawn, bit 1 if the right quarter is — so a caller can verify
  * multiple meshlets landed. -2 if no mesh-shader device, -1 on failure. */
-int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
+static int64_t scene_render(const double *offs, int64_t nfloats, const float plane[4]) {
     if(!offs || nfloats < 2 || (nfloats & 1)) return -1;
     enum { W=256, H=256 };
     uint32_t nmesh=(uint32_t)(nfloats/2);
@@ -302,8 +302,10 @@ int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
     VkDeviceMemory smem; CK(vkAllocateMemory(dev,&sma,0,&smem)); vkBindBufferMemory(dev,ssbo,smem,0);
     void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,xy,(size_t)nmesh*2*sizeof(float)); vkUnmapMemory(dev,smem); free(xy);
 
-    /* Descriptor set layout (binding 0 = SSBO, mesh stage) + pool + set. */
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_MESH_BIT_EXT};
+    /* Descriptor set layout (binding 0 = SSBO). The task stage also reads the scene
+     * when it culls, so include it whenever a task stage exists. */
+    VkShaderStageFlags sceneStages = VK_SHADER_STAGE_MESH_BIT_EXT | (VK_TASK_TRI_N>0 ? VK_SHADER_STAGE_TASK_BIT_EXT : 0);
+    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=sceneStages};
     VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
     VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1};
@@ -359,7 +361,9 @@ int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
     vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&dset,0,0);
-    draw_indirect(cmd,ibuf,0,1,sizeof icmd);      /* N meshlets, one indirect dispatch */
+    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
+    vkCmdPushConstants(cmd,pl,pcStages,0,16,plane);   /* frustum plane for the @task cull */
+    draw_indirect(cmd,ibuf,0,1,sizeof icmd);      /* N task/mesh workgroups, one indirect dispatch */
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
     vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
@@ -383,6 +387,20 @@ int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
     return mask;
+}
+
+/* vk_mesh_scene(offsets): many meshlets, no culling — a permissive plane. */
+int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
+    float permissive[4]={0.0f,0.0f,0.0f,1.0f};
+    return scene_render(offs,nfloats,permissive);
+}
+
+/* vk_mesh_scene_cull(offsets, nx,ny,nz,d): the fused GPU-driven cull renderer. The
+ * @task tests each meshlet's center against the pushed frustum plane and emits only
+ * the survivors (payload carries the index); the @mesh draws them. */
+int64_t jrt_vk_mesh_scene_cull(const double *offs, int64_t nfloats, double nx, double ny, double nz, double dd) {
+    float plane[4]={(float)nx,(float)ny,(float)nz,(float)dd};
+    return scene_render(offs,nfloats,plane);
 }
 
 /* vk_mesh_shader(): the GPU-driven path (VM milestone). A mesh shader emits the

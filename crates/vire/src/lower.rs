@@ -2844,6 +2844,25 @@ impl<'a> FnLower<'a> {
         // vk_mesh: position-only geometry (jrt_vk_mesh). vk_mesh_c: per-vertex
         // attributes — the [Float] interleaves (x,y, r,g,b), read in the @vertex via
         // attr_color() (jrt_vk_mesh_c). Both pass the proven (data-ptr, count) pair.
+        // vk_mesh_scene_cull(offsets, nx, ny, nz, d): the fused GPU-driven cull path —
+        // the scene SSBO plus a frustum plane; the @task tests each meshlet and emits
+        // only survivors, the @mesh draws them (payload carries the index).
+        if name == "vk_mesh_scene_cull" && !args.is_empty() {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let mut call_args = vec![Operand::Copy(ptr), len];
+            // The frustum plane (nx, ny, nz, d); missing components default permissive.
+            let defaults = [0.0, 0.0, 0.0, 1.0];
+            for k in 0..4 {
+                let op = args.get(k + 1).map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstF64(defaults[k]));
+                call_args.push(op);
+            }
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh_scene_cull".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_mesh_scene(offsets): many meshlets from a Vire scene buffer — the flat
         // [Float] of interleaved (x,y) per-meshlet offsets is uploaded to an SSBO and
         // one indirect dispatch draws them all (the @mesh reads meshlet_offset()).

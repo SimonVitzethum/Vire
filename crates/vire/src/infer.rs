@@ -451,7 +451,7 @@ impl<'a> Ctx<'a> {
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window"
                         | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader"
-                        | "vk_mesh_scene" => return T::I64,
+                        | "vk_mesh_scene" | "vk_mesh_scene_cull" => return T::I64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {

@@ -416,6 +416,42 @@ fn main() {
 }
 EOF
 
+# Fused GPU-driven cull renderer: scene buffer + per-meshlet culling in one dispatch.
+# N task workgroups each read their meshlet's center (meshlet_offset), test it against
+# the pushed frustum plane, and emit ONLY the survivors — the payload carries the
+# meshlet index to the mesh workgroup, which reads scene[payload.idx] (culled_offset).
+# With plane d=1 both meshlets pass (mask 3); with plane x>0 the left one (x=-0.5) is
+# culled on the GPU (mask 2). -2 → skip where no mesh device.
+case_ vire_scene_cull <<'EOF'
+@task
+fn ts() {
+    mut o = meshlet_offset()
+    mut plane = cull_plane()
+    mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))
+    emit_visible(d > 0.0 - 0.2)
+}
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.4, 0.7, 0.9, 1.0) }
+fn main() {
+    mut scene = [0.0 - 0.5, 0.0, 0.5, 0.0]
+    mut both = vk_mesh_scene_cull(scene, 0.0, 0.0, 0.0, 1.0)
+    mut only = vk_mesh_scene_cull(scene, 1.0, 0.0, 0.0, 0.0)
+    mut ok = 0
+    if both == -2 { ok = 1 }
+    if both == 3 { if only == 2 { ok = 1 } }   // both pass, then left culled on GPU
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

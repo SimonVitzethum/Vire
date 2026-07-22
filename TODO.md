@@ -436,14 +436,22 @@ Staged (each stage runnable):
   reads its own offset with `meshlet_offset()` (`scene[gl_WorkGroupID.x]`, a
   descriptor-set-bound storage buffer) and emits its triangle there. Verified: two
   meshlets (left+right) both render, and the scene array decides which exist
-  (`tests/vire_vulkan.sh vire_mesh_scene`; `examples/vire/vulkan_scene.vr`). *Remaining:*
-  fuse the scene path with the `@task` cull (per-meshlet frustum/cone test before
-  emit, via a task payload carrying the surviving indices); backface/cone culling
-  (per-meshlet cone axis); per-vertex mesh attributes (color/normal) → fragment; a
+  (`tests/vire_vulkan.sh vire_mesh_scene`; `examples/vire/vulkan_scene.vr`). *Fused
+  GPU-driven cull renderer DONE:* `vk_mesh_scene_cull(offsets, nx,ny,nz,d)` runs one
+  `@task` workgroup per meshlet — each reads its center (`meshlet_offset()`), tests it
+  against the pushed frustum plane (`cull_plane()`, `dot` + compare), and emits ONLY
+  the survivors via `emit_visible(bool)`, which writes the meshlet index into a
+  task→mesh **payload** (`TaskPayloadWorkgroupEXT`). The `@mesh` reads
+  `scene[payload.idx]` (`culled_offset()`) and draws it. So invisible meshlets never
+  reach the rasterizer — the decision is entirely on the GPU from the camera plane.
+  Verified: a left+right scene shows both with a permissive plane, and the left
+  meshlet is GPU-culled with a +x plane (`tests/vire_vulkan.sh vire_scene_cull`;
+  `examples/vire/vulkan_scene_cull.vr`). *Remaining:* backface/cone culling (per-meshlet
+  cone axis, needs a builder); per-vertex mesh attributes (color/normal) → fragment; a
   Vire `@compute` meshlet builder (partition + cone data) so the scene buffer itself
-  is GPU-built; typed Vire structs for the scene records (today it is a flat float
-  array). One Vire program = the whole GPU-driven renderer, normally GLSL/HLSL + C++
-  + a mesh toolchain.
+  is GPU-built; typed Vire structs for the scene records (today a flat float array).
+  One Vire program = the whole GPU-driven renderer, normally GLSL/HLSL + C++ + a mesh
+  toolchain.
 - [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
   of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup
   ops, `GLSL.std.450`); G1 intrinsics map directly (barrier→`OpControlBarrier`,
