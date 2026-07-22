@@ -1156,12 +1156,41 @@ static void free_obj(JObjHeader *h) {
 static JObjHeader **dropbuf = NULL;
 static size_t droplen = 0, dropcap = 0;
 static int draining = 0;
+/* Free-cascade budget: bound the frees done per top-level release so dropping a
+ * large dead subgraph is spread across operations, not one synchronous burst (a
+ * latency spike). Most cascades are ≤ FREE_BUDGET and still complete in one release
+ * (no deferral, no RAM overhead); only a huge cascade spreads. FREE_PUMP is drained
+ * per allocation to keep the queue draining. The queue is LIFO (depth-first), so it
+ * only ever holds the DFS frontier (~depth), not the whole subgraph. */
+#define FREE_BUDGET 4096
+#define FREE_PUMP 64
 static void drop_enq(JObjHeader *h) {
     if (droplen == dropcap) {
         dropcap = dropcap ? dropcap * 2 : 256;
         dropbuf = (JObjHeader **)plat_realloc(dropbuf, dropcap * sizeof(*dropbuf));
     }
     dropbuf[droplen++] = h;
+}
+/* Run up to `budget` deferred drops (0 = drain fully). Sound: queued objects are
+ * rc==0 (unreachable — the mutator cannot obtain a new reference to one), so
+ * deferring their free is invisible; their children stay alive (still held by the
+ * not-yet-run drop) until their turn. Re-entrant child releases only enqueue. */
+static void drain_drops(size_t budget) {
+    if (draining) return;
+    draining = 1;
+    size_t n = 0;
+    while (droplen && (budget == 0 || n < budget)) {
+        JObjHeader *x = dropbuf[--droplen];
+        run_drop(x); /* child releases enqueue (draining=1) */
+#ifdef FASTLLVM_COLLECTOR
+        SET_COLOR(x, COL_BLACK);
+        if (!BUFFERED(x)) free_obj(x);
+#else
+        free_obj(x);
+#endif
+        n++;
+    }
+    draining = 0;
 }
 #endif
 
@@ -1201,8 +1230,14 @@ static void possible_root(JObjHeader *h) {
 #endif /* FASTLLVM_COLLECTOR */
 
 static void jrt_shutdown(void) {
+#if !defined(FASTLLVM_THREADS)
+    drain_drops(0); /* flush any deferred free-cascade (may buffer cyclic roots) */
+#endif
 #ifdef FASTLLVM_COLLECTOR
     jrt_collect_cycles();
+#endif
+#if !defined(FASTLLVM_THREADS)
+    drain_drops(0); /* and anything the collect surfaced → 0 live */
 #endif
 #ifndef FASTLLVM_FREESTANDING
     /* Leak detector hosted only (getenv/process exit). */
@@ -1314,6 +1349,12 @@ void jrt_arena_pop(void) {}
 #endif
 
 void *jrt_alloc(int64_t size) {
+#if !defined(FASTLLVM_THREADS)
+    /* Amortize the deferred free-cascade against allocation: each alloc pays off a
+     * few pending drops, so deferred frees don't accumulate (RAM stays bounded
+     * relative to the allocation rate). */
+    if (droplen) drain_drops(FREE_PUMP);
+#endif
 #ifndef FASTLLVM_FREESTANDING
     /* In the capsule body: arena bump, immortal (RC/collector do not touch it),
      * not in live_objects (freed en bloc by jrt_arena_pop). */
@@ -1393,15 +1434,8 @@ void jrt_release(void *p) {
     if (h->refcount < 0) return; /* immortal */
     h->refcount -= RC_ONE;
     if (RC_COUNT(h) == 0) {
-        if (draining) { drop_enq(h); return; }   /* in cascade: just enqueue */
-        draining = 1;
         drop_enq(h);
-        while (droplen) {
-            JObjHeader *x = dropbuf[--droplen];
-            run_drop(x);                          /* child release enqueues */
-            free_obj(x);
-        }
-        draining = 0;
+        drain_drops(FREE_BUDGET); /* bounded; re-entrant child releases just enqueue */
     }
 }
 #else
@@ -1419,20 +1453,12 @@ void jrt_release(void *p) {
     if (h->refcount < 0) return; /* immortal */
     h->refcount -= RC_ONE;
     if (RC_COUNT(h) == 0) {
-        /* Release: decrement children (drop), then free if applicable.
-         * Iterative (drop buffer) instead of recursive — see drop_enq (soundness).
-         * An object that is still buffered stays put — the collector picks
-         * it up in MarkRoots (color black, rc 0). */
-        if (draining) { drop_enq(h); return; }
-        draining = 1;
+        /* Release: decrement children (drop), then free — iterative (drop buffer)
+         * and BUDGETED so a large dead subgraph frees across operations, not in one
+         * burst (see drain_drops). A still-buffered object stays put — the collector
+         * picks it up in MarkRoots (color black, rc 0). */
         drop_enq(h);
-        while (droplen) {
-            JObjHeader *x = dropbuf[--droplen];
-            run_drop(x);
-            SET_COLOR(x, COL_BLACK);
-            if (!BUFFERED(x)) free_obj(x);
-        }
-        draining = 0;
+        drain_drops(FREE_BUDGET);
     } else {
         possible_root(h);
     }

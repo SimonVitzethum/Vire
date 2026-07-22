@@ -7,6 +7,27 @@ oracle **67/67** + `tests/vire_heap.sh` 0-live + all `tests/vire_*.sh` green.
 
 ---
 
+## Runtime: budgeted free-cascade — no spike on large drops (shipped)
+
+Releasing the last reference to a large dead subgraph used to free the *whole* graph
+in one synchronous burst (`jrt_release`'s drop loop) — a latency spike ∝ graph size.
+Now `drain_drops(budget)` frees at most **FREE_BUDGET = 4096** objects per top-level
+release; the rest stay in the LIFO drop queue and are drained **FREE_PUMP = 64 per
+allocation** (amortized against the mutator) and fully at shutdown. So a big drop is
+spread across operations, not one pause. Applied to both single-thread RC variants
+(default + `NO_CYCLES`); threads (recursive free, no drop queue) unaffected.
+
+- **Sound.** Queued objects are rc==0 → unreachable (the mutator cannot obtain a new
+  reference to one), so deferring their free is invisible; their children stay alive
+  (still held by the not-yet-run drop) until their turn. The LIFO order means the
+  queue only holds the DFS frontier (~depth), not the whole subgraph, so most
+  cascades (≤ FREE_BUDGET) still complete in one release with no RAM overhead — only
+  a huge cascade spreads.
+- **Verified 0-live:** a **1M-node linked-list drop** (deferral engaged) →
+  `[heap] 1000000 allocated, 0 still live`; Java oracle **67/67** (incl. `listdrop` +
+  `cyclestress`); `tests/vire_heap.sh` 17/17; freestanding Cycle runs; threads/gpu/
+  vulkan green.
+
 ## Runtime: incremental collector — ATTEMPTED, reverted (unsound); + fixes kept
 
 Attempted to replace the synchronous Bacon–Rajan collector (one big stop-the-world

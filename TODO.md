@@ -131,10 +131,13 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   was reverted. A correct incremental Bacon–Rajan needs a **resumable traversal +
   write barrier** (mutation during a spread-out collection must be intercepted) or a
   fundamentally different buffer-processing invariant — bigger + correctness-critical.
-  Related: the release **free-cascade** on a large dead subgraph is still one burst
-  (`jrt_release` drop loop) — a budgeted/deferred-free (LIFO queue, drain a bounded
-  amount per op + pump on alloc) is more tractable and can be attempted independently.
   Also open: chunk-recycle bound tuning, larger arena chunks.
+- [x] **Free-cascade — budgeted/deferred, DONE** (`drain_drops`): the release drop
+  loop now frees at most `FREE_BUDGET` per top-level release (the rest deferred in the
+  LIFO drop queue, drained `FREE_PUMP` per allocation + fully at shutdown), so
+  dropping a large dead subgraph spreads across operations instead of one burst.
+  Sound (queued objects are rc==0, unreachable); verified 0-live incl. a 1M-node list
+  drop (deferral engaged) + the `listdrop` leak-catcher — see [DONE.md](DONE.md).
 
 ---
 
