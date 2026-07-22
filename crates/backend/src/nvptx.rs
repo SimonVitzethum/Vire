@@ -17,7 +17,7 @@
 //!     links straight to it. It marshals arguments (scalars by value, arrays via
 //!     H2D upload → launch → D2H copyback) through the `jrt_gpu_*` runtime.
 //!
-//! The design mirrors NVlabs/cuda-oxide (Apache-2.0, see third_party/cuda-oxide):
+//! The design mirrors NVlabs/cuda-oxide (Apache-2.0, see crates/cuda-oxide/NOTICE.md):
 //! single-source kernels → LLVM IR → PTX, typed device buffers, launch-by-N.
 
 use std::fmt::Write;
@@ -495,6 +495,75 @@ fn c_param_ty(ty: Ty, is_arr: bool) -> &'static str {
     }
 }
 
+/// Which array parameters the kernel only READS (never `ArrayStore`s into) and
+/// so need no D2H copyback. Design adapted from cuda-oxide's typed in/out
+/// `DeviceBuffer` distinction (idea, not code): an input-only buffer stays on the
+/// host untouched, so downloading it back is pure waste.
+///
+/// Sound-conservative by construction: skipping a *needed* copyback would silently
+/// drop a result, so the analysis only marks a param read-only when it can PROVE
+/// no store reaches it. Array pointers on the device originate solely from
+/// parameters (there is no device allocation), so every `ArrayStore` base traces
+/// to a param via copy-aliasing; any base we cannot trace forces every array to
+/// in/out (returns all-false). Returns a `bool` per parameter index (scalars →
+/// false, irrelevant).
+fn read_only_params(k: &GpuKernel) -> Vec<bool> {
+    let nparams = k.func.params.len();
+    let nlocals = k.func.locals.len();
+    // Bitset of param indices a local may hold; kernels are tiny, but guard >64.
+    if nparams > 64 {
+        return vec![false; nparams];
+    }
+    let mut points = vec![0u64; nlocals];
+    // Seed: locals 0..nparams ARE the parameters (local 0 = injected thread index);
+    // each array param initially points to itself.
+    for i in 0..nparams {
+        if k.param_arr.get(i).copied().flatten().is_some() {
+            points[i] = 1u64 << i;
+        }
+    }
+    // Fixpoint over copy-aliasing (`dest = src`): dest may hold whatever src does.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &k.func.blocks {
+            for st in &b.statements {
+                if let Statement::Assign(dest, Rvalue::Use(Operand::Copy(src))) = st {
+                    let s = points[src.0 as usize];
+                    let d = &mut points[dest.0 as usize];
+                    if *d | s != *d {
+                        *d |= s;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Collect which params any store can reach; bail (all in/out) on an untraceable base.
+    let mut written = 0u64;
+    for b in &k.func.blocks {
+        for st in &b.statements {
+            if let Statement::ArrayStore { arr, .. } = st {
+                match arr {
+                    Operand::Copy(l) => {
+                        let p = points[l.0 as usize];
+                        if p == 0 {
+                            return vec![false; nparams]; // base not traced to a param
+                        }
+                        written |= p;
+                    }
+                    _ => return vec![false; nparams], // non-local array base
+                }
+            }
+        }
+    }
+    (0..nparams)
+        .map(|i| {
+            k.param_arr.get(i).copied().flatten().is_some() && (written & (1u64 << i)) == 0
+        })
+        .collect()
+}
+
 /// Generates `gpu_stubs.c`: the per-kernel host launch stubs + `jrt_gpu_*`
 /// forward declarations. Returns `None` if there are no kernels.
 pub fn emit_gpu_stubs(program: &Program) -> Option<String> {
@@ -516,6 +585,7 @@ pub fn emit_gpu_stubs(program: &Program) -> Option<String> {
     for k in &program.gpu_kernels {
         let name = &k.func.name;
         let n = k.func.params.len();
+        let read_only = read_only_params(k);
         // Parameter 0 is the injected thread index — supplied on the device, NOT by
         // the host — so the stub signature and the launch marshal params 1.. only.
         write!(w, "void {name}(").unwrap();
@@ -558,11 +628,16 @@ pub fn emit_gpu_stubs(program: &Program) -> Option<String> {
             slot += 1;
         }
         writeln!(w, "  jrt_gpu_launch(_fn, _n, _params, {nkp});").unwrap();
-        // Copy back all array arguments (D2H) and free. v1: every array is treated
-        // as in/out (simple + correct); a future read-only analysis can skip these.
+        // Copy back written arrays (D2H) and free. A read-only array (the kernel
+        // never stores into it — see `read_only_params`) skips the copyback: the
+        // host data is unchanged, so downloading it back is pure waste.
         for i in 1..n {
             if k.param_arr.get(i).copied().flatten().is_some() {
-                writeln!(w, "  jrt_gpu_download((char*)p{i} + 32, _d{i}, _b{i});").unwrap();
+                if read_only[i] {
+                    writeln!(w, "  /* p{i} is read-only on the device — D2H skipped */").unwrap();
+                } else {
+                    writeln!(w, "  jrt_gpu_download((char*)p{i} + 32, _d{i}, _b{i});").unwrap();
+                }
                 writeln!(w, "  jrt_gpu_free(_d{i});").unwrap();
             }
         }

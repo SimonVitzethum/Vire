@@ -5,12 +5,14 @@
  * cuda.h-free and talk to the GPU only through the small `jrt_gpu_*` ABI below.
  *
  * v1 scope: one device (0), one lazily-created context + module, synchronous
- * launches (each launch syncs). Every array argument is uploaded before and
- * copied back after the launch (treated as in/out). This runs on the "GPU
+ * launches (each launch syncs). Array arguments are uploaded before the launch;
+ * the copyback (D2H) is emitted by the stub only for arrays the kernel writes —
+ * a read-only array (see `read_only_params` in backend/src/nvptx.rs) skips it.
+ * This runs on the "GPU
  * track" — it is deliberately NOT part of the bit-identical CPU oracle, since
  * GPU floating point differs from CPU (different FMA/rounding/reduction order).
  *
- * Design adapted from NVlabs/cuda-oxide (Apache-2.0); see third_party/cuda-oxide.
+ * Design adapted from NVlabs/cuda-oxide (Apache-2.0); see crates/cuda-oxide/NOTICE.md.
  */
 #include <cuda.h>
 #include <stdint.h>

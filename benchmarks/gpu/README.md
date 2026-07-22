@@ -47,3 +47,8 @@ adapts). cuda-oxide is a custom `rustc` codegen backend requiring its own
 toolchain (`rust-src`, a pinned nightly), so it is not built in this repo; the
 Rust-GPU column is left open. Device array access is unchecked (CUDA-like), so
 the GPU track is explicitly outside the memory-safe-vs-Rust CPU oracle.
+
+See [`VS-CUDA-OXIDE.md`](VS-CUDA-OXIDE.md) for the architectural analysis of where
+GPU performance is decided (both lower to PTX through the same LLVM NVPTX backend),
+and the two improvements it motivated: an `opt -O3` device-module middle-end and a
+read-only-array D2H-skip analysis — both adapted from cuda-oxide's design.

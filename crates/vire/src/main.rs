@@ -1187,16 +1187,40 @@ fn build_or_run(args: &[String]) {
             }
         };
         let dev_ll_path = build_dir.join("gpu_device.ll");
+        let dev_opt_path = build_dir.join("gpu_device.opt.ll");
         let dev_ptx_path = build_dir.join("gpu_device.ptx");
         if let Err(e) = std::fs::write(&dev_ll_path, &dev_ll) {
             eprintln!("writing device IR: {e}");
             exit(1);
         }
+        // Run the LLVM middle-end on the device module BEFORE PTX codegen. The
+        // NVPTX emitter deliberately produces naive alloca-per-local IR (no phis);
+        // `llc` runs codegen passes but NOT the target-independent mid-end
+        // (mem2reg/SROA/LICM/inline/unroll/vectorize), so without this the
+        // loop-carried scalars can spill to slow `.local` device memory. This
+        // gives Vire kernels the same mid-end a Rust→PTX path gets for free from
+        // rustc's LLVM pipeline (design adapted from cuda-oxide — no code copied).
+        // Best-effort: if `opt` is absent/errors we fall back to the raw module
+        // (llc -O3 still runs), so builds never regress on a toolchain without it.
+        let llc_input = match Command::new("opt")
+            .args(["-O3", "-S"])
+            .arg(&dev_ll_path)
+            .arg("-o")
+            .arg(&dev_opt_path)
+            .status()
+        {
+            Ok(s) if s.success() => &dev_opt_path,
+            Ok(_) => {
+                eprintln!("warning: opt -O3 on the device module failed; using unoptimized IR");
+                &dev_ll_path
+            }
+            Err(_) => &dev_ll_path, // opt not present → llc's codegen-only opt
+        };
         // sm_90 PTX: the CUDA driver JIT-compiles it forward onto the actual GPU
         // (PTX is forward-compatible), so this build is not tied to one GPU arch.
         let llc = Command::new("llc")
             .args(["-march=nvptx64", "-mcpu=sm_90", "-O3"])
-            .arg(&dev_ll_path)
+            .arg(llc_input)
             .arg("-o")
             .arg(&dev_ptx_path)
             .status();
