@@ -15,11 +15,13 @@ use std::fmt::Write;
 
 use crate::ast::{BinOp, Block, Expr, FnDef, Stmt};
 
-/// A shader value type: a float scalar or an N-component float vector.
+/// A shader value type: a float scalar, an N-component float vector, or a bool
+/// (produced by comparisons, consumed by `if`/`while` conditions).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ty {
     Float,
     Vec(u8),
+    Bool,
 }
 
 impl Ty {
@@ -29,15 +31,27 @@ impl Ty {
             Ty::Vec(2) => "%v2float",
             Ty::Vec(3) => "%v3float",
             Ty::Vec(_) => "%v4float",
+            Ty::Bool => "%bool",
+        }
+    }
+    /// The `Function`-storage pointer type for a mutable local of this type.
+    fn pf(self) -> &'static str {
+        match self {
+            Ty::Float => "%pf_float",
+            Ty::Vec(2) => "%pf_v2float",
+            Ty::Vec(3) => "%pf_v3float",
+            Ty::Vec(_) => "%pf_v4float",
+            Ty::Bool => "%pf_bool",
         }
     }
 }
 
 struct Cx {
     consts: String,             // `%kN = OpConstant %float …` lines
+    vars: String,               // `%vN = OpVariable %pf_… Function` decls (entry-block top)
     body: String,               // function-body instructions
     const_cache: HashMap<u32, String>, // float bits → id
-    env: HashMap<String, (String, Ty)>, // local name → (id, type)
+    env: HashMap<String, (String, Ty)>, // local name → (Function-pointer id, type)
     uses_fragcoord: bool,       // `frag_x/frag_y/frag_coord` → declare gl_FragCoord
     emits_varying: bool,        // vertex `out_color(vec3)` → declare the Location-0 Output
     uses_varying: bool,         // fragment `in_color()` → declare the Location-0 Input
@@ -63,15 +77,40 @@ impl Cx {
         id
     }
 
+    /// Declare a fresh `Function`-storage variable of `ty` (at the entry block) and
+    /// return its pointer id. Locals are storage-backed so assignment and mutation
+    /// across `if`/`while` boundaries just work (no SSA phi bookkeeping).
+    fn fresh_var(&mut self, ty: Ty) -> String {
+        let ptr = self.id("v");
+        writeln!(self.vars, "{ptr} = OpVariable {} Function", ty.pf()).unwrap();
+        ptr
+    }
+
+    /// Bind `name` to `val` (a computed SSA id of `ty`): reuse the local's variable
+    /// if it already exists with the same type, else declare one, then store.
+    fn bind(&mut self, name: &str, val: &str, ty: Ty) {
+        let ptr = match self.env.get(name) {
+            Some((p, t)) if *t == ty => p.clone(),
+            _ => self.fresh_var(ty),
+        };
+        writeln!(self.body, "OpStore {ptr} {val}").unwrap();
+        self.env.insert(name.to_string(), (ptr, ty));
+    }
+
     fn expr(&mut self, e: &Expr) -> Result<(String, Ty), String> {
         match e {
             Expr::Float(v, _) => Ok((self.constant(*v as f32), Ty::Float)),
             Expr::Int(v, _) => Ok((self.constant(*v as f32), Ty::Float)),
-            Expr::Ident(n, _) => self
-                .env
-                .get(n)
-                .cloned()
-                .ok_or_else(|| format!("shader: unknown variable `{n}`")),
+            Expr::Ident(n, _) => {
+                let (ptr, ty) = self
+                    .env
+                    .get(n)
+                    .cloned()
+                    .ok_or_else(|| format!("shader: unknown variable `{n}`"))?;
+                let id = self.id("t");
+                writeln!(self.body, "{id} = OpLoad {} {ptr}", ty.spirv()).unwrap();
+                Ok((id, ty))
+            }
             Expr::Call { callee, args, .. } => {
                 let name = match callee.as_ref() {
                     Expr::Ident(n, _) => n.as_str(),
@@ -131,6 +170,7 @@ impl Cx {
                     count += match t {
                         Ty::Float => 1,
                         Ty::Vec(k) => k,
+                        Ty::Bool => return Err("shader: a bool cannot be a vector component".into()),
                     };
                     parts.push(id);
                 }
@@ -157,7 +197,7 @@ impl Cx {
                 let (id, t) = self.expr(base)?;
                 let k = match t {
                     Ty::Vec(k) => k,
-                    Ty::Float => return Err("shader: swizzle on a scalar".into()),
+                    Ty::Float | Ty::Bool => return Err("shader: swizzle on a non-vector".into()),
                 };
                 let comp = match name.as_str() {
                     "x" => 0,
@@ -173,11 +213,88 @@ impl Cx {
                 writeln!(self.body, "{r} = OpCompositeExtract %float {id} {comp}").unwrap();
                 Ok((r, Ty::Float))
             }
-            _ => Err("shader: unsupported expression (literals, vars, vecN, swizzle, +-*/)".into()),
+            // `if cond { … valexpr } else { … valexpr }` as a value: a structured
+            // selection whose branches store into a result variable read after merge.
+            Expr::If { cond, then, elifs, els, .. } => {
+                let els = els.as_ref().ok_or("shader: `if` used as a value needs an `else`")?;
+                self.lower_if_value(cond, then, elifs, els)
+            }
+            _ => Err("shader: unsupported expression (literals, vars, vecN, swizzle, +-*/, if)".into()),
         }
     }
 
+    /// A value-producing `if`/`elif`/`else`: `OpSelectionMerge` + `OpBranchConditional`,
+    /// each branch storing its value into one result variable, loaded after the merge.
+    fn lower_if_value(
+        &mut self,
+        cond: &Expr,
+        then: &Block,
+        elifs: &[(Expr, Block)],
+        els: &Block,
+    ) -> Result<(String, Ty), String> {
+        let (c, ct) = self.expr(cond)?;
+        if ct != Ty::Bool {
+            return Err("shader: an `if` condition must be a comparison (bool)".into());
+        }
+        let then_l = self.id("then");
+        let else_l = self.id("else");
+        let merge_l = self.id("merge");
+        writeln!(self.body, "OpSelectionMerge {merge_l} None").unwrap();
+        writeln!(self.body, "OpBranchConditional {c} {then_l} {else_l}").unwrap();
+        // then branch
+        writeln!(self.body, "{then_l} = OpLabel").unwrap();
+        let (tv, tt) = self.block_value(then)?;
+        let res = self.fresh_var(tt);
+        writeln!(self.body, "OpStore {res} {tv}").unwrap();
+        writeln!(self.body, "OpBranch {merge_l}").unwrap();
+        // else branch: the next `elif` folds in as a nested value-if, else the `else`.
+        writeln!(self.body, "{else_l} = OpLabel").unwrap();
+        let (ev, et) = if let Some(((econd, eblk), rest)) = elifs.split_first() {
+            self.lower_if_value(econd, eblk, rest, els)?
+        } else {
+            self.block_value(els)?
+        };
+        if et != tt {
+            return Err("shader: `if` and `else` must yield the same type".into());
+        }
+        writeln!(self.body, "OpStore {res} {ev}").unwrap();
+        writeln!(self.body, "OpBranch {merge_l}").unwrap();
+        // merge: the value is whichever branch ran.
+        writeln!(self.body, "{merge_l} = OpLabel").unwrap();
+        let out = self.id("t");
+        writeln!(self.body, "{out} = OpLoad {} {res}", tt.spirv()).unwrap();
+        Ok((out, tt))
+    }
+
     fn binary(&mut self, op: BinOp, a: String, ta: Ty, b: String, tb: Ty) -> Result<(String, Ty), String> {
+        // Comparisons (scalar float → bool) feed `if`/`while` conditions.
+        let cmp = match op {
+            BinOp::Lt => Some("OpFOrdLessThan"),
+            BinOp::Le => Some("OpFOrdLessThanEqual"),
+            BinOp::Gt => Some("OpFOrdGreaterThan"),
+            BinOp::Ge => Some("OpFOrdGreaterThanEqual"),
+            BinOp::Eq => Some("OpFOrdEqual"),
+            BinOp::Ne => Some("OpFUnordNotEqual"),
+            _ => None,
+        };
+        if let Some(opc) = cmp {
+            if ta != Ty::Float || tb != Ty::Float {
+                return Err("shader: comparisons need scalar floats".into());
+            }
+            let id = self.id("t");
+            writeln!(self.body, "{id} = {opc} %bool {a} {b}").unwrap();
+            return Ok((id, Ty::Bool));
+        }
+        // Logical `&&`/`||` combine bool conditions.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            if ta != Ty::Bool || tb != Ty::Bool {
+                return Err("shader: `&&`/`||` need boolean operands".into());
+            }
+            let opc = if op == BinOp::And { "OpLogicalAnd" } else { "OpLogicalOr" };
+            let id = self.id("t");
+            writeln!(self.body, "{id} = {opc} %bool {a} {b}").unwrap();
+            return Ok((id, Ty::Bool));
+        }
         // scalar·vector and vector·scalar multiply → OpVectorTimesScalar.
         if op == BinOp::Mul && ta != tb {
             let (vec, vt, scalar) = match (ta, tb) {
@@ -226,21 +343,113 @@ impl Cx {
         Ok(false)
     }
 
-    fn block_output(&mut self, b: &Block) -> Result<(String, Ty), String> {
-        for st in &b.stmts {
-            match st {
-                Stmt::Let { name, value: Some(v), .. } => {
-                    let r = self.expr(v)?;
-                    self.env.insert(name.clone(), r);
+    /// Lower one statement. Returns `Some(value)` if it is a `return expr` (which
+    /// terminates the enclosing block's value), else `None`.
+    fn stmt(&mut self, st: &Stmt) -> Result<Option<(String, Ty)>, String> {
+        match st {
+            Stmt::Let { name, value: Some(v), .. } => {
+                let (id, ty) = self.expr(v)?;
+                self.bind(name, &id, ty);
+                Ok(None)
+            }
+            Stmt::Assign { target, op, value, .. } => {
+                self.assign(target, *op, value)?;
+                Ok(None)
+            }
+            Stmt::While { cond, body, .. } => {
+                self.lower_while(cond, body)?;
+                Ok(None)
+            }
+            Stmt::Return(Some(e), _) => Ok(Some(self.expr(e)?)),
+            Stmt::Expr(e) if self.void_call(e)? => Ok(None),
+            Stmt::Expr(Expr::If { .. }) => {
+                Err("shader: `if` is supported as a value (the block's result), not as a bare statement".into())
+            }
+            _ => Err("shader: only `let`/`mut`, assignment, `while`, `if`-value, `out_color(...)`, and a final value expression are supported".into()),
+        }
+    }
+
+    /// `name [op]= value` → store into the local's variable (load-op-store for `op=`).
+    fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr) -> Result<(), String> {
+        let name = match target {
+            Expr::Ident(n, _) => n.clone(),
+            _ => return Err("shader: can only assign to a variable".into()),
+        };
+        let (ptr, ty) = self
+            .env
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| format!("shader: assignment to unknown variable `{name}`"))?;
+        let (v, vt) = self.expr(value)?;
+        let stored = match op {
+            None => {
+                if vt != ty {
+                    return Err("shader: assignment type mismatch".into());
                 }
-                Stmt::Expr(e) if self.void_call(e)? => {}
-                Stmt::Return(Some(e), _) => return self.expr(e),
-                _ => return Err("shader: only `let`/`mut` bindings, `out_color(...)`, and a final color expression are supported".into()),
+                v
+            }
+            Some(binop) => {
+                let cur = self.id("t");
+                writeln!(self.body, "{cur} = OpLoad {} {ptr}", ty.spirv()).unwrap();
+                let (r, rt) = self.binary(binop, cur, ty, v, vt)?;
+                if rt != ty {
+                    return Err("shader: compound-assignment type mismatch".into());
+                }
+                r
+            }
+        };
+        writeln!(self.body, "OpStore {ptr} {stored}").unwrap();
+        Ok(())
+    }
+
+    /// `while cond { body }` → a structured loop (`OpLoopMerge`), body run for effects.
+    fn lower_while(&mut self, cond: &Expr, body: &Block) -> Result<(), String> {
+        let head = self.id("head");
+        let check = self.id("check");
+        let body_l = self.id("loopbody");
+        let cont = self.id("cont");
+        let merge = self.id("loopmerge");
+        writeln!(self.body, "OpBranch {head}").unwrap();
+        writeln!(self.body, "{head} = OpLabel").unwrap();
+        writeln!(self.body, "OpLoopMerge {merge} {cont} None").unwrap();
+        writeln!(self.body, "OpBranch {check}").unwrap();
+        writeln!(self.body, "{check} = OpLabel").unwrap();
+        let (c, ct) = self.expr(cond)?;
+        if ct != Ty::Bool {
+            return Err("shader: a `while` condition must be a comparison (bool)".into());
+        }
+        writeln!(self.body, "OpBranchConditional {c} {body_l} {merge}").unwrap();
+        writeln!(self.body, "{body_l} = OpLabel").unwrap();
+        self.block_effects(body)?;
+        writeln!(self.body, "OpBranch {cont}").unwrap();
+        writeln!(self.body, "{cont} = OpLabel").unwrap();
+        writeln!(self.body, "OpBranch {head}").unwrap();
+        writeln!(self.body, "{merge} = OpLabel").unwrap();
+        Ok(())
+    }
+
+    /// Lower a block's statements for their effects, ignoring any tail value (used for
+    /// loop bodies).
+    fn block_effects(&mut self, b: &Block) -> Result<(), String> {
+        for st in &b.stmts {
+            self.stmt(st)?;
+        }
+        if let Some(t) = &b.tail {
+            self.expr(t)?;
+        }
+        Ok(())
+    }
+
+    /// Lower a block and return its value — the tail expression (or an early `return`).
+    fn block_value(&mut self, b: &Block) -> Result<(String, Ty), String> {
+        for st in &b.stmts {
+            if let Some(v) = self.stmt(st)? {
+                return Ok(v);
             }
         }
         match &b.tail {
             Some(t) => self.expr(t),
-            None => Err("shader: the fragment must end in a color expression (a Vec4)".into()),
+            None => Err("shader: this block must end in a value expression".into()),
         }
     }
 }
@@ -259,6 +468,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         .ok_or("shader: `@vertex fn` needs a Vec2 position parameter")?;
     let mut cx = Cx {
         consts: String::new(),
+        vars: String::new(),
         body: String::new(),
         const_cache: HashMap::new(),
         env: HashMap::new(),
@@ -268,8 +478,10 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         uses_attr_color: false,
         n: 0,
     };
-    cx.env.insert(param, ("%pos".to_string(), Ty::Vec(2)));
-    let (out, ty) = cx.block_output(body)?;
+    // The position attribute is loaded into `%pos` by the preamble; bind the param to
+    // a Function-storage variable so the body can read (and even reassign) it.
+    cx.bind(&param, "%pos", Ty::Vec(2));
+    let (out, ty) = cx.block_value(body)?;
     if ty != Ty::Vec(4) {
         return Err("shader: the vertex output must be a Vec4 (gl_Position)".into());
     }
@@ -318,9 +530,15 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         %int = OpTypeInt 32 1
       %int_0 = OpConstant %int 0
      %ov4ptr = OpTypePointer Output %v4float
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
 {vary_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-        %pos = OpLoad %v2float %pos_in
+{vars}        %pos = OpLoad %v2float %pos_in
 {body}         %gp = OpAccessChain %ov4ptr %out %int_0
                OpStore %gp {out}
                OpReturn
@@ -330,6 +548,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         vary_dec = vary_dec,
         vary_decl = vary_decl,
         consts = cx.consts,
+        vars = cx.vars,
         body = cx.body,
         out = out
     ))
@@ -340,6 +559,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     let body = f.body.as_ref().ok_or("shader: `@fragment` fn has no body")?;
     let mut cx = Cx {
         consts: String::new(),
+        vars: String::new(),
         body: String::new(),
         const_cache: HashMap::new(),
         env: HashMap::new(),
@@ -349,7 +569,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         uses_attr_color: false,
         n: 0,
     };
-    let (out, ty) = cx.block_output(body)?;
+    let (out, ty) = cx.block_value(body)?;
     if ty != Ty::Vec(4) {
         return Err("shader: the fragment output must be a Vec4".into());
     }
@@ -393,9 +613,15 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     %v4float = OpTypeVector %float 4
        %optr = OpTypePointer Output %v4float
       %color = OpVariable %optr Output
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
 {fc_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-{body}               OpStore %color {out}
+{vars}{body}               OpStore %color {out}
                OpReturn
                OpFunctionEnd
 ",
@@ -403,6 +629,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         fc_decorate = fc_decorate,
         fc_decl = fc_decl,
         consts = cx.consts,
+        vars = cx.vars,
         body = cx.body,
         out = out
     ))

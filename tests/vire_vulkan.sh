@@ -197,6 +197,51 @@ fn main() {
 }
 EOF
 
+# Structured control flow — BRANCH: the fragment picks its color with an `if` on the
+# pixel position (OpSelectionMerge). The centroid (x=128) is >= 100, so it takes the
+# else branch → blue. A per-pixel decision, not a constant.
+case_ vire_shader_branch <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    if frag_x() < 100.0 { vec4(0.9, 0.1, 0.1, 1.0) } else { vec4(0.1, 0.1, 0.9, 1.0) }
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r < 60 { if g < 60 { if b > 200 { ok = 1 } } }   // else branch → blue
+    print(ok)
+}
+EOF
+
+# Structured control flow — LOOP: a `while` accumulates 0.1 five times (OpLoopMerge)
+# into the red channel → 0.5 → ~128. Proves real iteration with a mutable local
+# carried across the loop back-edge (the storage-variable model).
+case_ vire_shader_loop <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut acc = 0.0
+    mut i = 0.0
+    while i < 5.0 {
+        acc = acc + 0.1
+        i = i + 1.0
+    }
+    vec4(acc, 0.2, 0.7, 1.0)
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 118 { if r < 138 { if g > 40 { if g < 64 { if b > 165 { if b < 190 {
+        ok = 1 } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

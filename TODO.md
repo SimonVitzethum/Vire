@@ -395,10 +395,17 @@ Staged (each stage runnable):
   it as a varying — the classic RGB-corner triangle, where the centroid samples all
   three channels blended (`tests/vire_vulkan.sh vire_mesh_attr_color`;
   `examples/vire/vulkan_rgb.vr`). Geometry AND per-vertex data now both flow from
-  Vire — this is the typed stage I/O VM builds on. *Remaining:* (a) real
-  `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local); (b)
-  **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
-  builtins (normalize/dot/mix…); (c) index buffers + more attribute types (normal/uv).
+  Vire — this is the typed stage I/O VM builds on. *Structured control flow DONE:*
+  shader locals are now `Function`-storage variables (OpVariable + load/store, so
+  mutation carries across control-flow edges), and the emitter supports `if`/`else`
+  as a value (`OpSelectionMerge`), `while` loops (`OpLoopMerge`), comparisons
+  (`OpFOrdLessThan`…→ bool), `&&`/`||`, and `+=`/assignment. Verified: a per-pixel
+  `if frag_x() < 100` picks the color (centroid → blue), and a `while` accumulates
+  0.1×5 into red (→128) (`tests/vire_vulkan.sh vire_shader_branch`/`vire_shader_loop`;
+  `examples/vire/vulkan_control.vr`). *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the
+  host type system (today vectors are shader-local); (b) `GLSL.std.450` builtins
+  (normalize/dot/mix/sqrt…) + `if`-as-statement with effect-only branches; (c) index
+  buffers + more attribute types (normal/uv).
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

@@ -1,0 +1,32 @@
+// Vire @vulkan — structured control flow in a Vire shader: a branch and a loop,
+// both compiled to real SPIR-V (OpSelectionMerge / OpLoopMerge).
+//
+//   vire run examples/vire/vulkan_control.vr
+//
+// The fragment decides its color PER PIXEL. A `while` loop sums a small step to build
+// an intensity; an `if` on the pixel's horizontal position splits the triangle into a
+// warm left half and a cool right half. Comparisons (`<`), mutable locals carried
+// across the loop back-edge, and `if`/`else` as a value all lower to structured
+// SPIR-V. Vendor-neutral (any Vulkan GPU). See language/GPU-VULKAN.md.
+
+@fragment
+fn fs() -> Vec4 {
+    // Loop: accumulate an intensity (0.1 added 6 times → 0.6).
+    mut glow = 0.0
+    mut i = 0.0
+    while i < 6.0 {
+        glow = glow + 0.1
+        i = i + 1.0
+    }
+    // Branch: left half warm, right half cool — a per-pixel decision.
+    if frag_x() < 400.0 {
+        vec4(glow, 0.3, 0.1, 1.0)      // warm
+    } else {
+        vec4(0.1, 0.3, glow, 1.0)      // cool
+    }
+}
+
+fn main() {
+    mut ok = vk_window(0)
+    print(ok)
+}
