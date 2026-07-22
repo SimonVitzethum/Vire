@@ -212,10 +212,72 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ---
 
-## GPU kernels (`@gpu`) — follow-ups
+## GPU `@gpu` — reach and beat cuda-oxide
 
-*(The headline GPU perf items are promoted to the Performance Push, Tier 4 above.)*
-Remaining non-perf follow-ups tracked there too.
+*(Near-term GPU perf items live in the Performance Push, Tier 4 above. This is the
+full roadmap to match cuda-oxide's feature scope + performance and then exceed it.)*
+
+**Framing (see [benchmarks/gpu/VS-CUDA-OXIDE.md](benchmarks/gpu/VS-CUDA-OXIDE.md)):**
+both lower to PTX through the *same* LLVM NVPTX backend, so raw codegen is already
+at parity for simple kernels (after the `opt -O3` mid-end that just landed). The
+gap is four things: **(1)** device-programming *primitives* Vire can't express,
+**(2)** the *high-perf kernel classes* (tensor cores, TMA) that need those
+primitives, **(3)** perf *infrastructure* (async/streams/persistent buffers/
+autotuning), and **(4)** Vire-only *beat levers* (memory safety, whole-program
+specialization, single-source oracle). Honest scope: full tensor-core/TMA parity
+is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
+
+### Stage G1 — device-programming primitives (reach parity on the common 80%)
+- [ ] **Shared memory** (`@shared` arrays) + **`__syncthreads`** block barrier.
+- [ ] **Warp intrinsics**: shuffle (`shfl.sync`), vote/ballot, warp-level
+  reduce/scan (the building block for fast reductions).
+- [ ] **Device atomics** (atomicAdd/CAS on global + shared).
+- [ ] **Device math intrinsics** (sqrt/sin/cos/exp/log/… via `@llvm.nvvm.*` /
+  libdevice) — today only integer/`+-*` and plain float ops emit.
+- [ ] **Tunable launch config**: explicit block size, 2-D/3-D grids, dynamic
+  shared-memory size (replaces the fixed `block=256, grid=ceil(N/256)`).
+- [ ] **Device `printf`** (debugging).
+- [ ] **Device-side helper fns** with inlining (ensure non-kernel device fns emit;
+  `opt` inlines them).
+
+### Stage G2 — perf infrastructure (close the transfer/launch overhead)
+- [ ] **Write-only H2D elision** — skip the *upload* for output-only buffers
+  (complements the read-only D2H skip just shipped).
+- [ ] **Persistent device buffers** across launches (no malloc/free per call).
+- [ ] **Async launches + CUDA streams**; overlap H2D / compute / D2H.
+- [ ] **Pinned (page-locked) host memory** for faster transfers.
+- [ ] **Per-arch codegen** (`-mcpu=sm_90`/`sm_100`) + **cubin caching**, not only
+  forward-JIT PTX (saves the ~0.2 s JIT on every run).
+- [ ] **Occupancy-aware launch autotuning** (`cuOccupancyMaxPotentialBlockSize`).
+
+### Stage G3 — high-performance kernel classes (where cuda-oxide gets 10×+)
+- [ ] **`cp.async` / TMA** async global→shared copies (Hopper/Blackwell).
+- [ ] **Tensor-core MMA**: `mma.sync` / `wgmma` / `tcgen05` intrinsics.
+- [ ] **Cooperative groups / thread-block clusters**.
+- [ ] **Tiled-GEMM building block** in-language (comptime-generated) as the
+  reference win. *Scope: NVIDIA-research-grade; do G1/G2 first.*
+
+### Stage G4 — the BEAT levers (Vire-only — exceed, don't just match)
+- [ ] **Memory-safe device mode.** cuda-oxide device access is unchecked
+  (CUDA-like). Vire's solver can prove many device indices in-range (reuse
+  `bounds.rs` relational elision) and bounds-check the rest → an *optional safe GPU
+  mode* (off by default for parity, on for safety). No CUDA/C++/cuda-oxide analogue.
+- [ ] **Whole-program kernel specialization.** const-prop launch bounds +
+  monomorphize kernels per call-site (value generics exist) → constant loop trips,
+  `__launch_bounds__`, device dead-arg elimination. A single-source whole-program
+  compiler can specialize kernels a library-based flow cannot.
+- [ ] **Single-source CPU+GPU + bit-exact oracle (already unique).** Extend:
+  automatic CPU fallback when no GPU present; **differential CPU-vs-GPU fuzzing** of
+  kernels (reuse `fuzz_gen.py`); float kernels with an fp-contract-matched oracle.
+- [ ] **comptime kernel generation.** Generate specialized kernels (tile sizes,
+  unroll factors) at compile time from the comptime layer — autotuning with no
+  runtime JIT.
+
+### Fair measurement (fill the Rust-GPU column)
+- [ ] Build the cuda-oxide toolchain (pinned nightly) once; run **identical**
+  kernels; compare **kernel-compute time only** (warm context, exclude H2D/D2H).
+  Start with saxpy + a shared-mem reduction + a tiled GEMM. Per
+  [benchmarks/gpu/VS-CUDA-OXIDE.md](benchmarks/gpu/VS-CUDA-OXIDE.md).
 
 ---
 
