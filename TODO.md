@@ -67,6 +67,16 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   - Extends a proven mechanism: thread-local `arena_top`, `while_arena_safe`
     interprocedural escape check, `tests/vire_interproc_arena.sh`, 0-live oracle all
     already exist — this generalizes the trigger from explicit `capsule` to inferred.
+  - **Attempted (function-scoped auto-arena) and REVERTED — finding:** wrapping a
+    void/scalar, ref-param-free, single-exit function that passes `region_bad` gave
+    (a) nothing on the target case — `region_bad`'s recursion guard conservatively
+    rejects *recursive* builders (`build(d-1)`), exactly the tree/AST pattern — and
+    (b) only redundant wraps on non-recursive allocation the escape analysis already
+    stack-promotes (`StackNew`). It also changed `vire_interproc_arena`'s
+    push-count invariant. So the real work is **extending `region_bad` to admit
+    recursive allocators soundly** (prove a self-recursive function's returned
+    subgraph doesn't escape the caller's arena extent) — soundness-critical, do with
+    the 0-live oracle + `listdrop`-style leak tests as the gate. Not a quick win.
   - **Arena fixed costs — chunk recycling DONE** (`jrt_arena_pop`/`arena_alloc`):
     standard 64 KiB chunks are recycled through a capped per-thread free-list instead
     of `free()`d at each pop — removes the O(chunks) free burst (a latency spike) and

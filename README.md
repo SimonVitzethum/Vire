@@ -158,6 +158,56 @@ This links a Vire object with a C object (`-lm` because the runtime uses libm). 
 `import('vire')` module (`vire.executable()` / `vire.static_library()`) and a tested,
 runnable example are in [build-integration/meson/](build-integration/meson/).
 
+## Memory management: how little the runtime does
+
+There is no tracing GC. Memory is reference-counted, and the whole-program solver
+eliminates as much of the runtime bookkeeping as it can **prove** away statically, so
+what's left for the runtime to "handle" (allocate + RC retain/release + cycle
+collection) is small — and, since the runtime work this project added, **spike-free**.
+
+**What the solver removes statically** (verified against the code):
+- **Compute-bound code → 0% runtime handling.** No heap allocation at all
+  (`FASTLLVM_HEAPSTATS` shows no `[heap]` line).
+- **Traversal / read-only paths → RC already fully elided.** Borrow-slot analysis
+  (a field read from a stable base whose field the function *and its transitive
+  callees* never write is a borrow, not an owned ref), interprocedural
+  field-write analysis, and move-on-last-use together reduce RC on read/traverse code
+  to the `--no-rc` ceiling (`normal == --no-rc`).
+- **Provably-local allocations → stack / region / arena, immortal.** Escape analysis
+  promotes non-escaping objects to `alloca` (`StackNew`) and arrays to a bump region;
+  a `while`-loop body whose allocations provably can't leave the iteration
+  (interprocedural check) is bracketed in a per-iteration arena. All of these are
+  **immortal** — no per-object RC, no collector, freed en bloc — and are **not**
+  counted as runtime-handled at all.
+
+**What still reaches the runtime** — measured, honest: allocation-heavy **object
+graphs** (trees, lists, ASTs) whose nodes escape into the structure. Example:
+`build(18)` for a binary tree = ~524k heap nodes, all RC-managed (and, being a
+self-referential type, kept under the cycle collector). This is the residual.
+
+**Pushing the residual under ~0.5% — the lever and the honest ceiling.** The obvious
+lever is *auto-inferred arena inference*: where the solver can prove a whole subgraph
+is built, used, and dies within one scope (`t = build(); use(t); drop`), route its
+allocations into an arena (immortal, bulk-freed, zero RC/collector). The mechanism
+already exists (the `capsule`/loop arena). An attempt to auto-fire it at function
+scope was **reverted**: (a) the interprocedural escape check conservatively rejects
+*recursive* builders — exactly the tree/AST case we'd want — so extending it safely is
+non-trivial soundness-critical work (a wrong escape verdict is a use-after-free), and
+(b) the simple non-recursive cases the escape analysis *already* stack-promotes. So it
+stays a carefully-scoped future item ([TODO.md](TODO.md), Tier 1). And there is a hard
+floor: **topology-mutating / genuinely dynamic-lifetime graphs** (general mutable
+graphs, unpredictable-lifetime caches) cannot be proven away by any static analysis —
+they structurally need dynamic RC + the collector. For the common structured-lifetime
+workloads (compilers/ASTs, request handlers, batch processing) sub-0.5% is reachable;
+in full generality it is not.
+
+**No latency spikes.** The three synchronous runtime operations were made incremental/
+budgeted (see [DONE.md](DONE.md)): the cycle collector runs in bounded steps
+(continuous, buffer-bounded RAM), the release **free-cascade** of a large dead
+subgraph is spread across operations, and a large collected garbage cycle's free is
+deferred — all verified 0-live (Java oracle 67/67, a `listdrop` leak-catcher, a 2M-node
+ring, flat RSS across 8–16× allocation churn).
+
 ## Documents
 
 - **[TODO.md](TODO.md)** — roadmap and remaining work (M0 risk gate, front-end
