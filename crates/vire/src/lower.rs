@@ -2890,7 +2890,8 @@ impl<'a> FnLower<'a> {
         // vk_mesh_built(count, nx, ny, nz, d): the fully GPU-built renderer — a @compute
         // builder fills the scene SSBO with `count` meshlets on the GPU, then the mesh
         // pipeline culls + draws them (no host scene data).
-        if name == "vk_mesh_built" && !args.is_empty() {
+        if (name == "vk_mesh_built" || name == "vk_built_color") && !args.is_empty() {
+            let sym = if name == "vk_built_color" { "jrt_vk_built_color" } else { "jrt_vk_mesh_built" };
             let count = self.lower_expr(&args[0]).0;
             let mut call_args = vec![count];
             let defaults = [0.0, 0.0, 0.0, 1.0];
@@ -2899,7 +2900,7 @@ impl<'a> FnLower<'a> {
                 call_args.push(op);
             }
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh_built".into(), args: call_args });
+            self.emit(Statement::Call { dest: Some(d), func: sym.into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
         if name == "vk_mesh_scene_cull" && !args.is_empty() {

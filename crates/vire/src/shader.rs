@@ -74,8 +74,9 @@ fn resource_decls(ssbo: bool, wgid: bool, global_id: bool, payload: bool, push: 
     if ssbo {
         iface.push_str(" %scene");
         let ro = if writable { "" } else { "               OpMemberDecorate %Scene 0 NonWritable\n               OpDecorate %scene NonWritable\n" };
-        decor.push_str(&format!("               OpDecorate %_rt_Meshlet ArrayStride 16\n               OpMemberDecorate %Meshlet 0 Offset 0\n               OpMemberDecorate %Meshlet 1 Offset 8\n               OpDecorate %Scene Block\n{ro}               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n"));
-        decl.push_str("    %Meshlet = OpTypeStruct %v2float %v2float\n%_rt_Meshlet = OpTypeRuntimeArray %Meshlet\n      %Scene = OpTypeStruct %_rt_Meshlet\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n");
+        // Meshlet { offset: vec2 @0, cone: vec2 @8, color: vec4 @16 } — std430 stride 32.
+        decor.push_str(&format!("               OpDecorate %_rt_Meshlet ArrayStride 32\n               OpMemberDecorate %Meshlet 0 Offset 0\n               OpMemberDecorate %Meshlet 1 Offset 8\n               OpMemberDecorate %Meshlet 2 Offset 16\n               OpDecorate %Scene Block\n{ro}               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n"));
+        decl.push_str("    %Meshlet = OpTypeStruct %v2float %v2float %v4float\n%_rt_Meshlet = OpTypeRuntimeArray %Meshlet\n      %Scene = OpTypeStruct %_rt_Meshlet\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n%_ptr_ssbo_v4float = OpTypePointer StorageBuffer %v4float\n");
     }
     if payload {
         iface.push_str(" %pl");
@@ -311,6 +312,27 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
+                }
+                // The meshlet's per-record colour (record.color, member 2) for the mesh
+                // workgroup THIS invocation belongs to (scene[payload.idx]) — returns a
+                // vec3 (the .rgb), typically forwarded with `mesh_color(i, meshlet_rgb())`.
+                if name == "meshlet_rgb" {
+                    if !args.is_empty() {
+                        return Err("shader: meshlet_rgb() takes no arguments".into());
+                    }
+                    self.uses_ssbo = true;
+                    self.uses_payload = true;
+                    let ip = self.id("t");
+                    writeln!(self.body, "{ip} = OpAccessChain %_ptr_pl_uint %pl %i_0").unwrap();
+                    let idx = self.id("t");
+                    writeln!(self.body, "{idx} = OpLoad %uint {ip}").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v4float %scene %i_0 {idx} %i_2").unwrap();
+                    let c4 = self.id("t");
+                    writeln!(self.body, "{c4} = OpLoad %v4float {p}").unwrap();
+                    let c3 = self.id("t");
+                    writeln!(self.body, "{c3} = OpVectorShuffle %v3float {c4} {c4} 0 1 2").unwrap();
+                    return Ok((c3, Ty::Vec(3)));
                 }
                 // Push constant, read as a vec4: `cull_plane()` is the @task frustum
                 // plane; `uniform()` is the same 16-byte push constant the host supplies
@@ -982,6 +1004,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     uints.insert(1); // %u_1 sizes the built-in ClipDistance/CullDistance arrays
     ints.insert(0);  // %i_0 selects gl_Position / scene record member 0
     ints.insert(1);  // %i_1 selects the scene record's second field (cone)
+    ints.insert(2);  // %i_2 selects the scene record's third field (color)
 
     // A trailing call with no `;` parses as the block tail — treat it as a statement.
     let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
@@ -1282,7 +1305,27 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
                     writeln!(cx.body, "OpStore {cp} {cval}").unwrap();
                 }
             }
-            _ => return Err("shader: `@compute` (builder) supports `let` and set_meshlet(Vec2)".into()),
+            // set_meshlet_color(vec3): write this meshlet's colour (record member 2).
+            Stmt::Expr(Expr::Call { callee, args, .. })
+                if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "set_meshlet_color") =>
+            {
+                if args.len() != 1 { return Err("shader: set_meshlet_color(Vec3)".into()); }
+                let (c, cty) = cx.expr(&args[0])?;
+                if cty != Ty::Vec(3) { return Err("shader: set_meshlet_color expects a Vec3".into()); }
+                cx.uses_ssbo = true;
+                cx.uses_global_id = true;
+                let one = cx.constant(1.0);
+                let c4 = cx.id("t");
+                writeln!(cx.body, "{c4} = OpCompositeConstruct %v4float {c} {one}").unwrap();
+                let g = cx.id("t");
+                writeln!(cx.body, "{g} = OpLoad %v3uint %gl_GlobalInvocationID").unwrap();
+                let gx = cx.id("t");
+                writeln!(cx.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
+                let p = cx.id("t");
+                writeln!(cx.body, "{p} = OpAccessChain %_ptr_ssbo_v4float %scene %i_0 {gx} %i_2").unwrap();
+                writeln!(cx.body, "OpStore {p} {c4}").unwrap();
+            }
+            _ => return Err("shader: `@compute` (builder) supports `let`, set_meshlet(...) and set_meshlet_color(Vec3)".into()),
         }
     }
     // The scene SSBO is WRITABLE here (the mesh/task stages read the same buffer
@@ -1312,6 +1355,7 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
     %pf_bool = OpTypePointer Function %bool
         %i_0 = OpConstant %int 0
         %i_1 = OpConstant %int 1
+        %i_2 = OpConstant %int 2
 {decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {vars}{body}               OpReturn

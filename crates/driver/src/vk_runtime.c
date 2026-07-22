@@ -431,7 +431,7 @@ int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render
 /* Render a scene of meshlets. If `builder` is set, a @compute shader fills the scene
  * SSBO on the GPU first (bcount meshlets, `offs` ignored); otherwise the host offsets
  * are uploaded. `plane` is the frustum plane for the @task cull (permissive if none). */
-static int64_t scene_render(const double *offs, int64_t nfloats, const float plane[4], int builder, uint32_t bcount) {
+static int64_t scene_render(const double *offs, int64_t nfloats, const float plane[4], int builder, uint32_t bcount, int readmode) {
     enum { W=256, H=256 };
     if(!builder && (!offs || nfloats < 2 || (nfloats & 1))) return -1;
     uint32_t nmesh = builder ? bcount : (uint32_t)(nfloats/2);
@@ -459,10 +459,11 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect=(PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksIndirectEXT");
     if(!draw_indirect){ vkDestroyDevice(dev,0); vkDestroyInstance(inst,0); return -2; }
 
-    /* Scene SSBO: N typed Meshlet records (std430: vec2 offset @0, vec2 cone @8 —
-     * 16 bytes each), host-visible. The compute builder fills it on the GPU (left
-     * uninitialized here); otherwise upload the host offsets (cone left zero). */
-    VkDeviceSize ssz=(VkDeviceSize)nmesh*4*sizeof(float); if(ssz==0) ssz=16;
+    /* Scene SSBO: N typed Meshlet records (std430: vec2 offset @0, vec2 cone @8,
+     * vec4 color @16 — 32 bytes / 8 floats each), host-visible. The compute builder
+     * fills it on the GPU (left uninitialized here); otherwise upload the host offsets
+     * (cone + color left zero). */
+    VkDeviceSize ssz=(VkDeviceSize)nmesh*8*sizeof(float); if(ssz==0) ssz=32;
     VkBufferCreateInfo sbi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=ssz,.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
     VkBuffer ssbo; CK(vkCreateBuffer(dev,&sbi,0,&ssbo));
     VkMemoryRequirements smr; vkGetBufferMemoryRequirements(dev,ssbo,&smr);
@@ -470,9 +471,9 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     VkMemoryAllocateInfo sma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=smr.size,.memoryTypeIndex=smt};
     VkDeviceMemory smem; CK(vkAllocateMemory(dev,&sma,0,&smem)); vkBindBufferMemory(dev,ssbo,smem,0);
     if(!builder){
-        float *rec=calloc((size_t)nmesh*4,sizeof(float)); if(!rec) return -1;
-        for(uint32_t i=0;i<nmesh;i++){ rec[i*4+0]=(float)offs[i*2+0]; rec[i*4+1]=(float)offs[i*2+1]; } /* cone stays 0 */
-        void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,rec,(size_t)nmesh*4*sizeof(float)); vkUnmapMemory(dev,smem); free(rec);
+        float *rec=calloc((size_t)nmesh*8,sizeof(float)); if(!rec) return -1;
+        for(uint32_t i=0;i<nmesh;i++){ rec[i*8+0]=(float)offs[i*2+0]; rec[i*8+1]=(float)offs[i*2+1]; } /* cone + color stay 0 */
+        void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,rec,(size_t)nmesh*8*sizeof(float)); vkUnmapMemory(dev,smem); free(rec);
     }
 
     /* Descriptor set layout (binding 0 = SSBO). The task stage reads the scene when it
@@ -570,6 +571,8 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     int64_t mask=0;
     if(L[0]>40 || L[1]>40 || L[2]>40) mask|=1;       /* left quarter drawn */
     if(R[0]>40 || R[1]>40 || R[2]>40) mask|=2;       /* right quarter drawn */
+    /* readmode 1: the left-quarter pixel packed 0xRRGGBB (to verify per-meshlet colour). */
+    int64_t lcolor = ((int64_t)L[0]<<16)|((int64_t)L[1]<<8)|(int64_t)L[2];
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyBuffer(dev,ibuf,0); vkFreeMemory(dev,imem,0);
@@ -579,13 +582,13 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
-    return mask;
+    return readmode==1 ? lcolor : mask;
 }
 
 /* vk_mesh_scene(offsets): many meshlets, no culling — a permissive plane. */
 int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
     float permissive[4]={0.0f,0.0f,0.0f,1.0f};
-    return scene_render(offs,nfloats,permissive,0,0);
+    return scene_render(offs,nfloats,permissive,0,0,0);
 }
 
 /* vk_mesh_scene_cull(offsets, nx,ny,nz,d): the fused GPU-driven cull renderer. The
@@ -593,7 +596,7 @@ int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
  * the survivors (payload carries the index); the @mesh draws them. */
 int64_t jrt_vk_mesh_scene_cull(const double *offs, int64_t nfloats, double nx, double ny, double nz, double dd) {
     float plane[4]={(float)nx,(float)ny,(float)nz,(float)dd};
-    return scene_render(offs,nfloats,plane,0,0);
+    return scene_render(offs,nfloats,plane,0,0,0);
 }
 
 /* vk_mesh_built(count, nx,ny,nz,d): the whole renderer is GPU-built. A @compute
@@ -603,7 +606,16 @@ int64_t jrt_vk_mesh_scene_cull(const double *offs, int64_t nfloats, double nx, d
 int64_t jrt_vk_mesh_built(int64_t count, double nx, double ny, double nz, double dd) {
     if(count <= 0) return -1;
     float plane[4]={(float)nx,(float)ny,(float)nz,(float)dd};
-    return scene_render(0,0,plane,1,(uint32_t)count);
+    return scene_render(0,0,plane,1,(uint32_t)count,0);
+}
+
+/* vk_built_color(count, nx,ny,nz,d): like vk_mesh_built, but returns the LEFT-quarter
+ * pixel colour packed 0xRRGGBB — for verifying per-meshlet colour (set_meshlet_color →
+ * meshlet_rgb → fragment). */
+int64_t jrt_vk_built_color(int64_t count, double nx, double ny, double nz, double dd) {
+    if(count <= 0) return -1;
+    float plane[4]={(float)nx,(float)ny,(float)nz,(float)dd};
+    return scene_render(0,0,plane,1,(uint32_t)count,1);
 }
 
 /* vk_mesh_shader(): the GPU-driven path (VM milestone). A mesh shader emits the

@@ -452,7 +452,7 @@ impl<'a> Ctx<'a> {
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window" | "vk_bench"
                         | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader"
                         | "vk_mesh_scene" | "vk_mesh_scene_cull"
-                        | "vk_mesh_built" | "gpuvk_run" => return T::I64,
+                        | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {

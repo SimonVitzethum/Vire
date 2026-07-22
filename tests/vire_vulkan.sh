@@ -651,6 +651,50 @@ fn main() {
 }
 EOF
 
+# Wider scene records: the Meshlet struct now carries a per-record colour
+# (offset:vec2, cone:vec2, color:vec4). The @compute builder writes it with
+# set_meshlet_color; the @mesh reads it with meshlet_rgb and forwards it per vertex
+# (mesh_color); the fragment paints it. A GPU-built red meshlet (0.9,0.1,0.15) at the
+# left → left pixel ~ (229,25,38). vk_built_color returns that pixel. -2 → skip.
+case_ vire_meshlet_color <<'EOF'
+@compute
+fn build() {
+    set_meshlet(vec2(0.0 - 0.5, 0.0), vec2(1.0, 0.0))
+    set_meshlet_color(vec3(0.9, 0.1, 0.15))
+}
+@task
+fn ts() {
+    mut cone = meshlet_cone()
+    emit_visible(cone.x > 0.0)
+}
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mut c = meshlet_rgb()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_color(0, c)
+    mesh_color(1, c)
+    mesh_color(2, c)
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut px = vk_built_color(1, 0.0, 0.0, 0.0, 1.0)
+    mut ok = 0
+    if px == -2 { ok = 1 }
+    if px > 0 {
+        mut r = px / 65536
+        mut g = (px / 256) % 256
+        if r > 200 { if g < 60 { ok = 1 } }
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
