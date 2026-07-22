@@ -121,14 +121,20 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   insurance, not perf, but belongs with the perf work.)
 - [ ] **Analysis caching / incremental compile** — compile time measured super-linear
   ~O(n^1.4); orthogonal to runtime perf but the main compile-*speed* lever left.
-- [~] **Runtime GC latency — incremental collector DONE** (`jrt_collect_step`): the
-  synchronous Bacon–Rajan pass is now bounded incremental stepping (continuous, low
-  steady RAM, no accumulate-then-big-pass spike; 66/66 + flat RSS — see
-  [DONE.md](DONE.md)). *Remaining residuals* (both need a resumable traversal +
-  write barrier, so bigger + correctness-critical): (a) one *giant connected* garbage
-  component is still one pass; (b) the release **free-cascade** on a large dead
-  subgraph is still one synchronous burst (`jrt_release` drop loop) — could be
-  budgeted/deferred. Also open: chunk-recycle bound tuning, larger arena chunks.
+- [ ] **Runtime GC latency — incremental collector (REOPENED, unsound attempt
+  reverted).** The synchronous Bacon–Rajan pass runs one big stop-the-world scan at
+  the adaptive threshold — a latency spike ∝ accumulated garbage. A naive
+  **tail-batched** incremental version (`jrt_collect_step`: process the last N
+  candidate roots + their component, compact the buffer) was tried but **leaks**
+  (`tests/run.sh listdrop`: a prepend-built list that buffers each displaced node,
+  then dropped, left ~610 live — head-of-buffer live roots never reclaimed), so it
+  was reverted. A correct incremental Bacon–Rajan needs a **resumable traversal +
+  write barrier** (mutation during a spread-out collection must be intercepted) or a
+  fundamentally different buffer-processing invariant — bigger + correctness-critical.
+  Related: the release **free-cascade** on a large dead subgraph is still one burst
+  (`jrt_release` drop loop) — a budgeted/deferred-free (LIFO queue, drain a bounded
+  amount per op + pump on alloc) is more tractable and can be attempted independently.
+  Also open: chunk-recycle bound tuning, larger arena chunks.
 
 ---
 

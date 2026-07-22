@@ -1169,15 +1169,9 @@ static void drop_enq(JObjHeader *h) {
 /* Candidate roots for the cycle search (purple objects). */
 static JObjHeader **roots = NULL;
 static size_t roots_len = 0, roots_cap = 0;
-/* Incremental collection: each step drains a small tail batch (+ its connected
- * garbage component) so the buffer stays small — continuous collection, bounded
- * per-step pause (no accumulate-then-big-pass spike), low steady RAM. When the
- * buffer exceeds the soft cap a single step runs, keeping it near the cap. */
-#define COLLECT_BATCH 256
-#define ROOTS_SOFT_CAP 1024
+#define ROOTS_THRESHOLD 10000
 
-static void jrt_collect_step(void);  /* one bounded incremental step */
-static void jrt_collect_cycles(void); /* full drain (shutdown): steps until empty */
+static void jrt_collect_cycles(void);
 
 static void roots_push(JObjHeader *h) {
     if (roots_len == roots_cap) {
@@ -1193,12 +1187,14 @@ static void possible_root(JObjHeader *h) {
         if (!BUFFERED(h)) {
             SET_BUFFERED(h, 1);
             roots_push(h);
-            /* Incremental: drain one bounded batch when the buffer exceeds the soft
-             * cap, keeping it small. No O(n²) re-scan of the live set — each batch
-             * touches only its own roots' closures (each candidate processed once),
-             * so total work equals one big pass, just sliced. The shutdown drain
-             * catches the rest (0 live). */
-            if (roots_len >= ROOTS_SOFT_CAP) jrt_collect_step();
+            /* Adaptive threshold: a cycle search scans the candidates together with
+             * their transitive closure — with a fixed threshold it runs O(n) times
+             * on large live sets → O(n²) (M0). Letting the threshold scale with the
+             * live set bounds the frequency → amortized linear.
+             * Correctness unaffected: the shutdown collect catches everything (0 live). */
+            size_t thresh = (size_t)(live_objects > 0 ? live_objects * 2 : 0);
+            if (thresh < ROOTS_THRESHOLD) thresh = ROOTS_THRESHOLD;
+            if (roots_len >= thresh) jrt_collect_cycles();
         }
     }
 }
@@ -1864,10 +1860,7 @@ static void collect_white(JObjHeader *root) {
     wl_push(&cwork, &cwl, &cwc, root);
     while (cwl) {
         JObjHeader *h = cwork[--cwl];
-        /* Collect every white cycle member, including buffered ones (a garbage cycle
-         * may span several buffered roots across batches) — the step's compaction
-         * removes freed objects from the root buffer, so no dangling pointer. */
-        if (COLOR(h) != COL_WHITE) continue;
+        if (!(COLOR(h) == COL_WHITE && !BUFFERED(h))) continue;
         SET_COLOR(h, COL_BLACK);
         wl_push(&fwork, &fwl, &fwc, h);  /* free only at the end (post-order) */
         trace_fn t = trace_of(h);
@@ -1875,69 +1868,36 @@ static void collect_white(JObjHeader *root) {
     }
 }
 
-/* One bounded incremental collection step. Processes the last COLLECT_BATCH
- * candidate roots (the tail) plus their connected garbage components to
- * completion, then compacts the buffer. Sound: the step runs the full
- * mark/scan/collect atomically on its batch and leaves the graph consistent
- * between steps (every object BLACK or PURPLE-buffered, none GRAY/WHITE), so the
- * mutator runs freely in between. A garbage cycle spanning several buffered roots
- * is fully traced from any one of them (mark_gray follows all edges) and freed in
- * one post-order pass; its other buffered roots are dropped by the compaction.
- * Residual (honest): one giant *connected* garbage component is still one pass —
- * bounding that needs a resumable traversal + write barrier. */
-static void jrt_collect_step(void) {
-    if (!roots_len) return;
-    size_t total = roots_len;
-    size_t start = total > COLLECT_BATCH ? total - COLLECT_BATCH : 0;
-
-    /* MarkRoots (tail batch): gray live candidates; free dead-acyclic buffered
-     * objects (their drop already ran in jrt_release; only the free was deferred). */
-    for (size_t i = start; i < total; i++) {
+static void jrt_collect_cycles(void) {
+    /* MarkRoots: mark purple with rc>0 gray; remove the rest from the buffer. */
+    size_t kept = 0;
+    for (size_t i = 0; i < roots_len; i++) {
         JObjHeader *h = roots[i];
         if (COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) {
             mark_gray(h);
-        } else if (RC_COUNT(h) == 0) {
-            SET_BUFFERED(h, 0);
-            free_obj(h);
-            roots[i] = NULL;
-        }
-        /* else (live, non-purple): compaction drops it below. */
-    }
-    /* ScanRoots + CollectRoots over the batch — each traversal covers the whole
-     * component (including buffered members from earlier in the buffer). */
-    for (size_t i = start; i < total; i++) {
-        JObjHeader *h = roots[i];
-        if (h && COLOR(h) == COL_GRAY) scan(h);
-    }
-    for (size_t i = start; i < total; i++) {
-        JObjHeader *h = roots[i];
-        if (h && COLOR(h) == COL_WHITE) collect_white(h);
-    }
-    /* Compact the WHOLE buffer: keep only still-live PURPLE candidates. Everything
-     * else — freed cycle members (now BLACK, in fwork) and restored-live roots —
-     * has BUFFERED cleared and is dropped, so the pointers left are all valid and
-     * no freed object remains referenced. Reads run before the frees below. */
-    size_t kept = 0;
-    for (size_t i = 0; i < total; i++) {
-        JObjHeader *h = roots[i];
-        if (!h) continue;
-        if (BUFFERED(h) && COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) {
             roots[kept++] = h;
         } else {
             SET_BUFFERED(h, 0);
+            if (COLOR(h) == COL_BLACK && RC_COUNT(h) == 0) free_obj(h);
         }
     }
     roots_len = kept;
-    /* Post-order free: after compaction, so no live buffer slot points at a freed
-     * object, and no trace hits an already-freed cycle member. */
+
+    /* ScanRoots. */
+    for (size_t i = 0; i < roots_len; i++) scan(roots[i]);
+
+    /* CollectRoots: drain the buffer, collect white cycles (gathered in fwork). */
+    for (size_t i = 0; i < roots_len; i++) {
+        JObjHeader *h = roots[i];
+        SET_BUFFERED(h, 0);
+        collect_white(h);
+    }
+    roots_len = 0;
+    /* Post-order free: only after all traversals, so that no trace
+     * hits an already-freed cycle member. */
     for (size_t i = 0; i < fwl; i++) free_obj(fwork[i]);
     fwl = 0;
     collector_trim();
-}
-
-/* Full drain (shutdown / on demand): step until the buffer is empty → 0 live. */
-static void jrt_collect_cycles(void) {
-    while (roots_len) jrt_collect_step();
 }
 #endif /* FASTLLVM_COLLECTOR */
 
