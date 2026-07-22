@@ -183,7 +183,9 @@ static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint
     VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
-    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    /* A 16-byte push constant (vec4) for `uniform()` in the vertex/fragment stages. */
+    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,.offset=0,.size=16};
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=st,
         .pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vps,.pRasterizationState=&rs,
@@ -240,13 +242,16 @@ static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) {
     VkRenderPass rp=0; vkCreateRenderPass(dev,&ci,0,&rp); return rp;
 }
 static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
-                     uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts) {
+                     uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts,
+                     VkPipelineLayout pl, const float uni[4]) {
     VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&bi);
     VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
     VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{w,h}},.clearValueCount=1,.pClearValues=&clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+    float zero[4]={0,0,0,0};
+    vkCmdPushConstants(cmd,pl,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,16,uni?uni:zero); /* uniform() */
     VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
     vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
@@ -255,7 +260,7 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
 /* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
  *      image, read back; returns the centroid pixel packed as 0xRRGGBB (so callers
  *      can check the @fragment color), or -1 on failure ---- */
-static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv) {
+static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4]) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -297,7 +302,7 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv)
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
     VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
-    rec_draw(cmd,rp,fb,pipe,W,H,vbuf,nverts);
+    rec_draw(cmd,rp,fb,pipe,W,H,vbuf,nverts,pl,uni);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
     vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
     CK(vkEndCommandBuffer(cmd));
@@ -320,7 +325,10 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv)
 }
 
 /* The default triangle, from the compile-time corner buffer. */
-int64_t jrt_vk_triangle(void) { return render_headless(DEFAULT_TRI, 3, 2); }
+int64_t jrt_vk_triangle(double a, double b, double c, double d) {
+    float uni[4]={(float)a,(float)b,(float)c,(float)d};
+    return render_headless(DEFAULT_TRI, 3, 2, uni);
+}
 
 /* ---- benchmark: init once, render `frames` headless mesh-shader frames, return the
  *      total nanoseconds spent in the submit+wait loop (steady-state per-frame CPU
@@ -397,7 +405,8 @@ static int64_t mesh_render(const double *verts, int64_t nfloats, uint32_t fpv) {
     uint32_t nverts=(uint32_t)(nfloats/fpv);
     float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
     for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
-    int64_t r=render_headless(f, nverts, fpv);
+    float uni[4]={0,0,0,0};
+    int64_t r=render_headless(f, nverts, fpv, uni);
     free(f);
     return r;
 }
@@ -752,7 +761,8 @@ int64_t jrt_vk_window(int64_t frames) {
         CK(vkCreateImageView(dev,&iv,0,&views[i]));
         VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&views[i],.width=W,.height=H,.layers=1};
         CK(vkCreateFramebuffer(dev,&fbi,0,&fbs[i]));
-        rec_draw(cmds[i],rp,fbs[i],pipe,W,H,vbuf,3); CK(vkEndCommandBuffer(cmds[i]));
+        float uni[4]={0,0,0,0};
+        rec_draw(cmds[i],rp,fbs[i],pipe,W,H,vbuf,3,pl,uni); CK(vkEndCommandBuffer(cmds[i]));
     }
     VkSemaphoreCreateInfo semi={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,.flags=VK_FENCE_CREATE_SIGNALED_BIT};

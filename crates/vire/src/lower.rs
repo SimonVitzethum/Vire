@@ -2821,8 +2821,14 @@ impl<'a> FnLower<'a> {
         // @vulkan V2 bootstrap: render a self-verifying headless triangle, return
         // 1 on success (see crates/driver/src/vk_runtime.c, language/GPU-VULKAN.md).
         if name == "vk_triangle" {
+            // vk_triangle([a,b,c,d]): the optional four args are a vec4 `uniform()` the
+            // fragment/vertex can read (host-controlled colour/params); default zero.
+            let defaults = [0.0, 0.0, 0.0, 0.0];
+            let uni: Vec<Operand> = (0..4)
+                .map(|k| args.get(k).map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstF64(defaults[k])))
+                .collect();
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: uni });
             return (Operand::Copy(d), Ty::I64);
         }
         // gpuvk_run(arr): vendor-neutral Vulkan compute — run the program's `@gpuvk`

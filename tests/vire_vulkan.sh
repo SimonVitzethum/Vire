@@ -611,6 +611,26 @@ fn main() {
 }
 EOF
 
+# Host uniform (push constant): the fragment reads uniform() (a vec4 the host sets via
+# vk_triangle(r,g,b,_)) → the triangle renders in that host-controlled colour. Proves
+# host→shader parameters. Centroid (229,76,153) for (0.9,0.3,0.6).
+case_ vire_uniform <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut u = uniform()
+    vec4(u.x, u.y, u.z, 1.0)
+}
+fn main() {
+    mut px = vk_triangle(0.9, 0.3, 0.6, 0.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 219 { if g > 66 { if g < 86 { if b > 143 { if b < 163 { ok = 1 } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

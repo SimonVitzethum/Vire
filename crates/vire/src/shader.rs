@@ -312,12 +312,13 @@ impl Cx {
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
                 }
-                // Push constant: the frustum plane (nx,ny,nz,d) the host supplies for
-                // `@task` culling — read as a vec4. The stage declares the push-constant
-                // block only when this is used (currently the task stage).
-                if name == "cull_plane" {
+                // Push constant, read as a vec4: `cull_plane()` is the @task frustum
+                // plane; `uniform()` is the same 16-byte push constant the host supplies
+                // to a @fragment / @vertex (a colour, time, transform params, …). The
+                // stage declares the push-constant block only when one of these is used.
+                if name == "cull_plane" || name == "uniform" {
                     if !args.is_empty() {
-                        return Err("shader: cull_plane() takes no arguments".into());
+                        return Err(format!("shader: {name}() takes no arguments"));
                     }
                     self.uses_push_constant = true;
                     let p = self.id("t");
@@ -902,9 +903,11 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     } else {
         ("", "", "")
     };
-    let iface = format!("{fc_iface}{vy_iface}");
-    let fc_decorate = format!("{fc_decorate}{vy_decorate}");
-    let fc_decl = format!("{fc_decl}{vy_decl}");
+    // A host `uniform()` push constant (vec4) — declared only when used.
+    let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant);
+    let iface = format!("{fc_iface}{vy_iface}{pc_iface}");
+    let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}");
+    let fc_decl = format!("{pc_decl}{fc_decl}{vy_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
@@ -941,6 +944,20 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         body = cx.body,
         out = out
     ))
+}
+
+/// The `uniform()` push-constant (a vec4 at offset 0) declarations for a graphics
+/// stage — (entry-point interface, decorations, type/var decls) — or empties. Needs
+/// `%v4float` already declared; declares its own `%int`/`%i_0`.
+fn push_constant_decls(used: bool) -> (String, String, String) {
+    if !used {
+        return (String::new(), String::new(), String::new());
+    }
+    (
+        " %pcv".to_string(),
+        "               OpDecorate %pcblock Block\n               OpMemberDecorate %pcblock 0 Offset 0\n".to_string(),
+        "     %pc_int = OpTypeInt 32 1\n        %i_0 = OpConstant %pc_int 0\n     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n".to_string(),
+    )
 }
 
 /// Compile a Vire `@mesh fn` to a SPIR-V mesh shader (VK_EXT_mesh_shader). The body

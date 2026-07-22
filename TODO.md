@@ -332,7 +332,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
 - [x] **`@gpuvk` — vendor-neutral Vulkan compute.** A general data-parallel compute stage
   over a Vire array (SPIR-V compute + `vkCmdDispatch`), distinct from CUDA/ROCm `@gpu`.
   Runs on Intel/NVIDIA/AMD. `@gpu` stays CUDA (NVPTX); `@gpuvk` is the Vulkan option.
-- [ ] **Uniform / params** — a wider push constant (several floats) readable in
+- [x] **Uniform / params** — a wider push constant (several floats) readable in
   `@fragment`/`@vertex` (today only the task cull plane).
 - [ ] **`Mat` in shaders + transform** — a small matrix type + `mat*vec`, so a `@vertex`
   can apply a transform from a uniform.
