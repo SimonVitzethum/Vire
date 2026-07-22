@@ -116,6 +116,31 @@ fn main() {
 }
 EOF
 
+# Varyings: the @vertex stage writes a per-vertex color via `out_color(vec3)`, the
+# @fragment reads the INTERPOLATED value via `in_color()`. Color = position + 0.5
+# (blue held constant 0.15). At the sampled centroid the interpolated r≈128, g≈152 —
+# g≠r proves the per-vertex value is interpolated across the triangle (a flat
+# fragment color cannot do this), and b≈38 is the constant channel. The vertex→
+# fragment Location-0 link is auto-derived. Both stages Vire-authored.
+case_ vire_varying_color <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(vec3(pos.x + 0.5, pos.y + 0.5, 0.15))
+    vec4(pos.x, pos.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 108 { if r < 148 { if g > r { if g < 180 { if b > 20 { if b < 60 { ok = 1 } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

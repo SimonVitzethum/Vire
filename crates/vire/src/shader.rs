@@ -39,6 +39,8 @@ struct Cx {
     const_cache: HashMap<u32, String>, // float bits → id
     env: HashMap<String, (String, Ty)>, // local name → (id, type)
     uses_fragcoord: bool,       // `frag_x/frag_y/frag_coord` → declare gl_FragCoord
+    emits_varying: bool,        // vertex `out_color(vec3)` → declare the Location-0 Output
+    uses_varying: bool,         // fragment `in_color()` → declare the Location-0 Input
     n: u32,
 }
 
@@ -89,6 +91,17 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpCompositeExtract %float {fc} {comp}").unwrap();
                     return Ok((id, Ty::Float));
+                }
+                // Varying input: the interpolated per-vertex color the `@vertex`
+                // stage wrote with `out_color(...)` (Location 0, a vec3).
+                if name == "in_color" {
+                    if !args.is_empty() {
+                        return Err("shader: in_color() takes no arguments".into());
+                    }
+                    self.uses_varying = true;
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v3float %vcol_in").unwrap();
+                    return Ok((id, Ty::Vec(3)));
                 }
                 let n = match name {
                     "vec2" => 2u8,
@@ -178,6 +191,28 @@ impl Cx {
         Ok((id, ta))
     }
 
+    /// A statement-position `out_color(Vec3)` call (a `@vertex` varying write):
+    /// stores to the Location-0 Output. Returns `false` if `e` is not that call.
+    fn void_call(&mut self, e: &Expr) -> Result<bool, String> {
+        if let Expr::Call { callee, args, .. } = e {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == "out_color" {
+                    if args.len() != 1 {
+                        return Err("shader: out_color(Vec3) takes one argument".into());
+                    }
+                    let (id, t) = self.expr(&args[0])?;
+                    if t != Ty::Vec(3) {
+                        return Err("shader: out_color expects a Vec3".into());
+                    }
+                    writeln!(self.body, "OpStore %vcol {id}").unwrap();
+                    self.emits_varying = true;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn block_output(&mut self, b: &Block) -> Result<(String, Ty), String> {
         for st in &b.stmts {
             match st {
@@ -185,8 +220,9 @@ impl Cx {
                     let r = self.expr(v)?;
                     self.env.insert(name.clone(), r);
                 }
+                Stmt::Expr(e) if self.void_call(e)? => {}
                 Stmt::Return(Some(e), _) => return self.expr(e),
-                _ => return Err("shader: only `let`/`mut` bindings and a final color expression are supported".into()),
+                _ => return Err("shader: only `let`/`mut` bindings, `out_color(...)`, and a final color expression are supported".into()),
             }
         }
         match &b.tail {
@@ -214,6 +250,8 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         const_cache: HashMap::new(),
         env: HashMap::new(),
         uses_fragcoord: false,
+        emits_varying: false,
+        uses_varying: false,
         n: 0,
     };
     cx.env.insert(param, ("%pos".to_string(), Ty::Vec(2)));
@@ -221,14 +259,24 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     if ty != Ty::Vec(4) {
         return Err("shader: the vertex output must be a Vec4 (gl_Position)".into());
     }
+    // A `out_color(vec3)` varying adds a Location-0 Output the fragment reads back.
+    let (vary_iface, vary_dec, vary_decl) = if cx.emits_varying {
+        (
+            " %vcol",
+            "               OpDecorate %vcol Location 0\n",
+            "      %ov3ptr = OpTypePointer Output %v3float\n       %vcol = OpVariable %ov3ptr Output\n",
+        )
+    } else {
+        ("", "", "")
+    };
     Ok(format!(
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Vertex %main \"main\" %out %gl_VertexIndex %P
+               OpEntryPoint Vertex %main \"main\" %out %gl_VertexIndex %P{vary_iface}
                OpDecorate %glpv Block
                OpMemberDecorate %glpv 0 BuiltIn Position
                OpDecorate %gl_VertexIndex BuiltIn VertexIndex
-       %void = OpTypeVoid
+{vary_dec}       %void = OpTypeVoid
        %fnty = OpTypeFunction %void
       %float = OpTypeFloat 32
     %v2float = OpTypeVector %float 2
@@ -256,7 +304,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
 %gl_VertexIndex = OpVariable %inptr Input
      %pv2ptr = OpTypePointer Private %v2float
      %ov4ptr = OpTypePointer Output %v4float
-{consts}       %main = OpFunction %void None %fnty
+{vary_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
                OpStore %P %pini
         %idx = OpLoad %int %gl_VertexIndex
@@ -267,6 +315,9 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
                OpReturn
                OpFunctionEnd
 ",
+        vary_iface = vary_iface,
+        vary_dec = vary_dec,
+        vary_decl = vary_decl,
         consts = cx.consts,
         body = cx.body,
         out = out
@@ -282,6 +333,8 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         const_cache: HashMap::new(),
         env: HashMap::new(),
         uses_fragcoord: false,
+        emits_varying: false,
+        uses_varying: false,
         n: 0,
     };
     let (out, ty) = cx.block_output(body)?;
@@ -290,7 +343,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     }
     // gl_FragCoord (the pixel position) is declared only when a `frag_*` builtin is
     // used — listed in the entry-point interface + decorated BuiltIn FragCoord.
-    let (iface, fc_decorate, fc_decl) = if cx.uses_fragcoord {
+    let (fc_iface, fc_decorate, fc_decl) = if cx.uses_fragcoord {
         (
             " %gl_FragCoord",
             "               OpDecorate %gl_FragCoord BuiltIn FragCoord\n",
@@ -299,6 +352,21 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     } else {
         ("", "", "")
     };
+    // The interpolated varying the `@vertex` stage wrote (`in_color()`): a Location-0
+    // Input vec3. (Output Location 0 = %color and Input Location 0 are separate
+    // namespaces in Vulkan, so they don't collide.)
+    let (vy_iface, vy_decorate, vy_decl) = if cx.uses_varying {
+        (
+            " %vcol_in",
+            "               OpDecorate %vcol_in Location 0\n",
+            "%_ptr_Input_v3float = OpTypePointer Input %v3float\n%vcol_in = OpVariable %_ptr_Input_v3float Input\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    let iface = format!("{fc_iface}{vy_iface}");
+    let fc_decorate = format!("{fc_decorate}{vy_decorate}");
+    let fc_decl = format!("{fc_decl}{vy_decl}");
     Ok(format!(
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450

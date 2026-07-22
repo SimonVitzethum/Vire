@@ -374,12 +374,18 @@ Staged (each stage runnable):
   `gl_VertexIndex`) and returns `gl_Position` — so it **transforms** the geometry
   (swizzles `.x/.y` + mixed `vecN` construction added). Verified: a shift `vec4(pos.x
   + 3.0, …)` moves the triangle off-screen (`tests/vire_vulkan.sh vire_vertex_shader`;
-  both stages Vire-authored). *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type
-  system (today vectors are shader-local); (b) **structured control flow**
-  (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450` builtins (normalize/dot/mix…);
-  (c) **varyings** (vertex→fragment interpolated outputs); (d) **vertex-buffer**
-  geometry from Vire data (today the corners are the fixed built-in array) + typed
-  stage I/O — the bridge to VM meshlets.
+  both stages Vire-authored). *Varyings DONE:* the `@vertex` stage writes a per-vertex
+  value with `out_color(vec3)` and the `@fragment` reads the **interpolated** result
+  with `in_color()` — the vertex→fragment Location-0 link is derived by the compiler
+  (Output/Input decorated + added to each entry-point interface only when used). A
+  Gouraud triangle (corner colors from position) gives centroid r≈128, g≈152 with
+  g≠r, proving interpolation a flat fragment cannot produce (`tests/vire_vulkan.sh
+  vire_varying_color`; `examples/vire/vulkan_varying.vr`). *Remaining:* (a) real
+  `Vec2/3/4`/`Mat4` in the host type system (today vectors are shader-local); (b)
+  **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450`
+  builtins (normalize/dot/mix…); (c) **vertex-buffer** geometry from Vire data (today
+  the corners are the fixed built-in array) + typed stage I/O — the bridge to VM
+  meshlets (now that varyings carry per-vertex data between stages).
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

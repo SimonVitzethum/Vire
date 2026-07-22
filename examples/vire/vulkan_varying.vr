@@ -1,0 +1,31 @@
+// Vire @vulkan — a Gouraud triangle: color VARYING interpolated vertex→fragment.
+//
+//   vire run examples/vire/vulkan_varying.vr
+//
+// Both shader stages are written in Vire and compiled to SPIR-V by the Vire
+// compiler. The @vertex stage assigns a per-vertex color with `out_color(vec3)`;
+// the rasterizer interpolates it across the triangle; the @fragment stage reads the
+// interpolated value with `in_color()`. That vertex→fragment link (Location 0) is
+// derived by the compiler — no descriptor plumbing. This is the bridge to typed
+// stage I/O for GPU-driven meshlets. Vendor-neutral. See language/GPU-VULKAN.md.
+
+// The vertex stage: transform the geometry AND emit a per-vertex color. Here the
+// color is derived from the corner position, so the three corners get three
+// different colors that blend smoothly across the face.
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(vec3(pos.x + 0.5, pos.y + 0.5, 0.15))
+    vec4(pos.x, pos.y, 0.0, 1.0)
+}
+
+// The fragment stage: just paint the interpolated varying. Every pixel gets its own
+// blended color — impossible with a constant fragment shader.
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)
+}
+
+fn main() {
+    mut ok = vk_window(0)
+    print(ok)
+}
