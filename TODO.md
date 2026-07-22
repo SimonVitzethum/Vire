@@ -336,7 +336,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
   `@fragment`/`@vertex` (today only the task cull plane).
 - [~] **`Mat` in shaders + transform** — a small matrix type + `mat*vec`, so a `@vertex`
   can apply a transform from a uniform.
-- [ ] **Depth buffer** — a depth attachment so overlapping meshlets occlude correctly.
+- [x] **Depth buffer** — a depth attachment so overlapping meshlets occlude correctly.
 - [x] **Wider scene records** — a colour/normal field beyond `offset+cone`; normals for
   lit meshlets.
 - [ ] **`vkCmdDrawMeshTasksIndirectCountEXT`** — a GPU count buffer (today a fixed indirect count).

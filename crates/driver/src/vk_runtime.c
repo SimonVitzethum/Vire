@@ -196,7 +196,7 @@ static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint
 }
 /* The GPU-driven pipeline: a mesh stage (no vertex input, no input assembly — the
  * mesh shader emits vertices + primitives itself) + the fragment stage. */
-static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, VkDescriptorSetLayout dsl) {
+static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, VkDescriptorSetLayout dsl, int depth) {
     VkShaderModule ms=shmod(dev,VK_MESH_TRI,VK_MESH_TRI_N*4), fs=shmod(dev,VK_TRI_FRAG,VK_TRI_FRAG_N*4);
     if(!ms||!fs) return 0;
     /* Optional amplification (task) stage — prepended when the program has an @task. */
@@ -221,26 +221,38 @@ static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w,
     VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr,
         .setLayoutCount=(dsl?1u:0u),.pSetLayouts=(dsl?&dsl:0)};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
+    VkPipelineDepthStencilStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable=VK_TRUE,.depthWriteEnable=VK_TRUE,.depthCompareOp=VK_COMPARE_OP_LESS};
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=nst,.pStages=st,
         .pViewportState=&vps,.pRasterizationState=&rs,.pMultisampleState=&msi,.pColorBlendState=&cb,
+        .pDepthStencilState=depth?&ds:0,
         .layout=*out_layout,.renderPass=rp,.subpass=0};
     VkPipeline pipe=0; vkCreateGraphicsPipelines(dev,0,1,&gp,0,&pipe);
     vkDestroyShaderModule(dev,ms,0); vkDestroyShaderModule(dev,fs,0); if(ts) vkDestroyShaderModule(dev,ts,0);
     return pipe;
 }
-static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) {
-    VkAttachmentDescription att={.format=fmt,.samples=VK_SAMPLE_COUNT_1_BIT,
-        .loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR,.storeOp=VK_ATTACHMENT_STORE_OP_STORE,
-        .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED,.finalLayout=final};
+#define DEPTH_FMT VK_FORMAT_D32_SFLOAT
+static VkRenderPass build_rp_d(VkDevice dev, VkFormat fmt, VkImageLayout final, int depth) {
+    VkAttachmentDescription att[2]={
+        {.format=fmt,.samples=VK_SAMPLE_COUNT_1_BIT,
+         .loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR,.storeOp=VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED,.finalLayout=final},
+        {.format=DEPTH_FMT,.samples=VK_SAMPLE_COUNT_1_BIT,
+         .loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR,.storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED,.finalLayout=VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}};
     VkAttachmentReference ref={0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription sub={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&ref};
+    VkAttachmentReference dref={1,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=1,.pColorAttachments=&ref,
+        .pDepthStencilAttachment=depth?&dref:0};
     VkSubpassDependency dep={.srcSubpass=VK_SUBPASS_EXTERNAL,.dstSubpass=0,
         .srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,.dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         .dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
-    VkRenderPassCreateInfo ci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=1,.pAttachments=&att,.subpassCount=1,.pSubpasses=&sub,.dependencyCount=1,.pDependencies=&dep};
+    VkRenderPassCreateInfo ci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=(uint32_t)(depth?2:1),.pAttachments=att,.subpassCount=1,.pSubpasses=&sub,.dependencyCount=1,.pDependencies=&dep};
     VkRenderPass rp=0; vkCreateRenderPass(dev,&ci,0,&rp); return rp;
 }
+static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) { return build_rp_d(dev,fmt,final,0); }
 static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
                      uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts,
                      VkPipelineLayout pl, const float uni[4]) {
@@ -369,7 +381,7 @@ int64_t jrt_vk_bench(int64_t frames) {
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); if(!rp) return -1;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,0); if(!pipe) return -1;
+    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,0,0); if(!pipe) return -1;
     VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
@@ -517,7 +529,7 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,dsl); if(!pipe) return -1;
+    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,dsl,0); if(!pipe) return -1;
     /* Compute meshlet builder pipeline (reuses the graphics layout — same set 0). */
     VkPipeline cpipe=0;
     if(builder){
@@ -662,10 +674,22 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
     VkImageViewCreateInfo ivi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
     VkImageView view; CK(vkCreateImageView(dev,&ivi,0,&view));
-    VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
-    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
+    /* Depth attachment (D32) so overlapping meshlets occlude correctly. */
+    VkImageCreateInfo di={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=DEPTH_FMT,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage dimg; CK(vkCreateImage(dev,&di,0,&dimg));
+    VkMemoryRequirements dmr; vkGetImageMemoryRequirements(dev,dimg,&dmr);
+    uint32_t dit=find_mem(pd,dmr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(dit==~0u) return -1;
+    VkMemoryAllocateInfo dma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=dmr.size,.memoryTypeIndex=dit};
+    VkDeviceMemory dmem; CK(vkAllocateMemory(dev,&dma,0,&dmem)); vkBindImageMemory(dev,dimg,dmem,0);
+    VkImageViewCreateInfo dvi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=dimg,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=DEPTH_FMT,.subresourceRange={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1}};
+    VkImageView dview; CK(vkCreateImageView(dev,&dvi,0,&dview));
+    VkRenderPass rp=build_rp_d(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,1); if(!rp) return -1;
+    VkImageView atts[2]={view,dview};
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=2,.pAttachments=atts,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,0); if(!pipe) return -1;
+    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,0,1); if(!pipe) return -1;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
@@ -680,8 +704,8 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
     VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&cbi);
-    VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
-    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
+    VkClearValue clear[2]={{.color={{0.08f,0.08f,0.10f,1.0f}}},{.depthStencil={1.0f,0}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=2,.pClearValues=clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
     VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
@@ -702,6 +726,7 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
+    vkDestroyImageView(dev,dview,0); vkDestroyImage(dev,dimg,0); vkFreeMemory(dev,dmem,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
     return corner_clear ? packed : -1;

@@ -695,6 +695,40 @@ fn main() {
 }
 EOF
 
+# Depth buffer: a @mesh emits two overlapping triangles — a red one at z=0.2 (drawn
+# FIRST) and a blue one at z=0.8 (drawn SECOND). With depth testing the front (red)
+# wins at the centroid despite the blue being drawn later; without depth the blue
+# would overwrite. Centroid red (r~229, b~25) proves depth occlusion. -2 → skip.
+case_ vire_depth <<'EOF'
+@mesh
+fn ms() {
+    set_mesh_outputs(6, 2)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.2, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.2, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.2, 1.0))
+    mesh_color(0, vec3(0.9, 0.1, 0.1))
+    mesh_color(1, vec3(0.9, 0.1, 0.1))
+    mesh_color(2, vec3(0.9, 0.1, 0.1))
+    mesh_tri(0, 0, 1, 2)
+    mesh_pos(3, vec4(0.0, 0.0 - 0.6, 0.8, 1.0))
+    mesh_pos(4, vec4(0.6, 0.6, 0.8, 1.0))
+    mesh_pos(5, vec4(0.0 - 0.6, 0.6, 0.8, 1.0))
+    mesh_color(3, vec3(0.1, 0.1, 0.9))
+    mesh_color(4, vec3(0.1, 0.1, 0.9))
+    mesh_color(5, vec3(0.1, 0.1, 0.9))
+    mesh_tri(1, 3, 4, 5)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut px = vk_mesh_shader()
+    mut ok = 0
+    if px == -2 { ok = 1 }
+    if px > 0 { if px / 65536 > 200 { if px % 256 < 60 { ok = 1 } } }   // red front wins
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
