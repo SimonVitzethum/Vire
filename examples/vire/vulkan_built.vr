@@ -1,0 +1,52 @@
+// Vire @vulkan — the WHOLE GPU-driven renderer, built and driven on the GPU, from
+// one Vire program. Nothing about the meshlets ever exists on the host.
+//
+//   vire run examples/vire/vulkan_built.vr
+//
+// Four stages, all compiled from Vire to SPIR-V:
+//   @compute — the meshlet BUILDER: each invocation computes one meshlet record and
+//              writes it into the scene storage buffer (set_meshlet), indexed by
+//              meshlet_index(). The scene is produced on the GPU.
+//   @task    — per-meshlet frustum cull: reads its meshlet's centre (meshlet_offset),
+//              tests it against the pushed plane (cull_plane), emits only survivors
+//              (emit_visible) — the surviving index flows to the mesh via the payload.
+//   @mesh    — draws the surviving meshlet's triangle (culled_offset).
+//   @fragment— shades it.
+//
+// A barrier separates the build from the draw. This is exactly the shape of a modern
+// GPU-driven renderer (build → cull → draw), which normally spans GLSL/HLSL + C++ +
+// a mesh toolchain — here it is a single Vire file. See language/GPU-VULKAN.md.
+
+@compute
+fn build() {
+    // Place meshlet i evenly across the view: x = -0.6 + i * 0.4.
+    mut x = 0.0 - 0.6 + meshlet_index() * 0.4
+    set_meshlet(vec2(x, 0.0))
+}
+
+@task
+fn ts() {
+    mut o = meshlet_offset()
+    mut plane = cull_plane()
+    mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))
+    emit_visible(d > 0.0 - 0.2)
+}
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 { vec4(0.5, 0.8, 0.3, 1.0) }
+
+fn main() {
+    // Build 4 meshlets on the GPU; a +x plane culls the two on the left half.
+    mut mask = vk_mesh_built(4, 1.0, 0.0, 0.0, 0.0)
+    print(mask)     // 2 = the right side survived the GPU cull
+}

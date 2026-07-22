@@ -188,7 +188,7 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
             // `@vertex`/`@fragment` are SPIR-V shaders compiled by shader.rs, not
             // host code — their bodies use shader-only forms (`vecN`, vector math)
             // that the host inference doesn't model, so skip them here.
-            if f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task")) {
+            if f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task" | "compute")) {
                 continue;
             }
             if let Some(body) = &f.body {
@@ -451,7 +451,8 @@ impl<'a> Ctx<'a> {
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window"
                         | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader"
-                        | "vk_mesh_scene" | "vk_mesh_scene_cull" => return T::I64,
+                        | "vk_mesh_scene" | "vk_mesh_scene_cull"
+                        | "vk_mesh_built" => return T::I64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {

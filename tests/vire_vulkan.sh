@@ -452,6 +452,45 @@ fn main() {
 }
 EOF
 
+# Fully GPU-built renderer: a @compute builder fills the scene SSBO on the GPU
+# (set_meshlet, indexed by meshlet_index()), a barrier, then the @task cull + @mesh
+# draw run over it — the meshlet set never exists on the host. Two built meshlets
+# (left x=-0.5, right x=+0.5): permissive plane shows both (mask 3), +x plane culls
+# the left on the GPU (mask 2). Every stage — build, cull, emit, shade — is Vire.
+case_ vire_mesh_built <<'EOF'
+@compute
+fn build() {
+    mut x = 0.0 - 0.5 + meshlet_index() * 1.0
+    set_meshlet(vec2(x, 0.0))
+}
+@task
+fn ts() {
+    mut o = meshlet_offset()
+    mut plane = cull_plane()
+    mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))
+    emit_visible(d > 0.0 - 0.2)
+}
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.5, 0.8, 0.3, 1.0) }
+fn main() {
+    mut both = vk_mesh_built(2, 0.0, 0.0, 0.0, 1.0)
+    mut only = vk_mesh_built(2, 1.0, 0.0, 0.0, 0.0)
+    mut ok = 0
+    if both == -2 { ok = 1 }
+    if both == 3 { if only == 2 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

@@ -609,6 +609,12 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         Err(e) => errs.push(e),
                     }
                 }
+                if f.attrs.iter().any(|a| a.name == "compute") {
+                    match crate::shader::compile_compute(f) {
+                        Ok(asm) => prog.comp_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
+                }
                 continue;
             }
             if !f.sig.generics.is_empty() {
@@ -2847,6 +2853,21 @@ impl<'a> FnLower<'a> {
         // vk_mesh_scene_cull(offsets, nx, ny, nz, d): the fused GPU-driven cull path —
         // the scene SSBO plus a frustum plane; the @task tests each meshlet and emits
         // only survivors, the @mesh draws them (payload carries the index).
+        // vk_mesh_built(count, nx, ny, nz, d): the fully GPU-built renderer — a @compute
+        // builder fills the scene SSBO with `count` meshlets on the GPU, then the mesh
+        // pipeline culls + draws them (no host scene data).
+        if name == "vk_mesh_built" && !args.is_empty() {
+            let count = self.lower_expr(&args[0]).0;
+            let mut call_args = vec![count];
+            let defaults = [0.0, 0.0, 0.0, 1.0];
+            for k in 0..4 {
+                let op = args.get(k + 1).map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstF64(defaults[k]));
+                call_args.push(op);
+            }
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_mesh_built".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_mesh_scene_cull" && !args.is_empty() {
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);
@@ -3765,7 +3786,7 @@ fn lower_fn(
 /// A `@vulkan` shader stage (`@vertex`/`@fragment`) — compiled to SPIR-V, not host
 /// IR, so it is pulled out of normal lowering (see the lowering loop).
 fn is_shader_fn(f: &FnDef) -> bool {
-    f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task"))
+    f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task" | "compute"))
 }
 
 fn is_gpu_fn(f: &FnDef) -> bool {

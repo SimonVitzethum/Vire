@@ -40,6 +40,7 @@ fn new_cx() -> Cx {
         uses_ssbo: false,
         uses_workgroup_id: false,
         uses_payload: false,
+        uses_global_id: false,
         n: 0,
     }
 }
@@ -121,6 +122,7 @@ struct Cx {
     uses_ssbo: bool,            // `meshlet_offset()`/`culled_offset()` → the scene SSBO (binding 0)
     uses_workgroup_id: bool,    // read gl_WorkGroupID (meshlet_offset, emit_visible)
     uses_payload: bool,         // task→mesh payload (the surviving meshlet index)
+    uses_global_id: bool,       // compute `meshlet_index()`/`set_meshlet()` → gl_GlobalInvocationID
     n: u32,
 }
 
@@ -227,6 +229,22 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
+                }
+                // Compute builder: this invocation's meshlet index as a float —
+                // float(gl_GlobalInvocationID.x). Lets a @compute place meshlet i by
+                // formula (e.g. `-0.5 + meshlet_index() * spacing`).
+                if name == "meshlet_index" {
+                    if !args.is_empty() {
+                        return Err("shader: meshlet_index() takes no arguments".into());
+                    }
+                    self.uses_global_id = true;
+                    let g = self.id("t");
+                    writeln!(self.body, "{g} = OpLoad %v3uint %gl_GlobalInvocationID").unwrap();
+                    let gx = self.id("t");
+                    writeln!(self.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpConvertUToF %float {gx}").unwrap();
+                    return Ok((id, Ty::Float));
                 }
                 // Culled scene read (mesh stage, fused cull path): the offset of the
                 // meshlet THIS mesh workgroup was launched for — `scene[payload.idx]`,
@@ -1078,5 +1096,90 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
         body = cx.body,
         count_op = count_op,
         payload_op = payload_op,
+    ))
+}
+
+/// Compile a Vire `@compute fn` to a SPIR-V compute shader that BUILDS the scene
+/// buffer on the GPU. Each invocation (indexed by `gl_GlobalInvocationID.x`) computes
+/// one meshlet record and writes it with `set_meshlet(vec2)` — so the meshlet set the
+/// mesh pipeline later draws is produced on the GPU, not supplied by the host.
+/// `meshlet_index()` gives this invocation's index as a float for placement formulas.
+pub fn compile_compute(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@compute` fn has no body")?;
+    let mut cx = new_cx();
+    let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+    for st in body.stmts.iter().chain(tail_stmt.iter()) {
+        match st {
+            Stmt::Let { name, value: Some(v), .. } => {
+                let (id, ty) = cx.expr(v)?;
+                cx.bind(name, &id, ty);
+            }
+            Stmt::Expr(Expr::Call { callee, args, .. })
+                if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "set_meshlet") =>
+            {
+                if args.len() != 1 { return Err("shader: set_meshlet(Vec2)".into()); }
+                let (val, ty) = cx.expr(&args[0])?;
+                if ty != Ty::Vec(2) { return Err("shader: set_meshlet expects a Vec2".into()); }
+                cx.uses_ssbo = true;
+                cx.uses_global_id = true;
+                let g = cx.id("t");
+                writeln!(cx.body, "{g} = OpLoad %v3uint %gl_GlobalInvocationID").unwrap();
+                let gx = cx.id("t");
+                writeln!(cx.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
+                let p = cx.id("t");
+                writeln!(cx.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {gx}").unwrap();
+                writeln!(cx.body, "OpStore {p} {val}").unwrap();
+            }
+            _ => return Err("shader: `@compute` (builder) supports `let` and set_meshlet(Vec2)".into()),
+        }
+    }
+    // The scene SSBO is WRITABLE here (the mesh stage reads the same buffer readonly).
+    let glid = if cx.uses_global_id {
+        (" %gl_GlobalInvocationID",
+         "               OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId\n",
+         "%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input\n")
+    } else { ("", "", "") };
+    let ssbo = if cx.uses_ssbo {
+        (" %scene",
+         "               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n",
+         "%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n")
+    } else { ("", "", "") };
+    let iface = format!("{}{}", glid.0, ssbo.0);
+    let decor = format!("{}{}", glid.1, ssbo.1);
+    let decl = format!("{}{}", glid.2, ssbo.2);
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    Ok(format!(
+"               OpCapability Shader
+{glsl_import}               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main \"main\"{iface}
+               OpExecutionMode %main LocalSize 1 1 1
+{decor}       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+     %v3uint = OpTypeVector %uint 3
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
+        %i_0 = OpConstant %int 0
+{decl}{consts}       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+{vars}{body}               OpReturn
+               OpFunctionEnd
+",
+        glsl_import = glsl_import,
+        iface = iface,
+        decor = decor,
+        decl = decl,
+        consts = cx.consts,
+        vars = cx.vars,
+        body = cx.body,
     ))
 }

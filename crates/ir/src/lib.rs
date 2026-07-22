@@ -342,6 +342,10 @@ pub struct Program {
     /// (`emit_mesh_tasks(n)`): dispatches mesh workgroups, can cull. `None` → no task
     /// stage (the mesh shader runs directly). SPIR-V 1.4.
     pub task_spvasm: Option<String>,
+    /// `@vulkan` **compute** meshlet builder compiled from a Vire `@compute fn` body
+    /// (`set_meshlet(vec2)`): fills the scene SSBO on the GPU before the mesh draw, so
+    /// the meshlet set is GPU-built. `None` → the host supplies the scene. SPIR-V 1.4.
+    pub comp_spvasm: Option<String>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

@@ -1244,8 +1244,13 @@ fn build_or_run(args: &[String]) {
             Some(asm) => assemble(asm, "vk_task", Some("spv1.4")),
             None => Vec::new(),
         };
+        // The compute meshlet builder (fills the scene SSBO on the GPU), when present.
+        let cw: Vec<u32> = match &program.comp_spvasm {
+            Some(asm) => assemble(asm, "vk_build", Some("spv1.4")),
+            None => Vec::new(),
+        };
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw)] {
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));
             // A 0-length array is invalid ISO C; emit a dummy word (the _N stays 0).
             if w.is_empty() {
