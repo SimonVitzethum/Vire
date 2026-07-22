@@ -82,6 +82,7 @@ run equals        0 Equals Equals Point Plain
 run rc            0 Rc Rc Box
 run cycle         0 Cycle Cycle Box
 run cycle3        0 Cycle3 Cycle3 Box
+run cyclestress   0 CycleStress CycleStress
 
 # --- Arrays / Numbers / Strings ---
 run arr2          0 Arr2 Arr2 Box

@@ -3,7 +3,43 @@
 Archive of shipped/closed items moved out of [TODO.md](TODO.md) to keep the
 roadmap to *open* work only. Newest sections first. Design basis:
 [language/](language/). Soundness floor held for every item: Java heap-balance
-oracle **65/65** + `tests/vire_heap.sh` 0-live + all `tests/vire_*.sh` green.
+oracle **66/66** + `tests/vire_heap.sh` 0-live + all `tests/vire_*.sh` green.
+
+---
+
+## Runtime: incremental cycle collector (no GC spikes, low steady RAM) (shipped)
+
+The Bacon–Rajan cycle collector was **synchronous**: it buffered candidate roots
+until an adaptive threshold (`2 × live_objects`, floor 10000) then ran ONE pass over
+the whole buffer + its transitive closure — a stop-the-world latency **spike**
+proportional to the accumulated garbage. Replaced with **bounded incremental
+stepping** (`jrt_collect_step`, `crates/driver/src/runtime.c`): when the buffer
+exceeds a small soft cap (`ROOTS_SOFT_CAP = 1024`) a single step drains the last
+`COLLECT_BATCH = 256` candidate roots (plus their connected garbage components) to
+completion, then compacts the buffer. Continuous collection, small bounded per-step
+pause, low steady RAM (the buffer never accumulates).
+
+- **Sound.** Each step runs the full mark/scan/collect atomically on its batch and
+  leaves the graph consistent between steps (every object BLACK or PURPLE-buffered),
+  so the mutator runs freely in between — no write barrier needed. A garbage cycle
+  spanning several buffered roots is fully traced from any one of them and freed in
+  one post-order pass; its other buffered roots are dropped by the compaction
+  (`collect_white` no longer skips buffered objects; freed objects have `BUFFERED`
+  cleared before the compaction reads it, so no dangling buffer pointer). No O(n²)
+  re-scan: each candidate is processed once, total work = one big pass, just sliced.
+- **Verified.** Java oracle **66/66** incl. a new `cyclestress` regression (300k
+  self-cycles → `[heap] 300001 allocated, 0 still live` under continuous mid-run
+  stepping); `tests/vire_heap.sh` 17/17 incl. `collector_cycle_stress`; peak RSS
+  **flat** across 8× more allocations (1.8 MB at both 1M and 8M cyclic nodes) —
+  direct evidence of continuous reclamation with buffer-bounded RAM.
+- **Honest residual:** one *giant connected* garbage component is still one pass
+  (bounding that needs a resumable traversal + write barrier); the release
+  **free-cascade** on a large dead subgraph is likewise still one burst (both noted
+  in TODO). The common case — many independent cycles — is now spike-free.
+- **Freestanding fix (collateral):** rebuilding the debug `fastjavac` surfaced a
+  latent bug — the capsule deep-copy `copymap` used `malloc`/`calloc`/`free`
+  unguarded, breaking `--freestanding` (no libc). Guarded with no-op stubs (capsules
+  don't exist in freestanding; the stubs only satisfy the emitted copy-slot symbols).
 
 ---
 

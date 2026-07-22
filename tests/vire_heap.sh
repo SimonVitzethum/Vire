@@ -280,6 +280,32 @@ fn main() {
 }
 EOF
 
+# --- incremental cycle collector under load: 100k two-node garbage cycles created
+#     in a loop (each `keep = a` makes the previous a<->b cycle unreachable). This
+#     buffers far more than ROOTS_SOFT_CAP, so jrt_collect_step runs continuously
+#     mid-execution (not just at shutdown) — must stay 0-live and sum correctly.
+#     sum_{i<100000} i = 4999950000. `keep` forces heap (not the loop arena). ---
+case_ collector_cycle_stress 4999950000 <<'EOF'
+type Node { v: Int  next: Node }
+fn work(n: Int) -> Int {
+    mut sum = 0
+    mut keep = Node(0, null)
+    keep.next = keep
+    mut i = 0
+    while i < n {
+        mut a = Node(i, null)
+        mut b = Node(i, null)
+        a.next = b
+        b.next = a
+        keep = a
+        sum = sum + i
+        i = i + 1
+    }
+    sum
+}
+fn main() { print(work(100000)) }
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

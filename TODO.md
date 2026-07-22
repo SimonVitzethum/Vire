@@ -121,6 +121,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   insurance, not perf, but belongs with the perf work.)
 - [ ] **Analysis caching / incremental compile** — compile time measured super-linear
   ~O(n^1.4); orthogonal to runtime perf but the main compile-*speed* lever left.
+- [~] **Runtime GC latency — incremental collector DONE** (`jrt_collect_step`): the
+  synchronous Bacon–Rajan pass is now bounded incremental stepping (continuous, low
+  steady RAM, no accumulate-then-big-pass spike; 66/66 + flat RSS — see
+  [DONE.md](DONE.md)). *Remaining residuals* (both need a resumable traversal +
+  write barrier, so bigger + correctness-critical): (a) one *giant connected* garbage
+  component is still one pass; (b) the release **free-cascade** on a large dead
+  subgraph is still one synchronous burst (`jrt_release` drop loop) — could be
+  budgeted/deferred. Also open: chunk-recycle bound tuning, larger arena chunks.
 
 ---
 
