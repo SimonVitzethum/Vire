@@ -55,9 +55,19 @@ re-verified against the leak-catcher (`tests/run.sh listdrop`):**
 loop → 0-live, so the incremental steps really do collect cycles), Java oracle
 **67/67**, `tests/vire_heap.sh` 17/17, freestanding `Cycle` runs, threads/gpu/vulkan
 green. **Peak RSS flat: 1484 kB at both 1M and 8M cyclic allocations** — continuous
-reclamation, buffer-bounded RAM, no accumulate-then-spike. Honest residual: one
-*giant connected* garbage component is still one pass (bounding it needs a resumable
-traversal + write barrier).
+reclamation, buffer-bounded RAM, no accumulate-then-spike.
+
+**Giant-component residual — free phase now spread (sound).** Collecting one *giant
+connected* garbage component ran four O(n) traversals in a step (mark/scan/collect +
+the free-obj loop). The **free** (the dominant, slab-touching cost) is now routed
+through a **deferred garbage queue** (`gbuf`/`drain_gbuf`, free-only — collected
+garbage is unreachable/immutable): a bounded amount is freed per step, per
+allocation, and fully at shutdown, so a big cycle's reclamation isn't one burst.
+Verified: a **2M-node doubly-linked ring** dropped at once → 0-live; RSS flat 1484 kB
+at 2M and 1480 kB at 16M cyclic churn. *Remaining (the true research residual):* the
+mark/scan/collect *traversals* of a giant not-yet-proven-garbage component are still
+one atomic pass (~a few ms for millions of nodes) — fully bounding them needs a
+resumable traversal + a concurrent write barrier (Bacon–Rajan's concurrent variant).
 
 **Also fixed (collateral):** the `--freestanding` break (capsule deep-copy `copymap`
 used `malloc`/`calloc`/`free` unguarded) — guarded with no-op stubs. New regression

@@ -1216,6 +1216,27 @@ static void roots_push(JObjHeader *h) {
     roots[roots_len++] = h;
 }
 
+/* Deferred free queue for COLLECTED cycle garbage (free-only — the members' drops are
+ * not run; their refs are internal to the freed cycle, handled by the mark/scan
+ * accounting). Draining a large collected component here (a bounded amount per step,
+ * per allocation, and fully at shutdown) spreads the free_obj cost — the dominant part
+ * of reclaiming a big garbage cycle — so it is not one synchronous burst. Sound:
+ * collected garbage is unreachable (immutable) and already removed from the root
+ * buffer, so nothing references it before its deferred free. */
+static JObjHeader **gbuf = NULL;
+static size_t gbl = 0, gbc = 0;
+static void gb_push(JObjHeader *h) {
+    if (gbl == gbc) {
+        gbc = gbc ? gbc * 2 : 256;
+        gbuf = (JObjHeader **)plat_realloc(gbuf, gbc * sizeof(*gbuf));
+    }
+    gbuf[gbl++] = h;
+}
+static void drain_gbuf(size_t budget) {
+    size_t n = 0;
+    while (gbl && (budget == 0 || n < budget)) { free_obj(gbuf[--gbl]); n++; }
+}
+
 static void possible_root(JObjHeader *h) {
     if (COLOR(h) != COL_PURPLE) {
         SET_COLOR(h, COL_PURPLE);
@@ -1237,6 +1258,7 @@ static void jrt_shutdown(void) {
 #endif
 #ifdef FASTLLVM_COLLECTOR
     jrt_collect_cycles();
+    drain_gbuf(0); /* free all deferred collected-cycle garbage → 0 live */
 #endif
 #if !defined(FASTLLVM_THREADS)
     drain_drops(0); /* and anything the collect surfaced → 0 live */
@@ -1356,6 +1378,9 @@ void *jrt_alloc(int64_t size) {
      * few pending drops, so deferred frees don't accumulate (RAM stays bounded
      * relative to the allocation rate). */
     if (droplen) drain_drops(FREE_PUMP);
+#endif
+#ifdef FASTLLVM_COLLECTOR
+    if (gbl) drain_gbuf(FREE_PUMP); /* likewise for deferred collected-cycle garbage */
 #endif
 #ifndef FASTLLVM_FREESTANDING
     /* In the capsule body: arena bump, immortal (RC/collector do not touch it),
@@ -1819,6 +1844,7 @@ static void collector_trim(void) {
     trim_buf(&fwork, &fwl, &fwc);
     trim_buf(&roots, &roots_len, &roots_cap);
     trim_buf(&dropbuf, &droplen, &dropcap);
+    if (gbl == 0) trim_buf(&gbuf, &gbl, &gbc); /* only when no deferred garbage pending */
 }
 
 /* --- MarkGray: per edge decrement child, color node gray; iterative. --- */
@@ -1968,9 +1994,13 @@ static void jrt_collect_step(void) {
     }
     roots_len = kept;
     /* Post-order free: after compaction, so no live buffer slot points at a freed
-     * object and no trace hits an already-freed cycle member. */
-    for (size_t i = 0; i < fwl; i++) free_obj(fwork[i]);
+     * object and no trace hits an already-freed cycle member. Route the collected
+     * garbage through the deferred free queue and free only a bounded amount now —
+     * a giant component's free_obj cost spreads across steps/allocations instead of
+     * one burst (sound: this garbage is unreachable). */
+    for (size_t i = 0; i < fwl; i++) gb_push(fwork[i]);
     fwl = 0;
+    drain_gbuf(FREE_BUDGET);
     collector_trim();
 }
 

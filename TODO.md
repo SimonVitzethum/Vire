@@ -126,10 +126,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   Two soundness bugs found + fixed (MarkRoots must free only BLACK rc==0, not GRAY
   trial-deleted; a whole-buffer pass frees dead head-of-buffer nodes the compaction
   would otherwise drop unfreed), **verified against the `listdrop` leak-catcher** +
-  a cross-batch garbage-cycle stress + flat RSS — see [DONE.md](DONE.md). *Residual:*
-  one *giant connected* garbage component is still one pass (needs a resumable
-  traversal + write barrier). Also open: chunk-recycle bound tuning, larger arena
-  chunks.
+  a cross-batch garbage-cycle stress + flat RSS — see [DONE.md](DONE.md). The
+  giant-connected-component **free phase** is now spread too (deferred garbage queue;
+  a 2M-node ring drops 0-live, RSS flat to 16M). *Residual (research-level):* the
+  mark/scan/collect *traversals* of a giant not-yet-proven-garbage component are
+  still one atomic pass (~ms for millions of nodes) — fully bounding them needs a
+  resumable traversal + a concurrent **write barrier** (Bacon–Rajan concurrent
+  variant); high-risk, rare in practice. Also open: chunk-recycle bound tuning,
+  larger arena chunks.
 - [x] **Free-cascade — budgeted/deferred, DONE** (`drain_drops`): the release drop
   loop now frees at most `FREE_BUDGET` per top-level release (the rest deferred in the
   LIFO drop queue, drained `FREE_PUMP` per allocation + fully at shutdown), so
