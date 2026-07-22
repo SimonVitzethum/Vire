@@ -261,6 +261,22 @@ impl Cx {
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
                 }
+                // `@gpuvk` element read: `buffer[gl_GlobalInvocationID.x]`, this
+                // invocation's element of the data-parallel float buffer.
+                if name == "elem" {
+                    if !args.is_empty() {
+                        return Err("shader: elem() takes no arguments".into());
+                    }
+                    let g = self.id("t");
+                    writeln!(self.body, "{g} = OpLoad %v3uint %gvid").unwrap();
+                    let gx = self.id("t");
+                    writeln!(self.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_float %vbuf %i_0 {gx}").unwrap();
+                    let v = self.id("t");
+                    writeln!(self.body, "{v} = OpLoad %float {p}").unwrap();
+                    return Ok((v, Ty::Float));
+                }
                 // Compute builder: this invocation's meshlet index as a float —
                 // float(gl_GlobalInvocationID.x). Lets a @compute place meshlet i by
                 // formula (e.g. `-0.5 + meshlet_index() * spacing`).
@@ -1284,6 +1300,93 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
         iface = iface,
         decor = decor,
         decl = decl,
+        consts = cx.consts,
+        vars = cx.vars,
+        body = cx.body,
+    ))
+}
+
+/// Compile a Vire `@gpuvk fn` to a SPIR-V compute shader — vendor-neutral Vulkan
+/// compute (runs on any Vulkan device: Intel / NVIDIA / AMD), distinct from the
+/// CUDA/ROCm `@gpu` path. It is a data-parallel **map**: each invocation reads its
+/// element with `elem()` (`buffer[gl_GlobalInvocationID.x]`), and the function's
+/// value is written back to that element. A bounds guard (`gid < count`, count from a
+/// push constant) makes an over-dispatched workgroup safe. SPIR-V 1.4.
+pub fn compile_gpuvk(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@gpuvk` fn has no body")?;
+    let mut cx = new_cx();
+    // Bounds guard: `if gl_GlobalInvocationID.x < count { … store … }`.
+    let g = cx.id("t");
+    writeln!(cx.body, "{g} = OpLoad %v3uint %gvid").unwrap();
+    let gx = cx.id("t");
+    writeln!(cx.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
+    let cp = cx.id("t");
+    writeln!(cx.body, "{cp} = OpAccessChain %_ptr_pc_uint %pcv %i_0").unwrap();
+    let cnt = cx.id("t");
+    writeln!(cx.body, "{cnt} = OpLoad %uint {cp}").unwrap();
+    let ok = cx.id("t");
+    writeln!(cx.body, "{ok} = OpULessThan %bool {gx} {cnt}").unwrap();
+    let run = cx.id("run");
+    let mrg = cx.id("mrg");
+    writeln!(cx.body, "OpSelectionMerge {mrg} None").unwrap();
+    writeln!(cx.body, "OpBranchConditional {ok} {run} {mrg}").unwrap();
+    writeln!(cx.body, "{run} = OpLabel").unwrap();
+    let (val, ty) = cx.block_value(body)?;
+    if ty != Ty::Float {
+        return Err("shader: `@gpuvk` must return a Float (the new element value)".into());
+    }
+    let sp = cx.id("t");
+    writeln!(cx.body, "{sp} = OpAccessChain %_ptr_ssbo_float %vbuf %i_0 {gx}").unwrap();
+    writeln!(cx.body, "OpStore {sp} {val}").unwrap();
+    writeln!(cx.body, "OpBranch {mrg}").unwrap();
+    writeln!(cx.body, "{mrg} = OpLabel").unwrap();
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    Ok(format!(
+"               OpCapability Shader
+{glsl_import}               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main \"main\" %gvid %vbuf %pcv
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gvid BuiltIn GlobalInvocationId
+               OpDecorate %_rt_float ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Buf Block
+               OpDecorate %vbuf DescriptorSet 0
+               OpDecorate %vbuf Binding 0
+               OpDecorate %pcU Block
+               OpMemberDecorate %pcU 0 Offset 0
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+     %v3uint = OpTypeVector %uint 3
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
+        %i_0 = OpConstant %int 0
+%_ptr_in_v3uint = OpTypePointer Input %v3uint
+       %gvid = OpVariable %_ptr_in_v3uint Input
+   %_rt_float = OpTypeRuntimeArray %float
+        %Buf = OpTypeStruct %_rt_float
+%_ptr_ssbo_Buf = OpTypePointer StorageBuffer %Buf
+       %vbuf = OpVariable %_ptr_ssbo_Buf StorageBuffer
+%_ptr_ssbo_float = OpTypePointer StorageBuffer %float
+        %pcU = OpTypeStruct %uint
+%_ptr_pc_U = OpTypePointer PushConstant %pcU
+        %pcv = OpVariable %_ptr_pc_U PushConstant
+%_ptr_pc_uint = OpTypePointer PushConstant %uint
+{consts}       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+{vars}{body}               OpReturn
+               OpFunctionEnd
+",
+        glsl_import = glsl_import,
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,

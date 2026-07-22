@@ -131,7 +131,7 @@ impl Parser {
             // (`@vertex`/`@fragment`/`@compute`/`@task`/`@mesh`) introduce a
             // declaration item (other `@…` stay expressions/script statements, e.g.
             // inline `@c`/`@asm` blocks).
-            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "gpu" | "vertex" | "fragment" | "compute" | "task" | "mesh")))
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "gpu" | "vertex" | "fragment" | "compute" | "task" | "mesh" | "gpuvk")))
             // `name!(…)` — an item-macro invocation.
             || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }

@@ -346,6 +346,10 @@ pub struct Program {
     /// (`set_meshlet(vec2)`): fills the scene SSBO on the GPU before the mesh draw, so
     /// the meshlet set is GPU-built. `None` → the host supplies the scene. SPIR-V 1.4.
     pub comp_spvasm: Option<String>,
+    /// `@gpuvk` **vendor-neutral Vulkan compute** map compiled from a Vire `@gpuvk fn`
+    /// body (`elem()` → new value): runs data-parallel over a Float buffer on any
+    /// Vulkan device (Intel/NVIDIA/AMD), distinct from CUDA/ROCm `@gpu`. SPIR-V 1.4.
+    pub gpuvk_spvasm: Option<String>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

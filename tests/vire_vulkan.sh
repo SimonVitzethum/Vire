@@ -587,6 +587,30 @@ fn main() {
 }
 EOF
 
+# @gpuvk — vendor-neutral Vulkan compute (any device, not just mesh-shader ones).
+# A data-parallel map runs on the GPU over a Float array in place: each element x
+# becomes x*3 + 1. gpuvk_run returns 0 (ok) or -2 (no device → skip). Check a[2]:
+# 30*3+1 = 91, and a[0]: 10*3+1 = 31.
+case_ vire_gpuvk_compute <<'EOF'
+@gpuvk
+fn f() -> Float {
+    mut x = elem()
+    x * 3.0 + 1.0
+}
+fn main() {
+    mut a = [10.0, 20.0, 30.0, 40.0]
+    mut st = gpuvk_run(a)
+    mut ok = 0
+    if st == -2 { ok = 1 }
+    if st == 0 {
+        mut a0 = a[0]
+        mut a2 = a[2]
+        if a0 > 30.0 { if a0 < 32.0 { if a2 > 90.0 { if a2 < 92.0 { ok = 1 } } } }
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

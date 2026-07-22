@@ -327,9 +327,9 @@ Everything the shipped `@vulkan` does not yet cover, ordered roughly by tractabi
 Checked off as implemented + tested (`tests/vire_vulkan.sh`); items that turn out
 unsound or genuinely multi-week are marked *skipped* with the reason.
 
-- [ ] **Multi-component swizzles** — `.xy`/`.xyz`/`.rgb` reads (today single-component only).
-- [ ] **`if` as a statement** — effect-only branches (today `if` is value-only).
-- [ ] **`@gpuvk` — vendor-neutral Vulkan compute.** A general data-parallel compute stage
+- [x] **Multi-component swizzles** — `.xy`/`.xyz`/`.rgb` reads (today single-component only).
+- [x] **`if` as a statement** — effect-only branches (today `if` is value-only).
+- [x] **`@gpuvk` — vendor-neutral Vulkan compute.** A general data-parallel compute stage
   over a Vire array (SPIR-V compute + `vkCmdDispatch`), distinct from CUDA/ROCm `@gpu`.
   Runs on Intel/NVIDIA/AMD. `@gpu` stays CUDA (NVPTX); `@gpuvk` is the Vulkan option.
 - [ ] **Uniform / params** — a wider push constant (several floats) readable in

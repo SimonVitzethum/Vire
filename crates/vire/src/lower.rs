@@ -615,6 +615,12 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         Err(e) => errs.push(e),
                     }
                 }
+                if f.attrs.iter().any(|a| a.name == "gpuvk") {
+                    match crate::shader::compile_gpuvk(f) {
+                        Ok(asm) => prog.gpuvk_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
+                }
                 continue;
             }
             if !f.sig.generics.is_empty() {
@@ -2819,6 +2825,19 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // gpuvk_run(arr): vendor-neutral Vulkan compute — run the program's `@gpuvk`
+        // map over the Float array in place (SPIR-V compute + vkCmdDispatch on any
+        // Vulkan device). Passes the proven (data-ptr, elem-count) pair. Returns 0, or
+        // -2 if no Vulkan device is available.
+        if name == "gpuvk_run" && !args.is_empty() {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_gpuvk_run".into(), args: vec![Operand::Copy(ptr), len] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_bench(frames): steady-state headless benchmark — init once, render
         // `frames` mesh-shader frames, return total nanoseconds (perf parity vs
         // hand-written Vulkan in C++/Rust; benchmarks/vulkan/).
@@ -3795,7 +3814,7 @@ fn lower_fn(
 /// A `@vulkan` shader stage (`@vertex`/`@fragment`) — compiled to SPIR-V, not host
 /// IR, so it is pulled out of normal lowering (see the lowering loop).
 fn is_shader_fn(f: &FnDef) -> bool {
-    f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task" | "compute"))
+    f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task" | "compute" | "gpuvk"))
 }
 
 fn is_gpu_fn(f: &FnDef) -> bool {

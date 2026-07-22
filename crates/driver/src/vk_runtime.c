@@ -29,6 +29,92 @@ extern const uint32_t VK_TRI_FRAG[]; extern const unsigned VK_TRI_FRAG_N;
 extern const uint32_t VK_MESH_TRI[]; extern const unsigned VK_MESH_TRI_N;
 extern const uint32_t VK_TASK_TRI[]; extern const unsigned VK_TASK_TRI_N; /* N=0 → no task stage */
 extern const uint32_t VK_BUILD_COMP[]; extern const unsigned VK_BUILD_COMP_N; /* N=0 → no compute builder */
+extern const uint32_t VK_GPUVK_COMP[]; extern const unsigned VK_GPUVK_COMP_N; /* N=0 → no @gpuvk map */
+
+/* forward decls (defined below) */
+static uint32_t find_mem(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want);
+static VkShaderModule shmod(VkDevice d, const uint32_t *code, size_t n);
+
+/* gpuvk_run(data, n): vendor-neutral Vulkan compute. Runs the program's @gpuvk map
+ * over `n` f64 elements in place on ANY Vulkan device (no mesh-shader needed): upload
+ * as f32 to an SSBO, dispatch the compute shader (bounds-guarded), read back. Returns
+ * 0, or -2 if no Vulkan device / -1 on failure. */
+int64_t jrt_vk_gpuvk_run(double *data, int64_t n) {
+    if(!data || n <= 0) return -1;
+    if(VK_GPUVK_COMP_N == 0) return -1;
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_2};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
+    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd){ vkDestroyInstance(inst,0); return -2; }
+    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
+    VkPhysicalDevice pd=0; uint32_t qf=0;
+    for(uint32_t d=0; d<nd && !pd; d++){
+        uint32_t m=0; vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&m,0);
+        VkQueueFamilyProperties *qs=malloc(m*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&m,qs);
+        for(uint32_t i=0;i<m;i++) if(qs[i].queueFlags&VK_QUEUE_COMPUTE_BIT){ pd=pds[d]; qf=i; break; } free(qs);
+    }
+    free(pds); if(!pd){ vkDestroyInstance(inst,0); return -2; }
+    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
+    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
+    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+
+    VkDeviceSize sz=(VkDeviceSize)n*sizeof(float);
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=sz,.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return -1;
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    VkDeviceMemory bmem; CK(vkAllocateMemory(dev,&bm,0,&bmem)); vkBindBufferMemory(dev,buf,bmem,0);
+    float *host; CK(vkMapMemory(dev,bmem,0,sz,0,(void**)&host));
+    for(int64_t i=0;i<n;i++) host[i]=(float)data[i];
+    vkUnmapMemory(dev,bmem);
+
+    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT};
+    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1};
+    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
+    VkDescriptorBufferInfo dbi={.buffer=buf,.offset=0,.range=sz};
+    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi};
+    vkUpdateDescriptorSets(dev,1,&wds,0,0);
+
+    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,.offset=0,.size=4};
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&dsl,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
+    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev,&plci,0,&pl));
+    VkShaderModule cm=shmod(dev,VK_GPUVK_COMP,VK_GPUVK_COMP_N*4); if(!cm) return -1;
+    VkComputePipelineCreateInfo cpci={.sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage={.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=cm,.pName="main"},.layout=pl};
+    VkPipeline pipe=0; vkCreateComputePipelines(dev,0,1,&cpci,0,&pipe); vkDestroyShaderModule(dev,cm,0); if(!pipe) return -1;
+
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cmd,&cbi);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
+    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pl,0,1,&dset,0,0);
+    uint32_t cnt=(uint32_t)n;
+    vkCmdPushConstants(cmd,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&cnt);
+    vkCmdDispatch(cmd,(cnt+63)/64,1,1);
+    CK(vkEndCommandBuffer(cmd));
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
+    CK(vkMapMemory(dev,bmem,0,sz,0,(void**)&host));
+    for(int64_t i=0;i<n;i++) data[i]=(double)host[i];
+    vkUnmapMemory(dev,bmem);
+    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0);
+    vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0);
+    vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
+    vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    return 0;
+}
 
 /* Does a physical device advertise a given extension? */
 static int has_ext(VkPhysicalDevice pd, const char *name) {

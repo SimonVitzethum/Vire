@@ -1,0 +1,30 @@
+// Vire @gpuvk — vendor-neutral Vulkan compute. Runs on ANY Vulkan device (Intel,
+// NVIDIA, AMD, Apple/MoltenVK, …), unlike @gpu which targets CUDA/ROCm (NVPTX).
+//
+//   vire run examples/vire/gpuvk_map.vr
+//
+// A @gpuvk function is a data-parallel MAP: it runs once per array element on the GPU.
+// elem() reads this invocation's element (buffer[gl_GlobalInvocationID.x]); the
+// function's value is written back to it. gpuvk_run(arr) uploads the array to a GPU
+// storage buffer, dispatches the compute shader (bounds-guarded, 64-wide workgroups),
+// and reads the result back — the array is transformed in place. See language/GPU-VULKAN.md.
+
+@gpuvk
+fn scale() -> Float {
+    mut x = elem()
+    x * x + 1.0        // each element becomes x² + 1, computed on the GPU
+}
+
+fn main() {
+    mut a = [1.0, 2.0, 3.0, 4.0, 5.0]
+    mut status = gpuvk_run(a)      // 0 = ran on the GPU, -2 = no Vulkan device
+    if status == 0 {
+        mut i = 0
+        while i < 5 {
+            print(a[i])            // 2, 5, 10, 17, 26
+            i = i + 1
+        }
+    } else {
+        print(status)
+    }
+}
