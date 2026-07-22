@@ -1,85 +1,148 @@
-# Investigation: a Vulkan/SPIR-V backend for `@gpu`
+# Design investigation: `@vulkan` — safe, easy, full-performance Vulkan in Vire
 
-**Question:** would integrating a simple-but-powerful Vulkan compute path directly
-into the Vire compiler make sense — as a second `@gpu` target beside CUDA/PTX?
+**Goal (the user's vision):** make Vulkan usable in Vire *as easily as OpenGL* —
+you write a few lines to draw — while keeping **full Vulkan performance**,
+**memory safety**, and **Vire's whole-program optimizations**. Not a thin FFI
+binding, and not a compute-only offload: a **compiler-integrated, safe Vulkan
+framework** (graphics + compute) where the notorious boilerplate (swapchain,
+render passes, pipelines, descriptor sets, command buffers, synchronization,
+memory) is generated — correctly — by the compiler and a thin runtime.
 
-**Verdict: yes, high value and technically de-risked.** It is the cleanest way to
-make `@gpu` **vendor-neutral** (NVIDIA + AMD + Intel + Apple), which is exactly the
-kind of thing cuda-oxide (a NVIDIA-only `rustc` backend) structurally cannot do —
-so it directly serves the "beat cuda-oxide" goal. Below: the feasibility evidence,
-the design, the honest trade-offs, and the recommendation.
+Think "a compiler-integrated `wgpu`/`sokol_gfx`", but with two things those can't
+do: **whole-program pipeline/barrier baking** and **language-level safety**.
 
-## Why it's de-risked (measured on this machine)
+## Feasibility — everything needed is present (measured on this machine)
 
-- **LLVM already has the SPIR-V target built in.** `llc --version` lists
-  `spirv` / `spirv32` / `spirv64` (LLVM 22.1.8). Our NVPTX emitter already produces
-  LLVM IR *text*; the same IR can go to `llc -march=spirv64` instead of
-  `-march=nvptx64`. The device-IR structure is identical — the backend is ~90%
-  reusable.
-- **The Vulkan stack is present and universal.** `libvulkan.so.1` (loader),
-  `vulkan.h`, and `glslc`/`spirv-as`/`glslangValidator` are installed.
-- **Both GPUs enumerate under Vulkan** on this laptop: the **Intel iGPU** *and* the
-  **RTX 5070** (`vulkaninfo`). CUDA sees only the NVIDIA card; Vulkan runs on both —
-  a concrete demonstration of the portability win on the very same hardware.
+- **SPIR-V codegen**: LLVM 22 ships the `spirv64` target, and our `@gpu` device-IR
+  emitter already produces LLVM IR — so Vire shaders compile to SPIR-V through the
+  same path. (This is the compute foundation, already validated for `@gpu`.)
+- **Vulkan stack**: `libvulkan.so.1` (1.4), `vulkan.h`, `glslc`/`spirv-as` present.
+- **Windowing**: GLFW 3.4 and SDL2 (+headers) present; both Wayland (`wayland-0`)
+  and X11 (`:1`) sessions available.
+- **WSI**: both the Intel iGPU and the RTX 5070 expose
+  `VK_KHR_{wayland,xcb,xlib}_surface` + `VK_KHR_swapchain`.
+- **Vendor-neutral**: two Vulkan devices enumerate here (Intel + NVIDIA) — the same
+  `@vulkan` program runs on both, and on AMD/Apple(MoltenVK)/Android elsewhere.
 
-## The design (reuse the emitter, swap the dialect + runtime)
+So the full graphics path is buildable; nothing external is missing.
 
-`@gpu fn` → shared IR → **SPIR-V dialect** of the device emitter → `llc
--march=spirv64` → SPIR-V module → embedded in the binary → dispatched via a minimal
-Vulkan compute runtime. Concretely, three things change vs the PTX path; everything
-else (the whole kernel-body IR walk) is shared:
+## Architecture — three layers, most of the hard work at compile time
 
-| concern | CUDA/PTX (today) | Vulkan/SPIR-V |
-|---|---|---|
-| array pointers | `ptr addrspace(1)` (global) | `StorageBuffer` storage class (structured buffer) |
-| thread index | `@llvm.nvvm.read.ptx.sreg.*` | SPIR-V builtins `GlobalInvocationId` etc. |
-| barrier / warp / atomics | `nvvm.barrier0`, `shfl.sync`, `atomicrmw` | `OpControlBarrier`, `VK_KHR_shader_subgroup` ops, SPIR-V atomics |
-| shared memory (future) | `.shared` / `addrspace(3)` | `Workgroup` storage class |
-| host runtime | `jrt_gpu_*` over libcuda (84 lines) | `jrt_gpu_*` over libvulkan (~250–400 lines, one-time boilerplate) |
+### 1. Shaders in Vire (single-source, no GLSL files)
+`@vertex` / `@fragment` / `@compute` functions, compiled to SPIR-V via the emitter
+(reusing the `@gpu` path). Vertex/fragment I/O is typed by Vire structs, so the
+**vertex layout and descriptor bindings are known at compile time** from the shader
+signatures — no runtime reflection.
 
-The **G1 intrinsics just landed map directly**: `gpu_sync` → `OpControlBarrier`,
-`gpu_warp_reduce_add`/`gpu_shfl_down` → subgroup ops (`OpGroupNonUniform*`),
-`gpu_atomic_add` → `OpAtomicIAdd`, IEEE math → SPIR-V `ExtInst` (`GLSL.std.450`).
-So the primitive surface is already the right shape for both targets.
+```vire
+@vertex fn vs(pos: Vec3, uv: Vec2) -> (clip: Vec4, out_uv: Vec2) { ... }
+@fragment fn fs(uv: Vec2, tex: Sampler2D) -> Vec4 { ... }
+```
 
-The host ABI (`jrt_gpu_ensure/upload/download/free/launch`) stays identical, so the
-generated launch stubs and the read-only-array D2H-skip analysis are **backend-
-agnostic** — only the runtime `.c` behind the ABI differs. Selection: `--gpu=cuda|
-vulkan` (auto-default to CUDA if libcuda present, else Vulkan).
+### 2. Declarative resources + pipelines → baked by the compiler
+Typed handles (`Buffer`, `Image`, `Texture`, `Mesh`, `Pipeline`, `Uniforms`).
+Because Vire is **whole-program**, the compiler:
+- derives **descriptor-set layouts** from shader resource usage (no hand-written
+  `VkDescriptorSetLayout`);
+- **bakes the pipeline state object** (`VkGraphicsPipelineCreateInfo`: vertex input
+  from the `@vertex` input struct, blend/depth/topology from the declared config)
+  at compile time — no runtime pipeline introspection or stalls;
+- builds a **render graph** from the per-frame draw/dispatch sequence and inserts
+  **minimal, correct image-layout transitions + barriers automatically** — the
+  single most error-prone part of hand-written Vulkan, done statically.
 
-## Honest trade-offs
+### 3. A thin safe runtime over libvulkan (the OpenGL-like surface)
+Auto instance/device/queue selection, swapchain (re)creation, frames-in-flight
+sync, and a sub-allocating memory allocator — behind an immediate, OpenGL-simple
+API. The target ergonomics:
 
-**Wins (Vulkan):**
-- **Vendor-neutral**: NVIDIA + AMD + Intel + Apple (via MoltenVK) + Android. One
-  binary, any GPU. cuda-oxide cannot match this.
-- **No CUDA toolkit / libcuda dependency** — the Vulkan loader is more universally
-  present.
-- Subgroup, shared-memory, and atomic primitives all exist in core Vulkan / KHR
-  extensions, so G1/G2 features port.
+```vire
+fn main() {
+    let win  = window(1280, 720, "hello vire")
+    let pipe = pipeline(vs, fs)              // baked at compile time
+    let mesh = mesh(vertices, indices)
+    let tex  = texture("wood.png")
+    while !win.closing() {
+        frame(win) {                          // records the command buffer + barriers
+            clear(0.1, 0.1, 0.12)
+            draw(pipe, mesh, uniforms(mvp, tex))
+        }                                     // present, advance frame-in-flight
+    }
+}
+```
 
-**Costs / risks (Vulkan):**
-- **More host boilerplate**: instance → physical device → queue → descriptor set
-  layout → pipeline → command buffer → explicit memory barriers → dispatch. It's
-  templatable (write once), but it's ~3–5× the CUDA runtime's line count.
-- **SPIR-V "Logical" addressing is restrictive**: no arbitrary pointer arithmetic;
-  buffer access must be structured (index into a typed buffer). Our array GEPs
-  already *are* structured indexing, so this mostly fits — but pointer-heavy kernels
-  would need care. LLVM's SPIR-V backend is also newer/less battle-tested than
-  NVPTX; expect some IR constructs to need adjustment.
-- **Lower ceiling on cutting-edge NVIDIA features**: Vulkan has
-  `VK_KHR_cooperative_matrix` but it is less capable than CUDA's `wgmma`/`tcgen05`.
-  So the G3 tensor-core peak stays a CUDA-only story; Vulkan targets the broad 80%.
-- **Perf**: for standard compute, Vulkan ≈ CUDA on the same hardware (same SPIR-V →
-  native JIT). NVIDIA's CUDA path is sometimes marginally better on NV silicon;
-  Vulkan is the *only* option on non-NV.
+That is OpenGL-level line count for a textured, depth-tested draw — but every
+Vulkan object under it is explicit, baked, and correct.
+
+## What makes it *Vire* (why not just bind an existing framework)
+
+- **Compile-time pipeline/layout baking.** A whole-program compiler sees every
+  shader, resource, and draw call, so pipeline objects and descriptor layouts are
+  constants in the binary — no first-use hitches, no runtime reflection. wgpu/sokol
+  build these at runtime.
+- **Static render-graph → minimal barriers.** The compiler computes resource
+  read/write per pass and emits the tightest correct barrier set — hand-expert
+  quality, without the hand-expert bug surface.
+- **Language-level memory safety.** Handles are Vire objects with RC/region
+  lifetimes → no use-after-free of GPU resources, teardown ordered (device-idle
+  before destroy). Buffer writes go through typed, bounds-checked mapped regions;
+  no raw pointers in the safe surface.
+- **Zero-cost validation.** Usage rules (create-usage matches use, bind-before-draw,
+  shader I/O matches pipeline) checked by the solver where provable; Vulkan
+  validation layers on under `--debug`, compiled out in release (same pattern as
+  the logger / `--backtrace`) → safety in dev, full speed in ship.
+- **Whole-program optimization of the frame.** const-fold pipeline config,
+  monomorphize shader variants per material, dead-resource elimination, and
+  `@gpu`-style specialization all apply to the render path.
+- **Single-source.** Shaders, resources, and app logic in one language/IR — no
+  GLSL/SPIR-V toolchain juggling.
+- **No ceiling.** Raw `Vk*` handles remain reachable through verified `native "c"`
+  blocks for anything the safe layer doesn't cover yet — advanced use never blocks.
+
+## Memory-safety model
+
+| hazard (raw Vulkan) | how `@vulkan` prevents it |
+|---|---|
+| use-after-free of a buffer/image/pipeline | handles are RC/region-owned; destroy ordered after device-idle |
+| missing/incorrect image-layout transition | render graph inserts them; not user-writable |
+| descriptor/layout mismatch vs shader | layouts derived from typed shader signatures at compile time |
+| out-of-bounds buffer write | typed, bounds-checked mapped write regions |
+| use-before-bind, wrong usage flags | solver checks statically; validation layers in `--debug` |
+| forgotten sync (races/tearing) | frames-in-flight + semaphores/fences owned by the runtime |
+
+## Honest scope
+
+This is **large — multi-quarter**, not a two-month item. A safe windowed triangle
+already needs windowing + instance/device/swapchain + one baked pipeline + command
+buffer + sync + present. The full framework (textures, uniforms/descriptors, depth,
+render-graph, multi-pass, compute integration) is a real project. But it is
+*de-risked* (all deps present) and *incremental* (each stage is runnable), and it
+reuses the `@gpu` SPIR-V path and Vire's ownership/whole-program machinery rather
+than starting from zero.
+
+## Staged roadmap
+
+- **V1 — safe compute (foundation).** `@compute` → SPIR-V → dispatch over a minimal
+  safe Vulkan runtime; the `jrt_gpu_*` ABI + read-only analysis carry over. Delivers
+  vendor-neutral compute (Intel + NVIDIA here) with no windowing. *Smallest real
+  step; validates the SPIR-V emitter + runtime.*
+- **V2 — hello triangle.** Windowing (GLFW/SDL), swapchain, one compile-time-baked
+  graphics pipeline, `@vertex`/`@fragment` shaders, `frame { clear; draw }`, present.
+  The OpenGL-easy milestone.
+- **V3 — resources.** Buffers/meshes, uniforms, textures/samplers, auto descriptor
+  layouts from shader signatures; a `draw(pipe, mesh, uniforms)` API.
+- **V4 — render graph.** Per-frame graph → automatic layout transitions + minimal
+  barriers; depth buffer, multiple passes, MSAA, swapchain-resize handling.
+- **V5 — Vire optimizations.** Compile-time pipeline/descriptor baking, shader
+  monomorphization per material, whole-program resource-lifetime + dead-resource
+  elimination, zero-cost validation gating.
 
 ## Recommendation
 
-Build it as a **second target, not a replacement** — the CUDA path stays for peak
-NVIDIA performance (and the G3 tensor-core roadmap), and Vulkan adds portability.
-"Simple but powerful" = reuse the emitter (dialect flag), reuse the `jrt_gpu_*` ABI
-+ launch stubs + read-only analysis, and add one templated Vulkan compute runtime.
-Estimated effort: a few weeks for a working saxpy/reduction on both Intel + NVIDIA
-via the same `@gpu` source, because the hard parts (IR emission, the intrinsic
-surface, the host ABI) already exist. Staged plan and risks tracked in
-[../TODO.md](../TODO.md) (GPU section, "Vulkan/SPIR-V vendor-neutral backend").
+Yes — build it, staged, as a headline Vire capability: it turns Vire into a
+language where you get **OpenGL-simple, memory-safe, full-speed Vulkan** with
+optimizations no runtime framework can do. Start at **V1** (reuses the validated
+compute path, no windowing, smallest surface) to stand up the SPIR-V emitter + safe
+runtime, then **V2** for the triangle that proves the ergonomics. The compute
+backend previously discussed is exactly V1 — the foundation of this larger vision,
+not a separate track.

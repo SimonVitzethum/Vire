@@ -190,11 +190,15 @@ bit-exact vs CPU on an RTX 5070 (`tests/vire_gpu.sh` 8/8). See
   (`@llvm.minnum/maxnum.f64`), round-to-nearest = bit-exact vs the CPU runtime.
   Verified: Σ sqrt(i²)=Σi=4950; Σ floor(3.7)=300.
 
-### GPU — Vulkan/SPIR-V backend investigation
-Investigated a vendor-neutral second `@gpu` target. Verdict: high value, de-risked
-(LLVM 22 ships `spirv64`; Vulkan stack present; both Intel iGPU + RTX enumerate).
-Design/trade-offs/recommendation in [language/GPU-VULKAN.md](language/GPU-VULKAN.md);
-roadmap item in TODO.md (GPU G4). Not yet built.
+### `@vulkan` — safe full-Vulkan framework investigation
+Investigated the vision of Vulkan **as easy as OpenGL** but memory-safe, full-speed,
+and whole-program-optimized — a compiler-integrated safe Vulkan framework (graphics
++ compute), not an FFI binding. Verdict: high value, de-risked, multi-quarter. All
+deps present here (LLVM `spirv64`, libvulkan 1.4, GLFW/SDL2, Wayland+X11, WSI on both
+Intel iGPU + RTX). Design, safety model, target ergonomics, and staged plan (V1
+safe-compute → V2 triangle → V3 resources → V4 render-graph → V5 Vire-opts) in
+[language/GPU-VULKAN.md](language/GPU-VULKAN.md); roadmap in TODO.md (`@vulkan`
+section). Not yet built.
 
 ---
 

@@ -266,19 +266,6 @@ is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
   reference win. *Scope: NVIDIA-research-grade; do G1/G2 first.*
 
 ### Stage G4 — the BEAT levers (Vire-only — exceed, don't just match)
-- [ ] **Vendor-neutral Vulkan/SPIR-V backend** (investigated — high value, de-risked;
-  see [language/GPU-VULKAN.md](language/GPU-VULKAN.md)). A *second* `@gpu` target
-  beside CUDA: `@gpu fn` → SPIR-V dialect of the device emitter → `llc -march=spirv64`
-  → Vulkan compute dispatch. Runs on NVIDIA **+ AMD + Intel + Apple** — portability
-  cuda-oxide (NVIDIA-only) structurally cannot match. De-risked: LLVM 22 ships the
-  `spirv64` target, the Vulkan stack is present, and both the Intel iGPU and the RTX
-  enumerate under Vulkan here. Reuse: the emitter (~90%), the `jrt_gpu_*` ABI, the
-  launch stubs, and the read-only analysis are backend-agnostic; the G1 intrinsics
-  map directly (barrier→`OpControlBarrier`, warp→subgroup ops, atomic→`OpAtomicIAdd`,
-  math→`GLSL.std.450`). New: a SPIR-V dialect flag + one templated Vulkan runtime +
-  `--gpu=cuda|vulkan` selection. Caveats: SPIR-V Logical addressing is structured-only
-  (our GEPs fit), and the tensor-core peak (G3) stays CUDA-only. *First milestone:
-  saxpy + a reduction on Intel iGPU and NVIDIA from the same `@gpu` source.*
 - [ ] **Memory-safe device mode.** cuda-oxide device access is unchecked
   (CUDA-like). Vire's solver can prove many device indices in-range (reuse
   `bounds.rs` relational elision) and bounds-check the rest → an *optional safe GPU
@@ -299,6 +286,47 @@ is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
   kernels; compare **kernel-compute time only** (warm context, exclude H2D/D2H).
   Start with saxpy + a shared-mem reduction + a tiled GEMM. Per
   [benchmarks/gpu/VS-CUDA-OXIDE.md](benchmarks/gpu/VS-CUDA-OXIDE.md).
+
+---
+
+## `@vulkan` — safe, easy, full-performance Vulkan (graphics + compute)
+
+**Investigated — high value, de-risked, multi-quarter.** Full design, safety
+model, and target ergonomics in [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
+The vision: Vulkan **as easy as OpenGL** but with full performance, memory safety,
+and Vire's whole-program optimizations — a *compiler-integrated safe Vulkan
+framework* (not an FFI binding). What makes it Vire-only: **compile-time
+pipeline/descriptor baking** (constants in the binary, no runtime reflection or
+first-use hitches), a **static render graph → minimal correct barriers** (the
+hardest hand-Vulkan part, done by the compiler), **language-level handle safety**
+(RC/region lifetimes → no GPU-resource use-after-free), **zero-cost validation**
+(layers under `--debug`, compiled out in release), and **single-source shaders**
+(`@vertex`/`@fragment`/`@compute` → SPIR-V via the `@gpu` emitter). Escape hatch:
+raw `Vk*` via verified `native "c"`. All deps present here (LLVM `spirv64`,
+libvulkan, GLFW/SDL2, Wayland+X11, WSI on both Intel iGPU + RTX).
+
+Staged (each stage runnable):
+- [ ] **V1 — safe compute foundation.** `@compute` → SPIR-V → dispatch over a
+  minimal safe Vulkan runtime; reuse the `jrt_gpu_*` ABI + read-only analysis. No
+  windowing. Delivers vendor-neutral compute (runs on Intel + NVIDIA here). *Smallest
+  real step; stands up the SPIR-V emitter + runtime.* (This subsumes the old
+  "Vulkan compute backend" idea — it is the foundation, not a separate track.)
+- [ ] **V2 — hello triangle.** Windowing (GLFW/SDL) + swapchain + one
+  compile-time-baked graphics pipeline + `@vertex`/`@fragment` + `frame { clear;
+  draw }` + present. The OpenGL-easy milestone.
+- [ ] **V3 — resources.** Buffers/meshes, uniforms, textures/samplers, descriptor
+  layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
+- [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
+  depth, multi-pass, MSAA, swapchain-resize.
+- [ ] **V5 — Vire optimizations.** Compile-time pipeline/descriptor baking, shader
+  monomorphization per material, whole-program resource-lifetime + dead-resource
+  elimination, zero-cost validation gating.
+- [ ] **SPIR-V emitter**: a SPIR-V dialect of the device emitter (StorageBuffer /
+  `Workgroup` storage classes, SPIR-V builtins, subgroup ops, `GLSL.std.450` math)
+  + `llc -march=spirv64`. Shared by `@gpu`-on-Vulkan and `@vulkan` shaders. G1
+  intrinsics map directly (barrier→`OpControlBarrier`, warp→subgroup, atomic→
+  `OpAtomicIAdd`). Caveat: SPIR-V Logical addressing is structured-only (our GEPs
+  fit); tensor-core peak stays CUDA-only.
 
 ---
 
