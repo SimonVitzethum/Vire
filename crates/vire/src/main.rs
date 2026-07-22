@@ -1196,7 +1196,12 @@ fn build_or_run(args: &[String]) {
         // (crates/backend/src/spirv.rs), assemble with `spirv-as` (graphics Shader
         // flavor, which `llc -march=spirv64` does not do), and link the words in as
         // a generated C TU. The @fragment color comes from the Vire source.
-        let frag = program.frag_color.unwrap_or([1.0, 0.4, 0.1, 1.0]);
+        // Fragment: the Vire-compiled `@fragment` shader (crates/vire/src/shader.rs),
+        // or a default constant color when the program defines no fragment stage.
+        let frag_asm = program
+            .frag_spvasm
+            .clone()
+            .unwrap_or_else(|| fastllvm_backend::spirv::constant_fragment_spvasm([1.0, 0.4, 0.1, 1.0]));
         let assemble = |asm: &str, stem: &str| -> Vec<u32> {
             let asm_path = build_dir.join(format!("{stem}.spvasm"));
             let spv_path = build_dir.join(format!("{stem}.spv"));
@@ -1215,7 +1220,7 @@ fn build_or_run(args: &[String]) {
             bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
         };
         let vw = assemble(&fastllvm_backend::spirv::triangle_vertex_spvasm(), "vk_vert");
-        let fw = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm(frag), "vk_frag");
+        let fw = assemble(&frag_asm, "vk_frag");
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
         for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));

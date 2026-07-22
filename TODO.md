@@ -325,19 +325,21 @@ Staged (each stage runnable):
   layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
-- [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language*
-  (not Slang; Slang stays an optional import-only escape hatch). *Step 1 SHIPPED:*
-  Vire now **owns SPIR-V generation** — `crates/backend/src/spirv.rs` emits SPIR-V
-  **assembly**, the driver assembles it with `spirv-as` into a generated
-  `vk_shaders.c` (no more glslc/GLSL), and a Vire `@fragment fn fs() -> Vec4 {
-  vec4(r,g,b,a) }` drives the fragment color (parsed as an item attribute, pulled
-  out of host lowering, color extracted → `program.frag_color`). Verified: a green
-  Vire `@fragment` renders a green triangle (`tests/vire_vulkan.sh
-  vire_fragment_shader`), headless + windowed. *Remaining:* (a) a real `Vec2/3/4`/
-  `Mat4` type layer (today `vec4` is shader-local, constant only); (b) emit shader
-  **bodies** from the IR (arithmetic, varyings, structured control flow) not just a
-  constant; (c) a Vire-authored `@vertex` stage (vertex is still the fixed bootstrap
-  assembly); (d) vertex-buffer inputs / typed stage I/O.
+- [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*
+  *Steps 1+2 SHIPPED:* Vire **owns SPIR-V generation** (`crates/backend/src/spirv.rs`
+  emits assembly → `spirv-as` → generated `vk_shaders.c`, no glslc), and a real
+  **shader compiler** (`crates/vire/src/shader.rs`) compiles an `@fragment fn`
+  **body** to SPIR-V ops — float/vector arithmetic (`OpFAdd/Sub/Mul/Div`), `mut`
+  bindings, `vecN(...)` constructors, and vector·scalar (`OpVectorTimesScalar`) —
+  not just a constant. `@vertex`/`@fragment` parse as item attributes and are pulled
+  out of host lowering + inference. Verified (`tests/vire_vulkan.sh`): a computed
+  green fragment (`vec4(0.1,0.4,0.15,0.5) * 2.0`) renders green, headless + windowed.
+  *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type system (today vectors are
+  shader-local); (b) **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`)
+  + swizzles + more builtins (`GLSL.std.450`: normalize/dot/mix…); (c) **fragment
+  inputs** (`gl_FragCoord`, varyings from the vertex stage) so a shader computes
+  per-pixel, not per-constant; (d) a Vire-authored **`@vertex`** stage (still the
+  fixed bootstrap) + vertex-buffer / typed stage I/O.
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

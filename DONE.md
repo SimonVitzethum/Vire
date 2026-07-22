@@ -208,6 +208,19 @@ SPIR-V (glslc-embedded); single-source Vire→SPIR-V is the next milestone. Veri
 headless pixel-correct + windowed present (3-frame smoke → 1). No regression
 (gpu 8/8, heap 16/16; non-vulkan binaries unchanged).
 
+### `@vulkan` VS step 2 — a Vire shader compiler (bodies → SPIR-V ops) (shipped)
+`crates/vire/src/shader.rs` compiles an `@fragment fn` **body** to SPIR-V assembly:
+float/vector arithmetic (`OpFAdd/Sub/Mul/Div`), `mut` bindings, `vecN(...)`
+constructors, and vector·scalar (`OpVectorTimesScalar`) — real computation, not a
+baked constant. Vectors are shader-local types (no host type-system change).
+`program.frag_color` → `program.frag_spvasm` (the compiled assembly; `None` → a
+default constant fragment). Shader fns are pulled out of host **inference** too
+(they use shader-only forms). Unsupported constructs give a clear compile error.
+Verified: a computed green fragment (`vec4(0.1,0.4,0.15,0.5) * 2.0` → (0.2,0.8,0.3))
+renders green — `tests/vire_vulkan.sh vire_fragment_compute`, headless + windowed.
+No regression (gpu 8/8, heap 16/16). Next: host Vec/Mat types, control flow,
+fragment inputs (varyings), a Vire `@vertex` stage.
+
 ### `@vulkan` VS step 1 — Vire owns SPIR-V generation + first Vire shader (shipped)
 Vire is now the shader language (not Slang). The compiler generates the shaders'
 SPIR-V itself: `crates/backend/src/spirv.rs` emits SPIR-V **assembly** (the graphics

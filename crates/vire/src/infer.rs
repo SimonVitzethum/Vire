@@ -185,6 +185,12 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
             if !f.sig.generics.is_empty() {
                 continue; // generic → do not infer monomorphically
             }
+            // `@vertex`/`@fragment` are SPIR-V shaders compiled by shader.rs, not
+            // host code — their bodies use shader-only forms (`vecN`, vector math)
+            // that the host inference doesn't model, so skip them here.
+            if f.attrs.iter().any(|a| a.name == "vertex" || a.name == "fragment") {
+                continue;
+            }
             if let Some(body) = &f.body {
                 let sig = &sigs[&f.sig.name];
                 let mut cx = Ctx {

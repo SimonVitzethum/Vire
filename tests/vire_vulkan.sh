@@ -60,6 +60,26 @@ fn main() {
 }
 EOF
 
+# A Vire @fragment with real arithmetic (not a constant): a binding + vector*scalar
+# → OpCompositeConstruct/OpVectorTimesScalar in the emitted SPIR-V. (0.1,0.4,0.15,0.5)*2
+# = (0.2,0.8,0.3,1.0) green. Proves shader *bodies* compile, not just constants.
+case_ vire_fragment_compute <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut base = vec4(0.1, 0.4, 0.15, 0.5)
+    base * 2.0
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r < 90 { if g > 150 { if b > 30 { if b < 120 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

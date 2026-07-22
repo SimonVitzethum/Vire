@@ -324,11 +324,12 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// `@gpu` kernels (device code + host launch stubs), see [`GpuKernel`].
     pub gpu_kernels: Vec<GpuKernel>,
-    /// `@vulkan` shaders (VS milestone): the constant color of an `@fragment fn`
-    /// whose body is `vec4(r,g,b,a)`. `None` → the default triangle color. Drives
-    /// the SPIR-V the backend generates for the `@vulkan` fragment stage. Minimal
-    /// first step of "Vire is the shader language" — see language/GPU-VULKAN.md.
-    pub frag_color: Option<[f32; 4]>,
+    /// `@vulkan` fragment shader compiled to SPIR-V **assembly** by the frontend
+    /// shader compiler (`crates/vire/src/shader.rs`) from an `@fragment fn` body
+    /// (arithmetic, `let`, `vecN`). `None` → the driver uses a default constant
+    /// fragment. Assembled by `spirv-as` at build. "Vire is the shader language" —
+    /// see language/GPU-VULKAN.md.
+    pub frag_spvasm: Option<String>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

@@ -585,8 +585,11 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             // of lowering (their body uses shader builtins like `vec4`). Capture the
             // fragment's constant color for the backend's SPIR-V generation.
             if is_shader_fn(f) {
-                if let Some(c) = extract_frag_color(f) {
-                    prog.frag_color = Some(c);
+                if f.attrs.iter().any(|a| a.name == "fragment") {
+                    match crate::shader::compile_fragment(f) {
+                        Ok(asm) => prog.frag_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
                 }
                 continue;
             }
@@ -3687,39 +3690,6 @@ fn lower_fn(
 /// IR, so it is pulled out of normal lowering (see the lowering loop).
 fn is_shader_fn(f: &FnDef) -> bool {
     f.attrs.iter().any(|a| a.name == "vertex" || a.name == "fragment")
-}
-
-/// Extract the constant color of an `@fragment fn` whose body is `vec4(r,g,b,a)`
-/// (the VS first step). `None` if not a fragment or not a constant vec4.
-fn extract_frag_color(f: &FnDef) -> Option<[f32; 4]> {
-    if !f.attrs.iter().any(|a| a.name == "fragment") {
-        return None;
-    }
-    let body = f.body.as_ref()?;
-    let tail: &Expr = match &body.tail {
-        Some(t) => t,
-        None => match body.stmts.last()? {
-            Stmt::Expr(e) => e,
-            Stmt::Return(Some(e), _) => e,
-            _ => return None,
-        },
-    };
-    if let Expr::Call { callee, args, .. } = tail {
-        if let Expr::Ident(n, _) = callee.as_ref() {
-            if n == "vec4" && args.len() == 4 {
-                let mut c = [0f32; 4];
-                for (i, a) in args.iter().enumerate() {
-                    c[i] = match a {
-                        Expr::Float(v, _) => *v as f32,
-                        Expr::Int(v, _) => *v as f32,
-                        _ => return None,
-                    };
-                }
-                return Some(c);
-            }
-        }
-    }
-    None
 }
 
 fn is_gpu_fn(f: &FnDef) -> bool {
