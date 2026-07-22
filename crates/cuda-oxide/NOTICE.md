@@ -27,15 +27,18 @@ The following cuda-oxide concepts have direct Vire counterparts:
 
 ## Source
 
-The **full upstream cuda-oxide source tree is vendored in this directory**
-(everything except `.git`), redistributed under its Apache-2.0 license (see
-[`LICENSE`](LICENSE)). It is kept for **reference and attribution only** and is
-**not built**: the repository's workspace `Cargo.toml` lists
-`exclude = ["third_party/cuda-oxide"]`, so `cargo` never descends into it, and
-none of its code is compiled into or linked by any Vire artifact. cuda-oxide is
-a `rustc` codegen backend (with its own workspace and pinned toolchain) and
-cannot be used as a library by Vire's C-hosted runtime; only its *design* is
-adapted.
+Only the **idea** was adapted — **no cuda-oxide code is copied, compiled, or
+linked** by any Vire artifact. Accordingly, the bulky upstream source tree is
+**not tracked in this repository**: it is `.gitignore`d (only this `NOTICE.md`,
+the `LICENSE` text, and `update.sh` are tracked) and, when present locally, is
+`exclude`d from the workspace `Cargo.toml` (`exclude = ["crates/cuda-oxide"]`)
+so `cargo` never descends into it. cuda-oxide is a `rustc` codegen backend (its
+own workspace + pinned toolchain) and cannot be used as a library by Vire's
+C-hosted runtime; only its *design* is adapted.
+
+To obtain the full upstream tree locally (reference only), run
+`sh crates/cuda-oxide/update.sh`, which clones NVlabs/cuda-oxide into this
+directory under its Apache-2.0 license (see [`LICENSE`](LICENSE)).
 
 The Vire GPU implementation itself (`crates/backend` NVPTX emitter + C launch
 stubs, `crates/driver/src/gpu_runtime.c`, `crates/vire` `@gpu` lowering) is

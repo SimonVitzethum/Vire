@@ -22,3 +22,13 @@ tests/work/
 
 # Autonomer Arbeits-Journal (nicht committen)
 workflow.md
+
+# Vendored cuda-oxide (NVlabs, Apache-2.0): reference-only, `exclude`d from the
+# workspace and NEVER compiled/linked (only the @gpu *design* was adapted — no
+# code copied; see LICENSING.md / language/GPU-KERNELS.md). The bulky upstream
+# source tree is untracked; refresh it locally with `sh crates/cuda-oxide/update.sh`.
+# Kept tracked: the attribution note, its license text, and the pull script.
+crates/cuda-oxide/*
+!crates/cuda-oxide/NOTICE.md
+!crates/cuda-oxide/LICENSE
+!crates/cuda-oxide/update.sh
