@@ -1,0 +1,12 @@
+[package]
+name = "bench-ash"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

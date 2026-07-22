@@ -1,0 +1,15 @@
+// Vire @vulkan steady-state benchmark. vk_bench(frames) initialises Vulkan once,
+// renders a mesh-shader triangle to a headless image `frames` times (submit + fence
+// wait per frame), and returns the total nanoseconds — the same workload the C++
+// (bench.cpp) and Rust (rust-ash/) baselines run. Prints per-frame nanoseconds.
+//
+//   vire build bench.vr -o bench_vire && ./bench_vire
+fn main() {
+    mut frames = 5000
+    mut total = vk_bench(frames)
+    if total < 0 {
+        print(0 - 1)          // no mesh-shader device → skip
+    } else {
+        print(total / frames) // nanoseconds per frame
+    }
+}

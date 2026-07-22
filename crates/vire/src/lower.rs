@@ -2819,6 +2819,15 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_bench(frames): steady-state headless benchmark — init once, render
+        // `frames` mesh-shader frames, return total nanoseconds (perf parity vs
+        // hand-written Vulkan in C++/Rust; benchmarks/vulkan/).
+        if name == "vk_bench" {
+            let arg = args.first().map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstI64(1000));
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_bench".into(), args: vec![arg] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_mesh_shader([nx, ny, nz, d]): the GPU-driven mesh pipeline
         // (VK_EXT_mesh_shader) — a mesh shader emits the geometry itself. The optional
         // four args are a frustum plane pushed for the `@task` cull (`cull_plane()`);
