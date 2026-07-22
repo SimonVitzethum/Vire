@@ -22,6 +22,14 @@ fn word_counts(text: Str) -> Map[Str, Int] {
 
 Reads like Python — compiles to a memory-safe, RC-eliminated native binary.
 
+**`@vulkan` compiles to the same Vulkan API calls as handwritten C++ and Rust.** In a
+steady-state mesh-shader benchmark (identical SPIR-V, 5000 frames), Vire shows no
+measurable runtime overhead while reducing the application code from 85–132 lines to
+just 9 — the pipeline, render pass, descriptors, and synchronization are compiler-
+generated. The same single-source program spans the whole GPU-driven meshlet renderer
+(`@compute` build → `@task` cull → `@mesh` draw → `@fragment` shade). See
+[benchmarks/vulkan/](benchmarks/vulkan/) and [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
+
 ## The idea in one paragraph
 
 Classically, memory safety comes with one of three costs: a garbage collector

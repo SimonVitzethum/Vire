@@ -460,11 +460,16 @@ Staged (each stage runnable):
   cone)`); the `@task` reads the facing direction (`meshlet_cone()`) and backface-culls
   (`emit_visible(cone.x > 0)`) — verified: of two GPU-built meshlets the one facing
   toward is drawn and the one facing away is culled (`tests/vire_vulkan.sh
-  vire_cone_cull`; `examples/vire/vulkan_cone.vr`). *Remaining:* per-vertex mesh
-  attributes (color/normal) → fragment (a mesh per-vertex Location output); wider
-  records (add a color/normal field); real geometry input to the builder (today it
-  places meshlets by formula). The GPU-driven renderer skeleton — build, cull, draw,
-  shade — is now entirely Vire, which normally spans GLSL/HLSL + C++ + a mesh toolchain.
+  vire_cone_cull`; `examples/vire/vulkan_cone.vr`). *Per-vertex mesh attributes → fragment
+  DONE:* the `@mesh` writes a per-vertex colour with `mesh_color(i, vec3)` (a Location-0
+  output array sized to the vertex cap) and the `@fragment` reads it interpolated via
+  `in_color()` — the RGB-corner triangle produced by the mesh shader itself, verified
+  (`tests/vire_vulkan.sh vire_mesh_color`; `examples/vire/vulkan_mesh_color.vr`).
+  *Remaining:* wider scene records (a colour/normal field beyond offset+cone); normal
+  attributes for lit meshlets; real geometry input to the builder (today it places
+  meshlets by formula). The GPU-driven renderer skeleton — build, cull, draw, shade,
+  with per-vertex attributes — is now entirely Vire, which normally spans GLSL/HLSL +
+  C++ + a mesh toolchain.
 - [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
   of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup
   ops, `GLSL.std.450`); G1 intrinsics map directly (barrier→`OpControlBarrier`,

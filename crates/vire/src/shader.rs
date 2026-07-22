@@ -894,6 +894,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     let mut caps: Option<(i64, i64)> = None;
     let mut prim_consts = String::new();              // OpConstantComposite per triangle
     let mut primk = 0u32;
+    let mut emits_mesh_color = false;                 // mesh_color(i, vec3) → per-vertex Location-0 output
     uints.insert(1); // %u_1 sizes the built-in ClipDistance/CullDistance arrays
     ints.insert(0);  // %i_0 selects gl_Position / scene record member 0
     ints.insert(1);  // %i_1 selects the scene record's second field (cone)
@@ -949,10 +950,23 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
                         writeln!(cx.body, "{ac} = OpAccessChain %_ptr_Output_v3uint %gl_PrimitiveTriangleIndicesEXT %i_{i}").unwrap();
                         writeln!(cx.body, "OpStore {ac} {prim}").unwrap();
                     }
+                    "mesh_color" => {
+                        // A per-vertex colour output (Location 0) the fragment reads
+                        // interpolated via in_color() — a mesh-shader vertex attribute.
+                        if args.len() != 2 { return Err("shader: mesh_color(i, Vec3)".into()); }
+                        let i = int_lit(&args[0])?;
+                        let (id, ty) = cx.expr(&args[1])?;
+                        if ty != Ty::Vec(3) { return Err("shader: mesh_color must be a Vec3".into()); }
+                        ints.insert(i);
+                        emits_mesh_color = true;
+                        let ac = cx.id("t");
+                        writeln!(cx.body, "{ac} = OpAccessChain %_ptr_Output_v3float %vColor %i_{i}").unwrap();
+                        writeln!(cx.body, "OpStore {ac} {id}").unwrap();
+                    }
                     other => return Err(format!("shader: unsupported @mesh call `{other}`")),
                 }
             }
-            _ => return Err("shader: `@mesh` supports set_mesh_outputs / mesh_pos / mesh_tri / let".into()),
+            _ => return Err("shader: `@mesh` supports set_mesh_outputs / mesh_pos / mesh_tri / mesh_color / let".into()),
         }
     }
     let (nv, np) = caps.ok_or("shader: `@mesh` must call set_mesh_outputs(nv, np) first")?;
@@ -964,16 +978,27 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     // the plain scene path, or the task payload for the fused-cull path).
     let (scene_iface, scene_decor, scene_decl) =
         resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, false, cx.uses_payload, false, false);
+    // A per-vertex colour output (Location 0, sized to the vertex cap) — declared only
+    // when `mesh_color()` is used; the fragment reads it interpolated via `in_color()`.
+    let (color_iface, color_decor, color_decl) = if emits_mesh_color {
+        (
+            " %vColor".to_string(),
+            "               OpDecorate %vColor Location 0\n".to_string(),
+            format!("%_arr_v3col = OpTypeArray %v3float %u_{nv}\n%_ptr_out_v3col = OpTypePointer Output %_arr_v3col\n     %vColor = OpVariable %_ptr_out_v3col Output\n%_ptr_Output_v3float = OpTypePointer Output %v3float\n"),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
 {glsl_import}               OpMemoryModel Logical GLSL450
-               OpEntryPoint MeshEXT %main \"main\" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT{scene_iface}
+               OpEntryPoint MeshEXT %main \"main\" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT{scene_iface}{color_iface}
                OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
                OpExecutionMode %main OutputVertices {nv}
                OpExecutionMode %main OutputPrimitivesEXT {np}
                OpExecutionMode %main OutputTrianglesEXT
-{scene_decor}               OpDecorate %gl_MeshPerVertexEXT Block
+{color_decor}{scene_decor}               OpDecorate %gl_MeshPerVertexEXT Block
                OpMemberDecorate %gl_MeshPerVertexEXT 0 BuiltIn Position
                OpMemberDecorate %gl_MeshPerVertexEXT 1 BuiltIn PointSize
                OpMemberDecorate %gl_MeshPerVertexEXT 2 BuiltIn ClipDistance
@@ -1004,7 +1029,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
 %_ptr_out_idx = OpTypePointer Output %_arr_idx
 %gl_PrimitiveTriangleIndicesEXT = OpVariable %_ptr_out_idx Output
 %_ptr_Output_v3uint = OpTypePointer Output %v3uint
-{scene_decl}{prim_consts}{consts}       %main = OpFunction %void None %fnty
+{color_decl}{scene_decl}{prim_consts}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {vars}{body}               OpReturn
                OpFunctionEnd
@@ -1016,6 +1041,9 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
         scene_iface = scene_iface,
         scene_decor = scene_decor,
         scene_decl = scene_decl,
+        color_iface = color_iface,
+        color_decor = color_decor,
+        color_decl = color_decl,
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,

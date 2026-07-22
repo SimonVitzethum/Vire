@@ -259,9 +259,10 @@ the **GLSL.std.450** math set (`sqrt`, `abs`, `floor`, `ceil`, `fract`, `sin`, `
   `attr_color()` reads a per-vertex colour (Location 1, from `vk_mesh_c`); `out_color(vec3)`
   writes a varying the fragment reads back.
 - **`@mesh`**: `set_mesh_outputs(nv, np)`, `mesh_pos(i, vec4)` (a vertex position — full Vire
-  arithmetic), `mesh_tri(i, a, b, c)` (triangle indices); `meshlet_offset()` (scene record
-  offset, indexed by `gl_WorkGroupID`, no-task path) and `culled_offset()` (indexed by the
-  task payload, cull path).
+  arithmetic), `mesh_tri(i, a, b, c)` (triangle indices), `mesh_color(i, vec3)` (a per-vertex
+  colour output at Location 0, read by the fragment via `in_color()`); `meshlet_offset()`
+  (scene record offset, indexed by `gl_WorkGroupID`, no-task path) and `culled_offset()`
+  (indexed by the task payload, cull path).
 - **`@task`**: `meshlet_offset()` / `meshlet_cone()` (this meshlet's centre / facing, from
   the scene record), `cull_plane()` (the frustum plane, a push constant), `emit_mesh_tasks(n)`
   (fixed count or a bool → `OpSelect` 1/0), `emit_visible(bool)` (cull: writes the meshlet

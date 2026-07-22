@@ -1,0 +1,34 @@
+// Vire @vulkan — per-vertex colour from the MESH shader, interpolated to the fragment.
+//
+//   vire run examples/vire/vulkan_mesh_color.vr
+//
+// A mesh shader emits the triangle's geometry AND a per-vertex colour: mesh_color(i,
+// vec3) writes a colour output at each vertex (Location 0). The rasterizer interpolates
+// it, and the @fragment reads it with in_color() — the classic red/green/blue-corner
+// triangle, but the colours are produced by the mesh shader itself (no vertex buffer).
+// This is the per-vertex attribute path a meshlet renderer uses to carry shading data.
+// See language/GPU-VULKAN.md.
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_color(0, vec3(1.0, 0.0, 0.0))     // red top
+    mesh_color(1, vec3(0.0, 1.0, 0.0))     // green corner
+    mesh_color(2, vec3(0.0, 0.0, 1.0))     // blue corner
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)                  // the interpolated per-vertex colour
+}
+
+fn main() {
+    mut px = vk_mesh_shader()
+    print(px / 65536)       // red   at the centroid — a blend of all three corners
+    print((px / 256) % 256) // green at the centroid
+    print(px % 256)         // blue  at the centroid
+}

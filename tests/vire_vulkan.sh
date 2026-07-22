@@ -528,6 +528,40 @@ fn main() {
 }
 EOF
 
+# Per-vertex mesh-shader attributes → fragment. The @mesh writes a per-vertex colour
+# (mesh_color(i, vec3)) at Location 0; the @fragment reads it interpolated via
+# in_color() — the classic RGB triangle, but the colours come from the MESH shader
+# (not a vertex buffer). At the centroid all three channels blend (each 40..160),
+# only possible if three pure per-vertex colours interpolate. -2 → skip.
+case_ vire_mesh_color <<'EOF'
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_color(0, vec3(1.0, 0.0, 0.0))
+    mesh_color(1, vec3(0.0, 1.0, 0.0))
+    mesh_color(2, vec3(0.0, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut px = vk_mesh_shader()
+    mut ok = 0
+    if px == -2 { ok = 1 }
+    if px > 0 {
+        mut r = px / 65536
+        mut g = (px / 256) % 256
+        mut b = px % 256
+        if r > 40 { if r < 160 { if g > 40 { if g < 160 { if b > 40 { if b < 160 {
+            ok = 1 } } } } } }
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
