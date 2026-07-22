@@ -220,3 +220,104 @@ compute path, no windowing, smallest surface) to stand up the SPIR-V emitter + s
 runtime, then **V2** for the triangle that proves the ergonomics. The compute
 backend previously discussed is exactly V1 — the foundation of this larger vision,
 not a separate track.
+
+---
+
+# Shipped reference — the Vire `@vulkan` stack as it exists today
+
+Everything below is **built, tested, and headless-verified** (`tests/vire_vulkan.sh`,
+19 cases; skips cleanly without a Vulkan device / `spirv-as`). Vire owns the SPIR-V:
+each stage is compiled from a Vire function body to SPIR-V **assembly**
+(`crates/vire/src/shader.rs` + `crates/backend/src/spirv.rs`), assembled by `spirv-as`
+(graphics/mesh stages at `spv1.4`) into a generated C translation unit, and linked
+with a thin runtime (`crates/driver/src/vk_runtime.c`). Vendor-neutral — the same
+program runs on the Intel iGPU and the RTX 5070 here.
+
+## Shader stages (Vire → SPIR-V)
+
+| Attribute    | SPIR-V model | Purpose |
+|--------------|--------------|---------|
+| `@vertex`    | Vertex       | Transform a per-vertex position; may emit a varying |
+| `@fragment`  | Fragment     | Compute the output colour (per pixel) |
+| `@mesh`      | MeshEXT      | Emit a meshlet's vertices + primitives itself (no vertex buffer) |
+| `@task`      | TaskEXT      | Amplification: dispatch/cull meshlets, hand a payload to `@mesh` |
+| `@compute`   | GLCompute    | Build the scene buffer on the GPU |
+
+The shader language supports: `let`/`mut` locals (Function-storage, so they mutate
+across control flow), `vecN(...)` constructors and mixed construction, `+ - * /`,
+scalar·vector, single-component swizzles (`.x/.y/.z/.w`), **`if`/`else` as a value**
+(`OpSelectionMerge`), **`while` loops** (`OpLoopMerge`), comparisons + `&&`/`||`, and
+the **GLSL.std.450** math set (`sqrt`, `abs`, `floor`, `ceil`, `fract`, `sin`, `cos`,
+`exp`, `log`, `min`, `max`, `pow`, `clamp`, `mix`, `normalize`, `length`, `cross`,
+`dot`) — enough for real lighting.
+
+## Stage builtins
+
+- **`@fragment`**: `frag_x()` / `frag_y()` / `frag_coord()` (pixel position), `in_color()`
+  (interpolated varying from `@vertex`).
+- **`@vertex`**: the `Vec2` parameter is the vertex-buffer position (attribute Location 0);
+  `attr_color()` reads a per-vertex colour (Location 1, from `vk_mesh_c`); `out_color(vec3)`
+  writes a varying the fragment reads back.
+- **`@mesh`**: `set_mesh_outputs(nv, np)`, `mesh_pos(i, vec4)` (a vertex position — full Vire
+  arithmetic), `mesh_tri(i, a, b, c)` (triangle indices); `meshlet_offset()` (scene record
+  offset, indexed by `gl_WorkGroupID`, no-task path) and `culled_offset()` (indexed by the
+  task payload, cull path).
+- **`@task`**: `meshlet_offset()` / `meshlet_cone()` (this meshlet's centre / facing, from
+  the scene record), `cull_plane()` (the frustum plane, a push constant), `emit_mesh_tasks(n)`
+  (fixed count or a bool → `OpSelect` 1/0), `emit_visible(bool)` (cull: writes the meshlet
+  index into the task→mesh payload, emits only survivors).
+- **`@compute`**: `meshlet_index()` (`float(gl_GlobalInvocationID.x)`), `set_meshlet(offset[,
+  cone])` (write this meshlet's record).
+
+## The scene record (a typed Vire struct)
+
+```
+Meshlet { offset: vec2, cone: vec2 }   // std430: fields at 0 and 8, array stride 16
+```
+
+One layout, declared once (`resource_decls`) and shared by every stage that touches the
+scene SSBO (binding 0), so `@compute` (writes it), `@task` and `@mesh` (read it) all agree.
+`offset` is the meshlet centre; `cone` is its 2D facing direction (backface culling).
+
+## Host entry points (call from `fn main`)
+
+| Builtin | What it does |
+|---------|--------------|
+| `vk_triangle()` | Headless render of the default triangle; returns the centroid pixel `0xRRGGBB` (CI). |
+| `vk_window(frames)` | Open a GLFW window + swapchain and present (`frames=0`: until closed). |
+| `vk_mesh(verts)` | Draw a triangle list from a Vire `[Float]` of `(x,y)` positions (vertex buffer). |
+| `vk_mesh_c(verts)` | As above with per-vertex colour: `(x,y, r,g,b)` records. |
+| `vk_mesh_shader()` | Draw via a mesh pipeline (`VK_EXT_mesh_shader`) — no vertex buffer. |
+| `vk_mesh_scene(offsets)` | Many meshlets from a Vire scene buffer (SSBO) via one indirect dispatch. |
+| `vk_mesh_scene_cull(offsets, nx,ny,nz,d)` | The above + per-meshlet frustum culling in `@task`. |
+| `vk_mesh_built(count, nx,ny,nz,d)` | The scene is GPU-built by `@compute`, then culled + drawn. |
+
+The mesh entry points return the centroid pixel (`0xRRGGBB`) or a coverage mask, or `-2`
+where the device has no mesh-shader support (so tests skip cleanly).
+
+## The GPU-driven renderer — one Vire program
+
+`vk_mesh_built` runs the full modern pipeline, every stage authored in Vire:
+
+```
+@compute  build the scene SSBO (set_meshlet: offset + cone)   ← geometry exists on the GPU
+   │  shader-write → read barrier
+@task     per meshlet: frustum + backface cull (cull_plane, meshlet_cone),
+   │      emit only survivors, index via the payload            ← GPU culling
+@mesh     draw the surviving meshlet (culled_offset)            ← no vertex buffer
+@fragment shade it
+```
+
+The runtime dispatches it with `vkCmdDrawMeshTasksIndirectEXT` over one descriptor set
+(the scene SSBO), a push-constant frustum plane, and a compute pre-pass with a barrier —
+all generated, none hand-written by the user. This normally spans GLSL/HLSL + C++ + a mesh
+toolchain; here it is a single Vire file.
+
+## Examples (`examples/vire/`)
+
+`vulkan_triangle` (fragment gradient), `vulkan_varying` (Gouraud), `vulkan_mesh`
+(vertex-buffer geometry), `vulkan_rgb` (per-vertex colour), `vulkan_control` (if/while),
+`vulkan_meshlet` (bootstrap mesh shader), `vulkan_meshlet_authored` (Vire `@mesh`+`@task`),
+`vulkan_cull` (`@task` frustum cull), `vulkan_scene` (multi-meshlet scene buffer),
+`vulkan_scene_cull` (fused per-meshlet cull), `vulkan_built` (GPU-built scene),
+`vulkan_cone` (typed records + backface cull).

@@ -51,6 +51,7 @@ native binaries today.
 | **LLVM backend** (`crates/backend`) — textual IR + clang `-O2 -flto -march=native`; TBAA, `!invariant.load`, branch weights, cold error paths; hosted/freestanding/threads | built |
 | **Runtime** (`crates/driver`) — RC + Bacon–Rajan cycle collector, slab allocator, packed 16-byte header | built |
 | **GPU kernels** (`@gpu`) — single-source device functions → NVPTX (`llc`) → PTX → CUDA Driver-API launch; up to **16× vs CPU** on an RTX 5070, bit-exact for integer kernels | built — [language/GPU-KERNELS.md](language/GPU-KERNELS.md), [benchmarks/gpu/](benchmarks/gpu/) |
+| **`@vulkan` graphics** — Vire-authored shaders (`@vertex`/`@fragment`/`@mesh`/`@task`/`@compute`) → SPIR-V, and a full **GPU-driven meshlet renderer** (compute-built scene → GPU frustum/backface cull → mesh-shader draw) from one Vire program; vendor-neutral (Intel iGPU + RTX 5070) | built — [language/GPU-VULKAN.md](language/GPU-VULKAN.md), [examples/vire/](examples/vire/) (`vulkan_*.vr`), `tests/vire_vulkan.sh` (19) |
 | **Tooling** — VS Code extension (syntax highlighting, `vire check` diagnostics, hover, go-to-definition, completion, quick fixes — via the **frontend compiled to WebAssembly**, so it needs no toolchain) + **native debugging** (breakpoints, stepping, call stack, **local variables**) via `--debug` DWARF + lldb-dap | built — [vscode-vire/](vscode-vire/) |
 | **Cross-compilation** (`--target`) — **Windows** produces a working `.exe` (MinGW + LLD); BSD compiles to an object; macOS needs the SDK. The runtime is portable C | built — [language/CROSS-COMPILE.md](language/CROSS-COMPILE.md) |
 
@@ -223,6 +224,11 @@ ring, flat RSS across 8–16× allocation churn).
   the eight requested features (multithreading, templates, comptime reflection, own
   preprocessor, Meson, logger, Go-style error handling, debug crash paths).
 - **[language/PARSER.md](language/PARSER.md)** — parser/front-end build plan.
+- **[language/GPU-KERNELS.md](language/GPU-KERNELS.md)** — `@gpu` data-parallel device
+  kernels (NVPTX → CUDA).
+- **[language/GPU-VULKAN.md](language/GPU-VULKAN.md)** — `@vulkan`: Vire-authored
+  shaders and the GPU-driven meshlet renderer. Ends with a **shipped reference** (every
+  stage, builtin, host entry point, and the build→cull→draw pipeline).
 - **[language/examples/](language/examples/)** — example programs across areas and
   features.
 - **[vscode-vire/](vscode-vire/)** — VS Code extension. Language
@@ -263,6 +269,12 @@ memory-safety verifier) under the **Apache License 2.0**
   injected like a `parallel_for` worker `(i, …)`. Up to **16× vs CPU** on an
   RTX 5070, bit-exact for integer kernels. See
   [language/GPU-KERNELS.md](language/GPU-KERNELS.md).
+- **`@vulkan` graphics** — write the shaders in Vire (`@vertex`/`@fragment`/`@mesh`/
+  `@task`/`@compute` → SPIR-V) and get a **GPU-driven meshlet renderer** from one
+  program: a `@compute` builder fills the scene on the GPU, `@task` frustum/backface-
+  culls each meshlet, `@mesh` draws the survivors, `@fragment` shades — normally
+  GLSL/HLSL + C++ + a mesh toolchain. Vendor-neutral. See
+  [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
 - **C native** — `extern "C"`/header bindings; C++/Rust via the C ABI. Meson
   first-class.
 
