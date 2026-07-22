@@ -121,17 +121,15 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   insurance, not perf, but belongs with the perf work.)
 - [ ] **Analysis caching / incremental compile** — compile time measured super-linear
   ~O(n^1.4); orthogonal to runtime perf but the main compile-*speed* lever left.
-- [ ] **Runtime GC latency — incremental collector (REOPENED, unsound attempt
-  reverted).** The synchronous Bacon–Rajan pass runs one big stop-the-world scan at
-  the adaptive threshold — a latency spike ∝ accumulated garbage. A naive
-  **tail-batched** incremental version (`jrt_collect_step`: process the last N
-  candidate roots + their component, compact the buffer) was tried but **leaks**
-  (`tests/run.sh listdrop`: a prepend-built list that buffers each displaced node,
-  then dropped, left ~610 live — head-of-buffer live roots never reclaimed), so it
-  was reverted. A correct incremental Bacon–Rajan needs a **resumable traversal +
-  write barrier** (mutation during a spread-out collection must be intercepted) or a
-  fundamentally different buffer-processing invariant — bigger + correctness-critical.
-  Also open: chunk-recycle bound tuning, larger arena chunks.
+- [x] **Runtime GC latency — incremental cycle collector DONE** (`jrt_collect_step`):
+  bounded incremental stepping (continuous, buffer-bounded RAM, no big-pass spike).
+  Two soundness bugs found + fixed (MarkRoots must free only BLACK rc==0, not GRAY
+  trial-deleted; a whole-buffer pass frees dead head-of-buffer nodes the compaction
+  would otherwise drop unfreed), **verified against the `listdrop` leak-catcher** +
+  a cross-batch garbage-cycle stress + flat RSS — see [DONE.md](DONE.md). *Residual:*
+  one *giant connected* garbage component is still one pass (needs a resumable
+  traversal + write barrier). Also open: chunk-recycle bound tuning, larger arena
+  chunks.
 - [x] **Free-cascade — budgeted/deferred, DONE** (`drain_drops`): the release drop
   loop now frees at most `FREE_BUDGET` per top-level release (the rest deferred in the
   LIFO drop queue, drained `FREE_PUMP` per allocation + fully at shutdown), so

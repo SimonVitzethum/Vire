@@ -1198,9 +1198,15 @@ static void drain_drops(size_t budget) {
 /* Candidate roots for the cycle search (purple objects). */
 static JObjHeader **roots = NULL;
 static size_t roots_len = 0, roots_cap = 0;
-#define ROOTS_THRESHOLD 10000
+/* Incremental collection: each step drains a small tail batch (+ its connected
+ * garbage component) so the buffer stays small — continuous, bounded per-step pause
+ * (no accumulate-then-big-pass spike), low steady RAM. A step runs when the buffer
+ * exceeds the soft cap. */
+#define COLLECT_BATCH 256
+#define ROOTS_SOFT_CAP 1024
 
-static void jrt_collect_cycles(void);
+static void jrt_collect_step(void);   /* one bounded incremental step */
+static void jrt_collect_cycles(void); /* full drain (shutdown): steps until empty */
 
 static void roots_push(JObjHeader *h) {
     if (roots_len == roots_cap) {
@@ -1216,14 +1222,10 @@ static void possible_root(JObjHeader *h) {
         if (!BUFFERED(h)) {
             SET_BUFFERED(h, 1);
             roots_push(h);
-            /* Adaptive threshold: a cycle search scans the candidates together with
-             * their transitive closure — with a fixed threshold it runs O(n) times
-             * on large live sets → O(n²) (M0). Letting the threshold scale with the
-             * live set bounds the frequency → amortized linear.
-             * Correctness unaffected: the shutdown collect catches everything (0 live). */
-            size_t thresh = (size_t)(live_objects > 0 ? live_objects * 2 : 0);
-            if (thresh < ROOTS_THRESHOLD) thresh = ROOTS_THRESHOLD;
-            if (roots_len >= thresh) jrt_collect_cycles();
+            /* Incremental: drain one bounded batch when the buffer exceeds the soft
+             * cap, keeping it small. Each candidate is processed once (no O(n²)
+             * re-scan of the live set); the shutdown drain catches the rest. */
+            if (roots_len >= ROOTS_SOFT_CAP) jrt_collect_step();
         }
     }
 }
@@ -1886,7 +1888,10 @@ static void collect_white(JObjHeader *root) {
     wl_push(&cwork, &cwl, &cwc, root);
     while (cwl) {
         JObjHeader *h = cwork[--cwl];
-        if (!(COLOR(h) == COL_WHITE && !BUFFERED(h))) continue;
+        /* Collect every white cycle member, incl. buffered ones (a garbage cycle
+         * may span several buffered roots across batches) — the step's compaction
+         * removes freed objects from the root buffer, so no dangling pointer. */
+        if (COLOR(h) != COL_WHITE) continue;
         SET_COLOR(h, COL_BLACK);
         wl_push(&fwork, &fwl, &fwc, h);  /* free only at the end (post-order) */
         trace_fn t = trace_of(h);
@@ -1894,36 +1899,84 @@ static void collect_white(JObjHeader *root) {
     }
 }
 
-static void jrt_collect_cycles(void) {
-    /* MarkRoots: mark purple with rc>0 gray; remove the rest from the buffer. */
-    size_t kept = 0;
-    for (size_t i = 0; i < roots_len; i++) {
+/* One bounded incremental collection step. Processes the last COLLECT_BATCH
+ * candidate roots (the tail) plus their connected components to completion, then
+ * compacts the buffer. Sound: the step runs the full mark/scan/collect atomically
+ * on its batch and leaves the graph consistent between steps (every object BLACK or
+ * PURPLE-buffered), so the mutator runs freely in between — no write barrier needed.
+ *
+ * CRITICAL (the fix over the first, unsound attempt): `mark_gray` of an earlier
+ * batch root TRIAL-DELETES later batch roots' refcounts to 0 (temporarily). A
+ * trial-deleted node is GRAY, NOT dead — MarkRoots must free only BLACK rc==0
+ * objects (drop already ran); a GRAY rc==0 node is restored to BLACK by `scan`
+ * (`scan_black` from the root that still has an external reference) or collected as
+ * WHITE if it is truly garbage. Freeing on rc==0 alone frees a live node mid-trial
+ * → corruption/leak (caught by tests/run.sh listdrop). */
+static void jrt_collect_step(void) {
+    if (!roots_len) return;
+    size_t total = roots_len;
+
+    /* Pass 1 (WHOLE buffer): free already-dead acyclic buffered objects — BLACK
+     * rc==0, i.e. dropped by RC (drop ran in jrt_release) but left buffered so the
+     * free was deferred to the collector. Doing this over the whole buffer (not just
+     * the tail) is what fixes the first leak: otherwise dead head-of-buffer nodes are
+     * dropped by the compaction below WITHOUT being freed. Bounded (buffer is small).
+     * Safe vs the collect below: cycle members are PURPLE/GRAY here (not BLACK rc==0),
+     * so pass 1 never touches an object that `collect_white` will free (no double
+     * free), and it runs before any node enters `fwork`. */
+    for (size_t i = 0; i < total; i++) {
         JObjHeader *h = roots[i];
-        if (COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) {
-            mark_gray(h);
+        if (h && COLOR(h) == COL_BLACK && RC_COUNT(h) == 0) {
+            SET_BUFFERED(h, 0);
+            free_obj(h);
+            roots[i] = NULL;
+        }
+    }
+
+    /* Tail batch: mark_gray the live candidates. A trial-deleted node is GRAY (not
+     * dead) — never freed here; `scan_black` from a root with an external reference
+     * restores it before it is wrongly collected. */
+    size_t start = total > COLLECT_BATCH ? total - COLLECT_BATCH : 0;
+    for (size_t i = start; i < total; i++) {
+        JObjHeader *h = roots[i];
+        if (h && COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) mark_gray(h);
+    }
+    /* ScanRoots + CollectRoots over the batch (each traversal covers the whole
+     * connected component, incl. buffered members from earlier in the buffer). */
+    for (size_t i = start; i < total; i++) {
+        JObjHeader *h = roots[i];
+        if (h && COLOR(h) == COL_GRAY) scan(h);
+    }
+    for (size_t i = start; i < total; i++) {
+        JObjHeader *h = roots[i];
+        if (h && COLOR(h) == COL_WHITE) collect_white(h);
+    }
+    /* Compact the WHOLE buffer: keep only still-live PURPLE candidates; everything
+     * else — restored-live roots (BLACK, freed later by RC) and collected cycle
+     * members (BLACK, in fwork, freed post-order below) — has BUFFERED cleared and
+     * is dropped. No dead node is dropped unfreed (pass 1 freed the acyclic dead;
+     * fwork frees the cyclic dead). Reads run before the frees below. */
+    size_t kept = 0;
+    for (size_t i = 0; i < total; i++) {
+        JObjHeader *h = roots[i];
+        if (!h) continue;
+        if (BUFFERED(h) && COLOR(h) == COL_PURPLE && RC_COUNT(h) > 0) {
             roots[kept++] = h;
         } else {
             SET_BUFFERED(h, 0);
-            if (COLOR(h) == COL_BLACK && RC_COUNT(h) == 0) free_obj(h);
         }
     }
     roots_len = kept;
-
-    /* ScanRoots. */
-    for (size_t i = 0; i < roots_len; i++) scan(roots[i]);
-
-    /* CollectRoots: drain the buffer, collect white cycles (gathered in fwork). */
-    for (size_t i = 0; i < roots_len; i++) {
-        JObjHeader *h = roots[i];
-        SET_BUFFERED(h, 0);
-        collect_white(h);
-    }
-    roots_len = 0;
-    /* Post-order free: only after all traversals, so that no trace
-     * hits an already-freed cycle member. */
+    /* Post-order free: after compaction, so no live buffer slot points at a freed
+     * object and no trace hits an already-freed cycle member. */
     for (size_t i = 0; i < fwl; i++) free_obj(fwork[i]);
     fwl = 0;
     collector_trim();
+}
+
+/* Full drain (shutdown / on demand): step until the buffer is empty → 0 live. */
+static void jrt_collect_cycles(void) {
+    while (roots_len) jrt_collect_step();
 }
 #endif /* FASTLLVM_COLLECTOR */
 

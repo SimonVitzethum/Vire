@@ -28,35 +28,41 @@ spread across operations, not one pause. Applied to both single-thread RC varian
   `cyclestress`); `tests/vire_heap.sh` 17/17; freestanding Cycle runs; threads/gpu/
   vulkan green.
 
-## Runtime: incremental collector — ATTEMPTED, reverted (unsound); + fixes kept
+## Runtime: incremental cycle collector — correct, verified (shipped)
 
-Attempted to replace the synchronous Bacon–Rajan collector (one big stop-the-world
-pass at the adaptive threshold) with **bounded incremental stepping** for no-spike,
-low-steady-RAM continuous collection. The batched design (`jrt_collect_step`:
-process the last `COLLECT_BATCH` tail roots + their component, compact the buffer)
-passed the Java oracle + a `cyclestress` (300k self-cycles → 0-live) and showed flat
-RSS across 8× allocations — but a **linked-list stress test caught a leak**: a list
-built by prepend (each `head = x` buffers the displaced node as a possible-root at
-rc>0), then dropped, left **~610 objects still live** — the synchronous collector is
-0-live on the same program. So the naive batching is **unsound** (some buffered live
-roots at the head of the buffer are never reclaimed), and it was **reverted** to the
-synchronous collector to preserve the paramount 0-live guarantee. A correct
-incremental Bacon–Rajan needs more than tail-batching (a resumable traversal +
-write barrier, or a different buffer-processing invariant) — reopened in TODO.
+The synchronous Bacon–Rajan collector ran one big stop-the-world pass at the adaptive
+threshold (`2 × live`) — a latency **spike** ∝ accumulated garbage. Replaced with
+**bounded incremental stepping** (`jrt_collect_step`): when the buffer exceeds
+`ROOTS_SOFT_CAP = 1024`, a step processes the last `COLLECT_BATCH = 256` candidate
+roots + their connected components to completion and compacts the buffer. Continuous
+collection, small bounded per-step pause, low steady RAM.
 
-**Kept from the attempt (both sound, verified):**
-- **`--freestanding` fix.** Rebuilding the debug `fastjavac` surfaced a latent bug:
-  the capsule deep-copy `copymap` used `malloc`/`calloc`/`free` unguarded, breaking
-  freestanding (no libc). Guarded with no-op stubs (capsules don't exist in
-  freestanding; the stubs only satisfy the emitted copy-slot symbols). `nm -u` shows
-  no `malloc` undef; the freestanding `Cycle` test links + runs.
-- **Regression tests** that make the oracle stronger: `cyclestress` (300k self-cycles,
-  0-live) and **`listdrop`** (200k-node prepend list built + dropped, 0-live — the
-  exact pattern that caught the incremental-collector leak). Both green on the
-  synchronous collector. Java oracle **67/67**.
+**Two soundness bugs — a first naive attempt was reverted, then fixed and
+re-verified against the leak-catcher (`tests/run.sh listdrop`):**
+1. *Trial-deletion mistaken for death.* `mark_gray` of one batch root temporarily
+   trial-deletes later batch roots' refcounts to 0; a GRAY rc==0 node is NOT dead
+   (it is restored by `scan_black` from a root with an external ref). MarkRoots must
+   free only **BLACK** rc==0 objects, never on rc==0 alone.
+2. *Dead head-of-buffer nodes dropped unfreed.* The compaction dropped BLACK rc==0
+   (dead acyclic) nodes from the buffer **without freeing** them — a leak (`listdrop`:
+   ~610 live). Fixed with a **whole-buffer pass 1** that frees BLACK rc==0 objects
+   (drop already ran; free was deferred) before the tail processing + compaction.
+   Safe vs `collect_white`: cycle members are PURPLE/GRAY at pass-1 time, never BLACK
+   rc==0, so no double free.
 
-(The earlier **arena chunk recycling** — a separate, sound change — remains; it kills
-the O(chunks) arena-pop burst.)
+**Verified (rigorously this time):** `listdrop` (1k/100k/1M prepend-list drops →
+0-live), a cross-batch **garbage-cycle** stress (1M 2-node cycles created+dropped in a
+loop → 0-live, so the incremental steps really do collect cycles), Java oracle
+**67/67**, `tests/vire_heap.sh` 17/17, freestanding `Cycle` runs, threads/gpu/vulkan
+green. **Peak RSS flat: 1484 kB at both 1M and 8M cyclic allocations** — continuous
+reclamation, buffer-bounded RAM, no accumulate-then-spike. Honest residual: one
+*giant connected* garbage component is still one pass (bounding it needs a resumable
+traversal + write barrier).
+
+**Also fixed (collateral):** the `--freestanding` break (capsule deep-copy `copymap`
+used `malloc`/`calloc`/`free` unguarded) — guarded with no-op stubs. New regression
+tests `cyclestress` + `listdrop`. The separate **arena chunk recycling** (kills the
+O(chunks) arena-pop burst) and the **budgeted free-cascade** (above) remain.
 
 ---
 
