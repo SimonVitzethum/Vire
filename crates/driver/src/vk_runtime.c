@@ -16,62 +16,11 @@
 
 #define CK(x) do { if((x)!=VK_SUCCESS) return 0; } while(0)
 
-static const uint32_t VK_TRI_VERT[] = {
-  0x07230203,0x00010000,0x000d000b,0x00000028,0x00000000,0x00020011,0x00000001,0x0006000b,
-  0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-  0x0007000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x00000019,0x0000001d,0x00030003,
-  0x00000002,0x000001c2,0x000a0004,0x475f4c47,0x4c474f4f,0x70635f45,0x74735f70,0x5f656c79,
-  0x656e696c,0x7269645f,0x69746365,0x00006576,0x00080004,0x475f4c47,0x4c474f4f,0x6e695f45,
-  0x64756c63,0x69645f65,0x74636572,0x00657669,0x00040005,0x00000004,0x6e69616d,0x00000000,
-  0x00030005,0x0000000c,0x00000050,0x00060005,0x00000017,0x505f6c67,0x65567265,0x78657472,
-  0x00000000,0x00060006,0x00000017,0x00000000,0x505f6c67,0x7469736f,0x006e6f69,0x00070006,
-  0x00000017,0x00000001,0x505f6c67,0x746e696f,0x657a6953,0x00000000,0x00070006,0x00000017,
-  0x00000002,0x435f6c67,0x4470696c,0x61747369,0x0065636e,0x00070006,0x00000017,0x00000003,
-  0x435f6c67,0x446c6c75,0x61747369,0x0065636e,0x00030005,0x00000019,0x00000000,0x00060005,
-  0x0000001d,0x565f6c67,0x65747265,0x646e4978,0x00007865,0x00030047,0x00000017,0x00000002,
-  0x00050048,0x00000017,0x00000000,0x0000000b,0x00000000,0x00050048,0x00000017,0x00000001,
-  0x0000000b,0x00000001,0x00050048,0x00000017,0x00000002,0x0000000b,0x00000003,0x00050048,
-  0x00000017,0x00000003,0x0000000b,0x00000004,0x00040047,0x0000001d,0x0000000b,0x0000002a,
-  0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
-  0x00040017,0x00000007,0x00000006,0x00000002,0x00040015,0x00000008,0x00000020,0x00000000,
-  0x0004002b,0x00000008,0x00000009,0x00000003,0x0004001c,0x0000000a,0x00000007,0x00000009,
-  0x00040020,0x0000000b,0x00000006,0x0000000a,0x0004003b,0x0000000b,0x0000000c,0x00000006,
-  0x0004002b,0x00000006,0x0000000d,0x00000000,0x0004002b,0x00000006,0x0000000e,0xbf19999a,
-  0x0005002c,0x00000007,0x0000000f,0x0000000d,0x0000000e,0x0004002b,0x00000006,0x00000010,
-  0x3f19999a,0x0005002c,0x00000007,0x00000011,0x00000010,0x00000010,0x0005002c,0x00000007,
-  0x00000012,0x0000000e,0x00000010,0x0006002c,0x0000000a,0x00000013,0x0000000f,0x00000011,
-  0x00000012,0x00040017,0x00000014,0x00000006,0x00000004,0x0004002b,0x00000008,0x00000015,
-  0x00000001,0x0004001c,0x00000016,0x00000006,0x00000015,0x0006001e,0x00000017,0x00000014,
-  0x00000006,0x00000016,0x00000016,0x00040020,0x00000018,0x00000003,0x00000017,0x0004003b,
-  0x00000018,0x00000019,0x00000003,0x00040015,0x0000001a,0x00000020,0x00000001,0x0004002b,
-  0x0000001a,0x0000001b,0x00000000,0x00040020,0x0000001c,0x00000001,0x0000001a,0x0004003b,
-  0x0000001c,0x0000001d,0x00000001,0x00040020,0x0000001f,0x00000006,0x00000007,0x0004002b,
-  0x00000006,0x00000022,0x3f800000,0x00040020,0x00000026,0x00000003,0x00000014,0x00050036,
-  0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0003003e,0x0000000c,
-  0x00000013,0x0004003d,0x0000001a,0x0000001e,0x0000001d,0x00050041,0x0000001f,0x00000020,
-  0x0000000c,0x0000001e,0x0004003d,0x00000007,0x00000021,0x00000020,0x00050051,0x00000006,
-  0x00000023,0x00000021,0x00000000,0x00050051,0x00000006,0x00000024,0x00000021,0x00000001,
-  0x00070050,0x00000014,0x00000025,0x00000023,0x00000024,0x0000000d,0x00000022,0x00050041,
-  0x00000026,0x00000027,0x00000019,0x0000001b,0x0003003e,0x00000027,0x00000025,0x000100fd,
-  0x00010038,
-};
-
-static const uint32_t VK_TRI_FRAG[] = {
-  0x07230203,0x00010000,0x000d000b,0x0000000e,0x00000000,0x00020011,0x00000001,0x0006000b,
-  0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-  0x0006000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x00030010,0x00000004,
-  0x00000007,0x00030003,0x00000002,0x000001c2,0x000a0004,0x475f4c47,0x4c474f4f,0x70635f45,
-  0x74735f70,0x5f656c79,0x656e696c,0x7269645f,0x69746365,0x00006576,0x00080004,0x475f4c47,
-  0x4c474f4f,0x6e695f45,0x64756c63,0x69645f65,0x74636572,0x00657669,0x00040005,0x00000004,
-  0x6e69616d,0x00000000,0x00030005,0x00000009,0x00000063,0x00040047,0x00000009,0x0000001e,
-  0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,
-  0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,0x00000003,
-  0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x0004002b,0x00000006,0x0000000a,
-  0x3f800000,0x0004002b,0x00000006,0x0000000b,0x3ecccccd,0x0004002b,0x00000006,0x0000000c,
-  0x3dcccccd,0x0007002c,0x00000007,0x0000000d,0x0000000a,0x0000000b,0x0000000c,0x0000000a,
-  0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0003003e,
-  0x00000009,0x0000000d,0x000100fd,0x00010038,
-};
+/* Shader SPIR-V is generated at Vire build time (crates/backend/src/spirv.rs ->
+ * spirv-as) into vk_shaders.c and linked alongside — the @fragment color comes
+ * from the Vire source. Declared extern here (word counts as *_N). */
+extern const uint32_t VK_TRI_VERT[]; extern const unsigned VK_TRI_VERT_N;
+extern const uint32_t VK_TRI_FRAG[]; extern const unsigned VK_TRI_FRAG_N;
 
 static uint32_t find_mem(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd,&mp);
@@ -87,7 +36,7 @@ static VkShaderModule shmod(VkDevice d, const uint32_t *code, size_t n) {
 /* The one shared piece: build the triangle graphics pipeline for a render pass +
  * extent. Layout is empty (no descriptors); shaders are the embedded SPIR-V. */
 static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout) {
-    VkShaderModule vs=shmod(dev,VK_TRI_VERT,sizeof VK_TRI_VERT), fs=shmod(dev,VK_TRI_FRAG,sizeof VK_TRI_FRAG);
+    VkShaderModule vs=shmod(dev,VK_TRI_VERT,VK_TRI_VERT_N*4), fs=shmod(dev,VK_TRI_FRAG,VK_TRI_FRAG_N*4);
     if(!vs||!fs) return 0;
     VkPipelineShaderStageCreateInfo st[2]={
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vs,.pName="main"},
@@ -133,8 +82,9 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
     vkCmdEndRenderPass(cmd);
 }
 
-/* ---- headless: render to an image, read back, self-verify ---- */
-int jrt_vk_triangle(void) {
+/* ---- headless: render to an image, read back; returns the centroid pixel packed
+ *      as 0xRRGGBB (so callers can check the @fragment color), or -1 on failure ---- */
+int64_t jrt_vk_triangle(void) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -185,17 +135,19 @@ int jrt_vk_triangle(void) {
     CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
     unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
     int cx=W/2, cy=(int)(H*0.55); unsigned char *c=&px[(cy*W+cx)*4], *tl=&px[(5*W+5)*4];
-    int ok = c[0]>200&&c[1]>60&&c[1]<140&&c[2]<80 && tl[0]<60&&tl[1]<60&&tl[2]<60;
+    /* centroid = the triangle (fragment color); corner must be the clear color. */
+    int64_t packed = ((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
+    int corner_clear = tl[0]<60 && tl[1]<60 && tl[2]<60;
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
-    return ok?1:0;
+    return corner_clear ? packed : -1;
 }
 
 /* ---- windowed: open a window and present the triangle (frames=0: until closed) ---- */
-int jrt_vk_window(int64_t frames) {
+int64_t jrt_vk_window(int64_t frames) {
     if(!glfwInit()) return 0;
     if(!glfwVulkanSupported()){ glfwTerminate(); return 0; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);

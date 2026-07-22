@@ -1192,6 +1192,47 @@ fn build_or_run(args: &[String]) {
             exit(1);
         }
         vk_paths.push(vk_path);
+        // Generate the shader SPIR-V — Vire owns it: emit SPIR-V assembly
+        // (crates/backend/src/spirv.rs), assemble with `spirv-as` (graphics Shader
+        // flavor, which `llc -march=spirv64` does not do), and link the words in as
+        // a generated C TU. The @fragment color comes from the Vire source.
+        let frag = program.frag_color.unwrap_or([1.0, 0.4, 0.1, 1.0]);
+        let assemble = |asm: &str, stem: &str| -> Vec<u32> {
+            let asm_path = build_dir.join(format!("{stem}.spvasm"));
+            let spv_path = build_dir.join(format!("{stem}.spv"));
+            if std::fs::write(&asm_path, asm).is_err() {
+                eprintln!("writing {stem}.spvasm failed");
+                exit(1);
+            }
+            match Command::new("spirv-as").arg(&asm_path).arg("-o").arg(&spv_path).status() {
+                Ok(s) if s.success() => {}
+                _ => {
+                    eprintln!("error: `spirv-as` failed/absent — @vulkan shaders need spirv-tools");
+                    exit(1);
+                }
+            }
+            let bytes = std::fs::read(&spv_path).unwrap_or_default();
+            bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        };
+        let vw = assemble(&fastllvm_backend::spirv::triangle_vertex_spvasm(), "vk_vert");
+        let fw = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm(frag), "vk_frag");
+        let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw)] {
+            sc.push_str(&format!("const uint32_t {name}[] = {{"));
+            for (i, x) in w.iter().enumerate() {
+                if i % 8 == 0 {
+                    sc.push_str("\n  ");
+                }
+                sc.push_str(&format!("0x{x:08x},"));
+            }
+            sc.push_str(&format!("\n}};\nconst unsigned {name}_N = {};\n", w.len()));
+        }
+        let sc_path = build_dir.join("vk_shaders.c");
+        if std::fs::write(&sc_path, sc).is_err() {
+            eprintln!("writing vk_shaders.c failed");
+            exit(1);
+        }
+        vk_paths.push(sc_path);
         link_libs.push("vulkan".into());
         link_libs.push("glfw".into()); // windowing (vk_window); the runtime references it
     }

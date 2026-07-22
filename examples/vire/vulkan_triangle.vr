@@ -1,15 +1,19 @@
-// Vire @vulkan — a windowed triangle.
+// Vire @vulkan — a windowed triangle with a shader written in Vire.
 //
 //   vire run examples/vire/vulkan_triangle.vr
 //
-// Opens a real window (GLFW + Vulkan swapchain) and presents the triangle until
-// you close it. The whole graphics pipeline — instance, device, swapchain, a
-// compile-time-fixed pipeline, per-frame acquire/submit/present — runs from this
-// one Vire program, memory-safe from the Vire side and vendor-neutral (any Vulkan
-// GPU: NVIDIA, AMD, Intel, Apple via MoltenVK). See language/GPU-VULKAN.md.
+// Opens a real window (GLFW + Vulkan swapchain) and presents a triangle until you
+// close it. The whole pipeline runs from this one Vire program — and the fragment
+// color comes from the `@fragment` shader below, written in Vire and compiled to
+// SPIR-V by the Vire compiler (via spirv-as). See language/GPU-VULKAN.md.
 //
-// vk_window(n): n = 0 loops until the window is closed; n > 0 presents n frames
-// then returns (used by the non-blocking smoke test). Returns 1 on success.
+// vk_window(n): n = 0 loops until the window is closed; n > 0 presents n frames.
+// Vendor-neutral (any Vulkan GPU: NVIDIA, AMD, Intel, Apple via MoltenVK).
+
+// The fragment stage — a Vire function. Its constant color drives the triangle.
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.55, 0.95, 1.0) }   // a nice blue
+
 fn main() {
     mut ok = vk_window(0)
     print(ok)

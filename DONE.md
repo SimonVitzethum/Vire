@@ -208,6 +208,23 @@ SPIR-V (glslc-embedded); single-source Vire→SPIR-V is the next milestone. Veri
 headless pixel-correct + windowed present (3-frame smoke → 1). No regression
 (gpu 8/8, heap 16/16; non-vulkan binaries unchanged).
 
+### `@vulkan` VS step 1 — Vire owns SPIR-V generation + first Vire shader (shipped)
+Vire is now the shader language (not Slang). The compiler generates the shaders'
+SPIR-V itself: `crates/backend/src/spirv.rs` emits SPIR-V **assembly** (the graphics
+Shader flavor that `llc -march=spirv64` does not produce), the driver assembles it
+with `spirv-as` into a generated `vk_shaders.c` linked alongside the runtime — the
+glslc/GLSL bootstrap is gone. A Vire `@fragment fn fs() -> Vec4 { vec4(r,g,b,a) }`
+drives the fragment color: `@vertex`/`@fragment` parse as item attributes
+(parser.rs whitelist), are pulled out of host lowering (`is_shader_fn`), and the
+constant color is extracted to `program.frag_color` (`extract_frag_color`) and baked
+into the emitted fragment SPIR-V. Runtime decoupled: `vk_runtime.c` references the
+shader arrays `extern` (`VK_TRI_VERT/FRAG` + `_N`). `vk_triangle()` now returns the
+centroid pixel packed `0xRRGGBB` so a Vire program can check the color. Verified: a
+green Vire `@fragment` → green triangle (`tests/vire_vulkan.sh`
+default_color + vire_fragment_shader), headless + windowed
+(`examples/vire/vulkan_triangle.vr`, blue). No regression (gpu 8/8, heap 16/16).
+Next: real Vec/Mat types, shader *bodies* from the IR, a Vire `@vertex` stage.
+
 ### `@vulkan` — safe full-Vulkan framework investigation
 Investigated the vision of Vulkan **as easy as OpenGL** but memory-safe, full-speed,
 and whole-program-optimized — a compiler-integrated safe Vulkan framework (graphics

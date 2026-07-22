@@ -324,6 +324,11 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// `@gpu` kernels (device code + host launch stubs), see [`GpuKernel`].
     pub gpu_kernels: Vec<GpuKernel>,
+    /// `@vulkan` shaders (VS milestone): the constant color of an `@fragment fn`
+    /// whose body is `vec4(r,g,b,a)`. `None` → the default triangle color. Drives
+    /// the SPIR-V the backend generates for the `@vulkan` fragment stage. Minimal
+    /// first step of "Vire is the shader language" — see language/GPU-VULKAN.md.
+    pub frag_color: Option<[f32; 4]>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

@@ -325,16 +325,19 @@ Staged (each stage runnable):
   layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
-- [ ] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language*
-  (not Slang; Slang stays an optional import-only escape hatch). *NEXT CODING
-  MILESTONE.* Sub-steps: (a) `Vec2/3/4`/`Mat4` type layer; (b)
-  `crates/backend/src/spirv.rs` emits SPIR-V **assembly** from the shader IR
-  (straight-line first, then structured `OpLoopMerge`/`OpSelectionMerge`), assembled
-  by `spirv-as`, validated by `spirv-val` — NOT `llc -march=spirv64`, which only does
-  the Kernel/compute flavor, not the graphics Shader flavor (measured; round-trip
-  `spv→dis→as→spv` validates, so we own generation). (c) `@vertex`/`@fragment` stage
-  wrappers (entry point + interface from typed I/O); (d) replace the triangle's glslc
-  bootstrap with a Vire-authored shader, headless pixel-verified.
+- [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language*
+  (not Slang; Slang stays an optional import-only escape hatch). *Step 1 SHIPPED:*
+  Vire now **owns SPIR-V generation** — `crates/backend/src/spirv.rs` emits SPIR-V
+  **assembly**, the driver assembles it with `spirv-as` into a generated
+  `vk_shaders.c` (no more glslc/GLSL), and a Vire `@fragment fn fs() -> Vec4 {
+  vec4(r,g,b,a) }` drives the fragment color (parsed as an item attribute, pulled
+  out of host lowering, color extracted → `program.frag_color`). Verified: a green
+  Vire `@fragment` renders a green triangle (`tests/vire_vulkan.sh
+  vire_fragment_shader`), headless + windowed. *Remaining:* (a) a real `Vec2/3/4`/
+  `Mat4` type layer (today `vec4` is shader-local, constant only); (b) emit shader
+  **bodies** from the IR (arithmetic, varyings, structured control flow) not just a
+  constant; (c) a Vire-authored `@vertex` stage (vertex is still the fixed bootstrap
+  assembly); (d) vertex-buffer inputs / typed stage I/O.
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`
