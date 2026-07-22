@@ -170,8 +170,31 @@ Vire-vs-cuda-oxide architectural analysis.
   array params a kernel never `ArrayStore`s into (copy-alias fixpoint over the
   kernel body) and skips their D2H copyback. Sound-conservative: an array base not
   traceable to a parameter forces every array to in/out, so a needed copyback is
-  never dropped. Verified bit-exact (`tests/vire_gpu.sh` 4/4; saxpy `x` skips D2H,
+  never dropped; an array passed to any device Call (e.g. `gpu_atomic_add`) also
+  counts as written. Verified bit-exact (`tests/vire_gpu.sh`; saxpy `x` skips D2H,
   `y` still downloads).
+
+### GPU G1 — device-programming primitives (intrinsic-based subset)
+Added to the `gpu_intrinsic` dispatch (`crates/backend/src/nvptx.rs`) + frontend
+(`lower.rs` `gpu_intrinsic_typed`, `infer.rs` return types). All integer/IEEE cases
+bit-exact vs CPU on an RTX 5070 (`tests/vire_gpu.sh` 8/8). See
+[language/GPU-KERNELS.md](language/GPU-KERNELS.md).
+- **Block barrier** `gpu_sync()` → `@llvm.nvvm.barrier0` (unit-typed so it can be a
+  kernel's tail statement — required teaching `infer.rs` the intrinsic return types).
+- **Warp intrinsics** `gpu_shfl_down(v,d)` (`shfl.sync.down.i32`) and
+  `gpu_warp_reduce_add(v)` (5× shuffle+add full-warp sum) → the fast-reduction idiom
+  (warp-reduce → atomic) with no shared memory. Verified: 1024 threads → 1024.
+- **Device atomics** `gpu_atomic_add(arr, idx, v)` → `atomicrmw add` (global,
+  Int/Long), returns the old value. Verified: histogram 1000 → 1000.
+- **IEEE math** `gpu_sqrt/fabs/floor/ceil` (`@llvm.<fn>.f64`) + `gpu_fmin/fmax`
+  (`@llvm.minnum/maxnum.f64`), round-to-nearest = bit-exact vs the CPU runtime.
+  Verified: Σ sqrt(i²)=Σi=4950; Σ floor(3.7)=300.
+
+### GPU — Vulkan/SPIR-V backend investigation
+Investigated a vendor-neutral second `@gpu` target. Verdict: high value, de-risked
+(LLVM 22 ships `spirv64`; Vulkan stack present; both Intel iGPU + RTX enumerate).
+Design/trade-offs/recommendation in [language/GPU-VULKAN.md](language/GPU-VULKAN.md);
+roadmap item in TODO.md (GPU G4). Not yet built.
 
 ---
 

@@ -117,6 +117,70 @@ fn k(i: Int, n: Int, x: array) {
 fn main() { mut x = array(4)  k(4, x)  print(x[1]) }
 EOF
 
+# --- G1 device primitives (all integer/IEEE → bit-exact vs CPU) ---
+
+# atomic_add: n threads each add 1 into out[0] → n. Also pins read-only soundness:
+# the atomic writes through a Call arg, so out MUST still be copied back (D2H).
+ok gpu_atomic "$(printf '1000')" <<'EOF'
+@gpu
+fn hist(i: Int, n: Int, out: array) {
+    if i < n { mut old = gpu_atomic_add(out, 0, 1) }
+}
+fn main() { mut out = array(1)  out[0] = 0  hist(1000, out)  print(out[0]) }
+EOF
+
+# warp_reduce_add + atomic: each thread contributes 1; each warp sums to lane 0,
+# which atomically adds into out[0] → total thread count (the fast-reduction idiom).
+ok gpu_warp "$(printf '1024')" <<'EOF'
+@gpu
+fn wr(i: Int, n: Int, out: array) {
+    if i < n {
+        mut s = gpu_warp_reduce_add(1)
+        mut lane = gpu_tid() - (gpu_tid() / 32) * 32
+        if lane == 0 { mut old = gpu_atomic_add(out, 0, s) }
+    }
+}
+fn main() { mut out = array(1)  out[0] = 0  wr(1024, out)  print(out[0]) }
+EOF
+
+# sqrt (IEEE round-to-nearest = CPU): sqrt(i*i)=i, sum_{i<100} = 4950, bit-exact.
+ok gpu_sqrt "$(printf '4950')" <<'EOF'
+@gpu
+fn sq(i: Int, n: Int, x: farray) {
+    if i < n { x[i] = gpu_sqrt(x[i]) }
+}
+fn main() {
+    mut x = farray(100)
+    mut k = 0
+    while k < 100 { x[k] = (k * k) as Float  k = k + 1 }
+    sq(100, x)
+    mut s = 0
+    mut j = 0
+    while j < 100 { s = s + (x[j] as Int)  j = j + 1 }
+    print(s)
+}
+EOF
+
+# barrier + floor: a block barrier is valid device code (no shared mem needed to
+# emit it); floor(3.7)=3 per element, summed → 100*3 = 300.
+ok gpu_sync_floor "$(printf '300')" <<'EOF'
+@gpu
+fn f(i: Int, n: Int, x: farray) {
+    if i < n { x[i] = gpu_floor(x[i]) }
+    gpu_sync()
+}
+fn main() {
+    mut x = farray(100)
+    mut k = 0
+    while k < 100 { x[k] = 3.7  k = k + 1 }
+    f(100, x)
+    mut s = 0
+    mut j = 0
+    while j < 100 { s = s + (x[j] as Int)  j = j + 1 }
+    print(s)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

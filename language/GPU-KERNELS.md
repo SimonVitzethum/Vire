@@ -69,6 +69,42 @@ fn fill(i: Int, n: Int, out: array) {
 }
 ```
 
+### G1 device primitives (barrier, atomics, warp, IEEE math)
+
+Beyond the index reads, these device primitives are available inside a `@gpu`
+function (guarded by `tests/vire_gpu.sh`, all integer/IEEE cases bit-exact vs CPU):
+
+| intrinsic | lowers to | meaning |
+|---|---|---|
+| `gpu_sync()` | `@llvm.nvvm.barrier0` | block barrier (`__syncthreads`); unit-typed |
+| `gpu_atomic_add(arr, idx, v)` | `atomicrmw add` (global) | atomic add into `arr[idx]`, returns the old value; `Int`/`Long` arrays |
+| `gpu_shfl_down(v, d)` | `shfl.sync.down.i32` | full-warp shuffle-down by `d` lanes |
+| `gpu_warp_reduce_add(v)` | 5× shuffle+add | sum `v` across the warp (result in lane 0) |
+| `gpu_sqrt/fabs/floor/ceil(x)` | `@llvm.<fn>.f64` | IEEE round-to-nearest (bit-exact vs CPU) |
+| `gpu_fmin/fmax(a, b)` | `@llvm.minnum/maxnum.f64` | IEEE min/max |
+
+The fast-reduction idiom needs no shared memory — each warp reduces with
+`gpu_warp_reduce_add`, then lane 0 combines with `gpu_atomic_add`:
+
+```vire
+@gpu
+fn sum(i: Int, n: Int, in: array, out: array) {
+    mut v = 0
+    if i < n { v = in[i] }
+    mut s = gpu_warp_reduce_add(v)
+    if gpu_tid() - (gpu_tid() / 32) * 32 == 0 { mut old = gpu_atomic_add(out, 0, s) }
+}
+```
+
+*Read-only note:* `gpu_atomic_add` writes through its array argument, so the
+read-only-array analysis correctly keeps that buffer's D2H copyback (an array
+passed to any device call counts as written — see `read_only_params`).
+
+Still open (see [../TODO.md](../TODO.md) GPU G1/G2): shared memory (`@shared`) +
+tunable launch config (block size, 2-D/3-D grids), device `printf`, transcendental
+math (sin/cos/exp/log via libdevice), and a vendor-neutral Vulkan/SPIR-V backend
+(see [GPU-VULKAN.md](GPU-VULKAN.md)).
+
 ## Calling convention & launch
 
 - Parameter 0 (the thread index) is injected; callers pass params 1.. , exactly

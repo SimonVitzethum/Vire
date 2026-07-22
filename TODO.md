@@ -228,12 +228,20 @@ specialization, single-source oracle). Honest scope: full tensor-core/TMA parity
 is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
 
 ### Stage G1 — device-programming primitives (reach parity on the common 80%)
-- [ ] **Shared memory** (`@shared` arrays) + **`__syncthreads`** block barrier.
-- [ ] **Warp intrinsics**: shuffle (`shfl.sync`), vote/ballot, warp-level
-  reduce/scan (the building block for fast reductions).
-- [ ] **Device atomics** (atomicAdd/CAS on global + shared).
-- [ ] **Device math intrinsics** (sqrt/sin/cos/exp/log/… via `@llvm.nvvm.*` /
-  libdevice) — today only integer/`+-*` and plain float ops emit.
+- [x] **Block barrier** (`gpu_sync()` → `@llvm.nvvm.barrier0`) — DONE.
+- [x] **Warp intrinsics** — DONE: `gpu_shfl_down` (`shfl.sync.down.i32`) and
+  `gpu_warp_reduce_add` (5× shuffle+add full-warp sum). Enables the fast-reduction
+  idiom (warp-reduce → atomic) with no shared memory. *Vote/ballot/scan still open.*
+- [x] **Device atomics** — DONE: `gpu_atomic_add(arr, idx, v)` → `atomicrmw add`
+  (global, Int/Long), returns the old value. Read-only analysis made sound (an array
+  passed to any device call counts as written). *CAS/other ops still open.*
+- [x] **IEEE device math** — DONE: `gpu_sqrt/fabs/floor/ceil/fmin/fmax` via
+  `@llvm.*.f64` (round-to-nearest → bit-exact vs CPU). *Transcendentals below.*
+- [ ] **Transcendental math** (sin/cos/exp/log/tan/pow) — needs libdevice
+  (`__nv_*`) bitcode linked into the device module (not plain LLVM intrinsics).
+- [ ] **Shared memory** (`@shared` arrays, `Workgroup`/`addrspace(3)`) — new syntax
+  + IR; unlocks block-level (not just warp-level) reductions and tiling.
+- [ ] **Vote/ballot + warp scan**; atomic **CAS**/min/max/exchange.
 - [ ] **Tunable launch config**: explicit block size, 2-D/3-D grids, dynamic
   shared-memory size (replaces the fixed `block=256, grid=ceil(N/256)`).
 - [ ] **Device `printf`** (debugging).
@@ -258,6 +266,19 @@ is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
   reference win. *Scope: NVIDIA-research-grade; do G1/G2 first.*
 
 ### Stage G4 — the BEAT levers (Vire-only — exceed, don't just match)
+- [ ] **Vendor-neutral Vulkan/SPIR-V backend** (investigated — high value, de-risked;
+  see [language/GPU-VULKAN.md](language/GPU-VULKAN.md)). A *second* `@gpu` target
+  beside CUDA: `@gpu fn` → SPIR-V dialect of the device emitter → `llc -march=spirv64`
+  → Vulkan compute dispatch. Runs on NVIDIA **+ AMD + Intel + Apple** — portability
+  cuda-oxide (NVIDIA-only) structurally cannot match. De-risked: LLVM 22 ships the
+  `spirv64` target, the Vulkan stack is present, and both the Intel iGPU and the RTX
+  enumerate under Vulkan here. Reuse: the emitter (~90%), the `jrt_gpu_*` ABI, the
+  launch stubs, and the read-only analysis are backend-agnostic; the G1 intrinsics
+  map directly (barrier→`OpControlBarrier`, warp→subgroup ops, atomic→`OpAtomicIAdd`,
+  math→`GLSL.std.450`). New: a SPIR-V dialect flag + one templated Vulkan runtime +
+  `--gpu=cuda|vulkan` selection. Caveats: SPIR-V Logical addressing is structured-only
+  (our GEPs fit), and the tensor-core peak (G3) stays CUDA-only. *First milestone:
+  saxpy + a reduction on Intel iGPU and NVIDIA from the same `@gpu` source.*
 - [ ] **Memory-safe device mode.** cuda-oxide device access is unchecked
   (CUDA-like). Vire's solver can prove many device indices in-range (reuse
   `bounds.rs` relational elision) and bounds-check the rest → an *optional safe GPU

@@ -2771,6 +2771,22 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: sym.into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // Argument-taking GPU device intrinsics (barrier/atomic/warp/math). The
+        // return type is authoritative from the table, so the dest local is typed
+        // correctly regardless of inference; args lower normally (an array arg
+        // stays an `Operand::Copy` of its param local, so the backend can read its
+        // element kind for the atomic GEP).
+        if let Some((sym, ret)) = gpu_intrinsic_typed(&name) {
+            let lowered: Vec<Operand> = args.iter().map(|a| self.lower_expr(a).0).collect();
+            if ret == Ty::Void {
+                // Effect-only (e.g. the barrier): no destination, unit-valued.
+                self.emit(Statement::Call { dest: None, func: sym.into(), args: lowered });
+                return (Operand::ConstI64(0), Ty::Void);
+            }
+            let d = self.new_local(ret);
+            self.emit(Statement::Call { dest: Some(d), func: sym.into(), args: lowered });
+            return (Operand::Copy(d), ret);
+        }
         // Buffer-capture intrinsics for inline C/asm blocks: `@arraydata(a)` yields the
         // raw data pointer (past the 16-byte object header), `@arraylen(a)` the element
         // count. Together they pass a Vire array to a `native "c"` block as a proven
@@ -3656,6 +3672,31 @@ fn gpu_intrinsic_sym(name: &str) -> Option<&'static str> {
         "gpu_bid" => "__gpu_bid",       // blockIdx.x
         "gpu_bdim" => "__gpu_bdim",     // blockDim.x
         "gpu_gdim" => "__gpu_gdim",     // gridDim.x
+        _ => return None,
+    })
+}
+
+/// Maps an argument-taking / typed GPU device intrinsic to its backend symbol and
+/// authoritative return type (set here, not inferred — see the NVPTX emitter for
+/// the LLVM/nvvm lowering). `None` if `name` is not one. G1 device primitives:
+/// block barrier, device atomics, warp shuffle/reduce, IEEE math.
+fn gpu_intrinsic_typed(name: &str) -> Option<(&'static str, Ty)> {
+    Some(match name {
+        // Block barrier (__syncthreads). Unit-typed: called for effect, so it can
+        // sit as a kernel's tail statement without looking like a return value.
+        "gpu_sync" => ("__gpu_sync", Ty::Void),
+        // atomicAdd(arr, idx, val) → returns the OLD value.
+        "gpu_atomic_add" => ("__gpu_atomic_add", Ty::I64),
+        // Warp shuffle-down and a full-warp sum reduction (both i32 lanes).
+        "gpu_shfl_down" => ("__gpu_shfl_down", Ty::I64),
+        "gpu_warp_reduce_add" => ("__gpu_warp_reduce_add", Ty::I64),
+        // IEEE math (round-to-nearest → bit-exact vs the CPU runtime).
+        "gpu_sqrt" => ("__gpu_sqrt", Ty::F64),
+        "gpu_fabs" => ("__gpu_fabs", Ty::F64),
+        "gpu_floor" => ("__gpu_floor", Ty::F64),
+        "gpu_ceil" => ("__gpu_ceil", Ty::F64),
+        "gpu_fmin" => ("__gpu_fmin", Ty::F64),
+        "gpu_fmax" => ("__gpu_fmax", Ty::F64),
         _ => return None,
     })
 }

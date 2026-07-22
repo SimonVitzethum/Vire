@@ -434,6 +434,18 @@ impl<'a> Ctx<'a> {
                     if n == "print" {
                         return T::Void;
                     }
+                    // `@gpu` device intrinsics have fixed return types — teach them to
+                    // inference so one used as a kernel's tail (e.g. `gpu_sync()`)
+                    // doesn't look like a returned value (see lower::gpu_intrinsic_*).
+                    match n.as_str() {
+                        "gpu_sync" => return T::Void,
+                        "gpu_sqrt" | "gpu_fabs" | "gpu_floor" | "gpu_ceil" | "gpu_fmin"
+                        | "gpu_fmax" => return T::F64,
+                        "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
+                        | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
+                        | "gpu_warp_reduce_add" => return T::I64,
+                        _ => {}
+                    }
                     if let Some(sig) = self.sigs.get(n) {
                         // `@gpu` kernels: skip param 0 (the injected thread index) —
                         // the caller passes only params 1.. .

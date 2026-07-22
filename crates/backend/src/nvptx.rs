@@ -67,6 +67,15 @@ pub fn emit_ptx(program: &Program) -> Result<Option<String>, Vec<String>> {
     for sreg in ["tid.x", "ctaid.x", "ntid.x", "nctaid.x"] {
         writeln!(w, "declare i32 @llvm.nvvm.read.ptx.sreg.{sreg}()").unwrap();
     }
+    // G1 device primitives: block barrier, warp shuffle, IEEE math. (Atomics use
+    // the `atomicrmw` instruction, no declaration needed.)
+    w.push_str("declare void @llvm.nvvm.barrier0()\n");
+    w.push_str("declare i32 @llvm.nvvm.shfl.sync.down.i32(i32, i32, i32, i32)\n");
+    for f in ["sqrt", "fabs", "floor", "ceil"] {
+        writeln!(w, "declare double @llvm.{f}.f64(double)").unwrap();
+    }
+    w.push_str("declare double @llvm.minnum.f64(double, double)\n");
+    w.push_str("declare double @llvm.maxnum.f64(double, double)\n");
     w.push('\n');
 
     let mut errs = Vec::new();
@@ -330,8 +339,10 @@ impl Dev<'_> {
         t
     }
 
-    /// Lower a `gpu_*` intrinsic call to nvvm sreg reads. Returns `(value, i64)`.
-    fn gpu_intrinsic(&mut self, func: &str, _args: &[Operand]) -> Option<(String, Ty)> {
+    /// Lower a `gpu_*` device intrinsic call. Returns `(value, ty)`, or `None` if
+    /// `func` is not a device intrinsic. Covers the nullary special-register reads
+    /// and the G1 primitives (barrier, atomics, warp shuffle/reduce, IEEE math).
+    fn gpu_intrinsic(&mut self, func: &str, args: &[Operand]) -> Option<(String, Ty)> {
         let read = |dev: &mut Self, sreg: &str| -> String {
             let t = dev.fresh();
             writeln!(dev.w, "  {t} = call i32 @llvm.nvvm.read.ptx.sreg.{sreg}()").unwrap();
@@ -342,11 +353,12 @@ impl Dev<'_> {
             writeln!(dev.w, "  {t} = sext i32 {v} to i64").unwrap();
             t
         };
-        let val32 = match func {
-            "__gpu_tid" => read(self, "tid.x"),
-            "__gpu_bid" => read(self, "ctaid.x"),
-            "__gpu_bdim" => read(self, "ntid.x"),
-            "__gpu_gdim" => read(self, "nctaid.x"),
+        // Nullary special-register reads (thread/block indices + dimensions).
+        let sreg = match func {
+            "__gpu_tid" => Some(read(self, "tid.x")),
+            "__gpu_bid" => Some(read(self, "ctaid.x")),
+            "__gpu_bdim" => Some(read(self, "ntid.x")),
+            "__gpu_gdim" => Some(read(self, "nctaid.x")),
             "__gpu_gid" => {
                 let cta = read(self, "ctaid.x");
                 let ntid = read(self, "ntid.x");
@@ -355,19 +367,103 @@ impl Dev<'_> {
                 writeln!(self.w, "  {m} = mul i32 {cta}, {ntid}").unwrap();
                 let g = self.fresh();
                 writeln!(self.w, "  {g} = add i32 {m}, {tid}").unwrap();
-                g
+                Some(g)
             }
             "__gpu_gsize" => {
                 let nctaid = read(self, "nctaid.x");
                 let ntid = read(self, "ntid.x");
                 let m = self.fresh();
                 writeln!(self.w, "  {m} = mul i32 {nctaid}, {ntid}").unwrap();
-                m
+                Some(m)
             }
-            _ => return None,
+            _ => None,
         };
-        let v64 = sext(self, val32);
-        Some((v64, Ty::I64))
+        if let Some(v32) = sreg {
+            return Some((sext(self, v32), Ty::I64));
+        }
+
+        // A full-warp shuffle-down by `off` (all 32 lanes, warp-width clamp c=31).
+        let shfl_down = |dev: &mut Self, v: &str, off: &str| -> String {
+            let r = dev.fresh();
+            writeln!(dev.w, "  {r} = call i32 @llvm.nvvm.shfl.sync.down.i32(i32 -1, i32 {v}, i32 {off}, i32 31)").unwrap();
+            r
+        };
+        match func {
+            // __syncthreads block barrier. Called for effect; value is unused.
+            "__gpu_sync" => {
+                writeln!(self.w, "  call void @llvm.nvvm.barrier0()").unwrap();
+                Some(("0".into(), Ty::I64))
+            }
+            // atomicAdd(arr, idx, val) → old value. Global-memory i32/i64 only.
+            "__gpu_atomic_add" => {
+                let kind = match &args[0] {
+                    Operand::Copy(l) => self.arr_kind(l.0 as usize),
+                    _ => None,
+                };
+                let kind = match kind {
+                    Some(k @ (ArrKind::Int | ArrKind::Long)) => k,
+                    _ => {
+                        self.errs.push(format!(
+                            "@gpu kernel `{}`: gpu_atomic_add needs an Int/Long array argument",
+                            self.f.name
+                        ));
+                        ArrKind::Int
+                    }
+                };
+                let et = elem(kind);
+                let (base, _) = self.operand(&args[0]);
+                let (idx, it) = self.operand(&args[1]);
+                let idx = self.coerce(idx, it, Ty::I64);
+                let p = self.fresh();
+                writeln!(self.w, "  {p} = getelementptr {et}, ptr addrspace(1) {base}, i64 {idx}").unwrap();
+                let (v, vt) = self.operand(&args[2]);
+                let sv = self.narrow_to_elem(v, vt, kind);
+                let old = self.fresh();
+                writeln!(self.w, "  {old} = atomicrmw add ptr addrspace(1) {p}, {et} {sv} monotonic").unwrap();
+                let old64 = if kind == ArrKind::Long { old } else { sext(self, old) };
+                Some((old64, Ty::I64))
+            }
+            // Warp shuffle-down (single step) and a full-warp sum reduction.
+            "__gpu_shfl_down" => {
+                let (v, vt) = self.operand(&args[0]);
+                let v = self.coerce(v, vt, Ty::I32);
+                let (d, dt) = self.operand(&args[1]);
+                let d = self.coerce(d, dt, Ty::I32);
+                let r = shfl_down(self, &v, &d);
+                Some((sext(self, r), Ty::I64))
+            }
+            "__gpu_warp_reduce_add" => {
+                let (v, vt) = self.operand(&args[0]);
+                let mut acc = self.coerce(v, vt, Ty::I32);
+                for off in ["16", "8", "4", "2", "1"] {
+                    let s = shfl_down(self, &acc, off);
+                    let n = self.fresh();
+                    writeln!(self.w, "  {n} = add i32 {acc}, {s}").unwrap();
+                    acc = n;
+                }
+                Some((sext(self, acc), Ty::I64))
+            }
+            // IEEE math (round-to-nearest → bit-exact vs the CPU runtime).
+            "__gpu_sqrt" | "__gpu_fabs" | "__gpu_floor" | "__gpu_ceil" => {
+                let ll = &func["__gpu_".len()..];
+                let (x, xt) = self.operand(&args[0]);
+                let x = self.coerce(x, xt, Ty::F64);
+                let r = self.fresh();
+                writeln!(self.w, "  {r} = call double @llvm.{ll}.f64(double {x})").unwrap();
+                Some((r, Ty::F64))
+            }
+            "__gpu_fmin" | "__gpu_fmax" => {
+                let nv = if func.ends_with("fmin") { "minnum" } else { "maxnum" };
+                let (a, at) = self.operand(&args[0]);
+                let a = self.coerce(a, at, Ty::F64);
+                let (b, bt) = self.operand(&args[1]);
+                let b = self.coerce(b, bt, Ty::F64);
+                let r = self.fresh();
+                writeln!(self.w, "  {r} = call double @llvm.{nv}.f64(double {a}, double {b})").unwrap();
+                Some((r, Ty::F64))
+            }
+            _ => None,
+        }
     }
 
     fn rvalue(&mut self, rv: &Rvalue) -> (String, Ty) {
@@ -539,12 +635,17 @@ fn read_only_params(k: &GpuKernel) -> Vec<bool> {
             }
         }
     }
-    // Collect which params any store can reach; bail (all in/out) on an untraceable base.
+    // Collect which params can be written; bail (all in/out) on an untraceable base.
+    // A store's base is written; and — soundly — any array passed to a Call may be
+    // mutated by it (device atomics like `gpu_atomic_add` write through the arg,
+    // and we cannot see inside an intrinsic), so an array-typed call argument counts
+    // as written too. The pure intrinsics (math/warp/sreg) take no array args, so
+    // this costs them nothing.
     let mut written = 0u64;
     for b in &k.func.blocks {
         for st in &b.statements {
-            if let Statement::ArrayStore { arr, .. } = st {
-                match arr {
+            match st {
+                Statement::ArrayStore { arr, .. } => match arr {
                     Operand::Copy(l) => {
                         let p = points[l.0 as usize];
                         if p == 0 {
@@ -553,7 +654,15 @@ fn read_only_params(k: &GpuKernel) -> Vec<bool> {
                         written |= p;
                     }
                     _ => return vec![false; nparams], // non-local array base
+                },
+                Statement::Call { args, .. } => {
+                    for a in args {
+                        if let Operand::Copy(l) = a {
+                            written |= points[l.0 as usize]; // array arg (0 if scalar)
+                        }
+                    }
                 }
+                _ => {}
             }
         }
     }
