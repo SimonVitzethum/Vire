@@ -430,11 +430,19 @@ Staged (each stage runnable):
   meshlet's bounding-sphere center on the GPU (`dot` + compare → `emit_mesh_tasks(bool)`
   lowers to `OpSelect` 1/0). The same meshlet renders or is culled purely from the
   camera data (`tests/vire_vulkan.sh vire_task_gpu_cull`; `examples/vire/vulkan_cull.vr`).
-  *Remaining:* backface/cone culling (per-meshlet cone axis from a builder); per-vertex
-  mesh attributes (color/normal) → fragment; a Vire `@compute` meshlet builder
-  (partition + cone data); many meshlets via `vkCmdDrawMeshTasksIndirectCountEXT` +
-  bindless GPU scene buffers (typed Vire structs). One Vire program = the whole
-  GPU-driven renderer (builder + cull + draw + scene data), normally GLSL/HLSL + C++
+  *Many meshlets from a Vire scene buffer DONE:* `vk_mesh_scene(offsets)` uploads a
+  `[Float]` of per-meshlet (x,y) offsets to an **SSBO** and issues one
+  `vkCmdDrawMeshTasksIndirectEXT` dispatching N mesh workgroups; each `@mesh` workgroup
+  reads its own offset with `meshlet_offset()` (`scene[gl_WorkGroupID.x]`, a
+  descriptor-set-bound storage buffer) and emits its triangle there. Verified: two
+  meshlets (left+right) both render, and the scene array decides which exist
+  (`tests/vire_vulkan.sh vire_mesh_scene`; `examples/vire/vulkan_scene.vr`). *Remaining:*
+  fuse the scene path with the `@task` cull (per-meshlet frustum/cone test before
+  emit, via a task payload carrying the surviving indices); backface/cone culling
+  (per-meshlet cone axis); per-vertex mesh attributes (color/normal) → fragment; a
+  Vire `@compute` meshlet builder (partition + cone data) so the scene buffer itself
+  is GPU-built; typed Vire structs for the scene records (today it is a flat float
+  array). One Vire program = the whole GPU-driven renderer, normally GLSL/HLSL + C++
   + a mesh toolchain.
 - [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
   of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup

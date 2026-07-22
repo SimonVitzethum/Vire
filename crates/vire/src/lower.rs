@@ -2844,8 +2844,15 @@ impl<'a> FnLower<'a> {
         // vk_mesh: position-only geometry (jrt_vk_mesh). vk_mesh_c: per-vertex
         // attributes — the [Float] interleaves (x,y, r,g,b), read in the @vertex via
         // attr_color() (jrt_vk_mesh_c). Both pass the proven (data-ptr, count) pair.
-        if name == "vk_mesh" || name == "vk_mesh_c" {
-            let sym = if name == "vk_mesh_c" { "jrt_vk_mesh_c" } else { "jrt_vk_mesh" };
+        // vk_mesh_scene(offsets): many meshlets from a Vire scene buffer — the flat
+        // [Float] of interleaved (x,y) per-meshlet offsets is uploaded to an SSBO and
+        // one indirect dispatch draws them all (the @mesh reads meshlet_offset()).
+        if name == "vk_mesh" || name == "vk_mesh_c" || name == "vk_mesh_scene" {
+            let sym = match name.as_str() {
+                "vk_mesh_c" => "jrt_vk_mesh_c",
+                "vk_mesh_scene" => "jrt_vk_mesh_scene",
+                _ => "jrt_vk_mesh",
+            };
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);
             self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });

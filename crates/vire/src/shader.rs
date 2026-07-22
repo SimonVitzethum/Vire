@@ -37,6 +37,7 @@ fn new_cx() -> Cx {
         uses_attr_color: false,
         uses_glsl: false,
         uses_push_constant: false,
+        uses_scene: false,
         n: 0,
     }
 }
@@ -84,6 +85,7 @@ struct Cx {
     uses_attr_color: bool,      // vertex `attr_color()` → per-vertex color attribute (Location 1)
     uses_glsl: bool,            // a GLSL.std.450 builtin (sqrt/normalize/dot/…) → import the set
     uses_push_constant: bool,   // task `cull_plane()` → a vec4 push constant (the frustum plane)
+    uses_scene: bool,           // mesh `meshlet_offset()` → an SSBO indexed by gl_WorkGroupID
     n: u32,
 }
 
@@ -171,6 +173,24 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v3float %col_in").unwrap();
                     return Ok((id, Ty::Vec(3)));
+                }
+                // Scene buffer read (mesh stage): the per-meshlet (x,y) offset for THIS
+                // workgroup — `scene[gl_WorkGroupID.x]` from the SSBO the host fills.
+                // Lets one dispatch of N mesh workgroups draw N meshlets from Vire data.
+                if name == "meshlet_offset" {
+                    if !args.is_empty() {
+                        return Err("shader: meshlet_offset() takes no arguments".into());
+                    }
+                    self.uses_scene = true;
+                    let wid = self.id("t");
+                    writeln!(self.body, "{wid} = OpLoad %v3uint %gl_WorkGroupID").unwrap();
+                    let wx = self.id("t");
+                    writeln!(self.body, "{wx} = OpCompositeExtract %uint {wid} 0").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {wx}").unwrap();
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
+                    return Ok((id, Ty::Vec(2)));
                 }
                 // Push constant: the frustum plane (nx,ny,nz,d) the host supplies for
                 // `@task` culling — read as a vec4. The stage declares the push-constant
@@ -835,16 +855,27 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
     for i in &ints { writeln!(const_decls, "%i_{i} = OpConstant %int {i}").unwrap(); }
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    // The per-meshlet scene buffer (SSBO, binding 0) + gl_WorkGroupID — declared only
+    // when `meshlet_offset()` is used, so one dispatch draws N meshlets from Vire data.
+    let (scene_iface, scene_decor, scene_decl) = if cx.uses_scene {
+        (
+            " %gl_WorkGroupID %scene",
+            "               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId\n               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 NonWritable\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene NonWritable\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n",
+            "%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input\n%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n",
+        )
+    } else {
+        ("", "", "")
+    };
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
 {glsl_import}               OpMemoryModel Logical GLSL450
-               OpEntryPoint MeshEXT %main \"main\" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT
+               OpEntryPoint MeshEXT %main \"main\" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT{scene_iface}
                OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
                OpExecutionMode %main OutputVertices {nv}
                OpExecutionMode %main OutputPrimitivesEXT {np}
                OpExecutionMode %main OutputTrianglesEXT
-               OpDecorate %gl_MeshPerVertexEXT Block
+{scene_decor}               OpDecorate %gl_MeshPerVertexEXT Block
                OpMemberDecorate %gl_MeshPerVertexEXT 0 BuiltIn Position
                OpMemberDecorate %gl_MeshPerVertexEXT 1 BuiltIn PointSize
                OpMemberDecorate %gl_MeshPerVertexEXT 2 BuiltIn ClipDistance
@@ -875,7 +906,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
 %_ptr_out_idx = OpTypePointer Output %_arr_idx
 %gl_PrimitiveTriangleIndicesEXT = OpVariable %_ptr_out_idx Output
 %_ptr_Output_v3uint = OpTypePointer Output %v3uint
-{prim_consts}{consts}       %main = OpFunction %void None %fnty
+{scene_decl}{prim_consts}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {vars}{body}               OpReturn
                OpFunctionEnd
@@ -884,6 +915,9 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
         nv = nv, np = np,
         const_decls = const_decls,
         prim_consts = prim_consts,
+        scene_iface = scene_iface,
+        scene_decor = scene_decor,
+        scene_decl = scene_decl,
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,

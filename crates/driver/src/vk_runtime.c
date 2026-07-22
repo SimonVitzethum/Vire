@@ -106,7 +106,7 @@ static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint
 }
 /* The GPU-driven pipeline: a mesh stage (no vertex input, no input assembly — the
  * mesh shader emits vertices + primitives itself) + the fragment stage. */
-static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout) {
+static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, VkDescriptorSetLayout dsl) {
     VkShaderModule ms=shmod(dev,VK_MESH_TRI,VK_MESH_TRI_N*4), fs=shmod(dev,VK_TRI_FRAG,VK_TRI_FRAG_N*4);
     if(!ms||!fs) return 0;
     /* Optional amplification (task) stage — prepended when the program has an @task. */
@@ -128,7 +128,8 @@ static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w,
      * a task stage exists, else the mesh stage. */
     VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
     VkPushConstantRange pcr={.stageFlags=pcStages,.offset=0,.size=16};
-    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr,
+        .setLayoutCount=(dsl?1u:0u),.pSetLayouts=(dsl?&dsl:0)};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=nst,.pStages=st,
         .pViewportState=&vps,.pRasterizationState=&rs,.pMultisampleState=&msi,.pColorBlendState=&cb,
@@ -256,6 +257,134 @@ int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) { return mesh_render(v
  * rasterizer interpolates (the classic RGB-corner triangle). Typed stage I/O. */
 int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render(verts, nfloats, 5); }
 
+/* vk_mesh_scene(offsets): MANY meshlets from a Vire scene buffer. The N (x,y) offsets
+ * are uploaded to an SSBO (binding 0); one indirect dispatch of N mesh workgroups
+ * (vkCmdDrawMeshTasksIndirectEXT) draws N meshlets — each mesh workgroup reads its own
+ * offset via meshlet_offset() (scene[gl_WorkGroupID.x]). Returns a 2-bit mask: bit 0 if
+ * the left quarter is drawn, bit 1 if the right quarter is — so a caller can verify
+ * multiple meshlets landed. -2 if no mesh-shader device, -1 on failure. */
+int64_t jrt_vk_mesh_scene(const double *offs, int64_t nfloats) {
+    if(!offs || nfloats < 2 || (nfloats & 1)) return -1;
+    enum { W=256, H=256 };
+    uint32_t nmesh=(uint32_t)(nfloats/2);
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
+    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -2;
+    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
+    VkPhysicalDevice pd=0; uint32_t qf=0;
+    for(uint32_t d=0; d<nd && !pd; d++) {
+        if(!has_ext(pds[d], VK_EXT_MESH_SHADER_EXTENSION_NAME)) continue;
+        uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&n,0);
+        VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&n,qs);
+        for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){ pd=pds[d]; qf=i; break; }
+        free(qs);
+    }
+    free(pds); if(!pd){ vkDestroyInstance(inst,0); return -2; }
+
+    VkPhysicalDeviceMeshShaderFeaturesEXT mf={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.meshShader=VK_TRUE};
+    const char *dext[]={VK_EXT_MESH_SHADER_EXTENSION_NAME};
+    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
+    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.pNext=&mf,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci,.enabledExtensionCount=1,.ppEnabledExtensionNames=dext};
+    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect=(PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksIndirectEXT");
+    if(!draw_indirect){ vkDestroyDevice(dev,0); vkDestroyInstance(inst,0); return -2; }
+
+    /* Scene SSBO: N vec2 offsets (f32), host-visible. */
+    float *xy=malloc((size_t)nmesh*2*sizeof(float)); if(!xy) return -1;
+    for(uint32_t i=0;i<nmesh*2;i++) xy[i]=(float)offs[i];
+    VkDeviceSize ssz=(VkDeviceSize)nmesh*2*sizeof(float); if(ssz==0) ssz=8;
+    VkBufferCreateInfo sbi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=ssz,.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer ssbo; CK(vkCreateBuffer(dev,&sbi,0,&ssbo));
+    VkMemoryRequirements smr; vkGetBufferMemoryRequirements(dev,ssbo,&smr);
+    uint32_t smt=find_mem(pd,smr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(smt==~0u) return -1;
+    VkMemoryAllocateInfo sma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=smr.size,.memoryTypeIndex=smt};
+    VkDeviceMemory smem; CK(vkAllocateMemory(dev,&sma,0,&smem)); vkBindBufferMemory(dev,ssbo,smem,0);
+    void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,xy,(size_t)nmesh*2*sizeof(float)); vkUnmapMemory(dev,smem); free(xy);
+
+    /* Descriptor set layout (binding 0 = SSBO, mesh stage) + pool + set. */
+    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_MESH_BIT_EXT};
+    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1};
+    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
+    VkDescriptorBufferInfo dbi={.buffer=ssbo,.offset=0,.range=ssz};
+    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi};
+    vkUpdateDescriptorSets(dev,1,&wds,0,0);
+
+    /* Indirect command buffer: {groupCountX=N, 1, 1}. */
+    VkDrawMeshTasksIndirectCommandEXT icmd={.groupCountX=nmesh,.groupCountY=1,.groupCountZ=1};
+    VkBufferCreateInfo ibi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=sizeof icmd,.usage=VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+    VkBuffer ibuf; CK(vkCreateBuffer(dev,&ibi,0,&ibuf));
+    VkMemoryRequirements imr; vkGetBufferMemoryRequirements(dev,ibuf,&imr);
+    uint32_t imt=find_mem(pd,imr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(imt==~0u) return -1;
+    VkMemoryAllocateInfo ima={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=imr.size,.memoryTypeIndex=imt};
+    VkDeviceMemory imem; CK(vkAllocateMemory(dev,&ima,0,&imem)); vkBindBufferMemory(dev,ibuf,imem,0);
+    void *ip; CK(vkMapMemory(dev,imem,0,sizeof icmd,0,&ip)); memcpy(ip,&icmd,sizeof icmd); vkUnmapMemory(dev,imem);
+
+    /* Color target + framebuffer + pipeline (with the descriptor set layout). */
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; CK(vkCreateImage(dev,&ii,0,&img));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,img,&mr);
+    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return -1;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
+    VkImageViewCreateInfo ivi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    VkImageView view; CK(vkCreateImageView(dev,&ivi,0,&view));
+    VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
+    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
+    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,dsl); if(!pipe) return -1;
+
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return -1;
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    VkDeviceMemory bmem; CK(vkAllocateMemory(dev,&bm,0,&bmem)); vkBindBufferMemory(dev,buf,bmem,0);
+
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cmd,&cbi);
+    VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
+    vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&dset,0,0);
+    draw_indirect(cmd,ibuf,0,1,sizeof icmd);      /* N meshlets, one indirect dispatch */
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
+    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
+    CK(vkEndCommandBuffer(cmd));
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
+    unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
+    int cy=(int)(H*0.52);
+    unsigned char *L=&px[(cy*W + W/4)*4], *R=&px[(cy*W + 3*W/4)*4];
+    int64_t mask=0;
+    if(L[0]>40 || L[1]>40 || L[2]>40) mask|=1;       /* left quarter drawn */
+    if(R[0]>40 || R[1]>40 || R[2]>40) mask|=2;       /* right quarter drawn */
+    vkUnmapMemory(dev,bmem);
+    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyBuffer(dev,ibuf,0); vkFreeMemory(dev,imem,0);
+    vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
+    vkDestroyBuffer(dev,ssbo,0); vkFreeMemory(dev,smem,0);
+    vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
+    vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    return mask;
+}
+
 /* vk_mesh_shader(): the GPU-driven path (VM milestone). A mesh shader emits the
  * triangle itself — no vertex buffer, no vertex stage — dispatched with
  * vkCmdDrawMeshTasksEXT over VK_EXT_mesh_shader. Renders headless and returns the
@@ -303,7 +432,7 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl); if(!pipe) return -1;
+    VkPipelineLayout pl; VkPipeline pipe=build_mesh_pipeline(dev,rp,W,H,&pl,0); if(!pipe) return -1;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));

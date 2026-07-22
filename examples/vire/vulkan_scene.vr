@@ -1,0 +1,34 @@
+// Vire @vulkan — MANY meshlets from a Vire scene buffer, one indirect dispatch.
+//
+//   vire run examples/vire/vulkan_scene.vr
+//
+// The scene is a Vire array of per-meshlet (x,y) offsets. It is uploaded to a GPU
+// storage buffer (SSBO); a single vkCmdDrawMeshTasksIndirectEXT dispatches one mesh
+// workgroup per meshlet, and each @mesh workgroup reads ITS OWN offset from the scene
+// with meshlet_offset() (scene[gl_WorkGroupID.x]) and emits a small triangle there.
+// So the geometry that exists is decided by the Vire data — a GPU-driven, indirect,
+// multi-meshlet draw. This is the shape a real GPU-driven renderer takes; add the
+// @task cull (see vulkan_cull.vr) to drop off-screen meshlets on the GPU.
+// Returns a 2-bit mask (left quarter | right quarter drawn). See language/GPU-VULKAN.md.
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = meshlet_offset()                       // this meshlet's (x,y) from the scene
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 {
+    vec4(0.3, 0.8, 0.4, 1.0)
+}
+
+fn main() {
+    // Four meshlets across the view — the whole batch is this one array.
+    mut scene = [0.0 - 0.6, 0.0, 0.0 - 0.2, 0.0, 0.2, 0.0, 0.6, 0.0]
+    mut mask = vk_mesh_scene(scene)
+    print(mask)     // 3 = both the sampled left and right quarters were drawn
+}

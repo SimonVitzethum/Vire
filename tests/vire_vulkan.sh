@@ -388,6 +388,34 @@ fn main() {
 }
 EOF
 
+# Many meshlets from a Vire scene buffer, one indirect dispatch. The [Float] of
+# per-meshlet (x,y) offsets is uploaded to an SSBO; N mesh workgroups are dispatched
+# via vkCmdDrawMeshTasksIndirectEXT, and each @mesh workgroup reads its own offset
+# with meshlet_offset() (scene[gl_WorkGroupID.x]). Two meshlets — left (x=-0.5) and
+# right (x=+0.5) — both render → mask 3. Data-driven: the scene array decides the
+# geometry. -2 → skip where no mesh device.
+case_ vire_mesh_scene <<'EOF'
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = meshlet_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.3, 0.8, 0.4, 1.0) }
+fn main() {
+    mut scene = [0.0 - 0.5, 0.0, 0.5, 0.0]
+    mut mask = vk_mesh_scene(scene)
+    mut ok = 0
+    if mask == -2 { ok = 1 }
+    if mask == 3 { ok = 1 }        // both left and right meshlets rendered
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
