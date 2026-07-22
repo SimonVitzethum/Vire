@@ -729,6 +729,26 @@ fn main() {
 }
 EOF
 
+# Textures: the fragment samples a 2x2 RGBA texture (red/green/blue/orange quadrants)
+# with tex(uv) — a combined image sampler at set 0 binding 0, uv from gl_FragCoord.
+# The centroid (uv=0.5,0.55, NEAREST) samples the orange texel -> (255,128,0).
+case_ vire_texture <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut px = vk_textured()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 240 { if g > 110 { if g < 145 { if b < 30 { ok = 1 } } } }   // orange texel
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

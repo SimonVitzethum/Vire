@@ -2844,6 +2844,13 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_gpuvk_run".into(), args: vec![Operand::Copy(ptr), len] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_textured(): render the triangle sampling a 2x2 texture the @fragment reads
+        // with tex(uv). Returns the centroid pixel (0xRRGGBB).
+        if name == "vk_textured" {
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_textured".into(), args: vec![] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_bench(frames): steady-state headless benchmark — init once, render
         // `frames` mesh-shader frames, return total nanoseconds (perf parity vs
         // hand-written Vulkan in C++/Rust; benchmarks/vulkan/).

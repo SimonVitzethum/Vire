@@ -340,7 +340,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
 - [x] **Wider scene records** — a colour/normal field beyond `offset+cone`; normals for
   lit meshlets.
 - [ ] **`vkCmdDrawMeshTasksIndirectCountEXT`** — a GPU count buffer (today a fixed indirect count).
-- [~] **Textures / samplers** — image + sampler + descriptor + fragment sampling. *Large;
+- [x] **Textures / samplers** — image + sampler + descriptor + fragment sampling. *Large;
   attempt, else skip with reason.*
 - [~] **Typed resource handles + lifetime safety** — `Buffer`/`Texture`/`Pipeline` as
   RC/region-tracked Vire values (no GPU use-after-free). *Architectural; attempt a

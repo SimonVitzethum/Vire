@@ -41,6 +41,7 @@ fn new_cx() -> Cx {
         uses_workgroup_id: false,
         uses_payload: false,
         uses_global_id: false,
+        uses_texture: false,
         n: 0,
     }
 }
@@ -137,6 +138,7 @@ struct Cx {
     uses_workgroup_id: bool,    // read gl_WorkGroupID (meshlet_offset, emit_visible)
     uses_payload: bool,         // task→mesh payload (the surviving meshlet index)
     uses_global_id: bool,       // compute `meshlet_index()`/`set_meshlet()` → gl_GlobalInvocationID
+    uses_texture: bool,         // fragment `tex(uv)` → a sampler2D at set 0 binding 0
     n: u32,
 }
 
@@ -333,6 +335,23 @@ impl Cx {
                     let c3 = self.id("t");
                     writeln!(self.body, "{c3} = OpVectorShuffle %v3float {c4} {c4} 0 1 2").unwrap();
                     return Ok((c3, Ty::Vec(3)));
+                }
+                // Texture sample (fragment): `tex(uv)` samples the combined image
+                // sampler at set 0 binding 0 (the host-provided texture) → a vec4.
+                if name == "tex" {
+                    if args.len() != 1 {
+                        return Err("shader: tex(uv) takes one Vec2".into());
+                    }
+                    let (uv, uvt) = self.expr(&args[0])?;
+                    if uvt != Ty::Vec(2) {
+                        return Err("shader: tex(uv) — uv must be a Vec2".into());
+                    }
+                    self.uses_texture = true;
+                    let s = self.id("t");
+                    writeln!(self.body, "{s} = OpLoad %simg %tex").unwrap();
+                    let r = self.id("t");
+                    writeln!(self.body, "{r} = OpImageSampleImplicitLod %v4float {s} {uv}").unwrap();
+                    return Ok((r, Ty::Vec(4)));
                 }
                 // Push constant, read as a vec4: `cull_plane()` is the @task frustum
                 // plane; `uniform()` is the same 16-byte push constant the host supplies
@@ -928,9 +947,19 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     };
     // A host `uniform()` push constant (vec4) — declared only when used.
     let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant, true);
-    let iface = format!("{fc_iface}{vy_iface}{pc_iface}");
-    let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}");
-    let fc_decl = format!("{pc_decl}{fc_decl}{vy_decl}");
+    // A `tex(uv)` sampler2D (set 0 binding 0) — declared only when used.
+    let (tx_iface, tx_decor, tx_decl) = if cx.uses_texture {
+        (
+            " %tex",
+            "               OpDecorate %tex DescriptorSet 0\n               OpDecorate %tex Binding 0\n",
+            "        %img = OpTypeImage %float 2D 0 0 0 1 Unknown\n       %simg = OpTypeSampledImage %img\n%_ptr_uc_simg = OpTypePointer UniformConstant %simg\n        %tex = OpVariable %_ptr_uc_simg UniformConstant\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    let iface = format!("{fc_iface}{vy_iface}{pc_iface}{tx_iface}");
+    let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}");
+    let fc_decl = format!("{pc_decl}{tx_decl}{fc_decl}{vy_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
