@@ -406,13 +406,24 @@ Staged (each stage runnable):
   host type system (today vectors are shader-local); (b) `GLSL.std.450` builtins
   (normalize/dot/mix/sqrt…) + `if`-as-statement with effect-only branches; (c) index
   buffers + more attribute types (normal/uv).
-- [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
-  `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
-  / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`
-  meshlet builder (partition + cone data); GPU frustum/backface/cone culling in
-  `@task`; `vkCmdDrawMeshTasksIndirectCountEXT` + bindless GPU scene buffers (typed
-  Vire structs). One Vire program = the whole GPU-driven renderer (builder + cull +
-  draw shaders + scene data), which is normally GLSL/HLSL + C++ + a mesh toolchain.
+- [~] **VM — GPU-driven meshlets (first-class).** *Foundation SHIPPED — the mesh
+  pipeline runs end-to-end.* `vk_mesh_shader()` renders through a **mesh** pipeline
+  (`VK_EXT_mesh_shader`): no vertex buffer and no vertex stage — a `MeshEXT` shader
+  emits the triangle's vertices + primitive itself (`OpSetMeshOutputsEXT`,
+  `gl_MeshVerticesEXT`, `gl_PrimitiveTriangleIndicesEXT`), dispatched with
+  `vkCmdDrawMeshTasksEXT` (one task workgroup = one meshlet). The runtime selects a
+  mesh-capable device, enables the `meshShader` feature, and loads the draw entry via
+  `vkGetDeviceProcAddr`; returns -2 where unsupported so callers skip. SPIR-V is a
+  bootstrap `@mesh` (crates/backend/src/spirv.rs, assembled at spv1.4) + the Vire
+  `@fragment` for color. Verified: centroid = the Vire fragment color
+  (`tests/vire_vulkan.sh vire_mesh_shader`; `examples/vire/vulkan_meshlet.vr`).
+  *Remaining:* a **Vire-authored `@mesh` body** (per-meshlet vertex/primitive emit +
+  attributes, reusing the VS shader emitter — now that it has control flow + vector
+  math); a `@task` stage with GPU frustum/backface/cone culling; a Vire `@compute`
+  meshlet builder (partition + cone data); `vkCmdDrawMeshTasksIndirectCountEXT` +
+  bindless GPU scene buffers (typed Vire structs). One Vire program = the whole
+  GPU-driven renderer (builder + cull + draw + scene data), normally GLSL/HLSL + C++
+  + a mesh toolchain.
 - [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
   of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup
   ops, `GLSL.std.450`); G1 intrinsics map directly (barrier→`OpControlBarrier`,

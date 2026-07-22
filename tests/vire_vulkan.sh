@@ -267,6 +267,28 @@ fn main() {
 }
 EOF
 
+# GPU-driven mesh shader (VM milestone): vk_mesh_shader() draws via a mesh pipeline
+# (VK_EXT_mesh_shader / vkCmdDrawMeshTasksEXT) — the mesh shader emits the triangle
+# itself, no vertex buffer and no vertex stage. The Vire @fragment colors it orange
+# (0.9,0.5,0.1) → centroid ~ (229,127,25). Returns -2 where the device lacks mesh
+# shaders, so the case passes (as a skip) there too.
+case_ vire_mesh_shader <<'EOF'
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.5, 0.1, 1.0) }
+fn main() {
+    mut px = vk_mesh_shader()
+    mut ok = 0
+    if px == -2 { ok = 1 }                          // no mesh-shader device → skip-pass
+    if px > 0 {
+        mut r = px / 65536
+        mut g = (px / 256) % 256
+        mut b = px % 256
+        if r > 200 { if g > 105 { if g < 150 { if b < 60 { ok = 1 } } } }
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

@@ -47,6 +47,76 @@ pub fn constant_fragment_spvasm(rgba: [f32; 4]) -> String {
     )
 }
 
+/// A bootstrap `@mesh` stage (VK_EXT_mesh_shader): one workgroup emits the triangle
+/// directly — three vertices + one primitive via `OpSetMeshOutputsEXT` — with no
+/// vertex buffer and no vertex stage. This stands up the GPU-driven mesh pipeline
+/// (the `VM` milestone); a Vire-authored `@mesh` body (meshlet cull + emit) replaces
+/// it next. Needs SPIR-V 1.4 (assembled with `--target-env spv1.4`).
+pub fn mesh_triangle_spvasm() -> String {
+    MESH_TRI_SPVASM.to_string()
+}
+
+const MESH_TRI_SPVASM: &str = r###"               OpCapability MeshShadingEXT
+               OpExtension "SPV_EXT_mesh_shader"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint MeshEXT %main "main" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT
+               OpExecutionModeId %main LocalSizeId %uint_1 %uint_1 %uint_1
+               OpExecutionMode %main OutputVertices 3
+               OpExecutionMode %main OutputPrimitivesEXT 1
+               OpExecutionMode %main OutputTrianglesEXT
+               OpDecorate %gl_MeshPerVertexEXT Block
+               OpMemberDecorate %gl_MeshPerVertexEXT 0 BuiltIn Position
+               OpMemberDecorate %gl_MeshPerVertexEXT 1 BuiltIn PointSize
+               OpMemberDecorate %gl_MeshPerVertexEXT 2 BuiltIn ClipDistance
+               OpMemberDecorate %gl_MeshPerVertexEXT 3 BuiltIn CullDistance
+               OpDecorate %gl_PrimitiveTriangleIndicesEXT BuiltIn PrimitiveTriangleIndicesEXT
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+     %uint_1 = OpConstant %uint 1
+     %uint_3 = OpConstant %uint 3
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+%_arr_float_uint_1 = OpTypeArray %float %uint_1
+%gl_MeshPerVertexEXT = OpTypeStruct %v4float %float %_arr_float_uint_1 %_arr_float_uint_1
+%_arr_gl_MeshPerVertexEXT_uint_3 = OpTypeArray %gl_MeshPerVertexEXT %uint_3
+%_ptr_Output__arr_gl_MeshPerVertexEXT_uint_3 = OpTypePointer Output %_arr_gl_MeshPerVertexEXT_uint_3
+%gl_MeshVerticesEXT = OpVariable %_ptr_Output__arr_gl_MeshPerVertexEXT_uint_3 Output
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+    %float_0 = OpConstant %float 0
+%float_n0_600000024 = OpConstant %float -0.600000024
+    %float_1 = OpConstant %float 1
+         %21 = OpConstantComposite %v4float %float_0 %float_n0_600000024 %float_0 %float_1
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+      %int_1 = OpConstant %int 1
+%float_0_600000024 = OpConstant %float 0.600000024
+         %26 = OpConstantComposite %v4float %float_0_600000024 %float_0_600000024 %float_0 %float_1
+      %int_2 = OpConstant %int 2
+         %29 = OpConstantComposite %v4float %float_n0_600000024 %float_0_600000024 %float_0 %float_1
+     %v3uint = OpTypeVector %uint 3
+%_arr_v3uint_uint_1 = OpTypeArray %v3uint %uint_1
+%_ptr_Output__arr_v3uint_uint_1 = OpTypePointer Output %_arr_v3uint_uint_1
+%gl_PrimitiveTriangleIndicesEXT = OpVariable %_ptr_Output__arr_v3uint_uint_1 Output
+     %uint_0 = OpConstant %uint 0
+     %uint_2 = OpConstant %uint 2
+         %37 = OpConstantComposite %v3uint %uint_0 %uint_1 %uint_2
+%_ptr_Output_v3uint = OpTypePointer Output %v3uint
+       %main = OpFunction %void None %3
+          %5 = OpLabel
+               OpSetMeshOutputsEXT %uint_3 %uint_1
+         %23 = OpAccessChain %_ptr_Output_v4float %gl_MeshVerticesEXT %int_0 %int_0
+               OpStore %23 %21
+         %27 = OpAccessChain %_ptr_Output_v4float %gl_MeshVerticesEXT %int_1 %int_0
+               OpStore %27 %26
+         %30 = OpAccessChain %_ptr_Output_v4float %gl_MeshVerticesEXT %int_2 %int_0
+               OpStore %30 %29
+         %39 = OpAccessChain %_ptr_Output_v3uint %gl_PrimitiveTriangleIndicesEXT %int_0
+               OpStore %39 %37
+               OpReturn
+               OpFunctionEnd
+"###;
+
 const VERT_SPVASM: &str = r###"               OpCapability Shader
                OpMemoryModel Logical GLSL450
                OpEntryPoint Vertex %main "main" %out %pos_in

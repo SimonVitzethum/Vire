@@ -1202,14 +1202,20 @@ fn build_or_run(args: &[String]) {
             .frag_spvasm
             .clone()
             .unwrap_or_else(|| fastllvm_backend::spirv::constant_fragment_spvasm([1.0, 0.4, 0.1, 1.0]));
-        let assemble = |asm: &str, stem: &str| -> Vec<u32> {
+        // `target` selects the SPIR-V version: the graphics stages are 1.0, the mesh
+        // stage needs 1.4 (MeshShadingEXT / OpExecutionModeId).
+        let assemble = |asm: &str, stem: &str, target: Option<&str>| -> Vec<u32> {
             let asm_path = build_dir.join(format!("{stem}.spvasm"));
             let spv_path = build_dir.join(format!("{stem}.spv"));
             if std::fs::write(&asm_path, asm).is_err() {
                 eprintln!("writing {stem}.spvasm failed");
                 exit(1);
             }
-            match Command::new("spirv-as").arg(&asm_path).arg("-o").arg(&spv_path).status() {
+            let mut cmd = Command::new("spirv-as");
+            if let Some(t) = target {
+                cmd.arg("--target-env").arg(t);
+            }
+            match cmd.arg(&asm_path).arg("-o").arg(&spv_path).status() {
                 Ok(s) if s.success() => {}
                 _ => {
                     eprintln!("error: `spirv-as` failed/absent — @vulkan shaders need spirv-tools");
@@ -1223,10 +1229,13 @@ fn build_or_run(args: &[String]) {
             .vert_spvasm
             .clone()
             .unwrap_or_else(fastllvm_backend::spirv::triangle_vertex_spvasm);
-        let vw = assemble(&vert_asm, "vk_vert");
-        let fw = assemble(&frag_asm, "vk_frag");
+        let vw = assemble(&vert_asm, "vk_vert", None);
+        let fw = assemble(&frag_asm, "vk_frag", None);
+        // The GPU-driven mesh stage (VM milestone): a bootstrap `@mesh` that emits the
+        // triangle with no vertex buffer (`vk_mesh_shader()` renders it).
+        let mw = assemble(&fastllvm_backend::spirv::mesh_triangle_spvasm(), "vk_mesh_tri", Some("spv1.4"));
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw)] {
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));
             for (i, x) in w.iter().enumerate() {
                 if i % 8 == 0 {

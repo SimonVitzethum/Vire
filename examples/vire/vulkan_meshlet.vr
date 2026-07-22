@@ -1,0 +1,30 @@
+// Vire @vulkan — the GPU-driven mesh pipeline (VM milestone, VK_EXT_mesh_shader).
+//
+//   vire run examples/vire/vulkan_meshlet.vr
+//
+// `vk_mesh_shader()` renders through a *mesh* pipeline: there is no vertex buffer and
+// no vertex stage — a mesh shader emits the triangle's vertices and primitive itself,
+// dispatched with vkCmdDrawMeshTasksEXT (one task workgroup = one meshlet). This is
+// the foundation for fully GPU-driven renderers with meshlets: the GPU decides what
+// geometry exists. The @fragment below (Vire-authored) colors the result. Returns -2
+// where the device has no mesh-shader support. See language/GPU-VULKAN.md.
+//
+// Next on this path: a Vire-authored `@mesh` body (per-meshlet vertex/primitive emit
+// + GPU frustum/cone culling) and vkCmdDrawMeshTasksIndirectCountEXT over a Vire
+// scene buffer — one Vire program for the whole GPU-driven renderer.
+
+@fragment
+fn fs() -> Vec4 {
+    vec4(0.9, 0.5, 0.1, 1.0)      // color the mesh-shader triangle
+}
+
+fn main() {
+    mut px = vk_mesh_shader()
+    if px == -2 {
+        print(0)                  // this device has no mesh-shader support
+    } else {
+        print(px / 65536)         // red at the centroid (~229)
+        print((px / 256) % 256)   // green (~127)
+        print(px % 256)           // blue (~25)
+    }
+}
