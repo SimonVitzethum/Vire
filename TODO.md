@@ -334,12 +334,17 @@ Staged (each stage runnable):
   not just a constant. `@vertex`/`@fragment` parse as item attributes and are pulled
   out of host lowering + inference. Verified (`tests/vire_vulkan.sh`): a computed
   green fragment (`vec4(0.1,0.4,0.15,0.5) * 2.0`) renders green, headless + windowed.
-  *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type system (today vectors are
-  shader-local); (b) **structured control flow** (`OpLoopMerge`/`OpSelectionMerge`)
-  + swizzles + more builtins (`GLSL.std.450`: normalize/dot/mix…); (c) **fragment
-  inputs** (`gl_FragCoord`, varyings from the vertex stage) so a shader computes
-  per-pixel, not per-constant; (d) a Vire-authored **`@vertex`** stage (still the
-  fixed bootstrap) + vertex-buffer / typed stage I/O.
+  *Fragment inputs — `gl_FragCoord` DONE:* `frag_x()`/`frag_y()`/`frag_coord()`
+  read the pixel position (`OpLoad` + `OpCompositeExtract`, BuiltIn FragCoord added
+  to the interface only when used), so a fragment computes **per-pixel** — a
+  gradient `vec4(frag_x()/256.0, …)` gives centroid r≈128 from position, verified
+  (`tests/vire_vulkan.sh vire_fragment_fragcoord`; `examples/vire/vulkan_triangle.vr`
+  shows a visible gradient). *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type
+  system (today vectors are shader-local); (b) **structured control flow**
+  (`OpLoopMerge`/`OpSelectionMerge`) + swizzles + more builtins (`GLSL.std.450`:
+  normalize/dot/mix…); (c) **varyings** from the vertex stage (interpolated inputs);
+  (d) a Vire-authored **`@vertex`** stage (still the fixed bootstrap) + vertex-buffer
+  / typed stage I/O.
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

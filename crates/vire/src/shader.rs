@@ -38,6 +38,7 @@ struct Cx {
     body: String,               // function-body instructions
     const_cache: HashMap<u32, String>, // float bits → id
     env: HashMap<String, (String, Ty)>, // local name → (id, type)
+    uses_fragcoord: bool,       // `frag_x/frag_y/frag_coord` → declare gl_FragCoord
     n: u32,
 }
 
@@ -73,6 +74,22 @@ impl Cx {
                     Expr::Ident(n, _) => n.as_str(),
                     _ => return Err("shader: only vecN(...) calls are supported".into()),
                 };
+                // Fragment input builtins: the pixel position (gl_FragCoord).
+                if matches!(name, "frag_x" | "frag_y" | "frag_coord") {
+                    if !args.is_empty() {
+                        return Err(format!("shader: {name}() takes no arguments"));
+                    }
+                    self.uses_fragcoord = true;
+                    let fc = self.id("t");
+                    writeln!(self.body, "{fc} = OpLoad %v4float %gl_FragCoord").unwrap();
+                    if name == "frag_coord" {
+                        return Ok((fc, Ty::Vec(4)));
+                    }
+                    let comp = if name == "frag_x" { 0 } else { 1 };
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpCompositeExtract %float {fc} {comp}").unwrap();
+                    return Ok((id, Ty::Float));
+                }
                 let n = match name {
                     "vec2" => 2u8,
                     "vec3" => 3,
@@ -162,19 +179,31 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         body: String::new(),
         const_cache: HashMap::new(),
         env: HashMap::new(),
+        uses_fragcoord: false,
         n: 0,
     };
     let (out, ty) = cx.block_output(body)?;
     if ty != Ty::Vec(4) {
         return Err("shader: the fragment output must be a Vec4".into());
     }
+    // gl_FragCoord (the pixel position) is declared only when a `frag_*` builtin is
+    // used — listed in the entry-point interface + decorated BuiltIn FragCoord.
+    let (iface, fc_decorate, fc_decl) = if cx.uses_fragcoord {
+        (
+            " %gl_FragCoord",
+            "               OpDecorate %gl_FragCoord BuiltIn FragCoord\n",
+            "%_ptr_Input_v4float = OpTypePointer Input %v4float\n%gl_FragCoord = OpVariable %_ptr_Input_v4float Input\n",
+        )
+    } else {
+        ("", "", "")
+    };
     Ok(format!(
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Fragment %main \"main\" %color
+               OpEntryPoint Fragment %main \"main\" %color{iface}
                OpExecutionMode %main OriginUpperLeft
                OpDecorate %color Location 0
-       %void = OpTypeVoid
+{fc_decorate}       %void = OpTypeVoid
        %fnty = OpTypeFunction %void
       %float = OpTypeFloat 32
     %v2float = OpTypeVector %float 2
@@ -182,12 +211,15 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     %v4float = OpTypeVector %float 4
        %optr = OpTypePointer Output %v4float
       %color = OpVariable %optr Output
-{consts}       %main = OpFunction %void None %fnty
+{fc_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {body}               OpStore %color {out}
                OpReturn
                OpFunctionEnd
 ",
+        iface = iface,
+        fc_decorate = fc_decorate,
+        fc_decl = fc_decl,
         consts = cx.consts,
         body = cx.body,
         out = out

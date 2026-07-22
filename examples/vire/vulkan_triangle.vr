@@ -4,15 +4,18 @@
 //
 // Opens a real window (GLFW + Vulkan swapchain) and presents a triangle until you
 // close it. The whole pipeline runs from this one Vire program — and the fragment
-// color comes from the `@fragment` shader below, written in Vire and compiled to
-// SPIR-V by the Vire compiler (via spirv-as). See language/GPU-VULKAN.md.
+// shader below is written in Vire and compiled to SPIR-V by the Vire compiler.
 //
-// vk_window(n): n = 0 loops until the window is closed; n > 0 presents n frames.
-// Vendor-neutral (any Vulkan GPU: NVIDIA, AMD, Intel, Apple via MoltenVK).
+// This shader computes a PER-PIXEL color: the red channel follows the pixel's
+// horizontal position (gl_FragCoord.x) → a left-to-right gradient across the
+// triangle. Vendor-neutral (any Vulkan GPU). See language/GPU-VULKAN.md.
 
-// The fragment stage — a Vire function. Its constant color drives the triangle.
+// The fragment stage — a Vire function with real per-pixel computation.
 @fragment
-fn fs() -> Vec4 { vec4(0.2, 0.55, 0.95, 1.0) }   // a nice blue
+fn fs() -> Vec4 {
+    mut gx = frag_x() / 800.0        // 0..1 across the 800px-wide window
+    vec4(gx, 0.55, 0.95, 1.0)        // red ramps with x, over a steady blue base
+}
 
 fn main() {
     mut ok = vk_window(0)

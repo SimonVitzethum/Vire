@@ -80,6 +80,23 @@ fn main() {
 }
 EOF
 
+# Per-pixel computation: r = gl_FragCoord.x / 256 (a horizontal gradient). At the
+# sampled centroid (x=128) r≈128 — a value derived from the pixel POSITION, not any
+# constant in the shader (which only has 256.0, 0.8, 0.3). Proves fragment inputs.
+case_ vire_fragment_fragcoord <<'EOF'
+@fragment
+fn fs() -> Vec4 { vec4(frag_x() / 256.0, 0.8, 0.3, 1.0) }
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 118 { if r < 138 { if g > 190 { if b > 60 { if b < 90 { ok = 1 } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

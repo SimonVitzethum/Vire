@@ -208,6 +208,16 @@ SPIR-V (glslc-embedded); single-source Vire→SPIR-V is the next milestone. Veri
 headless pixel-correct + windowed present (3-frame smoke → 1). No regression
 (gpu 8/8, heap 16/16; non-vulkan binaries unchanged).
 
+### `@vulkan` VS — fragment inputs: per-pixel shaders via gl_FragCoord (shipped)
+`frag_x()`/`frag_y()`/`frag_coord()` in a Vire `@fragment` read the pixel position
+(`shader.rs`: `OpLoad %gl_FragCoord` + `OpCompositeExtract`; BuiltIn FragCoord is
+added to the entry-point interface + decorated only when used). So a fragment now
+computes **per-pixel**, not per-constant: `vec4(frag_x()/256.0, 0.8, 0.3, 1.0)` is a
+horizontal gradient — centroid (x=128) → r≈128, a value derived from position, not
+any shader constant. Verified `tests/vire_vulkan.sh vire_fragment_fragcoord`;
+`examples/vire/vulkan_triangle.vr` shows a visible gradient in the window. No
+regression (gpu 8/8, heap 16/16).
+
 ### `@vulkan` VS step 2 — a Vire shader compiler (bodies → SPIR-V ops) (shipped)
 `crates/vire/src/shader.rs` compiles an `@fragment fn` **body** to SPIR-V assembly:
 float/vector arithmetic (`OpFAdd/Sub/Mul/Div`), `mut` bindings, `vecN(...)`
