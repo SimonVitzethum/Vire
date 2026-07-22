@@ -443,7 +443,7 @@ impl<'a> Ctx<'a> {
                         | "gpu_fmax" => return T::F64,
                         "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
-                        | "gpu_warp_reduce_add" | "vk_triangle" => return T::I64,
+                        | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window" => return T::I64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {

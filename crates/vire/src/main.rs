@@ -1193,6 +1193,7 @@ fn build_or_run(args: &[String]) {
         }
         vk_paths.push(vk_path);
         link_libs.push("vulkan".into());
+        link_libs.push("glfw".into()); // windowing (vk_window); the runtime references it
     }
 
     let mut gpu_paths: Vec<PathBuf> = Vec::new();

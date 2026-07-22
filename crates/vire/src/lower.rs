@@ -2783,6 +2783,15 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_window(frames): open a window and present the triangle. frames=0 loops
+        // until the window is closed; a positive count renders that many frames then
+        // returns (used for a non-blocking smoke run).
+        if name == "vk_window" {
+            let arg = args.first().map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstI64(0));
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_window".into(), args: vec![arg] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if let Some((sym, ret)) = gpu_intrinsic_typed(&name) {
             let lowered: Vec<Operand> = args.iter().map(|a| self.lower_expr(a).0).collect();
             if ret == Ty::Void {

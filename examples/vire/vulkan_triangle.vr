@@ -1,0 +1,16 @@
+// Vire @vulkan — a windowed triangle.
+//
+//   vire run examples/vire/vulkan_triangle.vr
+//
+// Opens a real window (GLFW + Vulkan swapchain) and presents the triangle until
+// you close it. The whole graphics pipeline — instance, device, swapchain, a
+// compile-time-fixed pipeline, per-frame acquire/submit/present — runs from this
+// one Vire program, memory-safe from the Vire side and vendor-neutral (any Vulkan
+// GPU: NVIDIA, AMD, Intel, Apple via MoltenVK). See language/GPU-VULKAN.md.
+//
+// vk_window(n): n = 0 loops until the window is closed; n > 0 presents n frames
+// then returns (used by the non-blocking smoke test). Returns 1 on success.
+fn main() {
+    mut ok = vk_window(0)
+    print(ok)
+}
