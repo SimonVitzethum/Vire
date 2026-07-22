@@ -454,12 +454,17 @@ Staged (each stage runnable):
   stages compiled to SPIR-V + a compute pipeline with a shader-write→read barrier).
   Verified: 2 GPU-built meshlets show both under a permissive plane and cull the left
   under a +x plane (`tests/vire_vulkan.sh vire_mesh_built`; `examples/vire/vulkan_built.vr`).
-  *Remaining:* backface/cone culling (a per-meshlet cone axis the builder computes);
-  per-vertex mesh attributes (color/normal) → fragment; typed Vire structs for the
-  scene records (today a flat vec2 array); real geometry input to the builder (today
-  it places meshlets by formula). The GPU-driven renderer skeleton — build, cull,
-  draw, shade — is now entirely Vire, which normally spans GLSL/HLSL + C++ + a mesh
-  toolchain.
+  *Typed scene records + cone/backface culling DONE:* the scene record is a Vire struct
+  `Meshlet { offset: vec2, cone: vec2 }` (std430, one layout shared by every stage via
+  `resource_decls`). The `@compute` builder writes both fields (`set_meshlet(offset,
+  cone)`); the `@task` reads the facing direction (`meshlet_cone()`) and backface-culls
+  (`emit_visible(cone.x > 0)`) — verified: of two GPU-built meshlets the one facing
+  toward is drawn and the one facing away is culled (`tests/vire_vulkan.sh
+  vire_cone_cull`; `examples/vire/vulkan_cone.vr`). *Remaining:* per-vertex mesh
+  attributes (color/normal) → fragment (a mesh per-vertex Location output); wider
+  records (add a color/normal field); real geometry input to the builder (today it
+  places meshlets by formula). The GPU-driven renderer skeleton — build, cull, draw,
+  shade — is now entirely Vire, which normally spans GLSL/HLSL + C++ + a mesh toolchain.
 - [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
   of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup
   ops, `GLSL.std.450`); G1 intrinsics map directly (barrier→`OpControlBarrier`,

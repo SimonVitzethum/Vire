@@ -1,0 +1,44 @@
+// Vire @vulkan — typed scene records + cone/backface culling on the GPU.
+//
+//   vire run examples/vire/vulkan_cone.vr
+//
+// The scene record is a Vire struct: Meshlet { offset: vec2, cone: vec2 }. The offset
+// is where the meshlet sits; the cone is its facing direction. The @compute builder
+// writes BOTH fields per meshlet (set_meshlet(offset, cone)); the @task reads the
+// facing direction (meshlet_cone) and culls meshlets that face away from the camera —
+// backface culling done on the GPU, per meshlet, before anything is rasterized. The
+// surviving index flows to the @mesh via the payload. Every stage is Vire.
+// See language/GPU-VULKAN.md.
+
+@compute
+fn build() {
+    // Meshlet i sits at x = -0.5 + i; its facing flips with i (toward, then away).
+    mut x = 0.0 - 0.5 + meshlet_index() * 1.0
+    mut facing = 1.0 - meshlet_index() * 2.0     // i=0 → +1 (toward), i=1 → -1 (away)
+    set_meshlet(vec2(x, 0.0), vec2(facing, 0.0))
+}
+
+@task
+fn ts() {
+    mut cone = meshlet_cone()      // this meshlet's facing direction (record.cone)
+    emit_visible(cone.x > 0.0)     // keep only the meshlets facing the camera
+}
+
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+
+@fragment
+fn fs() -> Vec4 { vec4(0.8, 0.5, 0.9, 1.0) }
+
+fn main() {
+    // meshlet 0 (left) faces toward → drawn; meshlet 1 (right) faces away → culled.
+    mut mask = vk_mesh_built(2, 0.0, 0.0, 0.0, 1.0)
+    print(mask)     // 1 = only the left meshlet survived the backface cull
+}

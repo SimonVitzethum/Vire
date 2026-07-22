@@ -491,6 +491,43 @@ fn main() {
 }
 EOF
 
+# Typed scene records + cone/backface culling. The scene record is a Vire struct
+# Meshlet { offset: vec2, cone: vec2 }; the @compute builder writes BOTH fields
+# (set_meshlet(offset, cone)) and the @task reads the facing direction (meshlet_cone)
+# to backface-cull. Meshlet 0 faces toward (cone.x=+1) → drawn; meshlet 1 faces away
+# (cone.x=-1) → culled on the GPU. Mask 1 = only the left survived. -2 → skip.
+case_ vire_cone_cull <<'EOF'
+@compute
+fn build() {
+    mut x = 0.0 - 0.5 + meshlet_index() * 1.0
+    mut facing = 1.0 - meshlet_index() * 2.0
+    set_meshlet(vec2(x, 0.0), vec2(facing, 0.0))
+}
+@task
+fn ts() {
+    mut cone = meshlet_cone()
+    emit_visible(cone.x > 0.0)
+}
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut o = culled_offset()
+    mesh_pos(0, vec4(o.x, o.y - 0.15, 0.0, 1.0))
+    mesh_pos(1, vec4(o.x + 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_pos(2, vec4(o.x - 0.15, o.y + 0.15, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.8, 0.5, 0.9, 1.0) }
+fn main() {
+    mut mask = vk_mesh_built(2, 0.0, 0.0, 0.0, 1.0)
+    mut ok = 0
+    if mask == -2 { ok = 1 }
+    if mask == 1 { ok = 1 }        // left (facing toward) survives; right (away) culled
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

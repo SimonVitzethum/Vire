@@ -45,12 +45,19 @@ fn new_cx() -> Cx {
     }
 }
 
+/// The GPU scene record — a typed Vire struct, shared by every stage that touches the
+/// scene buffer so they agree on the layout. `offset` is the meshlet's (x,y) centre;
+/// `cone` is its 2D facing direction (for cone/backface culling in `@task`). std430:
+/// two vec2 fields at offsets 0 and 8, array stride 16.
+///
 /// Build the (entry-point interface, decorations, type/var decls) for the GPU-driven
-/// resources a stage touches — the scene SSBO (binding 0), gl_WorkGroupID, the
-/// task→mesh payload, and the frustum push constant. Shared by `@mesh` and `@task` so
-/// both declare them identically (SPIR-V 1.4 requires every global in the interface).
-/// `%i_0` (int 0) and `%v3uint` must already be declared by the caller's preamble.
-fn resource_decls(ssbo: bool, wgid: bool, payload: bool, push: bool) -> (String, String, String) {
+/// resources a stage touches — the scene SSBO (binding 0), gl_WorkGroupID /
+/// gl_GlobalInvocationID, the task→mesh payload, and the frustum push constant. Shared
+/// by `@mesh`/`@task`/`@compute` so all declare them identically (SPIR-V 1.4 requires
+/// every global in the interface). `%i_0`/`%i_1` and `%v3uint` must already be declared
+/// by the caller's preamble. `writable` drops the read-only decorations (the `@compute`
+/// builder writes the scene; the graphics stages read it).
+fn resource_decls(ssbo: bool, wgid: bool, global_id: bool, payload: bool, push: bool, writable: bool) -> (String, String, String) {
     let mut iface = String::new();
     let mut decor = String::new();
     let mut decl = String::new();
@@ -59,10 +66,16 @@ fn resource_decls(ssbo: bool, wgid: bool, payload: bool, push: bool) -> (String,
         decor.push_str("               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId\n");
         decl.push_str("%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_WorkGroupID = OpVariable %_ptr_Input_v3uint Input\n");
     }
+    if global_id {
+        iface.push_str(" %gl_GlobalInvocationID");
+        decor.push_str("               OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId\n");
+        decl.push_str("%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input\n");
+    }
     if ssbo {
         iface.push_str(" %scene");
-        decor.push_str("               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 NonWritable\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene NonWritable\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n");
-        decl.push_str("%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n");
+        let ro = if writable { "" } else { "               OpMemberDecorate %Scene 0 NonWritable\n               OpDecorate %scene NonWritable\n" };
+        decor.push_str(&format!("               OpDecorate %_rt_Meshlet ArrayStride 16\n               OpMemberDecorate %Meshlet 0 Offset 0\n               OpMemberDecorate %Meshlet 1 Offset 8\n               OpDecorate %Scene Block\n{ro}               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n"));
+        decl.push_str("    %Meshlet = OpTypeStruct %v2float %v2float\n%_rt_Meshlet = OpTypeRuntimeArray %Meshlet\n      %Scene = OpTypeStruct %_rt_Meshlet\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n");
     }
     if payload {
         iface.push_str(" %pl");
@@ -225,7 +238,25 @@ impl Cx {
                     let wx = self.id("t");
                     writeln!(self.body, "{wx} = OpCompositeExtract %uint {wid} 0").unwrap();
                     let p = self.id("t");
-                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {wx}").unwrap();
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {wx} %i_0").unwrap();
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
+                    return Ok((id, Ty::Vec(2)));
+                }
+                // The meshlet's facing direction (record.cone, member 1) for THIS task
+                // workgroup — cone/backface culling: emit only when it faces the camera.
+                if name == "meshlet_cone" {
+                    if !args.is_empty() {
+                        return Err("shader: meshlet_cone() takes no arguments".into());
+                    }
+                    self.uses_ssbo = true;
+                    self.uses_workgroup_id = true;
+                    let wid = self.id("t");
+                    writeln!(self.body, "{wid} = OpLoad %v3uint %gl_WorkGroupID").unwrap();
+                    let wx = self.id("t");
+                    writeln!(self.body, "{wx} = OpCompositeExtract %uint {wid} 0").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {wx} %i_1").unwrap();
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
@@ -260,7 +291,7 @@ impl Cx {
                     let idx = self.id("t");
                     writeln!(self.body, "{idx} = OpLoad %uint {ip}").unwrap();
                     let p = self.id("t");
-                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {idx}").unwrap();
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {idx} %i_0").unwrap();
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v2float {p}").unwrap();
                     return Ok((id, Ty::Vec(2)));
@@ -864,7 +895,8 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     let mut prim_consts = String::new();              // OpConstantComposite per triangle
     let mut primk = 0u32;
     uints.insert(1); // %u_1 sizes the built-in ClipDistance/CullDistance arrays
-    ints.insert(0);  // %i_0 selects gl_Position (member 0)
+    ints.insert(0);  // %i_0 selects gl_Position / scene record member 0
+    ints.insert(1);  // %i_1 selects the scene record's second field (cone)
 
     // A trailing call with no `;` parses as the block tail — treat it as a statement.
     let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
@@ -931,7 +963,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     // The GPU-driven resources this mesh stage touches (scene SSBO, gl_WorkGroupID for
     // the plain scene path, or the task payload for the fused-cull path).
     let (scene_iface, scene_decor, scene_decl) =
-        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, cx.uses_payload, false);
+        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, false, cx.uses_payload, false, false);
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
@@ -1055,11 +1087,11 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
     }
     let count_op = count_op.ok_or("shader: `@task` must call emit_mesh_tasks/emit_visible(arg)")?;
     let payload_op = if emit_payload { " %pl" } else { "" };
-    let mut const_decls = String::from("        %i_0 = OpConstant %int 0\n");
+    let mut const_decls = String::from("        %i_0 = OpConstant %int 0\n        %i_1 = OpConstant %int 1\n");
     for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     let (res_iface, res_decor, res_decl) =
-        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, cx.uses_payload, cx.uses_push_constant);
+        resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, false, cx.uses_payload, cx.uses_push_constant, false);
     Ok(format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
@@ -1117,7 +1149,7 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
             Stmt::Expr(Expr::Call { callee, args, .. })
                 if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "set_meshlet") =>
             {
-                if args.len() != 1 { return Err("shader: set_meshlet(Vec2)".into()); }
+                if args.is_empty() || args.len() > 2 { return Err("shader: set_meshlet(offset[, cone])".into()); }
                 let (val, ty) = cx.expr(&args[0])?;
                 if ty != Ty::Vec(2) { return Err("shader: set_meshlet expects a Vec2".into()); }
                 cx.uses_ssbo = true;
@@ -1127,26 +1159,24 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
                 let gx = cx.id("t");
                 writeln!(cx.body, "{gx} = OpCompositeExtract %uint {g} 0").unwrap();
                 let p = cx.id("t");
-                writeln!(cx.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {gx}").unwrap();
+                writeln!(cx.body, "{p} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {gx} %i_0").unwrap();
                 writeln!(cx.body, "OpStore {p} {val}").unwrap();
+                // Optional second arg: the meshlet's cone/facing direction (member 1).
+                if args.len() == 2 {
+                    let (cval, cty) = cx.expr(&args[1])?;
+                    if cty != Ty::Vec(2) { return Err("shader: set_meshlet cone must be a Vec2".into()); }
+                    let cp = cx.id("t");
+                    writeln!(cx.body, "{cp} = OpAccessChain %_ptr_ssbo_v2float %scene %i_0 {gx} %i_1").unwrap();
+                    writeln!(cx.body, "OpStore {cp} {cval}").unwrap();
+                }
             }
             _ => return Err("shader: `@compute` (builder) supports `let` and set_meshlet(Vec2)".into()),
         }
     }
-    // The scene SSBO is WRITABLE here (the mesh stage reads the same buffer readonly).
-    let glid = if cx.uses_global_id {
-        (" %gl_GlobalInvocationID",
-         "               OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId\n",
-         "%_ptr_Input_v3uint = OpTypePointer Input %v3uint\n%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input\n")
-    } else { ("", "", "") };
-    let ssbo = if cx.uses_ssbo {
-        (" %scene",
-         "               OpDecorate %_rt_v2float ArrayStride 8\n               OpDecorate %Scene Block\n               OpMemberDecorate %Scene 0 Offset 0\n               OpDecorate %scene DescriptorSet 0\n               OpDecorate %scene Binding 0\n",
-         "%_rt_v2float = OpTypeRuntimeArray %v2float\n      %Scene = OpTypeStruct %_rt_v2float\n%_ptr_ssbo_Scene = OpTypePointer StorageBuffer %Scene\n      %scene = OpVariable %_ptr_ssbo_Scene StorageBuffer\n%_ptr_ssbo_v2float = OpTypePointer StorageBuffer %v2float\n")
-    } else { ("", "", "") };
-    let iface = format!("{}{}", glid.0, ssbo.0);
-    let decor = format!("{}{}", glid.1, ssbo.1);
-    let decl = format!("{}{}", glid.2, ssbo.2);
+    // The scene SSBO is WRITABLE here (the mesh/task stages read the same buffer
+    // read-only); this compute builder writes it, indexed by gl_GlobalInvocationID.
+    let (iface, decor, decl) =
+        resource_decls(cx.uses_ssbo, false, cx.uses_global_id, false, false, true);
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
@@ -1169,6 +1199,7 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
  %pf_v4float = OpTypePointer Function %v4float
     %pf_bool = OpTypePointer Function %bool
         %i_0 = OpConstant %int 0
+        %i_1 = OpConstant %int 1
 {decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {vars}{body}               OpReturn

@@ -295,9 +295,10 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect=(PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(dev,"vkCmdDrawMeshTasksIndirectEXT");
     if(!draw_indirect){ vkDestroyDevice(dev,0); vkDestroyInstance(inst,0); return -2; }
 
-    /* Scene SSBO: N vec2 offsets (f32), host-visible. The compute builder fills it on
-     * the GPU (left uninitialized here); otherwise upload the host offsets. */
-    VkDeviceSize ssz=(VkDeviceSize)nmesh*2*sizeof(float); if(ssz==0) ssz=8;
+    /* Scene SSBO: N typed Meshlet records (std430: vec2 offset @0, vec2 cone @8 —
+     * 16 bytes each), host-visible. The compute builder fills it on the GPU (left
+     * uninitialized here); otherwise upload the host offsets (cone left zero). */
+    VkDeviceSize ssz=(VkDeviceSize)nmesh*4*sizeof(float); if(ssz==0) ssz=16;
     VkBufferCreateInfo sbi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=ssz,.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
     VkBuffer ssbo; CK(vkCreateBuffer(dev,&sbi,0,&ssbo));
     VkMemoryRequirements smr; vkGetBufferMemoryRequirements(dev,ssbo,&smr);
@@ -305,9 +306,9 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     VkMemoryAllocateInfo sma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=smr.size,.memoryTypeIndex=smt};
     VkDeviceMemory smem; CK(vkAllocateMemory(dev,&sma,0,&smem)); vkBindBufferMemory(dev,ssbo,smem,0);
     if(!builder){
-        float *xy=malloc((size_t)nmesh*2*sizeof(float)); if(!xy) return -1;
-        for(uint32_t i=0;i<nmesh*2;i++) xy[i]=(float)offs[i];
-        void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,xy,(size_t)nmesh*2*sizeof(float)); vkUnmapMemory(dev,smem); free(xy);
+        float *rec=calloc((size_t)nmesh*4,sizeof(float)); if(!rec) return -1;
+        for(uint32_t i=0;i<nmesh;i++){ rec[i*4+0]=(float)offs[i*2+0]; rec[i*4+1]=(float)offs[i*2+1]; } /* cone stays 0 */
+        void *sp; CK(vkMapMemory(dev,smem,0,ssz,0,&sp)); memcpy(sp,rec,(size_t)nmesh*4*sizeof(float)); vkUnmapMemory(dev,smem); free(rec);
     }
 
     /* Descriptor set layout (binding 0 = SSBO). The task stage reads the scene when it
