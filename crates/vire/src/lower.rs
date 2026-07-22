@@ -2776,6 +2776,13 @@ impl<'a> FnLower<'a> {
         // correctly regardless of inference; args lower normally (an array arg
         // stays an `Operand::Copy` of its param local, so the backend can read its
         // element kind for the atomic GEP).
+        // @vulkan V2 bootstrap: render a self-verifying headless triangle, return
+        // 1 on success (see crates/driver/src/vk_runtime.c, language/GPU-VULKAN.md).
+        if name == "vk_triangle" {
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_triangle".into(), args: vec![] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if let Some((sym, ret)) = gpu_intrinsic_typed(&name) {
             let lowered: Vec<Operand> = args.iter().map(|a| self.lower_expr(a).0).collect();
             if ret == Ty::Void {

@@ -126,9 +126,13 @@ than starting from zero.
   safe Vulkan runtime; the `jrt_gpu_*` ABI + read-only analysis carry over. Delivers
   vendor-neutral compute (Intel + NVIDIA here) with no windowing. *Smallest real
   step; validates the SPIR-V emitter + runtime.*
-- **V2 — hello triangle.** Windowing (GLFW/SDL), swapchain, one compile-time-baked
-  graphics pipeline, `@vertex`/`@fragment` shaders, `frame { clear; draw }`, present.
-  The OpenGL-easy milestone.
+- **V2 — hello triangle.** *Foundation shipped:* a Vire program renders a real,
+  self-verifying Vulkan triangle **headless** (`vk_triangle()` → instance/device/
+  render-pass/baked-pipeline/draw/readback, pixel-verified; `crates/driver/src/
+  vk_runtime.c`, `tests/vire_vulkan.sh`, runs on the Intel iGPU here). *Remaining:*
+  windowing (GLFW/SDL) + swapchain + present, and the `frame { clear; draw }`
+  surface — then the same pipeline shows in a window. Shaders are bootstrap SPIR-V
+  (glslc) until the emitter below lands.
 - **V3 — resources.** Buffers/meshes, uniforms, textures/samplers, auto descriptor
   layouts from shader signatures; a `draw(pipe, mesh, uniforms)` API.
 - **V4 — render graph.** Per-frame graph → automatic layout transitions + minimal

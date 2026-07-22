@@ -17,6 +17,7 @@ const RUNTIME_C: &str = include_str!("../../driver/src/runtime.c");
 const PYBRIDGE_C: &str = include_str!("pybridge.c");
 // Host-side CUDA Driver-API runtime for `@gpu` kernels (see language/GPU-KERNELS.md).
 const GPU_RUNTIME_C: &str = include_str!("../../driver/src/gpu_runtime.c");
+const VK_RUNTIME_C: &str = include_str!("../../driver/src/vk_runtime.c");
 
 /// Emits `text` as a sequence of adjacent C string literals, one per line (so the
 /// PTX embeds as `const char jrt_gpu_ptx[] = "...\n" "...\n";`). Escapes `\`, `"`.
@@ -1173,6 +1174,27 @@ fn build_or_run(args: &[String]) {
     // `llc`, embedded as a C string, and paired with a generated launch stub whose
     // symbol matches the kernel name (so the host `call @<name>` links to it). The
     // whole thing links against libcuda. See language/GPU-KERNELS.md.
+    // @vulkan runtime: linked only when the program actually calls a `jrt_vk_*`
+    // builtin (so binaries without Vulkan don't pull in libvulkan). See
+    // crates/driver/src/vk_runtime.c, language/GPU-VULKAN.md.
+    let want_vulkan = program.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.statements.iter().any(|s| {
+                matches!(s, fastllvm_ir::Statement::Call { func, .. } if func.starts_with("jrt_vk_"))
+            })
+        })
+    });
+    let mut vk_paths: Vec<PathBuf> = Vec::new();
+    if want_vulkan {
+        let vk_path = build_dir.join("vk_runtime.c");
+        if let Err(e) = std::fs::write(&vk_path, VK_RUNTIME_C) {
+            eprintln!("writing vulkan runtime: {e}");
+            exit(1);
+        }
+        vk_paths.push(vk_path);
+        link_libs.push("vulkan".into());
+    }
+
     let mut gpu_paths: Vec<PathBuf> = Vec::new();
     let want_gpu = !program.gpu_kernels.is_empty();
     if want_gpu {
@@ -1535,6 +1557,10 @@ fn build_or_run(args: &[String]) {
         for p in &gpu_paths {
             cmd.arg(p);
         }
+    }
+    // Vulkan glue: the generated headless-render runtime translation unit.
+    for p in &vk_paths {
+        cmd.arg(p);
     }
     if want_cpp {
         link_libs.push("stdc++".into()); // C++ blocks need the C++ stdlib

@@ -190,6 +190,17 @@ bit-exact vs CPU on an RTX 5070 (`tests/vire_gpu.sh` 8/8). See
   (`@llvm.minnum/maxnum.f64`), round-to-nearest = bit-exact vs the CPU runtime.
   Verified: Σ sqrt(i²)=Σi=4950; Σ floor(3.7)=300.
 
+### `@vulkan` V2 foundation — headless self-verifying triangle (shipped)
+First end-to-end Vulkan graphics from a Vire program: `vk_triangle()` builds a real
+pipeline (instance → device → render pass → compile-time-fixed graphics pipeline →
+draw → image readback) and self-verifies the pixels, returning 1. No windowing yet
+(CI-testable, vendor-neutral — runs on the Intel iGPU here). Wiring mirrors `@gpu`:
+`crates/driver/src/vk_runtime.c` (embedded bootstrap SPIR-V from glslc), `main.rs`
+links libvulkan only when a `jrt_vk_*` builtin is used (`want_vulkan` — plain
+binaries don't pull it in), `lower.rs`/`infer.rs` map the `vk_triangle()` builtin.
+`tests/vire_vulkan.sh` (skips cleanly without a device). Non-GPU suites green
+(gpu 8/8, heap 16/16). Next: windowing/swapchain + the single-source shader path.
+
 ### `@vulkan` — safe full-Vulkan framework investigation
 Investigated the vision of Vulkan **as easy as OpenGL** but memory-safe, full-speed,
 and whole-program-optimized — a compiler-integrated safe Vulkan framework (graphics

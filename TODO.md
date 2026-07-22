@@ -311,9 +311,14 @@ Staged (each stage runnable):
   windowing. Delivers vendor-neutral compute (runs on Intel + NVIDIA here). *Smallest
   real step; stands up the SPIR-V emitter + runtime.* (This subsumes the old
   "Vulkan compute backend" idea — it is the foundation, not a separate track.)
-- [ ] **V2 — hello triangle.** Windowing (GLFW/SDL) + swapchain + one
-  compile-time-baked graphics pipeline + `@vertex`/`@fragment` + `frame { clear;
-  draw }` + present. The OpenGL-easy milestone.
+- [~] **V2 — hello triangle.** *Foundation DONE:* a Vire program renders a real,
+  self-verifying Vulkan triangle headless (`vk_triangle()` → instance/device/
+  render-pass/baked-pipeline/draw/readback, pixel-verified → 1), linked only when
+  used (`want_vulkan`), skips cleanly without a device. `crates/driver/src/
+  vk_runtime.c`, `tests/vire_vulkan.sh` (ok on Intel iGPU here). *Remaining:*
+  windowing (GLFW/SDL) + swapchain + present (show it in a window), and the
+  `frame { clear; draw }` surface. Shaders are bootstrap SPIR-V (glslc); the
+  single-source `@vertex`/`@fragment` → SPIR-V path is the SPIR-V-emitter item below.
 - [ ] **V3 — resources.** Buffers/meshes, uniforms, textures/samplers, descriptor
   layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
