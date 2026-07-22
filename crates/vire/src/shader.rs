@@ -56,6 +56,7 @@ struct Cx {
     emits_varying: bool,        // vertex `out_color(vec3)` → declare the Location-0 Output
     uses_varying: bool,         // fragment `in_color()` → declare the Location-0 Input
     uses_attr_color: bool,      // vertex `attr_color()` → per-vertex color attribute (Location 1)
+    uses_glsl: bool,            // a GLSL.std.450 builtin (sqrt/normalize/dot/…) → import the set
     n: u32,
 }
 
@@ -154,6 +155,10 @@ impl Cx {
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v3float %vcol_in").unwrap();
                     return Ok((id, Ty::Vec(3)));
+                }
+                // GLSL.std.450 math builtins (OpExtInst) — enough for lighting/geometry.
+                if let Some(r) = self.glsl_builtin(name, args)? {
+                    return Ok(r);
                 }
                 let n = match name {
                     "vec2" => 2u8,
@@ -321,6 +326,99 @@ impl Cx {
         Ok((id, ta))
     }
 
+    /// A GLSL.std.450 math builtin call, if `name` is one. Returns `Ok(None)` when
+    /// it is not a known builtin (so the caller falls through to `vecN`/user calls).
+    /// Component-wise ops accept a scalar or a vector (genType) and preserve the type.
+    fn glsl_builtin(&mut self, name: &str, args: &[Expr]) -> Result<Option<(String, Ty)>, String> {
+        // Unary, same-type-in-out (float or vector, component-wise).
+        let unary = match name {
+            "sqrt" => Some("Sqrt"), "abs" => Some("FAbs"), "floor" => Some("Floor"),
+            "ceil" => Some("Ceil"), "fract" => Some("Fract"), "sin" => Some("Sin"),
+            "cos" => Some("Cos"), "exp" => Some("Exp"), "log" => Some("Log"),
+            _ => None,
+        };
+        if let Some(op) = unary {
+            if args.len() != 1 { return Err(format!("shader: {name}() takes one argument")); }
+            let (x, tx) = self.expr(&args[0])?;
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst {} %glsl {op} {x}", tx.spirv()).unwrap();
+            return Ok(Some((id, tx)));
+        }
+        // Binary, matching types → same type.
+        let binary = match name {
+            "min" => Some("FMin"), "max" => Some("FMax"), "pow" => Some("Pow"), _ => None,
+        };
+        if let Some(op) = binary {
+            if args.len() != 2 { return Err(format!("shader: {name}() takes two arguments")); }
+            let (a, ta) = self.expr(&args[0])?;
+            let (b, tb) = self.expr(&args[1])?;
+            if ta != tb { return Err(format!("shader: {name}() needs matching argument types")); }
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst {} %glsl {op} {a} {b}", ta.spirv()).unwrap();
+            return Ok(Some((id, ta)));
+        }
+        // Ternary: clamp(x,lo,hi) / mix(a,b,t). For mix, `t` may be scalar.
+        if name == "clamp" || name == "mix" {
+            if args.len() != 3 { return Err(format!("shader: {name}() takes three arguments")); }
+            let (a, ta) = self.expr(&args[0])?;
+            let (b, tb) = self.expr(&args[1])?;
+            let (c, tc) = self.expr(&args[2])?;
+            if ta != tb { return Err(format!("shader: {name}(): first two args must match")); }
+            let ok3 = tc == ta || (name == "mix" && tc == Ty::Float);
+            if !ok3 { return Err(format!("shader: {name}(): third arg type mismatch")); }
+            let op = if name == "clamp" { "FClamp" } else { "FMix" };
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst {} %glsl {op} {a} {b} {c}", ta.spirv()).unwrap();
+            return Ok(Some((id, ta)));
+        }
+        if name == "normalize" {
+            if args.len() != 1 { return Err("shader: normalize() takes one argument".into()); }
+            let (v, tv) = self.expr(&args[0])?;
+            if !matches!(tv, Ty::Vec(_)) { return Err("shader: normalize() needs a vector".into()); }
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst {} %glsl Normalize {v}", tv.spirv()).unwrap();
+            return Ok(Some((id, tv)));
+        }
+        if name == "length" {
+            if args.len() != 1 { return Err("shader: length() takes one argument".into()); }
+            let (v, tv) = self.expr(&args[0])?;
+            if !matches!(tv, Ty::Vec(_)) { return Err("shader: length() needs a vector".into()); }
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst %float %glsl Length {v}").unwrap();
+            return Ok(Some((id, Ty::Float)));
+        }
+        if name == "cross" {
+            if args.len() != 2 { return Err("shader: cross() takes two arguments".into()); }
+            let (a, ta) = self.expr(&args[0])?;
+            let (b, tb) = self.expr(&args[1])?;
+            if ta != Ty::Vec(3) || tb != Ty::Vec(3) {
+                return Err("shader: cross() needs two vec3".into());
+            }
+            self.uses_glsl = true;
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpExtInst %v3float %glsl Cross {a} {b}").unwrap();
+            return Ok(Some((id, Ty::Vec(3))));
+        }
+        // dot is a core instruction (OpDot), not an extended one.
+        if name == "dot" {
+            if args.len() != 2 { return Err("shader: dot() takes two arguments".into()); }
+            let (a, ta) = self.expr(&args[0])?;
+            let (b, tb) = self.expr(&args[1])?;
+            if !matches!(ta, Ty::Vec(_)) || ta != tb {
+                return Err("shader: dot() needs two matching vectors".into());
+            }
+            let id = self.id("t");
+            writeln!(self.body, "{id} = OpDot %float {a} {b}").unwrap();
+            return Ok(Some((id, Ty::Float)));
+        }
+        Ok(None)
+    }
+
     /// A statement-position `out_color(Vec3)` call (a `@vertex` varying write):
     /// stores to the Location-0 Output. Returns `false` if `e` is not that call.
     fn void_call(&mut self, e: &Expr) -> Result<bool, String> {
@@ -476,6 +574,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         emits_varying: false,
         uses_varying: false,
         uses_attr_color: false,
+        uses_glsl: false,
         n: 0,
     };
     // The position attribute is loaded into `%pos` by the preamble; bind the param to
@@ -509,9 +608,10 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     let vary_iface = format!("{vary_iface}{attr_iface}");
     let vary_dec = format!("{vary_dec}{attr_dec}");
     let vary_decl = format!("{vary_decl}{attr_decl}");
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
-               OpMemoryModel Logical GLSL450
+{glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint Vertex %main \"main\" %out %pos_in{vary_iface}
                OpDecorate %glpv Block
                OpMemberDecorate %glpv 0 BuiltIn Position
@@ -544,6 +644,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
                OpReturn
                OpFunctionEnd
 ",
+        glsl_import = glsl_import,
         vary_iface = vary_iface,
         vary_dec = vary_dec,
         vary_decl = vary_decl,
@@ -567,6 +668,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         emits_varying: false,
         uses_varying: false,
         uses_attr_color: false,
+        uses_glsl: false,
         n: 0,
     };
     let (out, ty) = cx.block_value(body)?;
@@ -599,9 +701,10 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     let iface = format!("{fc_iface}{vy_iface}");
     let fc_decorate = format!("{fc_decorate}{vy_decorate}");
     let fc_decl = format!("{fc_decl}{vy_decl}");
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
-               OpMemoryModel Logical GLSL450
+{glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint Fragment %main \"main\" %color{iface}
                OpExecutionMode %main OriginUpperLeft
                OpDecorate %color Location 0
@@ -625,6 +728,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
                OpReturn
                OpFunctionEnd
 ",
+        glsl_import = glsl_import,
         iface = iface,
         fc_decorate = fc_decorate,
         fc_decl = fc_decl,

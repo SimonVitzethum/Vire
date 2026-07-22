@@ -242,6 +242,31 @@ fn main() {
 }
 EOF
 
+# GLSL.std.450 builtins: a Lambert term from normalize()/dot()/max(), then mix()
+# between a dark and a bright color. dot(normalize(.3,.4,1), (0,0,1)) = 0.894, so
+# mix gives centroid ~ (47,207,70). Proves real vector math (OpExtInst + OpDot), the
+# lighting primitives shaders need.
+case_ vire_shader_glsl <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut nrm = normalize(vec3(0.3, 0.4, 1.0))
+    mut lgt = normalize(vec3(0.0, 0.0, 1.0))
+    mut d = max(dot(nrm, lgt), 0.0)
+    mut base = mix(vec3(0.05, 0.05, 0.05), vec3(0.2, 0.9, 0.3), d)
+    vec4(base, 1.0)
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 40 { if r < 55 { if g > 195 { if g < 216 { if b > 62 { if b < 78 {
+        ok = 1 } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
