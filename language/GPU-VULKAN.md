@@ -110,6 +110,61 @@ Vulkan object under it is explicit, baked, and correct.
 | use-before-bind, wrong usage flags | solver checks statically; validation layers in `--debug` |
 | forgotten sync (races/tearing) | frames-in-flight + semaphores/fences owned by the runtime |
 
+## Shaders: Vire is the shader language (decided)
+
+Shaders are written **in Vire**, not GLSL/HLSL/Slang — the single-source property is
+the whole point (type-safe CPU↔GPU struct sharing, compile-time layout derivation,
+whole-program specialization). Slang stays available only as an optional escape
+hatch for importing existing shaders, never the default.
+
+**How Vire owns SPIR-V generation (de-risked, measured).** LLVM's `spirv64` target
+emits the *Kernel/compute* SPIR-V flavor, not the *Shader* (graphics) flavor Vulkan
+needs for vertex/fragment/mesh stages. So the graphics path does not go through
+`llc`: the backend emits **SPIR-V assembly text** and `spirv-as` assembles it,
+`spirv-val` validates it — both present here, and a round-trip
+(`spv → spirv-dis → spirv-as → spv`) validates, so we can generate any Shader-flavor
+module ourselves with full control over execution models, builtins, and interface
+variables. (The `@gpu`-on-Vulkan *compute* path can still use `llc -march=spirv64`.)
+
+**The emitter** (`crates/backend/src/spirv.rs`, planned) reuses the same SSA-IR walk
+as the NVPTX emitter, but targets SPIR-V ops (SSA %ids, explicit types, *structured*
+control flow via `OpLoopMerge`/`OpSelectionMerge`). Stage wrappers add the entry
+point + execution model + interface:
+
+| Vire | SPIR-V execution model | I/O |
+|---|---|---|
+| `@vertex fn` | `Vertex` | inputs = vertex-buffer attributes (typed struct → `Location` decorations); output `gl_Position` + varyings |
+| `@fragment fn` | `Fragment` | inputs = interpolated varyings; output color attachment(s) |
+| `@task fn` / `@mesh fn` | `TaskEXT` / `MeshEXT` | meshlet pipeline (below) |
+
+Needs a small **vector/matrix type layer** (`Vec2/3/4`, `Mat4`) in the Vire type
+system for shader math — the one real prerequisite beyond the emitter.
+
+## GPU-driven rendering with meshlets (first-class goal)
+
+Both GPUs here support `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on the
+Intel iGPU **and** the RTX 5070), so the modern GPU-driven pipeline is viable and
+gets first-class support — not bolted on:
+
+- **Meshlets.** Geometry is pre-partitioned into meshlets (≤64 verts / ≤124 prims).
+  A `@mesh` shader emits a meshlet's micro-geometry directly (`SetMeshOutputsEXT`,
+  per-vertex + per-primitive output arrays) — no vertex-input assembly, no index
+  buffer bottleneck.
+- **GPU-driven culling.** A `@task` shader runs per meshlet-group, does frustum +
+  backface + cone culling on the GPU, and dispatches only the surviving `@mesh`
+  workgroups. The CPU stops deciding what to draw.
+- **Indirect everything.** `vkCmdDrawMeshTasksIndirectCountEXT` reads draw counts
+  from a GPU buffer a compute pass filled — the CPU records *one* call per frame for
+  an entire scene. Meshlet descriptors, transforms, and material indices live in
+  GPU buffers (bindless), indexed by the shaders.
+- **Where Vire wins here specifically.** The meshlet builder (partitioning + cone
+  data) is a Vire `@gpu`/`@compute` pass; the cull/draw shaders are Vire `@task`/
+  `@mesh`; the scene buffers are typed Vire structs shared with the shaders by
+  construction. One language, one type system, whole-program — a GPU-driven renderer
+  is normally split across GLSL/HLSL + C++ + a mesh-shader toolchain; here it is one
+  program the compiler reasons about end-to-end, and the safe layer still owns
+  barriers/lifetimes.
+
 ## Honest scope
 
 This is **large — multi-quarter**, not a two-month item. A safe windowed triangle
@@ -139,6 +194,19 @@ than starting from zero.
   layouts from shader signatures; a `draw(pipe, mesh, uniforms)` API.
 - **V4 — render graph.** Per-frame graph → automatic layout transitions + minimal
   barriers; depth buffer, multiple passes, MSAA, swapchain-resize handling.
+- **VS — Vire shaders (SPIR-V emitter).** The decided shader path. Sub-steps:
+  (a) `Vec2/3/4`/`Mat4` type layer; (b) `crates/backend/src/spirv.rs` emits SPIR-V
+  *assembly* from the shader IR (straight-line first, then structured control flow),
+  assembled by `spirv-as`, validated by `spirv-val`; (c) `@vertex`/`@fragment`
+  stage wrappers (entry point + interface from typed I/O); (d) replace the triangle's
+  glslc bootstrap with a Vire-authored shader, headless pixel-verified. *This is the
+  next coding milestone — it unblocks V3's real materials and the meshlet stage.*
+- **VM — GPU-driven meshlets.** On top of VS + V3: `@task`/`@mesh` stages
+  (`TaskEXT`/`MeshEXT` execution models, `SetMeshOutputsEXT`), a Vire `@compute`
+  meshlet builder (partition + cone data), GPU culling in `@task`, and
+  `vkCmdDrawMeshTasksIndirectCountEXT` with bindless GPU scene buffers (typed Vire
+  structs). Both GPUs here support `VK_EXT_mesh_shader`. *The headline GPU-driven
+  renderer — one Vire program end-to-end.*
 - **V5 — Vire optimizations.** Compile-time pipeline/descriptor baking, shader
   monomorphization per material, whole-program resource-lifetime + dead-resource
   elimination, zero-cost validation gating.

@@ -325,15 +325,31 @@ Staged (each stage runnable):
   layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
+- [ ] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language*
+  (not Slang; Slang stays an optional import-only escape hatch). *NEXT CODING
+  MILESTONE.* Sub-steps: (a) `Vec2/3/4`/`Mat4` type layer; (b)
+  `crates/backend/src/spirv.rs` emits SPIR-V **assembly** from the shader IR
+  (straight-line first, then structured `OpLoopMerge`/`OpSelectionMerge`), assembled
+  by `spirv-as`, validated by `spirv-val` — NOT `llc -march=spirv64`, which only does
+  the Kernel/compute flavor, not the graphics Shader flavor (measured; round-trip
+  `spv→dis→as→spv` validates, so we own generation). (c) `@vertex`/`@fragment` stage
+  wrappers (entry point + interface from typed I/O); (d) replace the triangle's glslc
+  bootstrap with a Vire-authored shader, headless pixel-verified.
+- [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
+  `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
+  / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`
+  meshlet builder (partition + cone data); GPU frustum/backface/cone culling in
+  `@task`; `vkCmdDrawMeshTasksIndirectCountEXT` + bindless GPU scene buffers (typed
+  Vire structs). One Vire program = the whole GPU-driven renderer (builder + cull +
+  draw shaders + scene data), which is normally GLSL/HLSL + C++ + a mesh toolchain.
+- [ ] **`@gpu`-on-Vulkan compute path** (separate from graphics): the SPIR-V dialect
+  of the device emitter via `llc -march=spirv64` (StorageBuffer/`Workgroup`, subgroup
+  ops, `GLSL.std.450`); G1 intrinsics map directly (barrier→`OpControlBarrier`,
+  warp→subgroup, atomic→`OpAtomicIAdd`). Compute-flavor SPIR-V, so `llc` suffices
+  here (unlike the graphics stages above).
 - [ ] **V5 — Vire optimizations.** Compile-time pipeline/descriptor baking, shader
   monomorphization per material, whole-program resource-lifetime + dead-resource
   elimination, zero-cost validation gating.
-- [ ] **SPIR-V emitter**: a SPIR-V dialect of the device emitter (StorageBuffer /
-  `Workgroup` storage classes, SPIR-V builtins, subgroup ops, `GLSL.std.450` math)
-  + `llc -march=spirv64`. Shared by `@gpu`-on-Vulkan and `@vulkan` shaders. G1
-  intrinsics map directly (barrier→`OpControlBarrier`, warp→subgroup, atomic→
-  `OpAtomicIAdd`). Caveat: SPIR-V Logical addressing is structured-only (our GEPs
-  fit); tensor-core peak stays CUDA-only.
 
 ---
 
