@@ -10,10 +10,35 @@
 //! for now — control flow (`OpLoopMerge`/`OpSelectionMerge`) and fragment inputs
 //! (varyings/`gl_FragCoord`) are the next steps.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
 use crate::ast::{BinOp, Block, Expr, FnDef, Stmt};
+
+/// Extract a non-negative integer literal (mesh/task indices and counts are constants).
+fn int_lit(e: &Expr) -> Result<i64, String> {
+    match e {
+        Expr::Int(v, _) if *v >= 0 => Ok(*v as i64),
+        _ => Err("shader: expected a non-negative integer literal".into()),
+    }
+}
+
+/// A fresh `Cx` for a shader stage that computes values (positions/colors).
+fn new_cx() -> Cx {
+    Cx {
+        consts: String::new(),
+        vars: String::new(),
+        body: String::new(),
+        const_cache: HashMap::new(),
+        env: HashMap::new(),
+        uses_fragcoord: false,
+        emits_varying: false,
+        uses_varying: false,
+        uses_attr_color: false,
+        uses_glsl: false,
+        n: 0,
+    }
+}
 
 /// A shader value type: a float scalar, an N-component float vector, or a bool
 /// (produced by comparisons, consumed by `if`/`while` conditions).
@@ -736,5 +761,179 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         vars = cx.vars,
         body = cx.body,
         out = out
+    ))
+}
+
+/// Compile a Vire `@mesh fn` to a SPIR-V mesh shader (VK_EXT_mesh_shader). The body
+/// is a straight-line meshlet emit: `set_mesh_outputs(nv, np)` first, then
+/// `mesh_pos(i, vec4expr)` to write each vertex position (the expression is full
+/// Vire — arithmetic, `vecN`, GLSL builtins), and `mesh_tri(i, a, b, c)` to write
+/// each triangle's vertex indices. `let` bindings may share computation. One
+/// workgroup emits one meshlet (SPIR-V 1.4).
+pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@mesh` fn has no body")?;
+    let mut cx = new_cx();
+    let mut ints: BTreeSet<i64> = BTreeSet::new();   // AccessChain indices (%i_N)
+    let mut uints: BTreeSet<i64> = BTreeSet::new();   // sizes + triangle indices (%u_N)
+    let mut caps: Option<(i64, i64)> = None;
+    let mut prim_consts = String::new();              // OpConstantComposite per triangle
+    let mut primk = 0u32;
+    uints.insert(1); // %u_1 sizes the built-in ClipDistance/CullDistance arrays
+    ints.insert(0);  // %i_0 selects gl_Position (member 0)
+
+    // A trailing call with no `;` parses as the block tail — treat it as a statement.
+    let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+    for (idx, st) in body.stmts.iter().chain(tail_stmt.iter()).enumerate() {
+        match st {
+            Stmt::Let { name, value: Some(v), .. } => {
+                let (id, ty) = cx.expr(v)?;
+                cx.bind(name, &id, ty);
+            }
+            Stmt::Expr(Expr::Call { callee, args, .. }) => {
+                let name = match callee.as_ref() {
+                    Expr::Ident(n, _) => n.as_str(),
+                    _ => return Err("shader: unsupported @mesh call".into()),
+                };
+                match name {
+                    "set_mesh_outputs" => {
+                        if idx != 0 {
+                            return Err("shader: set_mesh_outputs(nv, np) must be the first @mesh statement".into());
+                        }
+                        if args.len() != 2 { return Err("shader: set_mesh_outputs(nv, np)".into()); }
+                        let nv = int_lit(&args[0])?;
+                        let np = int_lit(&args[1])?;
+                        uints.insert(nv);
+                        uints.insert(np);
+                        caps = Some((nv, np));
+                        writeln!(cx.body, "OpSetMeshOutputsEXT %u_{nv} %u_{np}").unwrap();
+                    }
+                    "mesh_pos" => {
+                        if args.len() != 2 { return Err("shader: mesh_pos(i, Vec4)".into()); }
+                        let i = int_lit(&args[0])?;
+                        let (id, ty) = cx.expr(&args[1])?;
+                        if ty != Ty::Vec(4) { return Err("shader: mesh_pos position must be a Vec4".into()); }
+                        ints.insert(i);
+                        let ac = cx.id("t");
+                        writeln!(cx.body, "{ac} = OpAccessChain %_ptr_Output_v4float %gl_MeshVerticesEXT %i_{i} %i_0").unwrap();
+                        writeln!(cx.body, "OpStore {ac} {id}").unwrap();
+                    }
+                    "mesh_tri" => {
+                        if args.len() != 4 { return Err("shader: mesh_tri(i, a, b, c)".into()); }
+                        let i = int_lit(&args[0])?;
+                        let a = int_lit(&args[1])?;
+                        let b = int_lit(&args[2])?;
+                        let c = int_lit(&args[3])?;
+                        ints.insert(i);
+                        uints.insert(a); uints.insert(b); uints.insert(c);
+                        let prim = format!("%prim{primk}");
+                        primk += 1;
+                        writeln!(prim_consts, "{prim} = OpConstantComposite %v3uint %u_{a} %u_{b} %u_{c}").unwrap();
+                        let ac = cx.id("t");
+                        writeln!(cx.body, "{ac} = OpAccessChain %_ptr_Output_v3uint %gl_PrimitiveTriangleIndicesEXT %i_{i}").unwrap();
+                        writeln!(cx.body, "OpStore {ac} {prim}").unwrap();
+                    }
+                    other => return Err(format!("shader: unsupported @mesh call `{other}`")),
+                }
+            }
+            _ => return Err("shader: `@mesh` supports set_mesh_outputs / mesh_pos / mesh_tri / let".into()),
+        }
+    }
+    let (nv, np) = caps.ok_or("shader: `@mesh` must call set_mesh_outputs(nv, np) first")?;
+    let mut const_decls = String::new();
+    for u in &uints { writeln!(const_decls, "%u_{u} = OpConstant %uint {u}").unwrap(); }
+    for i in &ints { writeln!(const_decls, "%i_{i} = OpConstant %int {i}").unwrap(); }
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    Ok(format!(
+"               OpCapability MeshShadingEXT
+               OpExtension \"SPV_EXT_mesh_shader\"
+{glsl_import}               OpMemoryModel Logical GLSL450
+               OpEntryPoint MeshEXT %main \"main\" %gl_MeshVerticesEXT %gl_PrimitiveTriangleIndicesEXT
+               OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
+               OpExecutionMode %main OutputVertices {nv}
+               OpExecutionMode %main OutputPrimitivesEXT {np}
+               OpExecutionMode %main OutputTrianglesEXT
+               OpDecorate %gl_MeshPerVertexEXT Block
+               OpMemberDecorate %gl_MeshPerVertexEXT 0 BuiltIn Position
+               OpMemberDecorate %gl_MeshPerVertexEXT 1 BuiltIn PointSize
+               OpMemberDecorate %gl_MeshPerVertexEXT 2 BuiltIn ClipDistance
+               OpMemberDecorate %gl_MeshPerVertexEXT 3 BuiltIn CullDistance
+               OpDecorate %gl_PrimitiveTriangleIndicesEXT BuiltIn PrimitiveTriangleIndicesEXT
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+     %v3uint = OpTypeVector %uint 3
+       %bool = OpTypeBool
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
+{const_decls}%_arr_float_u1 = OpTypeArray %float %u_1
+%gl_MeshPerVertexEXT = OpTypeStruct %v4float %float %_arr_float_u1 %_arr_float_u1
+%_arr_mpv = OpTypeArray %gl_MeshPerVertexEXT %u_{nv}
+%_ptr_out_mpv = OpTypePointer Output %_arr_mpv
+%gl_MeshVerticesEXT = OpVariable %_ptr_out_mpv Output
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+%_arr_idx = OpTypeArray %v3uint %u_{np}
+%_ptr_out_idx = OpTypePointer Output %_arr_idx
+%gl_PrimitiveTriangleIndicesEXT = OpVariable %_ptr_out_idx Output
+%_ptr_Output_v3uint = OpTypePointer Output %v3uint
+{prim_consts}{consts}       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+{vars}{body}               OpReturn
+               OpFunctionEnd
+",
+        glsl_import = glsl_import,
+        nv = nv, np = np,
+        const_decls = const_decls,
+        prim_consts = prim_consts,
+        consts = cx.consts,
+        vars = cx.vars,
+        body = cx.body,
+    ))
+}
+
+/// Compile a Vire `@task fn` (amplification shader) to a SPIR-V task shader. The body
+/// dispatches mesh workgroups with `emit_mesh_tasks(n)` (an integer count) — the GPU
+/// decides how many meshlets run, the basis for GPU culling. One `emit_mesh_tasks`
+/// terminates the shader (SPIR-V 1.4).
+pub fn compile_task(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@task` fn has no body")?;
+    let mut count: Option<i64> = None;
+    let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+    for st in body.stmts.iter().chain(tail_stmt.iter()) {
+        match st {
+            Stmt::Expr(Expr::Call { callee, args, .. })
+                if matches!(callee.as_ref(), Expr::Ident(n, _) if n == "emit_mesh_tasks") =>
+            {
+                if args.len() != 1 { return Err("shader: emit_mesh_tasks(n)".into()); }
+                count = Some(int_lit(&args[0])?);
+            }
+            _ => return Err("shader: `@task` supports a single emit_mesh_tasks(n)".into()),
+        }
+    }
+    let n = count.ok_or("shader: `@task` must call emit_mesh_tasks(n)")?;
+    Ok(format!(
+"               OpCapability MeshShadingEXT
+               OpExtension \"SPV_EXT_mesh_shader\"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint TaskEXT %main \"main\"
+               OpExecutionModeId %main LocalSizeId %u_1 %u_1 %u_1
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %u_1 = OpConstant %uint 1
+        %u_n = OpConstant %uint {n}
+       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+               OpEmitMeshTasksEXT %u_n %u_1 %u_1
+               OpFunctionEnd
+",
+        n = n
     ))
 }

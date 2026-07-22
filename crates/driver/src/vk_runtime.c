@@ -26,6 +26,7 @@
 extern const uint32_t VK_TRI_VERT[]; extern const unsigned VK_TRI_VERT_N;
 extern const uint32_t VK_TRI_FRAG[]; extern const unsigned VK_TRI_FRAG_N;
 extern const uint32_t VK_MESH_TRI[]; extern const unsigned VK_MESH_TRI_N;
+extern const uint32_t VK_TASK_TRI[]; extern const unsigned VK_TASK_TRI_N; /* N=0 → no task stage */
 
 /* Does a physical device advertise a given extension? */
 static int has_ext(VkPhysicalDevice pd, const char *name) {
@@ -108,9 +109,14 @@ static VkPipeline build_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint
 static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout) {
     VkShaderModule ms=shmod(dev,VK_MESH_TRI,VK_MESH_TRI_N*4), fs=shmod(dev,VK_TRI_FRAG,VK_TRI_FRAG_N*4);
     if(!ms||!fs) return 0;
-    VkPipelineShaderStageCreateInfo st[2]={
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_MESH_BIT_EXT,.module=ms,.pName="main"},
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
+    /* Optional amplification (task) stage — prepended when the program has an @task. */
+    VkShaderModule ts=0; VkPipelineShaderStageCreateInfo st[3]; uint32_t nst=0;
+    if(VK_TASK_TRI_N>0){
+        ts=shmod(dev,VK_TASK_TRI,VK_TASK_TRI_N*4); if(!ts) return 0;
+        st[nst++]=(VkPipelineShaderStageCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_TASK_BIT_EXT,.module=ts,.pName="main"};
+    }
+    st[nst++]=(VkPipelineShaderStageCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_MESH_BIT_EXT,.module=ms,.pName="main"};
+    st[nst++]=(VkPipelineShaderStageCreateInfo){.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"};
     VkViewport vp={0,0,(float)w,(float)h,0,1}; VkRect2D sc={{0,0},{w,h}};
     VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
     VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1.0f};
@@ -119,11 +125,11 @@ static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w,
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
     VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
-    VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=st,
+    VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=nst,.pStages=st,
         .pViewportState=&vps,.pRasterizationState=&rs,.pMultisampleState=&msi,.pColorBlendState=&cb,
         .layout=*out_layout,.renderPass=rp,.subpass=0};
     VkPipeline pipe=0; vkCreateGraphicsPipelines(dev,0,1,&gp,0,&pipe);
-    vkDestroyShaderModule(dev,ms,0); vkDestroyShaderModule(dev,fs,0);
+    vkDestroyShaderModule(dev,ms,0); vkDestroyShaderModule(dev,fs,0); if(ts) vkDestroyShaderModule(dev,ts,0);
     return pipe;
 }
 static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) {

@@ -597,6 +597,18 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         Err(e) => errs.push(e),
                     }
                 }
+                if f.attrs.iter().any(|a| a.name == "mesh") {
+                    match crate::shader::compile_mesh(f) {
+                        Ok(asm) => prog.mesh_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
+                }
+                if f.attrs.iter().any(|a| a.name == "task") {
+                    match crate::shader::compile_task(f) {
+                        Ok(asm) => prog.task_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
+                }
                 continue;
             }
             if !f.sig.generics.is_empty() {
@@ -3720,7 +3732,7 @@ fn lower_fn(
 /// A `@vulkan` shader stage (`@vertex`/`@fragment`) — compiled to SPIR-V, not host
 /// IR, so it is pulled out of normal lowering (see the lowering loop).
 fn is_shader_fn(f: &FnDef) -> bool {
-    f.attrs.iter().any(|a| a.name == "vertex" || a.name == "fragment")
+    f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task"))
 }
 
 fn is_gpu_fn(f: &FnDef) -> bool {

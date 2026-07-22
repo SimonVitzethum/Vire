@@ -1231,12 +1231,26 @@ fn build_or_run(args: &[String]) {
             .unwrap_or_else(fastllvm_backend::spirv::triangle_vertex_spvasm);
         let vw = assemble(&vert_asm, "vk_vert", None);
         let fw = assemble(&frag_asm, "vk_frag", None);
-        // The GPU-driven mesh stage (VM milestone): a bootstrap `@mesh` that emits the
-        // triangle with no vertex buffer (`vk_mesh_shader()` renders it).
-        let mw = assemble(&fastllvm_backend::spirv::mesh_triangle_spvasm(), "vk_mesh_tri", Some("spv1.4"));
+        // The GPU-driven mesh stage (VM milestone): the Vire `@mesh` shader if the
+        // program defines one, else a bootstrap `@mesh` that emits the triangle.
+        let mesh_asm = program
+            .mesh_spvasm
+            .clone()
+            .unwrap_or_else(fastllvm_backend::spirv::mesh_triangle_spvasm);
+        let mw = assemble(&mesh_asm, "vk_mesh_tri", Some("spv1.4"));
+        // The task (amplification) stage — only when the program defines an `@task`.
+        // An empty array (N=0) tells the runtime there is no task stage.
+        let tw: Vec<u32> = match &program.task_spvasm {
+            Some(asm) => assemble(asm, "vk_task", Some("spv1.4")),
+            None => Vec::new(),
+        };
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw)] {
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));
+            // A 0-length array is invalid ISO C; emit a dummy word (the _N stays 0).
+            if w.is_empty() {
+                sc.push_str("0");
+            }
             for (i, x) in w.iter().enumerate() {
                 if i % 8 == 0 {
                     sc.push_str("\n  ");

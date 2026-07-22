@@ -334,6 +334,14 @@ pub struct Program {
     /// body (transforms the built-in triangle position). `None` → the driver uses
     /// the fixed bootstrap vertex. See `crates/vire/src/shader.rs`.
     pub vert_spvasm: Option<String>,
+    /// `@vulkan` GPU-driven **mesh** shader (VK_EXT_mesh_shader) compiled from a Vire
+    /// `@mesh fn` body (`set_mesh_outputs`/`mesh_pos`/`mesh_tri`). `None` → the driver
+    /// uses the bootstrap mesh triangle. SPIR-V 1.4. See `crates/vire/src/shader.rs`.
+    pub mesh_spvasm: Option<String>,
+    /// `@vulkan` **task** (amplification) shader compiled from a Vire `@task fn` body
+    /// (`emit_mesh_tasks(n)`): dispatches mesh workgroups, can cull. `None` → no task
+    /// stage (the mesh shader runs directly). SPIR-V 1.4.
+    pub task_spvasm: Option<String>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

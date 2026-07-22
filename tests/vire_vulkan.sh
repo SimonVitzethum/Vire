@@ -289,6 +289,68 @@ fn main() {
 }
 EOF
 
+# Vire-authored @mesh + @task (amplification): all THREE stages come from Vire. The
+# @task emits one mesh workgroup; the @mesh computes the triangle's positions (note
+# `mut s` + arithmetic) and writes the connectivity; the @fragment colors it cyan
+# (0.2,0.7,0.9) → centroid ~ (51,178,229). -2 → skip where no mesh-shader device.
+case_ vire_mesh_authored <<'EOF'
+@task
+fn ts() { emit_mesh_tasks(1) }
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mut s = 0.6
+    mesh_pos(0, vec4(0.0, 0.0 - s, 0.0, 1.0))
+    mesh_pos(1, vec4(s, s, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - s, s, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.7, 0.9, 1.0) }
+fn main() {
+    mut px = vk_mesh_shader()
+    mut ok = 0
+    if px == -2 { ok = 1 }
+    if px > 0 {
+        mut r = px / 65536
+        mut g = (px / 256) % 256
+        mut b = px % 256
+        if r < 65 { if g > 165 { if g < 190 { if b > 215 { ok = 1 } } } }
+    }
+    print(ok)
+}
+EOF
+
+# The amplification shader CULLS: emit_mesh_tasks(0) launches no meshlet, so the
+# triangle never renders and the centroid stays the dark clear color (~20,20,25).
+# Proves the @task stage gates GPU geometry — the basis for GPU-driven culling.
+case_ vire_task_cull <<'EOF'
+@task
+fn ts() { emit_mesh_tasks(0) }
+@mesh
+fn ms() {
+    set_mesh_outputs(3, 1)
+    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_tri(0, 0, 1, 2)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.2, 0.2, 1.0) }
+fn main() {
+    mut px = vk_mesh_shader()
+    mut ok = 0
+    if px == -2 { ok = 1 }
+    if px > 0 {
+        mut r = px / 65536
+        mut g = (px / 256) % 256
+        mut b = px % 256
+        if r < 40 { if g < 40 { if b < 40 { ok = 1 } } }   // culled → clear color
+    }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

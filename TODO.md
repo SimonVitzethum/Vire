@@ -417,9 +417,16 @@ Staged (each stage runnable):
   bootstrap `@mesh` (crates/backend/src/spirv.rs, assembled at spv1.4) + the Vire
   `@fragment` for color. Verified: centroid = the Vire fragment color
   (`tests/vire_vulkan.sh vire_mesh_shader`; `examples/vire/vulkan_meshlet.vr`).
-  *Remaining:* a **Vire-authored `@mesh` body** (per-meshlet vertex/primitive emit +
-  attributes, reusing the VS shader emitter — now that it has control flow + vector
-  math); a `@task` stage with GPU frustum/backface/cone culling; a Vire `@compute`
+  *Vire-authored `@mesh` + `@task` DONE:* all three GPU-driven stages now compile from
+  Vire. `@mesh` (`set_mesh_outputs(nv,np)` / `mesh_pos(i, vec4)` / `mesh_tri(i,a,b,c)`)
+  emits a meshlet's vertices + primitives with the positions computed in full Vire
+  (arithmetic/`vecN`/GLSL builtins); `@task` (`emit_mesh_tasks(n)`) is the
+  amplification stage that dispatches meshlet workgroups. Verified: a Vire-authored
+  triangle takes the fragment color, and `emit_mesh_tasks(0)` **culls** it (centroid →
+  clear) — GPU-gated geometry (`tests/vire_vulkan.sh vire_mesh_authored`/
+  `vire_task_cull`; `examples/vire/vulkan_meshlet_authored.vr`). *Remaining:* GPU
+  frustum/backface/cone culling logic in `@task` (needs push-constants/uniforms for
+  the camera); per-vertex mesh attributes (color/normal) → fragment; a Vire `@compute`
   meshlet builder (partition + cone data); `vkCmdDrawMeshTasksIndirectCountEXT` +
   bindless GPU scene buffers (typed Vire structs). One Vire program = the whole
   GPU-driven renderer (builder + cull + draw + scene data), normally GLSL/HLSL + C++

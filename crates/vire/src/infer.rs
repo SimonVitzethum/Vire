@@ -188,7 +188,7 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
             // `@vertex`/`@fragment` are SPIR-V shaders compiled by shader.rs, not
             // host code — their bodies use shader-only forms (`vecN`, vector math)
             // that the host inference doesn't model, so skip them here.
-            if f.attrs.iter().any(|a| a.name == "vertex" || a.name == "fragment") {
+            if f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task")) {
                 continue;
             }
             if let Some(body) = &f.body {
