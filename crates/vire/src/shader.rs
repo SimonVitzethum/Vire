@@ -362,26 +362,40 @@ impl Cx {
                 let (b, tb) = self.expr(rhs)?;
                 self.binary(*op, a, ta, b, tb)
             }
-            // Single-component swizzle: `v.x`/`.y`/`.z`/`.w` → OpCompositeExtract.
+            // Swizzle: `v.x` (→ float, OpCompositeExtract) or a multi-component swizzle
+            // `v.xy`/`.xyz`/`.rgb`/… (→ vecN, OpVectorShuffle). Components may repeat.
             Expr::Field { base, name, .. } => {
                 let (id, t) = self.expr(base)?;
                 let k = match t {
                     Ty::Vec(k) => k,
                     Ty::Float | Ty::Bool => return Err("shader: swizzle on a non-vector".into()),
                 };
-                let comp = match name.as_str() {
-                    "x" => 0,
-                    "y" => 1,
-                    "z" => 2,
-                    "w" => 3,
-                    _ => return Err(format!("shader: unknown swizzle `.{name}` (only .x/.y/.z/.w)")),
-                };
-                if comp >= k {
-                    return Err(format!("shader: `.{name}` out of range for a vec{k}"));
+                // Accept x/y/z/w and the r/g/b/a aliases.
+                let comps: Result<Vec<u8>, String> = name.chars().map(|c| match c {
+                    'x' | 'r' => Ok(0u8),
+                    'y' | 'g' => Ok(1),
+                    'z' | 'b' => Ok(2),
+                    'w' | 'a' => Ok(3),
+                    other => Err(format!("shader: unknown swizzle component `.{other}`")),
+                }).collect();
+                let comps = comps?;
+                if comps.is_empty() || comps.len() > 4 {
+                    return Err(format!("shader: bad swizzle `.{name}`"));
                 }
+                if let Some(&bad) = comps.iter().find(|&&c| c >= k) {
+                    return Err(format!("shader: `.{name}` uses component {bad}, out of range for a vec{k}"));
+                }
+                if comps.len() == 1 {
+                    let r = self.id("t");
+                    writeln!(self.body, "{r} = OpCompositeExtract %float {id} {}", comps[0]).unwrap();
+                    return Ok((r, Ty::Float));
+                }
+                // Multi-component → OpVectorShuffle (shuffle with the same vector twice).
+                let n = comps.len() as u8;
+                let idxs: Vec<String> = comps.iter().map(|c| c.to_string()).collect();
                 let r = self.id("t");
-                writeln!(self.body, "{r} = OpCompositeExtract %float {id} {comp}").unwrap();
-                Ok((r, Ty::Float))
+                writeln!(self.body, "{r} = OpVectorShuffle {} {id} {id} {}", Ty::Vec(n).spirv(), idxs.join(" ")).unwrap();
+                Ok((r, Ty::Vec(n)))
             }
             // `if cond { … valexpr } else { … valexpr }` as a value: a structured
             // selection whose branches store into a result variable read after merge.
@@ -625,11 +639,44 @@ impl Cx {
             }
             Stmt::Return(Some(e), _) => Ok(Some(self.expr(e)?)),
             Stmt::Expr(e) if self.void_call(e)? => Ok(None),
-            Stmt::Expr(Expr::If { .. }) => {
-                Err("shader: `if` is supported as a value (the block's result), not as a bare statement".into())
+            // `if cond { … } [else { … }]` as a statement: effect-only branches (the
+            // bodies assign / mutate; no value is produced).
+            Stmt::Expr(Expr::If { cond, then, elifs, els, .. }) => {
+                self.lower_if_effect(cond, then, elifs, els.as_ref())?;
+                Ok(None)
             }
-            _ => Err("shader: only `let`/`mut`, assignment, `while`, `if`-value, `out_color(...)`, and a final value expression are supported".into()),
+            _ => Err("shader: only `let`/`mut`, assignment, `while`, `if`, `out_color(...)`, and a final value expression are supported".into()),
         }
+    }
+
+    /// `if cond { … } [elif … ] [else … ]` run for effects (no value). Both branches
+    /// are lowered as effect blocks; a missing `else` branches straight to the merge.
+    fn lower_if_effect(&mut self, cond: &Expr, then: &Block, elifs: &[(Expr, Block)], els: Option<&Block>) -> Result<(), String> {
+        let (c, ct) = self.expr(cond)?;
+        if ct != Ty::Bool {
+            return Err("shader: an `if` condition must be a comparison (bool)".into());
+        }
+        let then_l = self.id("then");
+        let merge_l = self.id("merge");
+        // The false target: an else/elif block, or the merge directly.
+        let has_else = !elifs.is_empty() || els.is_some();
+        let else_l = if has_else { self.id("else") } else { merge_l.clone() };
+        writeln!(self.body, "OpSelectionMerge {merge_l} None").unwrap();
+        writeln!(self.body, "OpBranchConditional {c} {then_l} {else_l}").unwrap();
+        writeln!(self.body, "{then_l} = OpLabel").unwrap();
+        self.block_effects(then)?;
+        writeln!(self.body, "OpBranch {merge_l}").unwrap();
+        if has_else {
+            writeln!(self.body, "{else_l} = OpLabel").unwrap();
+            if let Some(((econd, eblk), rest)) = elifs.split_first() {
+                self.lower_if_effect(econd, eblk, rest, els)?;
+            } else if let Some(e) = els {
+                self.block_effects(e)?;
+            }
+            writeln!(self.body, "OpBranch {merge_l}").unwrap();
+        }
+        writeln!(self.body, "{merge_l} = OpLabel").unwrap();
+        Ok(())
     }
 
     /// `name [op]= value` → store into the local's variable (load-op-store for `op=`).

@@ -562,6 +562,31 @@ fn main() {
 }
 EOF
 
+# Multi-component swizzles (.rgb/.xy → OpVectorShuffle) + `if` as a statement (effect-
+# only branches → OpSelectionMerge). tint=0.5 (xy.x=0.2<0.3) added to r: r=(0.2+0.5)*255
+# =178, g=0.4*255=102, b=0.6*255=153.
+case_ vire_swizzle_ifstmt <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut base = vec4(0.2, 0.4, 0.6, 1.0)
+    mut rgb = base.rgb
+    mut xy = base.xy
+    mut tint = 0.0
+    if xy.x < 0.3 { tint = 0.5 } else { tint = 0.1 }
+    vec4(rgb.r + tint, rgb.g, rgb.b, 1.0)
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 168 { if r < 188 { if g > 92 { if g < 112 { if b > 143 { if b < 163 {
+        ok = 1 } } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

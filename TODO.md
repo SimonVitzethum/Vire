@@ -321,6 +321,35 @@ is NVIDIA-research-grade (multi-quarter), so sequence primitives first.
 
 ## `@vulkan` — safe, easy, full-performance Vulkan (graphics + compute)
 
+### Open backend work — autonomous implementation pass (tracking)
+
+Everything the shipped `@vulkan` does not yet cover, ordered roughly by tractability.
+Checked off as implemented + tested (`tests/vire_vulkan.sh`); items that turn out
+unsound or genuinely multi-week are marked *skipped* with the reason.
+
+- [ ] **Multi-component swizzles** — `.xy`/`.xyz`/`.rgb` reads (today single-component only).
+- [ ] **`if` as a statement** — effect-only branches (today `if` is value-only).
+- [ ] **`@gpuvk` — vendor-neutral Vulkan compute.** A general data-parallel compute stage
+  over a Vire array (SPIR-V compute + `vkCmdDispatch`), distinct from CUDA/ROCm `@gpu`.
+  Runs on Intel/NVIDIA/AMD. `@gpu` stays CUDA (NVPTX); `@gpuvk` is the Vulkan option.
+- [ ] **Uniform / params** — a wider push constant (several floats) readable in
+  `@fragment`/`@vertex` (today only the task cull plane).
+- [ ] **`Mat` in shaders + transform** — a small matrix type + `mat*vec`, so a `@vertex`
+  can apply a transform from a uniform.
+- [ ] **Depth buffer** — a depth attachment so overlapping meshlets occlude correctly.
+- [ ] **Wider scene records** — a colour/normal field beyond `offset+cone`; normals for
+  lit meshlets.
+- [ ] **`vkCmdDrawMeshTasksIndirectCountEXT`** — a GPU count buffer (today a fixed indirect count).
+- [~] **Textures / samplers** — image + sampler + descriptor + fragment sampling. *Large;
+  attempt, else skip with reason.*
+- [~] **Typed resource handles + lifetime safety** — `Buffer`/`Texture`/`Pipeline` as
+  RC/region-tracked Vire values (no GPU use-after-free). *Architectural; attempt a
+  minimal handle, else document.*
+- [~] **Render graph → auto barriers / declarative `frame { … }`** — *architectural,
+  multi-week; document honestly, do not fake.*
+- [~] **Windowed arbitrary geometry + per-frame Vire draw callback** — *needs a persistent
+  context; attempt, else document.*
+
 **Investigated — high value, de-risked, multi-quarter.** Full design, safety
 model, and target ergonomics in [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
 The vision: Vulkan **as easy as OpenGL** but with full performance, memory safety,
