@@ -330,6 +330,10 @@ pub struct Program {
     /// fragment. Assembled by `spirv-as` at build. "Vire is the shader language" —
     /// see language/GPU-VULKAN.md.
     pub frag_spvasm: Option<String>,
+    /// `@vulkan` vertex shader compiled to SPIR-V assembly from an `@vertex fn`
+    /// body (transforms the built-in triangle position). `None` → the driver uses
+    /// the fixed bootstrap vertex. See `crates/vire/src/shader.rs`.
+    pub vert_spvasm: Option<String>,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

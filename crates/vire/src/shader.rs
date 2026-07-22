@@ -96,16 +96,20 @@ impl Cx {
                     "vec4" => 4,
                     other => return Err(format!("shader: unsupported call `{other}` (only vec2/3/4)")),
                 };
-                if args.len() != n as usize {
-                    return Err(format!("shader: {name} needs {n} scalar args"));
-                }
+                // Mixed construction: args may be scalars or smaller vectors whose
+                // component counts sum to n (e.g. `vec4(pos, 0.0, 1.0)`).
                 let mut parts = Vec::new();
+                let mut count = 0u8;
                 for a in args {
                     let (id, t) = self.expr(a)?;
-                    if t != Ty::Float {
-                        return Err(format!("shader: {name} args must be scalars"));
-                    }
+                    count += match t {
+                        Ty::Float => 1,
+                        Ty::Vec(k) => k,
+                    };
                     parts.push(id);
+                }
+                if count != n {
+                    return Err(format!("shader: {name} components sum to {count}, need {n}"));
                 }
                 let id = self.id("t");
                 writeln!(
@@ -122,7 +126,28 @@ impl Cx {
                 let (b, tb) = self.expr(rhs)?;
                 self.binary(*op, a, ta, b, tb)
             }
-            _ => Err("shader: unsupported expression (only literals, vars, vecN, +-*/)".into()),
+            // Single-component swizzle: `v.x`/`.y`/`.z`/`.w` → OpCompositeExtract.
+            Expr::Field { base, name, .. } => {
+                let (id, t) = self.expr(base)?;
+                let k = match t {
+                    Ty::Vec(k) => k,
+                    Ty::Float => return Err("shader: swizzle on a scalar".into()),
+                };
+                let comp = match name.as_str() {
+                    "x" => 0,
+                    "y" => 1,
+                    "z" => 2,
+                    "w" => 3,
+                    _ => return Err(format!("shader: unknown swizzle `.{name}` (only .x/.y/.z/.w)")),
+                };
+                if comp >= k {
+                    return Err(format!("shader: `.{name}` out of range for a vec{k}"));
+                }
+                let r = self.id("t");
+                writeln!(self.body, "{r} = OpCompositeExtract %float {id} {comp}").unwrap();
+                Ok((r, Ty::Float))
+            }
+            _ => Err("shader: unsupported expression (literals, vars, vecN, swizzle, +-*/)".into()),
         }
     }
 
@@ -169,6 +194,83 @@ impl Cx {
             None => Err("shader: the fragment must end in a color expression (a Vec4)".into()),
         }
     }
+}
+
+/// Compile an `@vertex fn` to SPIR-V assembly. The stage receives the built-in
+/// triangle corner as its `Vec2` parameter (indexed by `gl_VertexIndex` from a
+/// fixed position array) and returns a `Vec4` `gl_Position` — so a Vire vertex
+/// shader *transforms* the geometry (scale/translate/…) without a vertex buffer.
+pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@vertex` fn has no body")?;
+    let param = f
+        .sig
+        .params
+        .first()
+        .map(|p| p.name.clone())
+        .ok_or("shader: `@vertex fn` needs a Vec2 position parameter")?;
+    let mut cx = Cx {
+        consts: String::new(),
+        body: String::new(),
+        const_cache: HashMap::new(),
+        env: HashMap::new(),
+        uses_fragcoord: false,
+        n: 0,
+    };
+    cx.env.insert(param, ("%pos".to_string(), Ty::Vec(2)));
+    let (out, ty) = cx.block_output(body)?;
+    if ty != Ty::Vec(4) {
+        return Err("shader: the vertex output must be a Vec4 (gl_Position)".into());
+    }
+    Ok(format!(
+"               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main \"main\" %out %gl_VertexIndex %P
+               OpDecorate %glpv Block
+               OpMemberDecorate %glpv 0 BuiltIn Position
+               OpDecorate %gl_VertexIndex BuiltIn VertexIndex
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+       %uint = OpTypeInt 32 0
+     %uint_3 = OpConstant %uint 3
+        %arr = OpTypeArray %v2float %uint_3
+       %parr = OpTypePointer Private %arr
+          %P = OpVariable %parr Private
+         %f0 = OpConstant %float 0
+        %fn6 = OpConstant %float -0.6
+         %f6 = OpConstant %float 0.6
+         %f1 = OpConstant %float 1
+         %p0 = OpConstantComposite %v2float %f0 %fn6
+         %p1 = OpConstantComposite %v2float %f6 %f6
+         %p2 = OpConstantComposite %v2float %fn6 %f6
+       %pini = OpConstantComposite %arr %p0 %p1 %p2
+       %glpv = OpTypeStruct %v4float
+     %outptr = OpTypePointer Output %glpv
+        %out = OpVariable %outptr Output
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+      %inptr = OpTypePointer Input %int
+%gl_VertexIndex = OpVariable %inptr Input
+     %pv2ptr = OpTypePointer Private %v2float
+     %ov4ptr = OpTypePointer Output %v4float
+{consts}       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+               OpStore %P %pini
+        %idx = OpLoad %int %gl_VertexIndex
+         %pp = OpAccessChain %pv2ptr %P %idx
+        %pos = OpLoad %v2float %pp
+{body}         %gp = OpAccessChain %ov4ptr %out %int_0
+               OpStore %gp {out}
+               OpReturn
+               OpFunctionEnd
+",
+        consts = cx.consts,
+        body = cx.body,
+        out = out
+    ))
 }
 
 /// Compile an `@fragment fn` to SPIR-V assembly, or an error message.

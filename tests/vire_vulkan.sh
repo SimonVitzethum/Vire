@@ -97,6 +97,25 @@ fn main() {
 }
 EOF
 
+# A Vire @vertex shader TRANSFORMS the geometry: shifting every corner x+3 moves the
+# triangle off-screen, so the centroid becomes the dark clear color. Proves the
+# vertex stage is Vire-authored (both stages: @vertex + @fragment here).
+case_ vire_vertex_shader <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 { vec4(pos.x + 3.0, pos.y, 0.0, 1.0) }
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.2, 0.2, 1.0) }
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r < 40 { if g < 40 { if b < 40 { ok = 1 } } }   // off-screen → dark clear
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

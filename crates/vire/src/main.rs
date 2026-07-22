@@ -1219,7 +1219,11 @@ fn build_or_run(args: &[String]) {
             let bytes = std::fs::read(&spv_path).unwrap_or_default();
             bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
         };
-        let vw = assemble(&fastllvm_backend::spirv::triangle_vertex_spvasm(), "vk_vert");
+        let vert_asm = program
+            .vert_spvasm
+            .clone()
+            .unwrap_or_else(fastllvm_backend::spirv::triangle_vertex_spvasm);
+        let vw = assemble(&vert_asm, "vk_vert");
         let fw = assemble(&frag_asm, "vk_frag");
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
         for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw)] {

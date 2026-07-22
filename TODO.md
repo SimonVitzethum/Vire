@@ -340,12 +340,17 @@ Staged (each stage runnable):
   to the interface only when used), so a fragment computes **per-pixel** — a
   gradient `vec4(frag_x()/256.0, …)` gives centroid r≈128 from position, verified
   (`tests/vire_vulkan.sh vire_fragment_fragcoord`; `examples/vire/vulkan_triangle.vr`
-  shows a visible gradient). *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type
+  shows a visible gradient). *`@vertex` DONE:* a Vire `@vertex fn vs(pos: Vec2) ->
+  Vec4` receives the built-in triangle corner (indexed from a fixed array by
+  `gl_VertexIndex`) and returns `gl_Position` — so it **transforms** the geometry
+  (swizzles `.x/.y` + mixed `vecN` construction added). Verified: a shift `vec4(pos.x
+  + 3.0, …)` moves the triangle off-screen (`tests/vire_vulkan.sh vire_vertex_shader`;
+  both stages Vire-authored). *Remaining:* (a) real `Vec2/3/4`/`Mat4` in the host type
   system (today vectors are shader-local); (b) **structured control flow**
-  (`OpLoopMerge`/`OpSelectionMerge`) + swizzles + more builtins (`GLSL.std.450`:
-  normalize/dot/mix…); (c) **varyings** from the vertex stage (interpolated inputs);
-  (d) a Vire-authored **`@vertex`** stage (still the fixed bootstrap) + vertex-buffer
-  / typed stage I/O.
+  (`OpLoopMerge`/`OpSelectionMerge`) + `GLSL.std.450` builtins (normalize/dot/mix…);
+  (c) **varyings** (vertex→fragment interpolated outputs); (d) **vertex-buffer**
+  geometry from Vire data (today the corners are the fixed built-in array) + typed
+  stage I/O — the bridge to VM meshlets.
 - [ ] **VM — GPU-driven meshlets (first-class).** On VS + V3. Both GPUs here support
   `VK_EXT_mesh_shader` (`meshShader`/`taskShader = true` on Intel iGPU + RTX). `@task`
   / `@mesh` stages (`TaskEXT`/`MeshEXT`, `SetMeshOutputsEXT`); a Vire `@compute`

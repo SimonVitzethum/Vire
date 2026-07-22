@@ -208,6 +208,18 @@ SPIR-V (glslc-embedded); single-source Vire→SPIR-V is the next milestone. Veri
 headless pixel-correct + windowed present (3-frame smoke → 1). No regression
 (gpu 8/8, heap 16/16; non-vulkan binaries unchanged).
 
+### `@vulkan` VS — the vertex stage in Vire: geometry transforms (shipped)
+A Vire `@vertex fn vs(pos: Vec2) -> Vec4` is now compiled to SPIR-V
+(`shader.rs::compile_vertex`): it receives the built-in triangle corner (a fixed
+3-position array indexed by `gl_VertexIndex`) as `pos` and returns `gl_Position`, so
+Vire code **transforms** the geometry — no vertex buffer needed. Added swizzles
+(`.x/.y/.z/.w` → `OpCompositeExtract`) and mixed `vecN` construction (`vec4(pos, 0,
+1)` → `OpCompositeConstruct` over scalars+vectors). `program.vert_spvasm`
+(`None` → the fixed bootstrap vertex). Verified: a shift `vec4(pos.x + 3.0, …)` moves
+the triangle off-screen → centroid clear (`tests/vire_vulkan.sh vire_vertex_shader`,
+both stages Vire-authored). Vire now writes BOTH shader stages. No regression
+(gpu 8/8, heap 16/16). Next: host Vec/Mat types, varyings, vertex-buffer geometry.
+
 ### `@vulkan` VS — fragment inputs: per-pixel shaders via gl_FragCoord (shipped)
 `frag_x()`/`frag_y()`/`frag_coord()` in a Vire `@fragment` read the pixel position
 (`shader.rs`: `OpLoad %gl_FragCoord` + `OpCompositeExtract`; BuiltIn FragCoord is

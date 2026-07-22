@@ -591,6 +591,12 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         Err(e) => errs.push(e),
                     }
                 }
+                if f.attrs.iter().any(|a| a.name == "vertex") {
+                    match crate::shader::compile_vertex(f) {
+                        Ok(asm) => prog.vert_spvasm = Some(asm),
+                        Err(e) => errs.push(e),
+                    }
+                }
                 continue;
             }
             if !f.sig.generics.is_empty() {
