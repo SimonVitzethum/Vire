@@ -245,19 +245,21 @@ program runs on the Intel iGPU and the RTX 5070 here.
 
 The shader language supports: `let`/`mut` locals (Function-storage, so they mutate
 across control flow), `vecN(...)` constructors and mixed construction, `+ - * /`,
-scalar·vector, single-component swizzles (`.x/.y/.z/.w`), **`if`/`else` as a value**
-(`OpSelectionMerge`), **`while` loops** (`OpLoopMerge`), comparisons + `&&`/`||`, and
-the **GLSL.std.450** math set (`sqrt`, `abs`, `floor`, `ceil`, `fract`, `sin`, `cos`,
-`exp`, `log`, `min`, `max`, `pow`, `clamp`, `mix`, `normalize`, `length`, `cross`,
-`dot`) — enough for real lighting.
+scalar·vector, swizzles — single (`.x`) **and multi-component** (`.xy`/`.xyz`/`.rgb`,
+`OpVectorShuffle`), **`if`/`else` as a value or a statement** (`OpSelectionMerge`),
+**`while` loops** (`OpLoopMerge`), comparisons + `&&`/`||`, and the **GLSL.std.450**
+math set (`sqrt`, `abs`, `floor`, `ceil`, `fract`, `sin`, `cos`, `exp`, `log`, `min`,
+`max`, `pow`, `clamp`, `mix`, `normalize`, `length`, `cross`, `dot`) — enough for real
+lighting.
 
 ## Stage builtins
 
 - **`@fragment`**: `frag_x()` / `frag_y()` / `frag_coord()` (pixel position), `in_color()`
-  (interpolated varying from `@vertex`).
+  (interpolated varying from `@vertex`), `uniform()` (a host-supplied vec4 push constant),
+  `tex(uv)` (sample a texture — combined image sampler at set 0 binding 0).
 - **`@vertex`**: the `Vec2` parameter is the vertex-buffer position (attribute Location 0);
   `attr_color()` reads a per-vertex colour (Location 1, from `vk_mesh_c`); `out_color(vec3)`
-  writes a varying the fragment reads back.
+  writes a varying the fragment reads back; `uniform()` reads the host push constant (transforms).
 - **`@mesh`**: `set_mesh_outputs(nv, np)`, `mesh_pos(i, vec4)` (a vertex position — full Vire
   arithmetic), `mesh_tri(i, a, b, c)` (triangle indices), `mesh_color(i, vec3)` (a per-vertex
   colour output at Location 0, read by the fragment via `in_color()`); `meshlet_offset()`
@@ -267,18 +269,24 @@ the **GLSL.std.450** math set (`sqrt`, `abs`, `floor`, `ceil`, `fract`, `sin`, `
   the scene record), `cull_plane()` (the frustum plane, a push constant), `emit_mesh_tasks(n)`
   (fixed count or a bool → `OpSelect` 1/0), `emit_visible(bool)` (cull: writes the meshlet
   index into the task→mesh payload, emits only survivors).
+  index into the task→mesh payload, emits only survivors). `meshlet_rgb()` (mesh side) reads
+  the record's per-meshlet colour via the payload → forwarded per vertex with `mesh_color`.
 - **`@compute`**: `meshlet_index()` (`float(gl_GlobalInvocationID.x)`), `set_meshlet(offset[,
-  cone])` (write this meshlet's record).
+  cone])` and `set_meshlet_color(vec3)` (write this meshlet's record).
+- **`@gpuvk`** (vendor-neutral compute, not graphics): `elem()` reads this invocation's array
+  element; the function's value is written back. `gpuvk_run(arr)` maps it over a Float array
+  on ANY Vulkan device — the Vulkan counterpart to the CUDA/ROCm `@gpu` track.
 
 ## The scene record (a typed Vire struct)
 
 ```
-Meshlet { offset: vec2, cone: vec2 }   // std430: fields at 0 and 8, array stride 16
+Meshlet { offset: vec2, cone: vec2, color: vec4 }   // std430: 0 / 8 / 16, array stride 32
 ```
 
 One layout, declared once (`resource_decls`) and shared by every stage that touches the
 scene SSBO (binding 0), so `@compute` (writes it), `@task` and `@mesh` (read it) all agree.
-`offset` is the meshlet centre; `cone` is its 2D facing direction (backface culling).
+`offset` is the meshlet centre; `cone` is its 2D facing direction (backface culling);
+`color` is the per-meshlet colour.
 
 ## Host entry points (call from `fn main`)
 
@@ -291,10 +299,13 @@ scene SSBO (binding 0), so `@compute` (writes it), `@task` and `@mesh` (read it)
 | `vk_mesh_shader()` | Draw via a mesh pipeline (`VK_EXT_mesh_shader`) — no vertex buffer. |
 | `vk_mesh_scene(offsets)` | Many meshlets from a Vire scene buffer (SSBO) via one indirect dispatch. |
 | `vk_mesh_scene_cull(offsets, nx,ny,nz,d)` | The above + per-meshlet frustum culling in `@task`. |
-| `vk_mesh_built(count, nx,ny,nz,d)` | The scene is GPU-built by `@compute`, then culled + drawn. |
+| `vk_mesh_built(count, nx,ny,nz,d)` | The scene is GPU-built by `@compute`, then culled + drawn (depth-tested). |
+| `vk_textured()` | Render the triangle sampling a 2×2 texture the `@fragment` reads with `tex(uv)`. |
+| `gpuvk_run(arr)` | Run the program's `@gpuvk` map over a Float array on any Vulkan device. |
 
 The mesh entry points return the centroid pixel (`0xRRGGBB`) or a coverage mask, or `-2`
-where the device has no mesh-shader support (so tests skip cleanly).
+where the device has no mesh-shader support (so tests skip cleanly). The mesh-shader path
+renders with a **depth buffer** (D32) so overlapping geometry occludes correctly.
 
 ## The GPU-driven renderer — one Vire program
 
