@@ -334,7 +334,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
   Runs on Intel/NVIDIA/AMD. `@gpu` stays CUDA (NVPTX); `@gpuvk` is the Vulkan option.
 - [x] **Uniform / params** — a wider push constant (several floats) readable in
   `@fragment`/`@vertex` (today only the task cull plane).
-- [ ] **`Mat` in shaders + transform** — a small matrix type + `mat*vec`, so a `@vertex`
+- [~] **`Mat` in shaders + transform** — a small matrix type + `mat*vec`, so a `@vertex`
   can apply a transform from a uniform.
 - [ ] **Depth buffer** — a depth attachment so overlapping meshlets occlude correctly.
 - [ ] **Wider scene records** — a colour/normal field beyond `offset+cone`; normals for

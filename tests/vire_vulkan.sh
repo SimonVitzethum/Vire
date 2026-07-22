@@ -631,6 +631,26 @@ fn main() {
 }
 EOF
 
+# Host-driven vertex transform: the @vertex reads uniform() and transforms the
+# geometry. A +3 x-shift (uniform.x) moves the triangle off-screen → centroid = dark
+# clear (~20); no shift → visible red (~229). Proves uniform() in the vertex stage.
+case_ vire_vertex_uniform <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    mut u = uniform()
+    vec4(pos.x + u.x, pos.y * u.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.9, 0.2, 0.2, 1.0) }
+fn main() {
+    mut off = vk_triangle(3.0, 1.0, 0.0, 0.0)
+    mut on = vk_triangle(0.0, 1.0, 0.0, 0.0)
+    mut ok = 0
+    if off / 65536 < 40 { if on / 65536 > 200 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

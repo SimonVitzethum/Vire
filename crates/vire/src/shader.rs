@@ -822,9 +822,10 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     } else {
         ("", "", "")
     };
-    let vary_iface = format!("{vary_iface}{attr_iface}");
-    let vary_dec = format!("{vary_dec}{attr_dec}");
-    let vary_decl = format!("{vary_decl}{attr_decl}");
+    let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant, false);
+    let vary_iface = format!("{vary_iface}{attr_iface}{pc_iface}");
+    let vary_dec = format!("{vary_dec}{attr_dec}{pc_decor}");
+    let vary_decl = format!("{pc_decl}{vary_decl}{attr_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
@@ -845,7 +846,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
       %inptr = OpTypePointer Input %v2float
      %pos_in = OpVariable %inptr Input
         %int = OpTypeInt 32 1
-      %int_0 = OpConstant %int 0
+        %i_0 = OpConstant %int 0
      %ov4ptr = OpTypePointer Output %v4float
        %bool = OpTypeBool
    %pf_float = OpTypePointer Function %float
@@ -856,7 +857,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
 {vary_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
 {vars}        %pos = OpLoad %v2float %pos_in
-{body}         %gp = OpAccessChain %ov4ptr %out %int_0
+{body}         %gp = OpAccessChain %ov4ptr %out %i_0
                OpStore %gp {out}
                OpReturn
                OpFunctionEnd
@@ -904,7 +905,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         ("", "", "")
     };
     // A host `uniform()` push constant (vec4) — declared only when used.
-    let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant);
+    let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant, true);
     let iface = format!("{fc_iface}{vy_iface}{pc_iface}");
     let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}");
     let fc_decl = format!("{pc_decl}{fc_decl}{vy_decl}");
@@ -948,15 +949,18 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
 
 /// The `uniform()` push-constant (a vec4 at offset 0) declarations for a graphics
 /// stage — (entry-point interface, decorations, type/var decls) — or empties. Needs
-/// `%v4float` already declared; declares its own `%int`/`%i_0`.
-fn push_constant_decls(used: bool) -> (String, String, String) {
+/// `%v4float` already declared; the access uses `%i_0` (int 0). `provide_int` adds
+/// `%int`/`%i_0` for a stage that lacks them (the fragment); the vertex passes false
+/// since it already declares them.
+fn push_constant_decls(used: bool, provide_int: bool) -> (String, String, String) {
     if !used {
         return (String::new(), String::new(), String::new());
     }
+    let int_decl = if provide_int { "        %int = OpTypeInt 32 1\n        %i_0 = OpConstant %int 0\n" } else { "" };
     (
         " %pcv".to_string(),
         "               OpDecorate %pcblock Block\n               OpMemberDecorate %pcblock 0 Offset 0\n".to_string(),
-        "     %pc_int = OpTypeInt 32 1\n        %i_0 = OpConstant %pc_int 0\n     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n".to_string(),
+        format!("{int_decl}     %pcblock = OpTypeStruct %v4float\n%_ptr_pc_block = OpTypePointer PushConstant %pcblock\n        %pcv = OpVariable %_ptr_pc_block PushConstant\n%_ptr_pc_v4float = OpTypePointer PushConstant %v4float\n"),
     )
 }
 
