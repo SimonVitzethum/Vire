@@ -342,12 +342,12 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
 - [ ] **`vkCmdDrawMeshTasksIndirectCountEXT`** — a GPU count buffer (today a fixed indirect count).
 - [x] **Textures / samplers** — image + sampler + descriptor + fragment sampling. *Large;
   attempt, else skip with reason.*
-- [~] **Typed resource handles + lifetime safety (RC-bound GPU handle DONE; persistent ctx)** — `Buffer`/`Texture`/`Pipeline` as
+- [~] **Typed resource handles + lifetime safety (RC-bound texture+buffer+session handles DONE; persistent ctx)** — `Buffer`/`Texture`/`Pipeline` as
   RC/region-tracked Vire values (no GPU use-after-free). *Architectural; attempt a
   minimal handle, else document.*
-- [~] **Render graph → auto barriers (layout transitions + N-pass chain + multi-input DAG DONE) / declarative `frame { … }`** — *architectural,
+- [~] **Render graph → auto barriers (layout transitions + N-pass chain + multi-input DAG DONE) / declarative `frame { bg }` first step DONE** — *architectural,
   multi-week; document honestly, do not fake.*
-- [~] **Windowed arbitrary geometry + per-frame draw (animated window + Vire-driven session DONE)** — *needs a persistent
+- [~] **Windowed arbitrary geometry + per-frame draw (animated window + Vire-driven session + windowed Vire geometry DONE)** — *needs a persistent
   context; attempt, else document.*
 
 **Investigated — high value, de-risked, multi-quarter.** Full design, safety

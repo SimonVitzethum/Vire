@@ -301,7 +301,42 @@ scene SSBO (binding 0), so `@compute` (writes it), `@task` and `@mesh` (read it)
 | `vk_mesh_scene_cull(offsets, nx,ny,nz,d)` | The above + per-meshlet frustum culling in `@task`. |
 | `vk_mesh_built(count, nx,ny,nz,d)` | The scene is GPU-built by `@compute`, then culled + drawn (depth-tested). |
 | `vk_textured()` | Render the triangle sampling a 2×2 texture the `@fragment` reads with `tex(uv)`. |
+| `vk_texture_draw(pixels, w)` | Sample a texture built from a Vire `[Float]` RGBA array (texture-as-value). |
+| `vk_built_color(count, …)` | Like `vk_mesh_built` but returns a pixel colour (to verify per-meshlet colour). |
 | `gpuvk_run(arr)` | Run the program's `@gpuvk` map over a Float array on any Vulkan device. |
+| `vk_window(frames)` / `vk_window_mesh(verts, frames)` | Present the default triangle / arbitrary Vire geometry in an **animated** window (per-frame `uniform()`). |
+
+**Interactive rendering** (Vire drives the per-frame loop):
+
+| Builtin | What it does |
+|---------|--------------|
+| `vk_session()` | Build a persistent render session (target + pipeline reused across frames) → an RC-bound handle. |
+| `vk_frame(session, r,g,b,a)` | Render one frame with that uniform (no per-frame setup); returns the centroid. |
+
+**Render graph** (offscreen passes, automatic layout barriers):
+
+| Builtin | What it does |
+|---------|--------------|
+| `vk_two_pass()` | Two passes: render → texture, auto-barrier, sample it — the minimal graph. |
+| `vk_chain(n)` | An N-pass chain; the runtime tracks each texture's layout and auto-inserts every barrier. |
+| `vk_blend2()` | A multi-input pass (a DAG): two sources + a blend pass reading both (`tex`+`tex2`). |
+
+**Lifetime-safe GPU resource handles** (RC-bound Vire objects — freed exactly when the last
+reference drops; use-after-free impossible; heap-balance-oracle 0-live):
+
+| Builtin | What it does |
+|---------|--------------|
+| `vk_texture_new(pixels, w)` / `vk_draw_handle(t)` | A persistent GPU texture handle; draw with it (no re-upload). |
+| `vk_buffer_new(data)` / `vk_buffer_get(b, i)` | A persistent GPU storage buffer handle; read element `i`. |
+
+**Declarative frame** (language-level surface):
+
+```vire
+frame { bg(0.9, 0.3, 0.6) }     // a render frame described by directives (bg = clear colour)
+```
+
+Parsed as a render frame and desugared to a builtin; `frame` is not a reserved word (only
+`frame {` triggers it).
 
 The mesh entry points return the centroid pixel (`0xRRGGBB`) or a coverage mask, or `-2`
 where the device has no mesh-shader support (so tests skip cleanly). The mesh-shader path
@@ -332,4 +367,14 @@ toolchain; here it is a single Vire file.
 `vulkan_meshlet` (bootstrap mesh shader), `vulkan_meshlet_authored` (Vire `@mesh`+`@task`),
 `vulkan_cull` (`@task` frustum cull), `vulkan_scene` (multi-meshlet scene buffer),
 `vulkan_scene_cull` (fused per-meshlet cull), `vulkan_built` (GPU-built scene),
-`vulkan_cone` (typed records + backface cull).
+`vulkan_cone` (typed records + backface cull), `vulkan_mesh_color` (per-vertex mesh
+colour), `vulkan_animate` (interactive animated window), `gpuvk_map` (vendor-neutral
+compute).
+
+## Verification
+
+`tests/vire_vulkan.sh` — **35 headless cases** (skips cleanly without a Vulkan device /
+`spirv-as`): every shader feature, the GPU-driven meshlet renderer, the render graph, the
+RC-bound handles (with 0-live heap-balance checks), `@gpuvk`, and the declarative frame.
+`benchmarks/vulkan/` shows `@vulkan` compiles to the same Vulkan calls as hand-written
+C++/Rust at no runtime overhead (see [../benchmarks/vulkan/README.md](../benchmarks/vulkan/README.md)).
