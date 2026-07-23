@@ -170,8 +170,10 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// `[mut] name [= expr]`
-    Let { mutable: bool, name: String, value: Option<Expr>, span: Span },
+    /// `[mut] name [: Type] [= expr]` — the optional type annotation is an escape
+    /// hatch for cases the monomorphic unifier can't reach (e.g. binding an object
+    /// whose class the RHS doesn't carry), so `n.field` still resolves.
+    Let { mutable: bool, name: String, ty: Option<Type>, value: Option<Expr>, span: Span },
     /// `lhs op= rhs` or `lhs = rhs`
     Assign { target: Expr, op: Option<BinOp>, value: Expr, span: Span },
     Expr(Expr),

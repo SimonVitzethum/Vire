@@ -690,15 +690,26 @@ impl Parser {
             Tok::Kw(Kw::Mut) => {
                 self.bump();
                 let name = self.ident();
+                // Optional `: Type` annotation (an escape hatch for inference).
+                let ty = if self.eat(&Tok::Colon) { Some(self.parse_type()) } else { None };
                 let value = if self.eat(&Tok::Eq) { Some(self.parse_expr(0)) } else { None };
-                Stmt::Let { mutable: true, name, value, span: sp }
+                Stmt::Let { mutable: true, name, ty, value, span: sp }
+            }
+            // `name : Type = expr` (annotated binding) — lookahead for `ident :`.
+            Tok::Ident(_) if matches!(self.peek_at(1), Tok::Colon) => {
+                let name = self.ident();
+                self.bump(); // :
+                let ty = Some(self.parse_type());
+                self.expect(&Tok::Eq, "'='");
+                let value = self.parse_expr(0);
+                Stmt::Let { mutable: false, name, ty, value: Some(value), span: sp }
             }
             // `name = expr` (binding) vs. expression: lookahead for `ident =`
             Tok::Ident(_) if matches!(self.peek_at(1), Tok::Eq) => {
                 let name = self.ident();
                 self.bump(); // =
                 let value = self.parse_expr(0);
-                Stmt::Let { mutable: false, name, value: Some(value), span: sp }
+                Stmt::Let { mutable: false, name, ty: None, value: Some(value), span: sp }
             }
             _ => {
                 let e = self.parse_expr(0);

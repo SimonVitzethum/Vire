@@ -1685,7 +1685,10 @@ impl<'a> FnLower<'a> {
     fn lower_stmt(&mut self, s: &Stmt) {
         self.mark_line(stmt_span(s));
         match s {
-            Stmt::Let { mutable, name, value, .. } => {
+            Stmt::Let { mutable, name, ty: ann, value, .. } => {
+                // An explicit `: Type` annotation names the object class the RHS may
+                // not carry (the inference escape hatch); used as a fallback below.
+                let ann_class = ann.as_ref().and_then(|t| class_of(Some(t)));
                 // `mut f = x -> …`: remember lambda (the call is inline-expanded).
                 if let Some(Expr::Lambda { params, body, .. }) = value {
                     let l = self.new_local(Ty::I64);
@@ -1717,7 +1720,9 @@ impl<'a> FnLower<'a> {
                 };
                 let l = self.new_local(ty);
                 // Pass the object class resp. array element kind on to the new local.
-                if let Some(c) = self.class_of_operand(&op) {
+                // The explicit `: Type` annotation is the fallback when the RHS operand
+                // carries no class (the inference escape hatch).
+                if let Some(c) = self.class_of_operand(&op).or(ann_class) {
                     self.local_class.insert(l.0, c);
                 }
                 if let Some(k) = self.arr_of_operand(&op) {
@@ -3597,6 +3602,25 @@ impl<'a> FnLower<'a> {
         }
         let rty = ends.iter().map(|(_, _, t)| *t).find(|t| *t != Ty::Void).unwrap_or(Ty::Void);
         let res = if rty != Ty::Void { Some(self.new_local(rty)) } else { None };
+        // SOUND class/array propagation (same rule as `lower_if`): the result inherits
+        // a class ONLY if EVERY value-producing arm agrees. A single disagreeing or
+        // unknown arm → leave it unknown, so `n.field` on a heterogeneous match errors
+        // loudly instead of loading against one arm's layout. `match` over homogeneous
+        // object arms (`0 => Node(..)  _ => Node(..)`) then resolves `.field`.
+        if let Some(r) = res {
+            let cls: Vec<Option<String>> = ends.iter().map(|(_, v, _)| self.class_of_operand(v)).collect();
+            if let Some(Some(first)) = cls.first() {
+                if cls.iter().all(|c| c.as_deref() == Some(first.as_str())) {
+                    self.local_class.insert(r.0, first.clone());
+                }
+            }
+            let ark: Vec<Option<ArrKind>> = ends.iter().map(|(_, v, _)| self.arr_of_operand(v)).collect();
+            if let Some(Some(first)) = ark.first() {
+                if ark.iter().all(|k| *k == Some(*first)) {
+                    self.local_arr.insert(r.0, *first);
+                }
+            }
+        }
         for (end, v, _) in &ends {
             if let Some(r) = res {
                 self.blocks[*end].statements.push(Statement::Assign(r, Rvalue::Use(v.clone())));
@@ -3774,11 +3798,19 @@ impl<'a> FnLower<'a> {
             // later `n.field` fails "type of the object unknown" — the same gap
             // that made a self-recursive object builder (after recursion-inlining
             // rewrites the tail self-call into an if/else) unusable.
-            if let Some(c) = self.class_of_operand(&tv).or_else(|| self.class_of_operand(&ev)) {
-                self.local_class.insert(res.0, c);
+            // SOUND propagation only: the result inherits a class/array-kind ONLY when
+            // BOTH branches agree on it. If they disagree (`if c { Node(..) } else {
+            // Leaf(..) }`), the runtime value is heterogeneous, so we must NOT pin a
+            // single layout — leaving it unknown restores the loud, conservative
+            // "type of the object unknown" error instead of a wrong-offset load. A
+            // branch with no class (e.g. a bare `null`) is also treated as disagreement.
+            match (self.class_of_operand(&tv), self.class_of_operand(&ev)) {
+                (Some(a), Some(b)) if a == b => { self.local_class.insert(res.0, a); }
+                _ => {}
             }
-            if let Some(k) = self.arr_of_operand(&tv).or_else(|| self.arr_of_operand(&ev)) {
-                self.local_arr.insert(res.0, k);
+            match (self.arr_of_operand(&tv), self.arr_of_operand(&ev)) {
+                (Some(a), Some(b)) if a == b => { self.local_arr.insert(res.0, a); }
+                _ => {}
             }
             self.blocks[te].statements.push(Statement::Assign(res, Rvalue::Use(tv)));
             self.blocks[ee].statements.push(Statement::Assign(res, Rvalue::Use(ev)));

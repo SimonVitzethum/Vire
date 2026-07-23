@@ -28,6 +28,53 @@ case_() {
     echo "ok   $name"; pass=$((pass+1))
 }
 
+# reject_ <name> <needle>: the build MUST fail mentioning <needle>. Guards soundness
+# invariants where the correct behavior is a compile error, not a silent miscompile.
+reject_() {
+    name="$1"; needle="$2"; f="$work/$name.vr"; cat > "$f"
+    if "$vire" build "$f" -o "$work/$name.bin" >/dev/null 2>"$work/e"; then
+        echo "FAIL $name (built — should reject, unsound)"; fail=$((fail+1)); return
+    fi
+    if grep -qi "$needle" "$work/e"; then echo "ok   $name (rejected)"; pass=$((pass+1))
+    else echo "FAIL $name (missing '$needle': $(head -1 "$work/e"))"; fail=$((fail+1)); fi
+}
+
+# SOUNDNESS: `if`/`match` whose branches have DIFFERENT object classes must NOT pin a
+# single layout — a `.field` on the merged value must be a loud compile error, never a
+# wrong-offset load. (Regression for the lower_if class-propagation fix.)
+reject_ heterogeneous_if_no_field "type of the object unknown" <<'EOF'
+type Node { val: Int nxt: Node }
+type Leaf { tag: Int a: Int b: Int }
+fn main() {
+    mut c = 1
+    mut n = if c == 1 { Node(7, null) } else { Leaf(1, 2, 3) }
+    print(n.val)
+}
+EOF
+
+# `match` over homogeneous object arms: the result keeps the class, `.field` resolves.
+case_ match_object_arms 20 <<'EOF'
+type Node { val: Int nxt: Node }
+fn pick(c: Int) -> Node {
+    match c {
+        0 -> Node(10, null)
+        _ -> Node(20, null)
+    }
+}
+fn main() { mut n = pick(1) print(n.val) }
+EOF
+
+# Local type annotation as the inference escape hatch: `mut n: Node = <if with a null
+# branch>` — the RHS carries no single class, the annotation supplies it.
+case_ local_annotation_escape 42 <<'EOF'
+type Node { val: Int nxt: Node }
+fn make() -> Node { Node(42, null) }
+fn main() {
+    mut n: Node = if 1 == 1 { make() } else { null }
+    print(n.val)
+}
+EOF
+
 # --- for-loop auto-arena: non-escaping array, scalar stores → promoted, must stay balanced ---
 case_ for_array_arena 1499998500000 <<'EOF'
 fn work(n: Int) -> Int {

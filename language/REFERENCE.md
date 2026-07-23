@@ -39,7 +39,13 @@ mut y = 0          // mutable binding
 y = y + 1          // assignment (y is `mut`) — ok
 x = 6              // ERROR: `x` immutable, no silent rebind
 const MAX = 1024   // compile-time constant (SCREAMING_SNAKE = const value)
+mut n: Node = pick()   // optional `: Type` — the inference escape hatch
 ```
+
+The `: Type` annotation is optional and rarely needed (types are inferred), but it is
+the **escape hatch** for the cases the monomorphic unifier can't reach — e.g. binding an
+object whose class the right-hand side doesn't carry (an `if` with a `null` branch), so
+a later `n.field` still resolves instead of erroring "type of the object unknown".
 
 **Binding vs. assignment without `let`** ([PARSER.md](PARSER.md) §1.4): the **first**
 `name =` in a scope **binds**; every **further** one in the same scope is an

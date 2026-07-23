@@ -196,16 +196,27 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   that appears only in return position defaults to `Int`).
 - [~] **Iterator-mutation check** ([REFERENCE.md](language/REFERENCE.md) §9a) — local
   non-mutation analysis; not provable → compile error.
-- [x] **`if`/`else` as a value keeps its object class.** `mut n = if c { a } else { b }`
-  now propagates the branches' object class (and array element kind) onto the result
-  local, so a following `n.field` resolves. This also unblocked self-recursive object
-  builders: recursion-inlining ([inline.rs](crates/vire/src/inline.rs)) rewrites the
-  tail self-call into an `if`/`else`, so a Vire binary tree that bound the recursive
-  result and read a field of it failed "type of the object unknown" before the fix
-  ([lower.rs](crates/vire/src/lower.rs) `lower_if`). Regression: `tests/vire_heap.sh
-  if_expr_object_class` (value + 0-live); example: `examples/vire/object_graph.vr`.
-  *Still open:* no local type annotation (`mut x: T = …`) exists as a fallback, so
-  cases the monomorphic unifier can't reach have no manual escape hatch yet.
+- [x] **Merge points keep the object class — SOUNDLY.** `mut n = if c { a } else { b }`
+  and `mut n = match … { … }` now propagate the branches'/arms' object class (and array
+  element kind) onto the result local **only when every branch agrees**; a disagreeing
+  or unknown branch leaves it unknown, so `n.field` on a heterogeneous merge is a loud
+  compile error, never a wrong-offset load ([lower.rs](crates/vire/src/lower.rs)
+  `lower_if`/`lower_match`). This unblocked self-recursive object builders: recursion-
+  inlining ([inline.rs](crates/vire/src/inline.rs)) rewrites the tail self-call into an
+  `if`/`else`, so a Vire binary tree that bound the recursive result and read a field of
+  it failed "type of the object unknown" before. The `while`-loop back-edge idiom
+  (`mut cur = head; while … { cur = cur.next }`) already worked. Regressions:
+  `tests/vire_heap.sh` `if_expr_object_class` / `match_object_arms` /
+  `heterogeneous_if_no_field` (must-reject, soundness) / `local_annotation_escape`;
+  example: `examples/vire/object_graph.vr`.
+  *Known remaining instance:* the `?` operator extracts the Ok/Some payload as a scalar,
+  so `mut n = find()?; n.field` still errors (loud, sound) — sits on the partial
+  Option/Result surface (Stdlib section) and is deferred with it.
+- [x] **Local type annotation `mut x: T = …`** (also `x: T = …`) — the inference escape
+  hatch. Supplies the object class the RHS may not carry (e.g. an `if` with a `null`
+  branch), so the monomorphic unifier having a blind spot no longer forces a program
+  rewrite. Parsed in [parser.rs](crates/vire/src/parser.rs); the class seeds the local in
+  `lower.rs`. Test: `tests/vire_heap.sh local_annotation_escape`.
 
 ## Stdlib + FFI
 
