@@ -851,6 +851,26 @@ fn main() {
 }
 EOF
 
+# Render graph with a MULTI-INPUT pass (a DAG, not a chain): two source passes render
+# red -> A and blue -> B, then a blend pass samples BOTH (tex(uv)+tex2(uv), mix 0.5).
+# The runtime auto-transitions BOTH inputs to SHADER_READ_ONLY before the fan-in pass.
+# Blend of red(0.9,0.2,0.2)+blue(0.1,0.2,0.9) -> (127,51,140).
+case_ vire_blend2 <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    mix(tex(uv), tex2(uv), 0.5)
+}
+fn main() {
+    mut px = vk_blend2()
+    mut r = px / 65536
+    mut b = px % 256
+    mut ok = 0
+    if r > 115 { if r < 140 { if b > 125 { if b < 155 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

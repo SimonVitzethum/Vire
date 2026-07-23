@@ -1235,6 +1235,8 @@ fn build_or_run(args: &[String]) {
         // (vk_two_pass): pass 1 fills an offscreen texture, pass 2 (the program's
         // @fragment) samples it. Always generated; small.
         let p1w = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm([0.9, 0.2, 0.2, 1.0]), "vk_pass1", None);
+        // A fixed blue fragment for the second source pass of the multi-input graph.
+        let p2w = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm([0.1, 0.2, 0.9, 1.0]), "vk_pass2", None);
         // The GPU-driven mesh stage (VM milestone): the Vire `@mesh` shader if the
         // program defines one, else a bootstrap `@mesh` that emits the triangle.
         let mesh_asm = program
@@ -1259,7 +1261,7 @@ fn build_or_run(args: &[String]) {
             None => Vec::new(),
         };
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw), ("VK_GPUVK_COMP", &gw), ("VK_PASS1_FRAG", &p1w)] {
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw), ("VK_GPUVK_COMP", &gw), ("VK_PASS1_FRAG", &p1w), ("VK_PASS2_FRAG", &p2w)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));
             // A 0-length array is invalid ISO C; emit a dummy word (the _N stays 0).
             if w.is_empty() {

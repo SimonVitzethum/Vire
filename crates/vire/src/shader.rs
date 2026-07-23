@@ -42,6 +42,7 @@ fn new_cx() -> Cx {
         uses_payload: false,
         uses_global_id: false,
         uses_texture: false,
+        uses_texture2: false,
         n: 0,
     }
 }
@@ -139,6 +140,7 @@ struct Cx {
     uses_payload: bool,         // task→mesh payload (the surviving meshlet index)
     uses_global_id: bool,       // compute `meshlet_index()`/`set_meshlet()` → gl_GlobalInvocationID
     uses_texture: bool,         // fragment `tex(uv)` → a sampler2D at set 0 binding 0
+    uses_texture2: bool,        // fragment `tex2(uv)` → a second sampler2D at binding 1
     n: u32,
 }
 
@@ -349,6 +351,19 @@ impl Cx {
                     self.uses_texture = true;
                     let s = self.id("t");
                     writeln!(self.body, "{s} = OpLoad %simg %tex").unwrap();
+                    let r = self.id("t");
+                    writeln!(self.body, "{r} = OpImageSampleImplicitLod %v4float {s} {uv}").unwrap();
+                    return Ok((r, Ty::Vec(4)));
+                }
+                // Second texture (binding 1) — for a multi-input render-graph pass that
+                // reads two textures (e.g. a blend).
+                if name == "tex2" {
+                    if args.len() != 1 { return Err("shader: tex2(uv) takes one Vec2".into()); }
+                    let (uv, uvt) = self.expr(&args[0])?;
+                    if uvt != Ty::Vec(2) { return Err("shader: tex2(uv) — uv must be a Vec2".into()); }
+                    self.uses_texture2 = true;
+                    let s = self.id("t");
+                    writeln!(self.body, "{s} = OpLoad %simg %tex2").unwrap();
                     let r = self.id("t");
                     writeln!(self.body, "{r} = OpImageSampleImplicitLod %v4float {s} {uv}").unwrap();
                     return Ok((r, Ty::Vec(4)));
@@ -947,16 +962,21 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     };
     // A host `uniform()` push constant (vec4) — declared only when used.
     let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant, true);
-    // A `tex(uv)` sampler2D (set 0 binding 0) — declared only when used.
-    let (tx_iface, tx_decor, tx_decl) = if cx.uses_texture {
-        (
-            " %tex",
-            "               OpDecorate %tex DescriptorSet 0\n               OpDecorate %tex Binding 0\n",
-            "        %img = OpTypeImage %float 2D 0 0 0 1 Unknown\n       %simg = OpTypeSampledImage %img\n%_ptr_uc_simg = OpTypePointer UniformConstant %simg\n        %tex = OpVariable %_ptr_uc_simg UniformConstant\n",
-        )
-    } else {
-        ("", "", "")
-    };
+    // A `tex(uv)` sampler2D (set 0 binding 0) — declared only when used; `tex2(uv)` adds
+    // a second sampler at binding 1 (multi-input render-graph passes).
+    let any_tex = cx.uses_texture || cx.uses_texture2;
+    let tx_types = if any_tex {
+        "        %img = OpTypeImage %float 2D 0 0 0 1 Unknown\n       %simg = OpTypeSampledImage %img\n%_ptr_uc_simg = OpTypePointer UniformConstant %simg\n"
+    } else { "" };
+    let (t1_iface, t1_decor, t1_decl) = if cx.uses_texture {
+        (" %tex", "               OpDecorate %tex DescriptorSet 0\n               OpDecorate %tex Binding 0\n", "        %tex = OpVariable %_ptr_uc_simg UniformConstant\n")
+    } else { ("", "", "") };
+    let (t2_iface, t2_decor, t2_decl) = if cx.uses_texture2 {
+        (" %tex2", "               OpDecorate %tex2 DescriptorSet 0\n               OpDecorate %tex2 Binding 1\n", "       %tex2 = OpVariable %_ptr_uc_simg UniformConstant\n")
+    } else { ("", "", "") };
+    let tx_iface = format!("{t1_iface}{t2_iface}");
+    let tx_decor = format!("{t1_decor}{t2_decor}");
+    let tx_decl = format!("{tx_types}{t1_decl}{t2_decl}");
     let iface = format!("{fc_iface}{vy_iface}{pc_iface}{tx_iface}");
     let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}");
     let fc_decl = format!("{pc_decl}{tx_decl}{fc_decl}{vy_decl}");

@@ -2904,6 +2904,14 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_texture_draw".into(), args: vec![Operand::Copy(ptr), len, w] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_blend2(): a render graph with a multi-input pass — two source passes and a
+        // blend pass reading both textures (tex + tex2); the runtime auto-transitions
+        // both inputs. Demonstrates a DAG (fan-in), not just a chain.
+        if name == "vk_blend2" {
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_blend2".into(), args: vec![] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_chain(n): an N-pass render graph — a chain of passes where the runtime
         // tracks each texture's layout and auto-inserts the barriers (deepened graph).
         if name == "vk_chain" {
