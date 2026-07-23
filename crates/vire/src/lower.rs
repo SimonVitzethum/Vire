@@ -1390,9 +1390,13 @@ impl<'a> FnLower<'a> {
     ///  - `in_loop`: we are inside a *nested* loop within the loop's own function.
     ///    A `break`/`continue` there targets the nested loop, not our arena loop,
     ///    so it does not skip our pop; at the arena-loop level it does → forbidden.
-    /// A field/index store of a possible ref is base-insensitive and stays
-    /// forbidden everywhere (including callees): it is the one way a callee could
-    /// make an arena object outlive the arena, so it is never relaxed.
+    /// A ref-storing field mutation `obj.f = ref` is forbidden in callees and,
+    /// in the loop's own function, allowed ONLY when both `obj` and the stored `ref`
+    /// are provably iteration-fresh (both allocated into — and freed with — this
+    /// iteration's arena): the store then keeps an arena ref inside an arena object,
+    /// so nothing outlives the pop. See `loop_fresh_locals` / `expr_is_fresh`.
+    /// A ref store whose base is not proven fresh, or any ref store inside a callee,
+    /// stays forbidden (the one way an arena object could outlive the arena).
     fn while_arena_safe(&self, body: &Block2) -> bool {
         let mut outer: std::collections::HashSet<String> = std::collections::HashSet::new();
         for s in &self.scopes {
@@ -1400,12 +1404,126 @@ impl<'a> FnLower<'a> {
                 outer.insert(k.clone());
             }
         }
+        // Iteration-fresh locals — the domain in which a ref-storing field mutation
+        // can be admitted soundly (loop's own function only).
+        let fresh = self.loop_fresh_locals(body);
         let mut seen = std::collections::HashSet::new();
-        if self.region_bad_block(body, false, false, None, &outer, &mut seen) {
+        if self.region_bad_block(body, false, false, None, &outer, &mut seen, &fresh) {
             return false;
         }
         seen.clear();
         self.region_allocates_block(body, &mut seen)
+    }
+
+    /// Locals that are provably iteration-fresh in the loop body: every assignment to
+    /// them comes from an arena-local source (a constructor / a call whose arguments
+    /// are all fresh / a field-read of a fresh object / `null` / a scalar / a string
+    /// concat, which allocates into the active arena). A greatest fixpoint: assume all
+    /// assigned locals fresh, then drop any with a non-fresh right-hand side until
+    /// stable. Non-fresh ground sources (a read of an outer ref variable, an opaque
+    /// call, an uninitialised `mut`) propagate and remove names transitively. Sound
+    /// direction: a name stays fresh only if EVERY reaching definition is fresh.
+    fn loop_fresh_locals(&self, body: &Block2) -> std::collections::HashSet<String> {
+        let mut assigns: Vec<(String, Option<&Expr>)> = Vec::new();
+        self.collect_fresh_assigns_block(body, &mut assigns);
+        let mut fresh: std::collections::HashSet<String> = assigns.iter().map(|(n, _)| n.clone()).collect();
+        loop {
+            let mut changed = false;
+            for (name, rhs) in &assigns {
+                if fresh.contains(name) {
+                    let ok = rhs.map(|e| self.expr_is_fresh(e, &fresh)).unwrap_or(false);
+                    if !ok {
+                        fresh.remove(name);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        fresh
+    }
+
+    fn collect_fresh_assigns_block<'e>(&self, b: &'e Block2, out: &mut Vec<(String, Option<&'e Expr>)>) {
+        for s in &b.stmts {
+            self.collect_fresh_assigns_stmt(s, out);
+        }
+        if let Some(e) = b.tail.as_deref() {
+            self.collect_fresh_assigns_expr(e, out);
+        }
+    }
+
+    fn collect_fresh_assigns_stmt<'e>(&self, s: &'e Stmt, out: &mut Vec<(String, Option<&'e Expr>)>) {
+        match s {
+            // `mut x = e` / `x = e` (rebind): the target binds to `e`. An uninitialised
+            // `mut x` (value None) records None → treated as non-fresh.
+            Stmt::Let { name, value, .. } => out.push((name.clone(), value.as_ref())),
+            // A plain `name = e` rebinds; a compound `name op= e` (op = Some) is recorded
+            // as None (non-fresh: op= on a ref is a string concat, and the base is scalar
+            // in every other case — either way we do not depend on it being fresh).
+            Stmt::Assign { target: Expr::Ident(n, _), op, value, .. } => {
+                out.push((n.clone(), if op.is_none() { Some(value) } else { None }));
+            }
+            Stmt::While { body, .. } | Stmt::For { body, .. } => self.collect_fresh_assigns_block(body, out),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.collect_fresh_assigns_expr(e, out),
+            _ => {}
+        }
+    }
+
+    fn collect_fresh_assigns_expr<'e>(&self, e: &'e Expr, out: &mut Vec<(String, Option<&'e Expr>)>) {
+        match e {
+            Expr::If { then, elifs, els, .. } => {
+                self.collect_fresh_assigns_block(then, out);
+                for (_, b) in elifs {
+                    self.collect_fresh_assigns_block(b, out);
+                }
+                if let Some(b) = els {
+                    self.collect_fresh_assigns_block(b, out);
+                }
+            }
+            Expr::Match { arms, .. } => {
+                for (_, _, b) in arms {
+                    self.collect_fresh_assigns_expr(b, out);
+                }
+            }
+            Expr::Block(b) => self.collect_fresh_assigns_block(b, out),
+            _ => {}
+        }
+    }
+
+    /// Is `e` an iteration-fresh (arena-local) value, or a scalar/null that can never
+    /// dangle? Used both for the mutation base/value check and inside the freshness
+    /// fixpoint. The invariant it maintains: an arena object's ref fields only ever
+    /// hold fresh refs, `null`, or immortal literals — so a field-read of a fresh base
+    /// is itself fresh, and a constructor/call yields fresh memory when its arguments
+    /// are all fresh (a callee that returns an argument returns a fresh one).
+    fn expr_is_fresh(&self, e: &Expr, fresh: &std::collections::HashSet<String>) -> bool {
+        match e {
+            // Scalars cannot be a dangling ref; a string literal is immortal (never
+            // freed, so no dangle); `a + b` allocates into the active arena (or is
+            // scalar arithmetic) → arena-local either way.
+            Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Str(..)
+            | Expr::Unary { .. } | Expr::Binary { .. } => true,
+            Expr::Ident(n, _) if n == "null" && self.lookup(n).is_none() => true,
+            // A fresh local, or any scalar-typed local (a scalar reference cannot dangle).
+            Expr::Ident(n, _) => fresh.contains(n) || !self.region_name_is_ref(n, None),
+            Expr::Field { base, .. } => self.expr_is_fresh(base, fresh),
+            // Constructor / known function: the result is arena-local as long as every
+            // argument is fresh (a callee that returns an argument returns a fresh one).
+            // Relies on Vire having NO global/static ref state (0 GetStatic/PutStatic
+            // emitted, consts are comptime scalars): a function can only return a fresh
+            // allocation, one of its arguments, or an immortal literal — never a
+            // pre-existing non-arena ref. If mutable global refs are ever added, this
+            // branch must also require the callee to be proven not to return one.
+            Expr::Call { callee, args, .. } => match callee.as_ref() {
+                Expr::Ident(n, _) if self.is_alloc_name(n) || self.fn_defs.contains_key(n) => {
+                    args.iter().all(|a| self.expr_is_fresh(a, fresh))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     // `cur_fn`: the function whose body we are traversing — `None` for the loop's
@@ -1413,12 +1531,12 @@ impl<'a> FnLower<'a> {
     // (resolve names via the callee's parameter annotations; a callee-local name is
     // unknown → conservatively a ref). Used so `p[0] = p[0] + 1` on an `Array[Int]`
     // parameter is seen as the scalar store it is, not a possible ref store.
-    fn region_bad_block(&self, b: &Block2, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
-        b.stmts.iter().any(|s| self.region_bad_stmt(s, in_callee, in_loop, cur_fn, outer, seen))
-            || b.tail.as_deref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
+    fn region_bad_block(&self, b: &Block2, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>, fresh: &std::collections::HashSet<String>) -> bool {
+        b.stmts.iter().any(|s| self.region_bad_stmt(s, in_callee, in_loop, cur_fn, outer, seen, fresh))
+            || b.tail.as_deref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen, fresh)).unwrap_or(false)
     }
 
-    fn region_bad_stmt(&self, s: &Stmt, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+    fn region_bad_stmt(&self, s: &Stmt, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>, fresh: &std::collections::HashSet<String>) -> bool {
         match s {
             // A `return` in the loop's OWN function bypasses the en-bloc pop (and
             // may hand an arena ref to the caller) → forbidden. A `return` inside a
@@ -1442,7 +1560,7 @@ impl<'a> FnLower<'a> {
                     && outer.contains(name)
                     && outer_is_ref
                     && value.as_ref().map(|v| self.expr_may_be_ref(v, cur_fn)).unwrap_or(false);
-                escapes || value.as_ref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
+                escapes || value.as_ref().map(|e| self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen, fresh)).unwrap_or(false)
             }
             Stmt::Assign { target, value, .. } => {
                 let target_bad = match target {
@@ -1455,10 +1573,18 @@ impl<'a> FnLower<'a> {
                     // relaxation-proof leak route: a heap ref stored into a long-lived
                     // container). `region_index_scalar`/`expr_may_be_ref` are conservative.
                     Expr::Index { base, .. } => !self.region_index_scalar(base, cur_fn) && self.expr_may_be_ref(value, cur_fn),
-                    // Field mutation `obj.f = v`: a scalar `v` cannot leak a ref. (Field
-                    // element-kind narrowing would need the object's class resolved here;
-                    // the value check is sound and covers the common cases.)
-                    Expr::Field { .. } => self.expr_may_be_ref(value, cur_fn),
+                    // Field mutation `obj.f = v`. A scalar `v` cannot leak a ref. A ref `v`
+                    // is admitted ONLY in the loop's own function when the mutated object
+                    // `base` AND the stored value are both provably iteration-fresh: then
+                    // both live in this iteration's arena and are freed together at the pop,
+                    // so nothing outlives it (no dangle) and no non-arena ref is captured
+                    // (no missing release → no leak). Otherwise it stays forbidden.
+                    Expr::Field { base, .. } => {
+                        self.expr_may_be_ref(value, cur_fn)
+                            && !(!in_callee
+                                && self.expr_is_fresh(base, fresh)
+                                && self.expr_is_fresh(value, fresh))
+                    }
                     // Ref to an outer variable (compound `x op= e`) → escapes. Safe if the
                     // outer variable is scalar-typed (a ref cannot be stored into an I64/F64
                     // slot) or the written value is provably scalar. Loop-function only.
@@ -1470,17 +1596,17 @@ impl<'a> FnLower<'a> {
                     }
                     _ => false,
                 };
-                target_bad || self.region_bad_expr(value, in_callee, in_loop, cur_fn, outer, seen)
+                target_bad || self.region_bad_expr(value, in_callee, in_loop, cur_fn, outer, seen, fresh)
             }
-            Stmt::Expr(e) => self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen),
+            Stmt::Expr(e) => self.region_bad_expr(e, in_callee, in_loop, cur_fn, outer, seen, fresh),
             // A nested loop within the SAME function: its body runs at `in_loop = true`
             // so a `break`/`continue` there targets it, not our arena loop.
-            Stmt::While { cond, body, .. } => self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen),
-            Stmt::For { iter, body, .. } => self.region_bad_expr(iter, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen),
+            Stmt::While { cond, body, .. } => self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen, fresh),
+            Stmt::For { iter, body, .. } => self.region_bad_expr(iter, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_block(body, in_callee, true, cur_fn, outer, seen, fresh),
         }
     }
 
-    fn region_bad_expr(&self, e: &Expr, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>) -> bool {
+    fn region_bad_expr(&self, e: &Expr, in_callee: bool, in_loop: bool, cur_fn: Option<&FnDef>, outer: &std::collections::HashSet<String>, seen: &mut std::collections::HashSet<String>, fresh: &std::collections::HashSet<String>) -> bool {
         match e {
             Expr::Call { callee, args, .. } => {
                 let callee_bad = match callee.as_ref() {
@@ -1492,7 +1618,10 @@ impl<'a> FnLower<'a> {
                                     // return/break/continue no longer disqualify the
                                     // arena), `in_loop = false` (a fresh loop nesting),
                                     // `cur_fn = Some(fd)` (resolve names via ITS params).
-                                    Some(b) => self.region_bad_block(b, true, false, Some(fd), outer, seen),
+                                    // Empty `fresh`: the loop's iteration-freshness domain
+                                    // does not extend into a callee, so ref-field mutation
+                                    // stays conservatively forbidden there.
+                                    Some(b) => self.region_bad_block(b, true, false, Some(fd), outer, seen, &std::collections::HashSet::new()),
                                     None => true, // only signature → opaque
                                 }
                             } else {
@@ -1507,26 +1636,26 @@ impl<'a> FnLower<'a> {
                     // Mutator method on a (possibly outer) object → could store.
                     _ => true,
                 };
-                callee_bad || args.iter().any(|a| self.region_bad_expr(a, in_callee, in_loop, cur_fn, outer, seen))
+                callee_bad || args.iter().any(|a| self.region_bad_expr(a, in_callee, in_loop, cur_fn, outer, seen, fresh))
             }
-            Expr::Unary { rhs, .. } => self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen),
-            Expr::Binary { lhs, rhs, .. } => self.region_bad_expr(lhs, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen),
-            Expr::Field { base, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen),
-            Expr::Index { base, index, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(index, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Unary { rhs, .. } => self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen, fresh),
+            Expr::Binary { lhs, rhs, .. } => self.region_bad_expr(lhs, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_expr(rhs, in_callee, in_loop, cur_fn, outer, seen, fresh),
+            Expr::Field { base, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen, fresh),
+            Expr::Index { base, index, .. } => self.region_bad_expr(base, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_expr(index, in_callee, in_loop, cur_fn, outer, seen, fresh),
             Expr::If { cond, then, elifs, els, .. } => {
-                self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen)
-                    || self.region_bad_block(then, in_callee, in_loop, cur_fn, outer, seen)
-                    || elifs.iter().any(|(c, b)| self.region_bad_expr(c, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen))
-                    || els.as_ref().map(|b| self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false)
+                self.region_bad_expr(cond, in_callee, in_loop, cur_fn, outer, seen, fresh)
+                    || self.region_bad_block(then, in_callee, in_loop, cur_fn, outer, seen, fresh)
+                    || elifs.iter().any(|(c, b)| self.region_bad_expr(c, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen, fresh))
+                    || els.as_ref().map(|b| self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen, fresh)).unwrap_or(false)
             }
             Expr::Match { scrutinee, arms, .. } => {
-                self.region_bad_expr(scrutinee, in_callee, in_loop, cur_fn, outer, seen)
-                    || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_bad_expr(g, in_callee, in_loop, cur_fn, outer, seen)).unwrap_or(false) || self.region_bad_expr(b, in_callee, in_loop, cur_fn, outer, seen))
+                self.region_bad_expr(scrutinee, in_callee, in_loop, cur_fn, outer, seen, fresh)
+                    || arms.iter().any(|(_, g, b)| g.as_ref().map(|g| self.region_bad_expr(g, in_callee, in_loop, cur_fn, outer, seen, fresh)).unwrap_or(false) || self.region_bad_expr(b, in_callee, in_loop, cur_fn, outer, seen, fresh))
             }
-            Expr::Block(b) => self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen),
-            Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, in_callee, in_loop, cur_fn, outer, seen)),
-            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, in_callee, in_loop, cur_fn, outer, seen),
-            Expr::Range { start, end, .. } => self.region_bad_expr(start, in_callee, in_loop, cur_fn, outer, seen) || self.region_bad_expr(end, in_callee, in_loop, cur_fn, outer, seen),
+            Expr::Block(b) => self.region_bad_block(b, in_callee, in_loop, cur_fn, outer, seen, fresh),
+            Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, in_callee, in_loop, cur_fn, outer, seen, fresh)),
+            Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, in_callee, in_loop, cur_fn, outer, seen, fresh),
+            Expr::Range { start, end, .. } => self.region_bad_expr(start, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_expr(end, in_callee, in_loop, cur_fn, outer, seen, fresh),
             // Lambda/Comprehension/MapLit/Capsule: conservatively opaque (could capture/store outside).
             Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) | Expr::Capsule { .. } => true,
             _ => false,

@@ -252,18 +252,26 @@ collector off) **394 ms**, shipping (RC + collector) **729 ms** — so the colle
 is the honest cost of the class, not an estimate.
 
 An earlier attempt to auto-fire the arena at function scope was reverted, and this
-benchmark **corrects the diagnosis that reverted it.** Recursion is *not* the blocker:
+benchmark **corrected the diagnosis that reverted it.** Recursion is *not* the blocker:
 the loop-arena already fires on a recursive build/use/drop (a non-mutating variant of
 this benchmark emits `jrt_arena_push`/`pop` around a recursive `chain(20)` and reports
-*zero* heap allocations — all 8M nodes immortal in the arena). What suppresses it here is
-one thing: the ref-storing field mutation `last.next = h`, whose base the region check
-cannot prove is itself arena-local, so it conservatively bails. The precise, sound
-extension is therefore narrow — admit `obj.f = ref` inside the arena when `obj` *and* the
-stored `ref` are provably iteration-fresh (both live and die in the arena) — not the
-open-ended "recursive escape" work the revert note described. It would take this workload
-from 729 ms toward the 273 ms ceiling (5.0× → ~1.9× Rust), the single biggest lever on
-the class. It remains soundness-critical (a wrong freshness verdict is a use-after-free)
-and gated by the 0-live oracle + `GUARD_FREE` + the fuzzer; see [TODO.md](TODO.md).
+*zero* heap allocations — all 8M nodes immortal in the arena). What suppressed it was one
+thing: the ref-storing field mutation `last.next = h`, whose base the region check could
+not prove was itself arena-local, so it conservatively bailed. **This lever is now built**
+(`while_arena_safe` + `loop_fresh_locals`/`expr_is_fresh` in `crates/vire/src/lower.rs`):
+a ref-storing field mutation `obj.f = ref` is admitted into the arena when `obj` *and* the
+stored `ref` are provably *iteration-fresh* — every reaching definition comes from a
+constructor, a call with fresh arguments, a field-read of a fresh object, `null`, or a
+scalar (a greatest-fixpoint freshness dataflow over the loop body). Both fresh ⇒ both live
+and die in the arena ⇒ the store creates no dangling pointer and captures no non-arena ref.
+On sharedgraph the arena now fires: **729 ms → 352 ms (2.08×; 5.0× → 2.4× Rust)**, zero
+heap allocations, zero collector work — verified 0-live and `GUARD_FREE`-clean. It stays
+soundness-critical (a wrong freshness verdict would be a use-after-free), so it is pinned
+in **both** directions by `tests/vire_interproc_arena.sh` (promote: fresh cyclic mutation;
+decline: mutation whose base is an outer object, whose value is an outer ref, or whose base
+is only conditionally fresh) plus the Java 0-live oracle, `GUARD_FREE`, and the fuzzer. It
+does *not* reach the 273 ms ceiling — the arena's per-iteration push/pop and bump-alloc are
+real — but it removes the entire 46 %-collector + 17 %-RC cost on the class.
 
 The **hard floor** is unchanged and real: **genuinely dynamic-lifetime graphs** (mutable
 caches, long-lived graphs mutated past any single scope) cannot be proven away by any

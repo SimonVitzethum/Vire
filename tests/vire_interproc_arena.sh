@@ -183,6 +183,77 @@ fn work(n: Int) -> Int {
 fn main() { print(work(1000)) }
 EOF
 
+# ── PROMOTE 3: iteration-fresh ref-field MUTATION. The loop builds a fresh graph,
+#    then mutates its topology — `c.side = c.next.next` (a shared grandchild) and a
+#    back-edge cycle `last.next = h`. Both the mutated object and the stored ref are
+#    iteration-fresh (reachable from `h = chain(...)`), so the store keeps an arena
+#    ref inside an arena object → arena-safe. This is the region-inference win on the
+#    shared/cyclic-graph class; without it the cycle collector runs (46% of runtime).
+#    Value: sum over 4000 trials of (h.id + h.side.id) with h.id=20, grandchild id=18.
+check fresh_mutation_cycle promote 152000 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn chain(len: Int) -> Node { if len == 0 { null } else { Node(len, chain(len - 1), null) } }
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 4000 {
+        mut h = chain(20)
+        mut c = h
+        while c.next != null {
+            if c.next.next != null { c.side = c.next.next }
+            c = c.next
+        }
+        mut last = h
+        while last.next != null { last = last.next }
+        last.next = h
+        sum = (sum + h.id + h.side.id) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
+EOF
+
+# ── DECLINE 6: ref-field mutation whose BASE is an OUTER object (`keep`, declared
+#    before the loop). Storing a fresh ref into it would dangle after the pop → must
+#    stay blocked. Reads keep.next.id in-loop; final keep.next=null. Sum of ids 0..99999.
+check mutate_outer_base decline 999949972 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn mk(v: Int) -> Node { Node(v, null, null) }
+fn main() {
+    mut keep = mk(0)
+    mut sum = 0
+    mut t = 0
+    while t < 100000 {
+        mut h = mk(t)
+        keep.next = h
+        sum = (sum + keep.next.id) % 1000000007
+        t = t + 1
+    }
+    keep.next = null
+    print(sum)
+}
+EOF
+
+# ── DECLINE 7: ref-field mutation storing an OUTER (non-fresh) ref into a fresh
+#    object. The fresh object would capture a non-arena ref → leak at the pop (its
+#    release never runs) → must stay blocked. Sum of ext.id=7 over 100000 trials.
+check mutate_outer_value decline 700000 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn mk(v: Int) -> Node { Node(v, null, null) }
+fn main() {
+    mut ext = mk(7)
+    mut sum = 0
+    mut t = 0
+    while t < 100000 {
+        mut h = mk(t)
+        h.next = ext
+        sum = (sum + h.next.id) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

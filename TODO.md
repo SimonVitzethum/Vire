@@ -57,13 +57,19 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Tier 1 — the structural ~2× lever (highest ceiling)
 
-- [ ] **Automatic interprocedural region/arena inference for short-lived heap
-  graphs.** binary-trees is at 0.91× Rust; the `--no-rc` oracle is **0.46× Rust but
-  leaks** — that gap is the allocator (per-node malloc/free cascade), not RC
-  (move-on-last-use already zeroed construction retains). Capture it *soundly*:
-  auto-fire the `capsule`-arena mechanism where escape analysis proves a whole
-  subgraph dies at a known point (build→consume→drop), **without** the user writing
-  `capsule`, and free the subgraph en bloc.
+- [x] **Automatic region/arena inference for short-lived heap graphs — ref-mutation
+  case DONE (2026-07).** The loop-arena already captured recursive build/use/drop; the
+  gap was ref-storing field mutation `obj.f = ref` (topology mutation, cycles). Now
+  admitted when `obj` AND `ref` are provably iteration-fresh (`loop_fresh_locals` /
+  `expr_is_fresh`, greatest-fixpoint over the loop body). On sharedgraph the arena fires:
+  729 → 352 ms (2.08×; 5.0× → 2.4× Rust), 0 heap allocs, 0 collector — 0-live +
+  GUARD_FREE-clean, pinned both directions in `vire_interproc_arena.sh` (+3 cases).
+  **Still open (smaller):** (a) the same relaxation inside CALLEES (currently only the
+  loop's own function; needs the freshness domain extended interprocedurally), (b)
+  ref-*array* element stores `a[i] = ref` on a fresh array, (c) the residual ~2.4× to
+  Rust's `Rc` is a separate bare-allocation codegen gap the arena does not touch.
+  Original framing (kept for context): capture the build→consume→drop pattern soundly
+  without the user writing `capsule`, freeing the subgraph en bloc.
   - Extends a proven mechanism: thread-local `arena_top`, `while_arena_safe`
     interprocedural escape check, `tests/vire_interproc_arena.sh`, 0-live oracle all
     already exist — this generalizes the trigger from explicit `capsule` to inferred.
