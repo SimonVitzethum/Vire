@@ -2851,6 +2851,13 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_textured".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_two_pass(): a two-pass render graph — pass 1 draws to an offscreen texture,
+        // an automatic layout barrier, pass 2 samples it (the program's tex(uv) @fragment).
+        if name == "vk_two_pass" {
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_two_pass".into(), args: vec![] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_bench(frames): steady-state headless benchmark — init once, render
         // `frames` mesh-shader frames, return total nanoseconds (perf parity vs
         // hand-written Vulkan in C++/Rust; benchmarks/vulkan/).

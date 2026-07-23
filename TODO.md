@@ -345,7 +345,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
 - [~] **Typed resource handles + lifetime safety** — `Buffer`/`Texture`/`Pipeline` as
   RC/region-tracked Vire values (no GPU use-after-free). *Architectural; attempt a
   minimal handle, else document.*
-- [~] **Render graph → auto barriers / declarative `frame { … }`** — *architectural,
+- [~] **Render graph → auto barriers (layout transitions: first step DONE) / declarative `frame { … }`** — *architectural,
   multi-week; document honestly, do not fake.*
 - [~] **Windowed arbitrary geometry + per-frame Vire draw callback** — *needs a persistent
   context; attempt, else document.*

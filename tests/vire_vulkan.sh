@@ -749,6 +749,27 @@ fn main() {
 }
 EOF
 
+# Render graph (first step): two passes with an automatic layout transition. Pass 1
+# renders a fixed-red triangle into an offscreen texture; the runtime auto-transitions
+# it COLOR_ATTACHMENT -> SHADER_READ_ONLY (auto_barrier derives the barrier); pass 2
+# samples it with the program's tex(uv) @fragment. Centroid red (~229,51,51) proves
+# the first-pass output is correctly barriered and sampled in the second pass.
+case_ vire_two_pass <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut px = vk_two_pass()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 200 { if g < 80 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
