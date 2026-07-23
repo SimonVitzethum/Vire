@@ -57,10 +57,14 @@ fn new_cx() -> Cx {
 fn stage_iface(cx: &Cx, stage: u32) -> fastllvm_ir::VkIface {
     use fastllvm_ir::{VkBinding, VkIface, VK_KIND_COMBINED_IMAGE_SAMPLER, VK_KIND_STORAGE_BUFFER};
     let mut it = VkIface::default();
-    // A storage buffer at set 0, binding 0 — the mesh/task/compute scene SSBO
-    // (`meshlet_offset()`) or a fragment's read-only float buffer (`buf(i)`).
-    if cx.uses_ssbo || cx.uses_frag_ssbo {
+    // The mesh/task/compute scene SSBO (`meshlet_offset()`) at set 0, binding 0.
+    if cx.uses_ssbo {
         it.bindings.push(VkBinding { binding: 0, kind: VK_KIND_STORAGE_BUFFER, stages: stage });
+    }
+    // A fragment's read-only float storage buffer (`buf(i)`) at binding 2 — clear of the
+    // samplers at 0/1, so a fragment can mix `tex()` (binding 0) and `buf()` in one draw.
+    if cx.uses_frag_ssbo {
+        it.bindings.push(VkBinding { binding: 2, kind: VK_KIND_STORAGE_BUFFER, stages: stage });
     }
     // A `tex(uv)` sampler2D at binding 0, `tex2(uv)` a second at binding 1 — fragment.
     if cx.uses_texture {
@@ -1092,7 +1096,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Str
     let (sb_iface, sb_decor, sb_decl) = if cx.uses_frag_ssbo {
         (
             " %fbuf",
-            "               OpDecorate %_rt_float ArrayStride 4\n               OpMemberDecorate %Buf 0 Offset 0\n               OpDecorate %Buf Block\n               OpDecorate %fbuf DescriptorSet 0\n               OpDecorate %fbuf Binding 0\n",
+            "               OpDecorate %_rt_float ArrayStride 4\n               OpMemberDecorate %Buf 0 Offset 0\n               OpDecorate %Buf Block\n               OpDecorate %fbuf DescriptorSet 0\n               OpDecorate %fbuf Binding 2\n",
             "       %uint = OpTypeInt 32 0\n        %u_0 = OpConstant %uint 0\n  %_rt_float = OpTypeRuntimeArray %float\n        %Buf = OpTypeStruct %_rt_float\n%_ptr_ssbo_Buf = OpTypePointer StorageBuffer %Buf\n       %fbuf = OpVariable %_ptr_ssbo_Buf StorageBuffer\n%_ptr_ssbo_float = OpTypePointer StorageBuffer %float\n",
         )
     } else {

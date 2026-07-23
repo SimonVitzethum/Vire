@@ -436,9 +436,15 @@ Staged (each stage runnable):
   `draw_res_geo` has a per-binding KIND switch — a `GpuTex` writes a sampler descriptor, a
   `GpuBuf` writes a storage-buffer descriptor — so `vk_draw_buf(verts, handle, ux..uw)`
   feeds a data-driven fragment from a Vire GPU buffer (`tests/vire_vulkan.sh vire_draw_buf`,
-  40). The generic graphics surface now binds textures AND buffers, one or many, all from
-  the shader interface. *Remaining:* the mesh/meshlet pipeline through a generic surface
-  (indirect draw), and `draw(pipe, mesh, uniforms)` sugar over these builtins.
+  40). *Mixed heterogeneous bindings DONE:* `buf()` moved to binding 2 (clear of the
+  samplers at 0/1), so `vk_draw_tex_buf(verts, tex, buf, ux..uw)` binds a texture (sampler,
+  binding 0) AND a storage buffer (binding 2) in ONE draw — the per-binding kind switch
+  writes each descriptor type, verified centroid (229,102) = (tex.r, buf[0]), 0-live
+  (`tests/vire_vulkan.sh vire_draw_tex_buf`, 41). The generic graphics surface now binds
+  textures AND buffers, one/many/mixed, all from the shader interface (vk_draw / _tex /
+  _tex2 / _buf / _tex_buf). *Remaining:* the mesh/meshlet pipeline through a generic
+  surface — needs device unification (persistent context + mesh-shader ext) to accept a
+  GpuBuf scene handle; the mesh layout is already reflected. And `draw(...)` naming sugar.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

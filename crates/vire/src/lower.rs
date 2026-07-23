@@ -3093,6 +3093,22 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_buf".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_draw_tex_buf(verts, tex_h, buf_h, ux,uy,uz,uw): generic draw with MIXED
+        // reflected resources — a texture (binding 0) AND a storage buffer (binding 2).
+        if name == "vk_draw_tex_buf" && args.len() == 7 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let tex_h = self.lower_expr(&args[1]).0;
+            let buf_h = self.lower_expr(&args[2]).0;
+            let uni: Vec<Operand> = args[3..7].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len, tex_h, buf_h];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex_buf".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_draw_tex2(verts, h0, h1, ux,uy,uz,uw): generic draw with TWO reflected
         // sampler bindings — h0 -> binding[0], h1 -> binding[1] (a 2-texture blend).
         if name == "vk_draw_tex2" && args.len() == 7 {

@@ -926,6 +926,23 @@ int64_t jrt_vk_draw_buf(const double *verts, int64_t nfloats, void *handle,
     return r;
 }
 
+/* vk_draw_tex_buf(verts, tex_h, buf_h, ux,uy,uz,uw): the generic draw with MIXED reflected
+ * resources — a texture (sampler binding 0) AND a storage buffer (binding 2) in one draw,
+ * for a @fragment that uses both tex() and buf(). Exercises the per-binding kind switch
+ * with heterogeneous descriptor types. draw_res_geo binds by the reflected order (the
+ * SSBO comes first), so the handles are passed {buf, tex}. Returns 0xRRGGBB. */
+int64_t jrt_vk_draw_tex_buf(const double *verts, int64_t nfloats, void *tex_h, void *buf_h,
+                            double ux, double uy, double uz, double uw) {
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw}; void *hs[2]={buf_h,tex_h};
+    int64_t r=draw_res_geo(hs, 2, f, nverts, uni);
+    free(f);
+    return r;
+}
+
 /* vk_draw_tex2(verts, h0, h1, ux,uy,uz,uw): the generic draw with TWO reflected samplers
  * — h0 binds to the shader's first reflected sampler binding, h1 to the second (e.g. a
  * two-texture blend @fragment reading tex() and tex2()). Multiple resources, all bound

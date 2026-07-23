@@ -957,6 +957,32 @@ fn main() {
 }
 EOF
 
+# MIXED reflected resources in one draw: vk_draw_tex_buf(verts, tex, buf, uni). The
+# @fragment uses tex() (sampler binding 0) AND buf() (storage binding 2) — heterogeneous
+# descriptor types bound in a single draw via the per-binding kind switch. Texture r=0.9,
+# buffer[0]=0.4 -> centroid (~229, ~102). One generic draw, a texture AND a buffer.
+case_ vire_draw_tex_buf <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut t = tex(vec2(0.5, 0.5))
+    mut b = buf(0.0)
+    vec4(t.x, b, 0.0, 1.0)
+}
+fn main() {
+    mut pix = [0.9, 0.0, 0.0, 1.0]
+    mut ht = vk_texture_new(pix, 1)
+    mut data = [0.4, 0.1, 0.2]
+    mut hb = vk_buffer_new(data)
+    mut tri = [0.0, 0.0 - 0.6, 0.6, 0.6, 0.0 - 0.6, 0.6]
+    mut px = vk_draw_tex_buf(tri, ht, hb, 0.0, 0.0, 0.0, 1.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 221 { if r < 237 { if g > 94 { if g < 110 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 # The generic draw with a reflected STORAGE BUFFER: vk_draw_buf(verts, handle, uni). The
 # @fragment reads buf(i) (a read-only float storage buffer at binding 0, reflected); the
 # GpuBuf handle binds there via the kind switch. data=[0.3,0.7,..] -> centroid (~76,~178).
