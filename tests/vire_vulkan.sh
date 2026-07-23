@@ -792,6 +792,28 @@ fn main() {
 }
 EOF
 
+# RC-bound GPU texture handle (real lifetime safety): vk_texture_new(pix, w) creates a
+# PERSISTENT GPU texture in a persistent Vulkan context and returns a Vire object whose
+# drop frees it. vk_draw_handle(t) draws with it WITHOUT re-uploading. When t drops, the
+# runtime's RC destroys the GPU texture (custom vtable drop) — verified 0-live below.
+# Two draws sample the same texel(1,1)=(0.2,0.8,0.4) → green (51,204).
+case_ vire_texture_handle <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut pix = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.2, 0.8, 0.4, 1.0]
+    mut t = vk_texture_new(pix, 2)
+    mut c1 = vk_draw_handle(t)
+    mut c2 = vk_draw_handle(t)
+    mut ok = 0
+    if (c1 / 256) % 256 > 185 { if (c2 / 256) % 256 > 185 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

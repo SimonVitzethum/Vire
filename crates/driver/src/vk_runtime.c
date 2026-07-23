@@ -479,6 +479,161 @@ int64_t jrt_vk_textured(void) {
     return packed;
 }
 
+/* ---- Persistent context + RC-bound GPU texture handle -----------------------------
+ * A lazily-created VkInstance/VkDevice shared across calls, so a GPU texture can OUTLIVE
+ * a single draw. The handle is a Vire heap object (jrt_alloc) whose drop vtable slot
+ * frees the GPU resources — so the texture's lifetime is tied to Vire's reference
+ * counting: it is destroyed exactly when the last Vire reference drops, and a
+ * use-after-free is impossible (you cannot name a dropped Vire value). This is the
+ * lifetime-safe GPU resource handle. */
+extern void *jrt_alloc(int64_t size);
+static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_gq; static uint32_t g_gqf; static int g_ctx_ok=0;
+static int ctx_init(void) {
+    if(g_ctx_ok) return 1;
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
+    if(vkCreateInstance(&ici,0,&g_inst)!=VK_SUCCESS) return 0;
+    uint32_t nd=0; vkEnumeratePhysicalDevices(g_inst,&nd,0); if(!nd) return 0;
+    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(g_inst,&nd,pds);
+    g_pd=pds[0]; free(pds); int f=0;
+    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,0);
+      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,qs);
+      for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_gqf=i;f=1;break;} free(qs); }
+    if(!f) return 0;
+    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_gqf,.queueCount=1,.pQueuePriorities=&pr};
+    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
+    if(vkCreateDevice(g_pd,&dci,0,&g_dev)!=VK_SUCCESS) return 0;
+    vkGetDeviceQueue(g_dev,g_gqf,0,&g_gq); g_ctx_ok=1; return 1;
+}
+
+/* The handle object: a Vire header (refcount, vtable) + the persistent GPU resources. */
+typedef struct { int64_t refcount; void *vtable; VkImage image; VkDeviceMemory mem; VkImageView view; VkSampler sampler; uint32_t tw, th; } GpuTex;
+static void gpu_tex_drop(void *p) {
+    GpuTex *t=(GpuTex*)p;
+    if(t->sampler) vkDestroySampler(g_dev,t->sampler,0);
+    if(t->view) vkDestroyImageView(g_dev,t->view,0);
+    if(t->image) vkDestroyImage(g_dev,t->image,0);
+    if(t->mem) vkFreeMemory(g_dev,t->mem,0);
+}
+static void gpu_tex_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; } /* no ref fields */
+static void *gpu_tex_vt[2] = { (void*)gpu_tex_drop, (void*)gpu_tex_trace };
+
+/* vk_texture_new(pixels, nfloats, w): create a PERSISTENT GPU texture from Vire data and
+ * return an RC-bound handle (a Vire object). The GPU texture lives until the handle's
+ * last reference drops (Vire RC → gpu_tex_drop). Returns 0 on failure. */
+void *jrt_vk_texture_new(const double *pixels, int64_t nfloats, int64_t w) {
+    if(!pixels || w<=0 || nfloats < 4*w || (nfloats % (4*w))!=0) return 0;
+    if(!ctx_init()) return 0;
+    uint32_t TW=(uint32_t)w, TH=(uint32_t)(nfloats/(4*w));
+    VkImageCreateInfo ti={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={TW,TH,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_LINEAR,
+        .usage=VK_IMAGE_USAGE_SAMPLED_BIT,.initialLayout=VK_IMAGE_LAYOUT_PREINITIALIZED};
+    VkImage tex; if(vkCreateImage(g_dev,&ti,0,&tex)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements tmr; vkGetImageMemoryRequirements(g_dev,tex,&tmr);
+    uint32_t tt=find_mem(g_pd,tmr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(tt==~0u) return 0;
+    VkMemoryAllocateInfo tma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=tmr.size,.memoryTypeIndex=tt};
+    VkDeviceMemory tmem; if(vkAllocateMemory(g_dev,&tma,0,&tmem)!=VK_SUCCESS) return 0; vkBindImageMemory(g_dev,tex,tmem,0);
+    VkImageSubresource sr={.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT}; VkSubresourceLayout srl; vkGetImageSubresourceLayout(g_dev,tex,&sr,&srl);
+    unsigned char *tp; if(vkMapMemory(g_dev,tmem,0,tmr.size,0,(void**)&tp)!=VK_SUCCESS) return 0;
+    for(uint32_t y=0;y<TH;y++) for(uint32_t x=0;x<TW;x++){
+        const double *s=&pixels[(y*TW+x)*4]; unsigned char *o=tp+srl.offset+y*srl.rowPitch+x*4;
+        for(int k=0;k<4;k++){ double v=s[k]; if(v<0)v=0; if(v>1)v=1; o[k]=(unsigned char)(v*255.0+0.5); }
+    }
+    vkUnmapMemory(g_dev,tmem);
+    VkImageViewCreateInfo tvi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=tex,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    VkImageView texview; if(vkCreateImageView(g_dev,&tvi,0,&texview)!=VK_SUCCESS) return 0;
+    VkSamplerCreateInfo smi={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_NEAREST,.minFilter=VK_FILTER_NEAREST,
+        .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+    VkSampler samp; if(vkCreateSampler(g_dev,&smi,0,&samp)!=VK_SUCCESS) return 0;
+    /* transition the texture to SHADER_READ_ONLY once, on a throwaway command buffer */
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=g_gqf};
+    VkCommandPool cp; vkCreateCommandPool(g_dev,&cpi,0,&cp);
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; vkAllocateCommandBuffers(g_dev,&cai,&cmd);
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(cmd,&cbi);
+    auto_barrier(cmd,tex,VK_IMAGE_LAYOUT_PREINITIALIZED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fe; vkCreateFence(g_dev,&fci,0,&fe);
+    vkQueueSubmit(g_gq,1,&si,fe); vkWaitForFences(g_dev,1,&fe,VK_TRUE,~0ull);
+    vkDestroyFence(g_dev,fe,0); vkDestroyCommandPool(g_dev,cp,0);
+
+    GpuTex *h=(GpuTex*)jrt_alloc((int64_t)sizeof(GpuTex));
+    h->vtable=gpu_tex_vt; h->image=tex; h->mem=tmem; h->view=texview; h->sampler=samp; h->tw=TW; h->th=TH;
+    return h;
+}
+
+/* vk_draw_handle(handle): render the triangle sampling the persistent texture the handle
+ * owns (no re-upload). Borrows the handle (does not release it). Returns the centroid
+ * pixel 0xRRGGBB, or -1. */
+int64_t jrt_vk_draw_handle(void *handle) {
+    if(!handle || !g_ctx_ok) return -1;
+    GpuTex *ht=(GpuTex*)handle;
+    enum { W=256, H=256 };
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; CK(vkCreateImage(dev,&ii,0,&img));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,img,&mr);
+    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return -1;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
+    VkImageViewCreateInfo ivi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    VkImageView view; CK(vkCreateImageView(dev,&ivi,0,&view));
+    VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
+    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
+    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
+    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
+    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
+    VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
+    VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
+    VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
+    VkDescriptorImageInfo dii={.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii};
+    vkUpdateDescriptorSets(dev,1,&wds,0,0);
+    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0,dsl); if(!pipe) return -1;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,6,&vbuf,&vmem)) return -1;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return -1;
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    VkDeviceMemory bmem; CK(vkAllocateMemory(dev,&bm,0,&bmem)); vkBindBufferMemory(dev,buf,bmem,0);
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(cmd,&cbi);
+    VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
+    vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+    vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&dset,0,0);
+    float zero[4]={0,0,0,0}; vkCmdPushConstants(cmd,pl,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,16,zero);
+    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off); vkCmdDraw(cmd,3,1,0,0);
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
+    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
+    CK(vkEndCommandBuffer(cmd));
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
+    unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
+    int scx=W/2, scy=(int)(H*0.55); unsigned char *c=&px[(scy*W+scx)*4];
+    int64_t packed=((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
+    vkUnmapMemory(dev,bmem);
+    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
+    vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0);
+    vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
+    vkDestroyFramebuffer(dev,fb,0); vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    return packed;   /* handle (persistent texture) NOT destroyed — lives until its RC drops */
+}
+
 /* vk_texture_draw(pixels, nfloats, w): a texture as a first-class Vire value. `pixels`
  * is a Vire [Float] of interleaved RGBA in 0..1 (4 per texel), width `w`, height
  * nfloats/(4w) — an RC-managed Vire array, so the "texture handle" is lifetime-safe by

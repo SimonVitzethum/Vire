@@ -342,7 +342,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
 - [ ] **`vkCmdDrawMeshTasksIndirectCountEXT`** — a GPU count buffer (today a fixed indirect count).
 - [x] **Textures / samplers** — image + sampler + descriptor + fragment sampling. *Large;
   attempt, else skip with reason.*
-- [~] **Typed resource handles + lifetime safety (texture-as-value: first step DONE)** — `Buffer`/`Texture`/`Pipeline` as
+- [~] **Typed resource handles + lifetime safety (RC-bound GPU handle DONE; persistent ctx)** — `Buffer`/`Texture`/`Pipeline` as
   RC/region-tracked Vire values (no GPU use-after-free). *Architectural; attempt a
   minimal handle, else document.*
 - [~] **Render graph → auto barriers (layout transitions: first step DONE) / declarative `frame { … }`** — *architectural,
