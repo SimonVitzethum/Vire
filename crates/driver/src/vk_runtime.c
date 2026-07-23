@@ -522,18 +522,9 @@ int64_t jrt_vk_triangle(double a, double b, double c, double d) {
  * frame cleared to (r,g,b) with no geometry, return the centroid (= the background). */
 int64_t jrt_vk_frame_bg(double r, double g, double b) {
     enum { W=64, H=64 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,qs);
-      int f=0; for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
         .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
         .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
@@ -573,7 +564,7 @@ int64_t jrt_vk_frame_bg(double r, double g, double b) {
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyFramebuffer(dev,fb,0); vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance — not destroyed. */
     return packed;
 }
 
@@ -582,18 +573,9 @@ int64_t jrt_vk_frame_bg(double r, double g, double b) {
  * set 0 binding 0. Returns the centroid pixel packed 0xRRGGBB, or -1 on failure. */
 int64_t jrt_vk_textured(void) {
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,qs);
-      int f=0; for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     /* color target + render pass + framebuffer */
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
@@ -689,7 +671,7 @@ int64_t jrt_vk_textured(void) {
     vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
     vkDestroySampler(dev,samp,0); vkDestroyImageView(dev,texview,0); vkDestroyImage(dev,tex,0); vkFreeMemory(dev,tmem,0);
     vkDestroyFramebuffer(dev,fb,0); vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance — not destroyed. */
     return packed;
 }
 
@@ -1059,18 +1041,9 @@ int64_t jrt_vk_texture_draw(const double *pixels, int64_t nfloats, int64_t w) {
     if(!pixels || w<=0 || nfloats < 4*w || (nfloats % (4*w))!=0) return -1;
     uint32_t TW=(uint32_t)w, TH=(uint32_t)(nfloats/(4*w));
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,qs);
-      int f=0; for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
         .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
@@ -1159,7 +1132,7 @@ int64_t jrt_vk_texture_draw(const double *pixels, int64_t nfloats, int64_t w) {
     vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
     vkDestroySampler(dev,samp,0); vkDestroyImageView(dev,texview,0); vkDestroyImage(dev,tex,0); vkFreeMemory(dev,tmem,0);
     vkDestroyFramebuffer(dev,fb,0); vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance — not destroyed. */
     return packed;
 }
 
@@ -1188,18 +1161,9 @@ static int mk_target(VkDevice dev, VkPhysicalDevice pd, uint32_t w, uint32_t h, 
  * Returns the centroid pixel 0xRRGGBB. */
 int64_t jrt_vk_blend2(void) {
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t m=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&m,0);
-      VkQueueFamilyProperties *qs=malloc(m*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&m,qs);
-      int f=0; for(uint32_t i=0;i<m;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); if(!rp) return -1;
     VkImage A,B,Cc; VkDeviceMemory Am,Bm,Cm; VkImageView Av,Bv,Cv; VkFramebuffer Af,Bf,Cf;
@@ -1279,7 +1243,7 @@ int64_t jrt_vk_blend2(void) {
     vkDestroyFramebuffer(dev,Cf,0); vkDestroyImageView(dev,Cv,0); vkDestroyImage(dev,Cc,0); vkFreeMemory(dev,Cm,0);
     vkDestroyFramebuffer(dev,Bf,0); vkDestroyImageView(dev,Bv,0); vkDestroyImage(dev,B,0); vkFreeMemory(dev,Bm,0);
     vkDestroyFramebuffer(dev,Af,0); vkDestroyImageView(dev,Av,0); vkDestroyImage(dev,A,0); vkFreeMemory(dev,Am,0);
-    vkDestroyRenderPass(dev,rp,0); vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    vkDestroyRenderPass(dev,rp,0); /* persistent device/instance not destroyed. */
     return packed;
 }
 
@@ -1292,18 +1256,9 @@ int64_t jrt_vk_chain(int64_t n) {
     if(n<1) n=1; if(n>7) n=7;
     uint32_t NT=(uint32_t)n+1;                  /* T[0..n] */
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t m=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&m,0);
-      VkQueueFamilyProperties *qs=malloc(m*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&m,qs);
-      int f=0; for(uint32_t i=0;i<m;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     /* N+1 textures (color attachment + sampled), and per-texture tracked layout. */
     VkImage Ti[8]; VkDeviceMemory Tm[8]; VkImageView Tv[8]; VkFramebuffer Tf[8]; VkImageLayout Tl[8];
@@ -1388,7 +1343,7 @@ int64_t jrt_vk_chain(int64_t n) {
     vkDestroyPipeline(dev,pipeRed,0); vkDestroyPipelineLayout(dev,pl0,0);
     for(uint32_t i=0;i<NT;i++){ vkDestroyFramebuffer(dev,Tf[i],0); vkDestroyImageView(dev,Tv[i],0); vkDestroyImage(dev,Ti[i],0); vkFreeMemory(dev,Tm[i],0); }
     vkDestroyRenderPass(dev,rp,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance — not destroyed. */
     return packed;
 }
 
@@ -1399,18 +1354,9 @@ int64_t jrt_vk_chain(int64_t n) {
  * Demonstrates automatic layout transitions + resource lifetimes between passes. */
 int64_t jrt_vk_two_pass(void) {
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -1;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,qs);
-      int f=0; for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return -1; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* persistent context — no per-call device (unified onto the one graphics device). */
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     /* the intermediate texture T (pass-1 target, pass-2 source) */
     VkImageCreateInfo ti={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
@@ -1511,7 +1457,7 @@ int64_t jrt_vk_two_pass(void) {
     vkDestroyFramebuffer(dev,fb2,0); vkDestroyRenderPass(dev,rp2,0); vkDestroyFramebuffer(dev,fb1,0); vkDestroyRenderPass(dev,rp1,0);
     vkDestroyImageView(dev,Cview,0); vkDestroyImage(dev,C,0); vkFreeMemory(dev,cmem,0);
     vkDestroyImageView(dev,Tview,0); vkDestroyImage(dev,T,0); vkFreeMemory(dev,tmem,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance — not destroyed. */
     return packed;
 }
 

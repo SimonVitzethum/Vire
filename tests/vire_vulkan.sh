@@ -1161,6 +1161,26 @@ else
         echo "FAIL $d_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
 fi
 
+# Persistent-context safety: several render-graph renders in ONE program must all
+# succeed and agree — i.e. the shared device must survive across calls (a path that
+# wrongly destroyed the persistent device would make the 2nd call fail). Guards the
+# render-graph paths' move onto the persistent context.
+case_ vire_persistent_multi <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut a = vk_two_pass()
+    mut b = vk_two_pass()
+    mut c = vk_two_pass()
+    mut ok = 0
+    if a > 0 { if a == b { if b == c { ok = 1 } } }   // all three succeeded and agree
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
