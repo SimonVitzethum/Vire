@@ -1,0 +1,24 @@
+// The generic draw surface: `vk_draw(verts, ux, uy, uz, uw)`.
+//
+// Instead of a fixed per-demo entry point, the program supplies BOTH what to draw
+// (the geometry — a flat [Float] of interleaved clip-space x,y) AND the parameters
+// (a vec4 uniform). The runtime renders it through THIS program's compiled shaders:
+// the @fragment reads the uniform via uniform(), and its descriptor/pipeline layout
+// is derived from the shader (V3). So the pipeline is the shader's, not the runtime's.
+//
+//   vire run examples/vire/vulkan_draw.vr    # needs a Vulkan device + spirv-as
+
+@fragment
+fn fs() -> Vec4 {
+    mut u = uniform()                 // the vec4 passed to vk_draw below
+    vec4(u.x, u.y, u.z, 1.0)
+}
+
+fn main() {
+    // one centered triangle: three (x,y) clip-space corners
+    mut tri = [0.0, -0.6, 0.6, 0.6, -0.6, 0.6]
+    // draw it, tinted by the uniform (0.5, 0.6, 0.0)
+    mut px = vk_draw(tri, 0.5, 0.6, 0.0, 1.0)
+    print(px / 65536)                 // R channel of the centre pixel (~128 = 0.5)
+    print((px / 256) % 256)           // G channel (~153 = 0.6)
+}

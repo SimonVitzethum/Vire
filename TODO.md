@@ -418,7 +418,13 @@ Staged (each stage runnable):
   now shader-derived. *Remaining:* the graphics vertex/fragment pipeline keeps its fixed
   16-byte per-frame `uniform()` channel (a runtime protocol, always pushed — not a
   shader-varying quantity), the standalone compute-dispatch dsl (size-4 host count),
-  texture arrays, and the `draw(pipe, mesh, uniforms)` host surface.
+  texture arrays, and the `draw(pipe, mesh, uniforms)` host surface. *Generic draw
+  surface DONE (graphics):* `vk_draw(verts, ux,uy,uz,uw)` — the program supplies the
+  geometry AND a vec4 uniform, rendered through its own compiled @vertex/@fragment (the
+  uniform reaches `uniform()`), instead of a fixed per-demo entry point
+  (`examples/vire/vulkan_draw.vr`, `tests/vire_vulkan.sh vire_draw_generic`, 37).
+  *Remaining:* extend the generic surface to bind reflected resources (textures/buffers
+  via handles) so a single `draw` covers the textured/meshlet cases too.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

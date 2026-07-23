@@ -916,6 +916,27 @@ fn main() {
 }
 EOF
 
+# The generic draw surface: vk_draw(verts, ux,uy,uz,uw) — the program supplies the
+# geometry AND a vec4 uniform, rendered through the compiled @fragment; uniform() reads
+# the pushed value, so the centroid = the uniform color (0.5,0.6) -> (~128,~153). Proves
+# geometry + uniform both come from the program, pipeline from its shader.
+case_ vire_draw_generic <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut u = uniform()
+    vec4(u.x, u.y, u.z, 1.0)
+}
+fn main() {
+    mut tri = [0.0, 0.0 - 0.6, 0.6, 0.6, 0.0 - 0.6, 0.6]
+    mut px = vk_draw(tri, 0.5, 0.6, 0.0, 1.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 120 { if r < 136 { if g > 145 { if g < 161 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 # Unary minus in a shader body (OpFNegate). Without it a shader must write `0.0 - x`.
 # frag color: r = -(-0.5) = 0.5 (~128), g = -y where y=-0.6 → 0.6 (~153).
 case_ vire_unary_minus <<'EOF'

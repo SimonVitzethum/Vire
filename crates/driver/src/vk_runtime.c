@@ -1419,6 +1419,24 @@ int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) { return mesh_render(v
  * rasterizer interpolates (the classic RGB-corner triangle). Typed stage I/O. */
 int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render(verts, nfloats, 5); }
 
+/* vk_draw(verts, ux,uy,uz,uw): the generic draw surface — the program supplies BOTH the
+ * geometry (a flat [Float] array of interleaved (x,y), like vk_mesh) AND a vec4 uniform.
+ * The runtime renders it through the compiled @vertex/@fragment shaders; the uniform is
+ * pushed to the shader-declared push channel and read via `uniform()`. So "what to draw"
+ * (geometry) and "with what parameters" (uniform) both come from the Vire program, and
+ * the pipeline comes from its shaders — instead of a fixed per-demo entry point. Returns
+ * the centroid pixel 0xRRGGBB (or -1). */
+int64_t jrt_vk_draw(const double *verts, int64_t nfloats, double ux, double uy, double uz, double uw) {
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;   /* >=3 (x,y) vertices */
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw};
+    int64_t r=render_headless(f, nverts, 2, uni);
+    free(f);
+    return r;
+}
+
 /* vk_mesh_scene(offsets): MANY meshlets from a Vire scene buffer. The N (x,y) offsets
  * are uploaded to an SSBO (binding 0); one indirect dispatch of N mesh workgroups
  * (vkCmdDrawMeshTasksIndirectEXT) draws N meshlets — each mesh workgroup reads its own
