@@ -2885,6 +2885,14 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_texture_draw".into(), args: vec![Operand::Copy(ptr), len, w] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_chain(n): an N-pass render graph — a chain of passes where the runtime
+        // tracks each texture's layout and auto-inserts the barriers (deepened graph).
+        if name == "vk_chain" {
+            let n = args.first().map(|a| self.lower_expr(a).0).unwrap_or(Operand::ConstI64(3));
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_chain".into(), args: vec![n] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_two_pass(): a two-pass render graph — pass 1 draws to an offscreen texture,
         // an automatic layout barrier, pass 2 samples it (the program's tex(uv) @fragment).
         if name == "vk_two_pass" {

@@ -814,6 +814,27 @@ fn main() {
 }
 EOF
 
+# Render graph, deepened: vk_chain(n) is an N-pass chain — pass 0 renders red into a
+# texture, each pass i samples texture[i-1] into texture[i], a final copy reads the
+# last. The runtime TRACKS each texture's layout and auto-inserts the barrier at every
+# hop (not a fixed 2-pass). A 3-pass chain propagates the red → centroid (~229,51). A
+# missing/wrong barrier would give undefined data or a validation error, not red.
+case_ vire_chain <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut px = vk_chain(3)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 200 { if g < 80 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
