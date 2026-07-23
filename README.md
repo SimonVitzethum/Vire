@@ -223,6 +223,22 @@ subgraph is spread across operations, and a large collected garbage cycle's free
 deferred — all verified 0-live (Java oracle 67/67, a `listdrop` leak-catcher, a 2M-node
 ring, flat RSS across 8–16× allocation churn).
 
+**Temporal safety of the RC residual — a second eye beyond 0-live.** The 0-live oracle
+checks the heap *balance*, not the *timing*: for the interesting configuration (a heap
+object with the retain elided, so exactly one release), a premature free — dropping an
+object still reachable through a second reference — leaves `live_objects` at 0 anyway.
+So `FASTLLVM_GUARD_FREE=1` adds a non-perturbing check (companion to
+`FASTLLVM_HEAPSTATS`): each RC-managed object gets its own guard-paged mapping, and at
+`rc→0` the runtime `mprotect(PROT_NONE)`s it instead of recycling the memory, turning
+any premature free into a **deterministic SIGSEGV at the dereference**. It is runtime-
+only — codegen is byte-identical to the shipping binary, so unlike ASan it does not
+disturb the RC-elision it checks (a modeled premature free is caught; the same read
+without the guard silently returns recycled bytes). Every ownership program — `build(16)`,
+shared-child DAGs, escaping chains with a live alias, list traversal — runs **clean**
+under it. (The GPU/`@vulkan` binaries are excluded: the guard-page layout perturbs the
+GPU driver's own `atexit` teardown — a `SEGV_MAPERR` in its `munmap` cascade, i.e. an
+instrument artifact at the external-driver boundary, not an RC premature free.)
+
 ## Documents
 
 - **[TODO.md](TODO.md)** — roadmap and remaining work (M0 risk gate, front-end

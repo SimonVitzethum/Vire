@@ -171,6 +171,8 @@ static int fmt_spec_f(char *buf, const char *spec, double v) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h> /* FASTLLVM_GUARD_FREE: mmap/mprotect guard-page allocation */
+#include <unistd.h>
 static void *plat_alloc(size_t n) { return calloc(1, n); }
 static void *plat_realloc(void *p, size_t n) { return realloc(p, n); }
 static void plat_free(void *p) { free(p); }
@@ -1142,7 +1144,51 @@ static uint64_t rc_elide_counter = 0;
 #define FASTLLVM_COLLECTOR 1
 #endif
 
+/* FASTLLVM_GUARD_FREE=1 — a NON-PERTURBING temporal-safety probe (companion to
+ * FASTLLVM_HEAPSTATS). Each RC-managed heap object is placed on its own mmap'd
+ * guard region; at rc->0, free_obj mprotect(PROT_NONE)s it instead of recycling
+ * the memory. A premature free — an over-eagerly elided retain that dropped an
+ * object still reachable through a second reference — then becomes a DETERMINISTIC
+ * SIGSEGV at the exact load/store that dereferences the dangling pointer, rather
+ * than silently reading recycled bytes. Crucially this is runtime-only: codegen is
+ * byte-identical to the shipping binary, so unlike ASan it does not disturb the
+ * RC-elision it exists to check (the configuration the ownership thesis stands on:
+ * heap object, 0 retain, exactly one release — where the 0-live balance oracle is
+ * structurally blind to *when* the free happened). Hosted only; ~2 pages/object and
+ * never reclaimed, so run it on small inputs. A double-free faults too (the metadata
+ * page is poisoned as well). */
+#ifndef FASTLLVM_FREESTANDING
+static int g_guard = -1; /* -1 = uninitialised, 0 = off, 1 = on */
+static size_t g_page = 4096;
+static int guard_on(void) {
+    if (g_guard < 0) {
+        const char *e = getenv("FASTLLVM_GUARD_FREE");
+        g_guard = (e && e[0] && e[0] != '0') ? 1 : 0;
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps > 0) g_page = (size_t)ps;
+    }
+    return g_guard;
+}
+static void *guard_alloc(size_t size) {
+    size_t obj = (size + g_page - 1) & ~(g_page - 1); /* round the object up to whole pages */
+    size_t total = g_page + obj;                      /* one metadata page + the object pages */
+    char *m = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    *(size_t *)m = total;    /* stash the length so free_obj knows how much to poison */
+    return m + g_page;       /* the object lives on the (page-aligned) second page; mmap zeroes it */
+}
+static void guard_free(void *p) {
+    char *meta = (char *)p - g_page;
+    size_t total = *(size_t *)meta;         /* read the length BEFORE poisoning the page */
+    mprotect(meta, total, PROT_NONE);       /* poison object + metadata; do NOT munmap (keep the address dead) */
+}
+#endif
+
 static void free_obj(JObjHeader *h) {
+#ifndef FASTLLVM_FREESTANDING
+    if (guard_on()) { guard_free(h); CNT_DEC(live_objects); return; }
+#endif
     slab_free(h);
     CNT_DEC(live_objects);
 }
@@ -1391,7 +1437,11 @@ void *jrt_alloc(int64_t size) {
         return ap;
     }
 #endif
+#ifndef FASTLLVM_FREESTANDING
+    void *p = guard_on() ? guard_alloc((size_t)size) : slab_alloc((size_t)size);
+#else
     void *p = slab_alloc((size_t)size);
+#endif
     if (!p) {
         plat_puts("Exception in thread \"main\" java.lang.OutOfMemoryError\n");
         plat_abort();
