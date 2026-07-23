@@ -2820,6 +2820,14 @@ impl<'a> FnLower<'a> {
         // element kind for the atomic GEP).
         // @vulkan V2 bootstrap: render a self-verifying headless triangle, return
         // 1 on success (see crates/driver/src/vk_runtime.c, language/GPU-VULKAN.md).
+        // vk_frame_bg(r,g,b): the target of the declarative `frame { bg(r,g,b) }` — a
+        // frame cleared to (r,g,b); returns the centroid (the background colour).
+        if name == "vk_frame_bg" && args.len() == 3 {
+            let call_args: Vec<Operand> = args.iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_frame_bg".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_triangle" {
             // vk_triangle([a,b,c,d]): the optional four args are a vec4 `uniform()` the
             // fragment/vertex can read (host-controlled colour/params); default zero.

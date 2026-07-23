@@ -898,6 +898,24 @@ fn main() {
 }
 EOF
 
+# Declarative `frame { bg(r,g,b) }` syntax (language level): a render frame described by
+# directives, desugared at parse time to a builtin. `bg` sets the clear/background colour;
+# the frame has no geometry, so the centroid is the background. frame{bg(0.9,0.3,0.6)} ->
+# (229,76,153). `frame` is not a reserved word (only `frame {` triggers it).
+case_ vire_declframe <<'EOF'
+fn main() {
+    mut px = frame {
+        bg(0.9, 0.3, 0.6)
+    }
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r > 219 { if g > 66 { if g < 86 { if b > 143 { if b < 163 { ok = 1 } } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

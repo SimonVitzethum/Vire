@@ -990,6 +990,29 @@ impl Parser {
                 let name = format!("@{}", self.ident());
                 Expr::Ident(name, sp)
             }
+            // Declarative `frame { bg(r, g, b) }` — a render frame described by
+            // directives (first: `bg` = the clear/background colour). Desugars at parse
+            // time to a `vk_frame_bg(r, g, b)` builtin call. Not a reserved word: only
+            // `frame` immediately followed by `{` triggers this, so `frame` stays a
+            // usable identifier everywhere else.
+            Tok::Ident(ref n) if n == "frame" && matches!(self.peek_at(1), Tok::LBrace) => {
+                self.bump(); // frame
+                self.expect(&Tok::LBrace, "'{'");
+                self.skip_nl();
+                let (r, g, b) = if matches!(self.peek(), Tok::Ident(d) if d == "bg") {
+                    self.bump(); // bg
+                    self.expect(&Tok::LParen, "'('");
+                    let r = self.parse_expr(0); self.expect(&Tok::Comma, "','");
+                    let g = self.parse_expr(0); self.expect(&Tok::Comma, "','");
+                    let b = self.parse_expr(0); self.expect(&Tok::RParen, "')'");
+                    (r, g, b)
+                } else {
+                    (Expr::Float(0.08, sp), Expr::Float(0.08, sp), Expr::Float(0.10, sp))
+                };
+                self.skip_nl();
+                self.expect(&Tok::RBrace, "'}'");
+                Expr::Call { callee: Box::new(Expr::Ident("vk_frame_bg".into(), sp)), args: vec![r, g, b], span: sp }
+            }
             Tok::Ident(_) => {
                 // Lambda `x -> e`?
                 if matches!(self.peek_at(1), Tok::Arrow) {
