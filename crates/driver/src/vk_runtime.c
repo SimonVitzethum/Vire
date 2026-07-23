@@ -1624,7 +1624,7 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
  *      program whose @fragment reads uniform() shows an animation. Interactive windowed
  *      rendering. frames=0: until the window is closed. Returns 1, or 0 without a
  *      display/window. ---- */
-int64_t jrt_vk_window(int64_t frames) {
+static int64_t vk_window_impl(const float *verts, uint32_t nverts, int64_t frames) {
     if(!glfwInit()) return 0;
     if(!glfwVulkanSupported()){ glfwTerminate(); return 0; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -1676,7 +1676,7 @@ int64_t jrt_vk_window(int64_t frames) {
     VkImage *imgs=malloc(nimg*sizeof*imgs); vkGetSwapchainImagesKHR(dev,sw,&nimg,imgs);
     VkRenderPass rp=build_rp(dev,sf.format,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR); if(!rp) return 0;
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0,0); if(!pipe) return 0;
-    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,6,&vbuf,&vmem)) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,verts,nverts*2,&vbuf,&vmem)) return 0;
 
     VkImageView *views=malloc(nimg*sizeof*views); VkFramebuffer *fbs=malloc(nimg*sizeof*fbs);
     VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=qf};
@@ -1690,7 +1690,7 @@ int64_t jrt_vk_window(int64_t frames) {
         VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&views[i],.width=W,.height=H,.layers=1};
         CK(vkCreateFramebuffer(dev,&fbi,0,&fbs[i]));
         float uni[4]={0,0,0,0};
-        rec_draw(cmds[i],rp,fbs[i],pipe,W,H,vbuf,3,pl,uni); CK(vkEndCommandBuffer(cmds[i]));
+        rec_draw(cmds[i],rp,fbs[i],pipe,W,H,vbuf,nverts,pl,uni); CK(vkEndCommandBuffer(cmds[i]));
     }
     VkSemaphoreCreateInfo semi={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,.flags=VK_FENCE_CREATE_SIGNALED_BIT};
@@ -1706,7 +1706,7 @@ int64_t jrt_vk_window(int64_t frames) {
          * reads uniform()), so the window shows a moving colour — interactive rendering. */
         { float t=(float)(count%120)/120.0f; float uni[4]={t,1.0f-t,0.5f,1.0f};
           vkResetCommandBuffer(cmds[idx],0);
-          rec_draw(cmds[idx],rp,fbs[idx],pipe,W,H,vbuf,3,pl,uni); vkEndCommandBuffer(cmds[idx]); }
+          rec_draw(cmds[idx],rp,fbs[idx],pipe,W,H,vbuf,nverts,pl,uni); vkEndCommandBuffer(cmds[idx]); }
         VkPipelineStageFlags wait=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.waitSemaphoreCount=1,.pWaitSemaphores=&avail,.pWaitDstStageMask=&wait,
             .commandBufferCount=1,.pCommandBuffers=&cmds[idx],.signalSemaphoreCount=1,.pSignalSemaphores=&done};
@@ -1725,4 +1725,18 @@ int64_t jrt_vk_window(int64_t frames) {
     glfwDestroyWindow(win); glfwTerminate();
     free(imgs); free(views); free(fbs); free(cmds);
     return 1;
+}
+/* vk_window(frames): the default animated triangle. */
+int64_t jrt_vk_window(int64_t frames) { return vk_window_impl(DEFAULT_TRI, 3, frames); }
+/* vk_window_mesh(verts, nfloats, frames): present ARBITRARY Vire geometry in the window —
+ * `verts` is a flat [Float] of interleaved (x,y), f64, drawn as a triangle list and
+ * animated (the @fragment reads uniform()). */
+int64_t jrt_vk_window_mesh(const double *verts, int64_t nfloats, int64_t frames) {
+    if(!verts || nfloats < 6 || (nfloats & 1)) return 0;
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *xy=malloc((size_t)nfloats*sizeof(float)); if(!xy) return 0;
+    for(int64_t i=0;i<nfloats;i++) xy[i]=(float)verts[i];
+    int64_t r=vk_window_impl(xy, nverts, frames);
+    free(xy);
+    return r;
 }

@@ -2984,6 +2984,18 @@ impl<'a> FnLower<'a> {
         // vk_mesh: position-only geometry (jrt_vk_mesh). vk_mesh_c: per-vertex
         // attributes — the [Float] interleaves (x,y, r,g,b), read in the @vertex via
         // attr_color() (jrt_vk_mesh_c). Both pass the proven (data-ptr, count) pair.
+        // vk_window_mesh(verts, frames): present ARBITRARY Vire geometry in a window —
+        // the flat [Float] of interleaved (x,y) is drawn as an animated triangle list.
+        if name == "vk_window_mesh" && args.len() == 2 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let frames = self.lower_expr(&args[1]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_window_mesh".into(), args: vec![Operand::Copy(ptr), len, frames] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_mesh_scene_cull(offsets, nx, ny, nz, d): the fused GPU-driven cull path —
         // the scene SSBO plus a frustum plane; the @task tests each meshlet and emits
         // only survivors, the @mesh draws them (payload carries the index).
