@@ -2883,6 +2883,23 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_buffer_new".into(), args: vec![Operand::Copy(ptr), len] });
             return (Operand::Copy(d), Ty::Ref);
         }
+        // vk_session(): a persistent render session (RC-bound handle) — the target,
+        // pipeline and buffers are created once and reused. vk_frame(s, r,g,b,a) renders
+        // one frame with that uniform (Vire drives the per-frame loop). The session frees
+        // its GPU objects when the handle drops.
+        if name == "vk_session" && args.is_empty() {
+            let d = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_session".into(), args: vec![] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        if name == "vk_frame" && args.len() == 5 {
+            let h = self.lower_expr(&args[0]).0;
+            let mut call_args = vec![h];
+            for a in &args[1..5] { call_args.push(self.lower_expr(a).0); }
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_frame".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_buffer_get" && args.len() == 2 {
             let h = self.lower_expr(&args[0]).0;
             let i = self.lower_expr(&args[1]).0;

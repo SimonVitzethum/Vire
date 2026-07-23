@@ -557,6 +557,90 @@ double jrt_vk_buffer_get(void *handle, int64_t i) {
     double v=(double)p[i]; vkUnmapMemory(g_dev,b->mem); return v;
 }
 
+/* A persistent headless RENDER SESSION (a third RC-bound resource): the render target,
+ * pipeline, vertex buffer and readback buffer are created ONCE and reused across frames,
+ * so a Vire-driven loop can render many frames without per-frame setup — the interactive
+ * rendering core. vk_frame(session, r,g,b,a) renders one frame with the uniform and
+ * returns the centroid; the session (and all its GPU objects) is freed when the RC
+ * handle drops. */
+enum { SW=256, SH=256 };
+typedef struct { int64_t refcount; void *vtable;
+    VkImage img; VkDeviceMemory imem; VkImageView view; VkRenderPass rp; VkFramebuffer fb;
+    VkPipeline pipe; VkPipelineLayout pl; VkBuffer vbuf; VkDeviceMemory vmem; VkBuffer rbuf; VkDeviceMemory rbmem; VkCommandPool cp; } GpuSession;
+static void gpu_session_drop(void *p) {
+    GpuSession *s=(GpuSession*)p;
+    if(s->cp) vkDestroyCommandPool(g_dev,s->cp,0);
+    if(s->rbuf) vkDestroyBuffer(g_dev,s->rbuf,0); if(s->rbmem) vkFreeMemory(g_dev,s->rbmem,0);
+    if(s->vbuf) vkDestroyBuffer(g_dev,s->vbuf,0); if(s->vmem) vkFreeMemory(g_dev,s->vmem,0);
+    if(s->pipe) vkDestroyPipeline(g_dev,s->pipe,0); if(s->pl) vkDestroyPipelineLayout(g_dev,s->pl,0);
+    if(s->fb) vkDestroyFramebuffer(g_dev,s->fb,0); if(s->rp) vkDestroyRenderPass(g_dev,s->rp,0);
+    if(s->view) vkDestroyImageView(g_dev,s->view,0); if(s->img) vkDestroyImage(g_dev,s->img,0); if(s->imem) vkFreeMemory(g_dev,s->imem,0);
+}
+static void gpu_session_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; }
+static void *gpu_session_vt[2] = { (void*)gpu_session_drop, (void*)gpu_session_trace };
+
+/* vk_session(): build a persistent headless render session; return an RC-bound handle. */
+void *jrt_vk_session(void) {
+    if(!ctx_init()) return 0;
+    GpuSession *s=(GpuSession*)jrt_alloc((int64_t)sizeof(GpuSession));
+    memset((char*)s+sizeof(int64_t)+sizeof(void*), 0, sizeof(GpuSession)-sizeof(int64_t)-sizeof(void*));
+    s->vtable=gpu_session_vt;
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={SW,SH,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    if(vkCreateImage(g_dev,&ii,0,&s->img)!=VK_SUCCESS) return s;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev,s->img,&mr);
+    uint32_t it=find_mem(g_pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return s;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    vkAllocateMemory(g_dev,&ma,0,&s->imem); vkBindImageMemory(g_dev,s->img,s->imem,0);
+    VkImageViewCreateInfo ivi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=s->img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    vkCreateImageView(g_dev,&ivi,0,&s->view);
+    s->rp=build_rp(g_dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=s->rp,.attachmentCount=1,.pAttachments=&s->view,.width=SW,.height=SH,.layers=1};
+    vkCreateFramebuffer(g_dev,&fbi,0,&s->fb);
+    s->pipe=build_pipeline(g_dev,s->rp,SW,SH,&s->pl,0,0);
+    make_vbuf(g_dev,g_pd,DEFAULT_TRI,6,&s->vbuf,&s->vmem);
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=SW*SH*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    vkCreateBuffer(g_dev,&bi,0,&s->rbuf);
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(g_dev,s->rbuf,&br);
+    uint32_t bt=find_mem(g_pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    vkAllocateMemory(g_dev,&bm,0,&s->rbmem); vkBindBufferMemory(g_dev,s->rbuf,s->rbmem,0);
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=g_gqf};
+    vkCreateCommandPool(g_dev,&cpi,0,&s->cp);
+    return s;
+}
+/* vk_frame(handle, r,g,b,a): render one frame with the given uniform (the @fragment
+ * reads uniform()); return the centroid pixel 0xRRGGBB. Reuses the session's persistent
+ * pipeline/target — no per-frame setup. Borrows the handle. */
+int64_t jrt_vk_frame(void *handle, double r, double g, double b, double a) {
+    if(!handle || !g_ctx_ok) return -1;
+    GpuSession *s=(GpuSession*)handle; if(!s->pipe) return -1;
+    float uni[4]={(float)r,(float)g,(float)b,(float)a};
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=s->cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; if(vkAllocateCommandBuffers(g_dev,&cai,&cmd)!=VK_SUCCESS) return -1;
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(cmd,&cbi);
+    VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=s->rp,.framebuffer=s->fb,.renderArea={{0,0},{SW,SH}},.clearValueCount=1,.pClearValues=&clear};
+    vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,s->pipe);
+    vkCmdPushConstants(cmd,s->pl,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,16,uni);
+    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&s->vbuf,&off); vkCmdDraw(cmd,3,1,0,0);
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={SW,SH,1}};
+    vkCmdCopyImageToBuffer(cmd,s->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,s->rbuf,1,&rg);
+    vkEndCommandBuffer(cmd);
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fe; vkCreateFence(g_dev,&fci,0,&fe);
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    vkQueueSubmit(g_gq,1,&si,fe); vkWaitForFences(g_dev,1,&fe,VK_TRUE,~0ull);
+    unsigned char *px; vkMapMemory(g_dev,s->rbmem,0,SW*SH*4,0,(void**)&px);
+    int scx=SW/2, scy=(int)(SH*0.55); unsigned char *c=&px[(scy*SW+scx)*4];
+    int64_t packed=((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
+    vkUnmapMemory(g_dev,s->rbmem);
+    vkDestroyFence(g_dev,fe,0); vkFreeCommandBuffers(g_dev,s->cp,1,&cmd);
+    return packed;
+}
+
 /* vk_texture_new(pixels, nfloats, w): create a PERSISTENT GPU texture from Vire data and
  * return an RC-bound handle (a Vire object). The GPU texture lives until the handle's
  * last reference drops (Vire RC → gpu_tex_drop). Returns 0 on failure. */

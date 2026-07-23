@@ -871,6 +871,33 @@ fn main() {
 }
 EOF
 
+# Persistent render session + per-frame Vire-driven rendering (interactive core, RC-bound):
+# vk_session() creates a persistent target+pipeline+buffers ONCE (a third RC handle type);
+# a Vire while-loop calls vk_frame(s, r,g,b,a) each frame with an animating uniform (no
+# per-frame setup). The last frame (r=0.8) reads (204,76,128). The session's GPU objects
+# are freed when s drops (verified 0-live elsewhere).
+case_ vire_session <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut u = uniform()
+    vec4(u.x, u.y, u.z, 1.0)
+}
+fn main() {
+    mut s = vk_session()
+    mut i = 0
+    mut r = 0.0
+    mut last = 0
+    while i < 5 {
+        last = vk_frame(s, r, 0.3, 0.5, 1.0)
+        r = r + 0.2
+        i = i + 1
+    }
+    mut ok = 0
+    if last / 65536 > 195 { if (last / 256) % 256 > 66 { if last % 256 > 118 { ok = 1 } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

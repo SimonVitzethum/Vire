@@ -449,12 +449,12 @@ impl<'a> Ctx<'a> {
                         | "gpu_fmax" => return T::F64,
                         "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
-                        | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window" | "vk_bench" | "vk_textured" | "vk_two_pass" | "vk_chain" | "vk_blend2" | "vk_texture_draw" | "vk_draw_handle"
+                        | "gpu_warp_reduce_add" | "vk_triangle" | "vk_window" | "vk_bench" | "vk_textured" | "vk_two_pass" | "vk_chain" | "vk_blend2" | "vk_frame" | "vk_texture_draw" | "vk_draw_handle"
                         | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader"
                         | "vk_mesh_scene" | "vk_mesh_scene_cull"
                         | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
                         // Returns an RC-bound GPU texture handle (a Vire object).
-                        "vk_texture_new" | "vk_buffer_new" => return T::Ref,
+                        "vk_texture_new" | "vk_buffer_new" | "vk_session" => return T::Ref,
                         "vk_buffer_get" => return T::F64,
                         _ => {}
                     }
