@@ -1619,7 +1619,11 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     return corner_clear ? packed : -1;
 }
 
-/* ---- windowed: open a window and present the triangle (frames=0: until closed) ---- */
+/* ---- windowed: open a window and present the triangle, ANIMATED — each frame's
+ *      command buffer is re-recorded with a per-frame uniform (a moving colour), so a
+ *      program whose @fragment reads uniform() shows an animation. Interactive windowed
+ *      rendering. frames=0: until the window is closed. Returns 1, or 0 without a
+ *      display/window. ---- */
 int64_t jrt_vk_window(int64_t frames) {
     if(!glfwInit()) return 0;
     if(!glfwVulkanSupported()){ glfwTerminate(); return 0; }
@@ -1675,7 +1679,7 @@ int64_t jrt_vk_window(int64_t frames) {
     VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,6,&vbuf,&vmem)) return 0;
 
     VkImageView *views=malloc(nimg*sizeof*views); VkFramebuffer *fbs=malloc(nimg*sizeof*fbs);
-    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=qf};
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBuffer *cmds=malloc(nimg*sizeof*cmds);
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=nimg};
@@ -1698,6 +1702,11 @@ int64_t jrt_vk_window(int64_t frames) {
         glfwPollEvents();
         vkWaitForFences(dev,1,&inflight,VK_TRUE,~0ull); vkResetFences(dev,1,&inflight);
         uint32_t idx=0; if(vkAcquireNextImageKHR(dev,sw,~0ull,avail,0,&idx)!=VK_SUCCESS) break;
+        /* animate: re-record the acquired image with a per-frame uniform (the @fragment
+         * reads uniform()), so the window shows a moving colour — interactive rendering. */
+        { float t=(float)(count%120)/120.0f; float uni[4]={t,1.0f-t,0.5f,1.0f};
+          vkResetCommandBuffer(cmds[idx],0);
+          rec_draw(cmds[idx],rp,fbs[idx],pipe,W,H,vbuf,3,pl,uni); vkEndCommandBuffer(cmds[idx]); }
         VkPipelineStageFlags wait=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.waitSemaphoreCount=1,.pWaitSemaphores=&avail,.pWaitDstStageMask=&wait,
             .commandBufferCount=1,.pCommandBuffers=&cmds[idx],.signalSemaphoreCount=1,.pSignalSemaphores=&done};

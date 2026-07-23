@@ -1,0 +1,23 @@
+// Vire @vulkan — interactive windowed rendering with a per-frame animated uniform.
+//
+//   vire run examples/vire/vulkan_animate.vr
+//
+// Opens a real window (GLFW + Vulkan swapchain) and presents an ANIMATED triangle: the
+// window loop re-records each frame with a per-frame uniform (a colour that cycles), and
+// the @fragment below reads it with uniform() — so the colour moves over time. This is
+// the interactive-rendering path (a live window, per-frame state), the windowed
+// counterpart to the headless per-frame session (vk_session/vk_frame). Pass a frame count
+// to run that many frames and exit, or 0 to run until you close the window.
+// See language/GPU-VULKAN.md.
+
+@fragment
+fn fs() -> Vec4 {
+    mut u = uniform()              // the per-frame animated colour
+    vec4(u.x, u.y, u.z, 1.0)
+}
+
+fn main() {
+    // 0 = present until the window is closed; a positive count runs that many frames.
+    mut ok = vk_window(0)
+    print(ok)                      // 1 = presented, 0 = no display available
+}

@@ -347,7 +347,7 @@ unsound or genuinely multi-week are marked *skipped* with the reason.
   minimal handle, else document.*
 - [~] **Render graph → auto barriers (layout transitions + N-pass chain + multi-input DAG DONE) / declarative `frame { … }`** — *architectural,
   multi-week; document honestly, do not fake.*
-- [~] **Windowed arbitrary geometry + per-frame Vire draw callback** — *needs a persistent
+- [~] **Windowed arbitrary geometry + per-frame draw (animated window + Vire-driven session DONE)** — *needs a persistent
   context; attempt, else document.*
 
 **Investigated — high value, de-risked, multi-quarter.** Full design, safety
