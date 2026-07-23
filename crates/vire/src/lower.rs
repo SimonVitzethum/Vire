@@ -2851,6 +2851,20 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_textured".into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_texture_draw(pixels, w): a texture as a first-class Vire value. `pixels` is
+        // an RC-managed [Float] of interleaved RGBA (0..1); the GPU resource is derived
+        // per call, so the handle (the array) is lifetime-safe by construction. Renders
+        // the triangle sampling it (the program's tex(uv)); returns the centroid pixel.
+        if name == "vk_texture_draw" && args.len() == 2 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let w = self.lower_expr(&args[1]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_texture_draw".into(), args: vec![Operand::Copy(ptr), len, w] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_two_pass(): a two-pass render graph — pass 1 draws to an offscreen texture,
         // an automatic layout barrier, pass 2 samples it (the program's tex(uv) @fragment).
         if name == "vk_two_pass" {

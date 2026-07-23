@@ -770,6 +770,28 @@ fn main() {
 }
 EOF
 
+# Texture as a first-class Vire value (typed-handle first step): vk_texture_draw(pix, w)
+# builds a GPU texture from an RC-managed [Float] of RGBA and renders sampling it — the
+# handle (the Vire array) is lifetime-safe by construction (no GPU resource outlives the
+# call). A 2x2 texture whose texel(1,1)=(0.2,0.8,0.4) → centroid (51,204,102).
+case_ vire_texture_value <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut uv = vec2(frag_x() / 256.0, frag_y() / 256.0)
+    tex(uv)
+}
+fn main() {
+    mut pix = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.2, 0.8, 0.4, 1.0]
+    mut px = vk_texture_draw(pix, 2)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut b = px % 256
+    mut ok = 0
+    if r < 70 { if g > 185 { if b > 85 { if b < 120 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
