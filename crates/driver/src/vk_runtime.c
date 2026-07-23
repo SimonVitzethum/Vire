@@ -67,6 +67,22 @@ static VkDescriptorSetLayout mk_dsl_reflected(VkDevice dev) {
     return dsl;
 }
 
+/* Build a VkPipelineLayout from a descriptor-set layout (may be 0) plus the REFLECTED
+ * push-constant range (VK_IFACE_PUSH_SIZE/STAGES from the shader). push_size == 0 → no
+ * range. Together with mk_dsl_reflected() this makes the whole pipeline layout —
+ * descriptors AND push — come from the shader signatures rather than a hardcoded range.
+ * (The graphics vertex/fragment pipeline keeps its fixed 16-byte per-frame `uniform()`
+ * channel; this reflected path is for the mesh/task stages whose push IS the shader's
+ * `cull_plane()`.) Returns 1 on success. */
+static int mk_pipeline_layout_reflected(VkDevice dev, VkDescriptorSetLayout dsl, VkPipelineLayout *out) {
+    VkPushConstantRange pcr={.stageFlags=VK_IFACE_PUSH_STAGES,.offset=0,.size=VK_IFACE_PUSH_SIZE};
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount=(dsl?1u:0u),.pSetLayouts=(dsl?&dsl:0),
+        .pushConstantRangeCount=(VK_IFACE_PUSH_SIZE?1u:0u),
+        .pPushConstantRanges=(VK_IFACE_PUSH_SIZE?&pcr:0)};
+    return vkCreatePipelineLayout(dev,&plci,0,out)==VK_SUCCESS;
+}
+
 /* Insert the correct pipeline barrier for an image layout transition — the render
  * graph's "minimal correct barriers": src/dst access masks + pipeline stages are
  * derived from (old,new) layouts, so callers don't hand-tune them. Covers the
@@ -269,14 +285,10 @@ static VkPipeline build_mesh_pipeline(VkDevice dev, VkRenderPass rp, uint32_t w,
     VkPipelineMultisampleStateCreateInfo msi={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
-    /* A 16-byte push constant (the frustum plane) for the amplification/task cull.
-     * The range's stages must be a subset of the pipeline's — include TASK only when
-     * a task stage exists, else the mesh stage. */
-    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
-    VkPushConstantRange pcr={.stageFlags=pcStages,.offset=0,.size=16};
-    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr,
-        .setLayoutCount=(dsl?1u:0u),.pSetLayouts=(dsl?&dsl:0)};
-    if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
+    /* Pipeline layout — descriptor set AND the push-constant range (the frustum plane
+     * for the @task `cull_plane()`) both REFLECTED from the shader interface, so the
+     * range's size and stage mask come from which stage actually reads the push. */
+    if(!mk_pipeline_layout_reflected(dev, dsl, out_layout)) return 0;
     VkPipelineDepthStencilStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable=VK_TRUE,.depthWriteEnable=VK_TRUE,.depthCompareOp=VK_COMPARE_OP_LESS};
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=nst,.pStages=st,
@@ -1537,8 +1549,8 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
     vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&dset,0,0);
-    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
-    vkCmdPushConstants(cmd,pl,pcStages,0,16,plane);   /* frustum plane for the @task cull */
+    VkShaderStageFlags pcStages = VK_IFACE_PUSH_STAGES;  /* reflected: the stage that reads cull_plane() */
+    vkCmdPushConstants(cmd,pl,pcStages,0,VK_IFACE_PUSH_SIZE,plane);   /* frustum plane for the @task cull */
     draw_indirect(cmd,ibuf,0,1,sizeof icmd);      /* N task/mesh workgroups, one indirect dispatch */
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
@@ -1679,8 +1691,8 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=2,.pClearValues=clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
-    VkShaderStageFlags pcStages = (VK_TASK_TRI_N>0) ? (VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT) : VK_SHADER_STAGE_MESH_BIT_EXT;
-    vkCmdPushConstants(cmd,pl,pcStages,0,16,plane);   /* the frustum plane for @task cull */
+    VkShaderStageFlags pcStages = VK_IFACE_PUSH_STAGES;  /* reflected: the stage that reads cull_plane() */
+    vkCmdPushConstants(cmd,pl,pcStages,0,VK_IFACE_PUSH_SIZE,plane);   /* the frustum plane for @task cull */
     draw_mesh(cmd,1,1,1);                    /* one task workgroup → one meshlet */
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};

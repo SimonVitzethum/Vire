@@ -409,10 +409,16 @@ Staged (each stage runnable):
   it via one generic `mk_dsl_reflected()` instead of a hardcoded per-demo layout. Wired
   for the textured (1 sampler), 2-sampler blend, and mesh/meshlet SSBO paths — the
   binding, descriptor type AND stage mask now come from the shader, verified
-  pixel-identical (`tests/vire_vulkan.sh`, 36). *Remaining:* derive the **push-constant
-  range** and the **pipeline layout** from the interface too (today the runtime still
-  hardcodes the vec4 push range + the standalone compute-dispatch dsl), texture arrays,
-  and the `draw(pipe, mesh, uniforms)` host surface.
+  pixel-identical (`tests/vire_vulkan.sh`, 36). *Push-constant range + pipeline layout
+  DONE for the mesh/meshlet path:* one `mk_pipeline_layout_reflected()` builds the
+  `VkPipelineLayout` from the reflected dsl + the reflected push range
+  (`VK_IFACE_PUSH_SIZE/STAGES`), and the `@task cull_plane()` push command pushes to the
+  reflected stage — so the range's size and stage mask come from *which stage reads the
+  push*, not `MESH | maybe TASK`. The whole mesh pipeline layout (descriptors + push) is
+  now shader-derived. *Remaining:* the graphics vertex/fragment pipeline keeps its fixed
+  16-byte per-frame `uniform()` channel (a runtime protocol, always pushed — not a
+  shader-varying quantity), the standalone compute-dispatch dsl (size-4 host count),
+  texture arrays, and the `draw(pipe, mesh, uniforms)` host surface.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

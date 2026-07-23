@@ -34,8 +34,12 @@ lines of C++/Rust setup. The **descriptor-set layout is now derived from the sha
 the runtime builds the `VkDescriptorSetLayout` from it via one generic reflected path —
 the binding, descriptor type, and stage mask come from the shader, not a hardcoded
 per-demo layout (verified pixel-identical across textured / multi-sampler / meshlet-SSBO
-paths). Still hardcoded and on the roadmap: the push-constant range, the full pipeline
-layout, and a `draw(pipe, mesh, uniforms)` host surface (see [TODO.md](TODO.md) V3/V4).
+paths). For the **mesh/meshlet path the whole pipeline layout is now shader-derived** —
+the descriptor set *and* the push-constant range (size + stage mask) come from the
+shader, so the `@task cull_plane()` push targets exactly the stage that reads it. Still a
+fixed runtime protocol (not shader-varying): the graphics vertex/fragment pipeline's
+16-byte per-frame `uniform()` channel and the compute-dispatch count; and on the roadmap
+a `draw(pipe, mesh, uniforms)` host surface (see [TODO.md](TODO.md) V3/V4).
 See [benchmarks/vulkan/](benchmarks/vulkan/) and [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
 
 ## The idea in one paragraph
