@@ -364,7 +364,36 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_gq; static uint32_t g_gqf; static int g_ctx_ok=0;
 static int g_has_mesh=0;
 static PFN_vkCmdDrawMeshTasksIndirectEXT g_draw_mesh=0;
+/* The persistent context + pipeline cache are shared mutable state, and the render queue
+ * (g_gq) is not externally synchronised — so `vk_*` rendering is SINGLE-THREADED. Under
+ * threads a lock serialises context init + cache access + submission (correctness over
+ * concurrency; GPU renders serialise anyway). Without threads it compiles to nothing. */
+#if defined(FASTLLVM_THREADS)
+#include <pthread.h>
+static pthread_mutex_t g_vk_lock = PTHREAD_MUTEX_INITIALIZER;
+#define VK_LOCK()   pthread_mutex_lock(&g_vk_lock)
+#define VK_UNLOCK() pthread_mutex_unlock(&g_vk_lock)
+#else
+#define VK_LOCK()   ((void)0)
+#define VK_UNLOCK() ((void)0)
+#endif
+/* FNV-1a over a shader's SPIR-V words — folded into the pipeline-cache key so two
+ * different shaders can never collide on the same (mode,depth,size) slot. */
+static uint64_t spv_hash(const uint32_t *code, unsigned n) {
+    uint64_t h=1469598103934665603ull;
+    for(unsigned i=0;i<n;i++){ h^=code[i]; h*=1099511628211ull; }
+    return h;
+}
+/* Locking wrapper: first init wins, others wait, everyone sees the ready context. */
+static int ctx_init_unlocked(void);
 static int ctx_init(void) {
+    if(g_ctx_ok) return 1;                 /* fast path — already initialised */
+    VK_LOCK();
+    int r = g_ctx_ok ? 1 : ctx_init_unlocked();
+    VK_UNLOCK();
+    return r;
+}
+static int ctx_init_unlocked(void) {
     if(g_ctx_ok) return 1;
     /* API 1.3 instance so VK_EXT_mesh_shader (a 1.3-era device extension) is usable. */
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
@@ -402,19 +431,23 @@ static int ctx_init(void) {
  * its layout — keyed by (vertex mode, depth, W, H). Building a pipeline compiles the
  * SPIR-V; an animation that renders the same shaders every frame must not pay that per
  * frame. Lives on the persistent context, so it is built once and reused. */
-typedef struct { int valid; int vmode, depth; uint32_t w, h; VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl; } RCacheEntry;
+typedef struct { int valid; int vmode, depth; uint32_t w, h; uint64_t shash; VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl; } RCacheEntry;
 static RCacheEntry g_rcache[8];
 static int rcache_get(VkDevice dev, int vmode, int depth, uint32_t w, uint32_t h,
                       VkRenderPass *rp, VkPipeline *pipe, VkPipelineLayout *pl) {
+    /* The shader IS part of the key (hashed), so two @vertex/@fragment pairs can never
+     * share a slot even at the same mode/depth/size — a wrong-pipeline hit is impossible. */
+    uint64_t sh = spv_hash(VK_TRI_VERT,VK_TRI_VERT_N) ^ (spv_hash(VK_TRI_FRAG,VK_TRI_FRAG_N)*3);
+    VK_LOCK();   /* the cache map is shared mutable state — serialise access */
     for(int i=0;i<8;i++){ RCacheEntry *e=&g_rcache[i];
-        if(e->valid && e->vmode==vmode && e->depth==depth && e->w==w && e->h==h){ *rp=e->rp; *pipe=e->pipe; *pl=e->pl; return 1; } }
+        if(e->valid && e->vmode==vmode && e->depth==depth && e->w==w && e->h==h && e->shash==sh){ *rp=e->rp; *pipe=e->pipe; *pl=e->pl; VK_UNLOCK(); return 1; } }
     VkRenderPass r = depth ? build_rp_d(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,1)
                            : build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    if(!r) return 0;
+    if(!r){ VK_UNLOCK(); return 0; }
     VkPipelineLayout layout; VkPipeline p=build_pipeline_d(dev,r,w,h,&layout,vmode,0,VK_TRI_FRAG,VK_TRI_FRAG_N,depth);
-    if(!p){ vkDestroyRenderPass(dev,r,0); return 0; }
-    for(int i=0;i<8;i++){ RCacheEntry *e=&g_rcache[i]; if(!e->valid){ *e=(RCacheEntry){1,vmode,depth,w,h,r,p,layout}; break; } }
-    *rp=r; *pipe=p; *pl=layout; return 1;
+    if(!p){ vkDestroyRenderPass(dev,r,0); VK_UNLOCK(); return 0; }
+    for(int i=0;i<8;i++){ RCacheEntry *e=&g_rcache[i]; if(!e->valid){ *e=(RCacheEntry){1,vmode,depth,w,h,sh,r,p,layout}; break; } }
+    *rp=r; *pipe=p; *pl=layout; VK_UNLOCK(); return 1;
 }
 
 /* Headless render resolution — square, default 256, settable from Vire via vk_resolution(n).

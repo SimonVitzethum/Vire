@@ -26,6 +26,15 @@ stage() {  # stage <name> <command...>
     else printf '  [FAIL] %s\n' "$name"; stages_failed="$stages_failed $name"; fi
 }
 
+# 0. C syntax of the embedded runtime sources. cargo only `include_str!`s them — clang
+#    doesn't touch vk_runtime.c until a Vire @vulkan program is built WITH a device, so a
+#    C syntax error there sails green through the whole gate on any deviceless machine
+#    (CI, GPU busy). -fsyntax-only needs no GPU and closes that gap.
+if command -v clang >/dev/null 2>&1; then
+    stage "vk_runtime.c syntax" clang -fsyntax-only "$root/crates/driver/src/vk_runtime.c"
+    stage "runtime.c syntax"    clang -fsyntax-only "$root/crates/driver/src/runtime.c"
+fi
+
 # 1. cargo — build release first (the suites need the binary), then test.
 stage "cargo build --release" cargo build --release
 stage "cargo test --release"  cargo test --release --workspace
