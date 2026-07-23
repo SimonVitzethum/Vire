@@ -428,8 +428,11 @@ Staged (each stage runnable):
   with program geometry + uniform — so one generic draw covers the textured case, pipeline
   + descriptor layout from the shader, resource + geometry + parameters from the program
   (`tests/vire_vulkan.sh vire_draw_tex`, 38; the fixed `vk_draw_handle` now shares the same
-  `draw_res_geo` path). *Remaining:* the same for storage-buffer/meshlet handles, and
-  multiple reflected bindings in one draw.
+  `draw_res_geo` path). *Multiple reflected bindings DONE:* `draw_res_geo` takes a handle
+  array and binds each to `VK_IFACE_BINDING[i]`, so `vk_draw_tex2(verts, h0, h1, ux..uw)`
+  binds two textures to the two reflected sampler bindings of a `tex()`+`tex2()` blend
+  @fragment (`tests/vire_vulkan.sh vire_draw_tex2`, 39). *Remaining:* storage-buffer/meshlet
+  handles through the same surface (needs the GpuBuf write path + per-binding kind switch).
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

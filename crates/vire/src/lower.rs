@@ -3078,6 +3078,22 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_draw_tex2(verts, h0, h1, ux,uy,uz,uw): generic draw with TWO reflected
+        // sampler bindings — h0 -> binding[0], h1 -> binding[1] (a 2-texture blend).
+        if name == "vk_draw_tex2" && args.len() == 7 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let h0 = self.lower_expr(&args[1]).0;
+            let h1 = self.lower_expr(&args[2]).0;
+            let uni: Vec<Operand> = args[3..7].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len, h0, h1];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex2".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_mesh" || name == "vk_mesh_c" || name == "vk_mesh_scene" {
             let sym = match name.as_str() {
                 "vk_mesh_c" => "jrt_vk_mesh_c",

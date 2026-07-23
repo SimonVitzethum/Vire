@@ -798,9 +798,8 @@ void *jrt_vk_texture_new(const double *pixels, int64_t nfloats, int64_t w) {
  * `handle`, with the vec4 `uni` pushed. The descriptor-set layout is REFLECTED from the
  * shader (mk_dsl_reflected), and the handle's texture is written to the reflected sampler
  * binding — so a single generic path binds the reflected resource. Persistent context. */
-static int64_t draw_res_geo(void *handle, const float *fdata, uint32_t nverts, const float uni[4]) {
-    if(!handle || !g_ctx_ok) return -1;
-    GpuTex *ht=(GpuTex*)handle;
+static int64_t draw_res_geo(void **handles, uint32_t nh, const float *fdata, uint32_t nverts, const float uni[4]) {
+    if((nh && !handles) || !g_ctx_ok) return -1;
     enum { W=256, H=256 };
     VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
@@ -818,15 +817,22 @@ static int64_t draw_res_geo(void *handle, const float *fdata, uint32_t nverts, c
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
     /* descriptor-set layout reflected from the @fragment's tex() usage (V3) */
     VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
-    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
+    /* Bind each supplied handle to ITS reflected binding — the caller passes handles in
+     * binding order, and each goes to VK_IFACE_BINDING[i], so multiple reflected samplers
+     * (e.g. a 2-texture blend @fragment) are bound generically from the shader interface. */
+    unsigned nb = VK_IFACE_NB < nh ? VK_IFACE_NB : nh; if(nb>8) nb=8;
+    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=(nb?nb:1u)};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
     VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
     VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
-    /* write the handle's texture to the reflected sampler binding (not a fixed 0). */
-    VkDescriptorImageInfo dii={.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=(VK_IFACE_NB?VK_IFACE_BINDING[0]:0u),.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii};
-    vkUpdateDescriptorSets(dev,1,&wds,0,0);
+    VkDescriptorImageInfo dii[8]; VkWriteDescriptorSet wds[8];
+    for(unsigned i=0;i<nb;i++){
+        GpuTex *ht=(GpuTex*)handles[i];
+        dii[i]=(VkDescriptorImageInfo){.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=VK_IFACE_BINDING[i],.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii[i]};
+    }
+    if(nb) vkUpdateDescriptorSets(dev,nb,wds,0,0);
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0,dsl); if(!pipe) return -1;
     VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,fdata,nverts*2,&vbuf,&vmem)) return -1;
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -868,8 +874,8 @@ static int64_t draw_res_geo(void *handle, const float *fdata, uint32_t nverts, c
 
 /* vk_draw_handle(h): draw the built-in triangle sampling the texture handle `h`. */
 int64_t jrt_vk_draw_handle(void *handle) {
-    float zero[4]={0,0,0,0};
-    return draw_res_geo(handle, DEFAULT_TRI, 3, zero);
+    float zero[4]={0,0,0,0}; void *hs[1]={handle};
+    return draw_res_geo(hs, 1, DEFAULT_TRI, 3, zero);
 }
 
 /* vk_draw_tex(verts, h, ux,uy,uz,uw): the generic draw surface WITH a reflected resource
@@ -884,8 +890,24 @@ int64_t jrt_vk_draw_tex(const double *verts, int64_t nfloats, void *handle,
     uint32_t nverts=(uint32_t)(nfloats/2);
     float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
     for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
-    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw};
-    int64_t r=draw_res_geo(handle, f, nverts, uni);
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw}; void *hs[1]={handle};
+    int64_t r=draw_res_geo(hs, 1, f, nverts, uni);
+    free(f);
+    return r;
+}
+
+/* vk_draw_tex2(verts, h0, h1, ux,uy,uz,uw): the generic draw with TWO reflected samplers
+ * — h0 binds to the shader's first reflected sampler binding, h1 to the second (e.g. a
+ * two-texture blend @fragment reading tex() and tex2()). Multiple resources, all bound
+ * from the shader interface, plus program geometry + uniform. Returns 0xRRGGBB. */
+int64_t jrt_vk_draw_tex2(const double *verts, int64_t nfloats, void *h0, void *h1,
+                         double ux, double uy, double uz, double uw) {
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw}; void *hs[2]={h0,h1};
+    int64_t r=draw_res_geo(hs, 2, f, nverts, uni);
     free(f);
     return r;
 }

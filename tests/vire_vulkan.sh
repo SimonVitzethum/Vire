@@ -957,6 +957,32 @@ fn main() {
 }
 EOF
 
+# The generic draw with TWO reflected sampler bindings: vk_draw_tex2(verts, h0, h1, uni).
+# The @fragment reads tex() (binding 0) and tex2() (binding 1); h0/h1 bind to those two
+# reflected bindings. Texture A r=0.8, texture B g=0.7 -> centroid (~204, ~179). One
+# generic draw, two resources, both bound from the shader interface.
+case_ vire_draw_tex2 <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut a = tex(vec2(0.5, 0.5))
+    mut b = tex2(vec2(0.5, 0.5))
+    vec4(a.x, b.y, 0.0, 1.0)
+}
+fn main() {
+    mut pa = [0.8, 0.1, 0.0, 1.0]
+    mut pb = [0.0, 0.7, 0.0, 1.0]
+    mut ha = vk_texture_new(pa, 1)
+    mut hb = vk_texture_new(pb, 1)
+    mut tri = [0.0, 0.0 - 0.6, 0.6, 0.6, 0.0 - 0.6, 0.6]
+    mut px = vk_draw_tex2(tri, ha, hb, 0.0, 0.0, 0.0, 1.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 196 { if r < 212 { if g > 170 { if g < 188 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 # Unary minus in a shader body (OpFNegate). Without it a shader must write `0.0 - x`.
 # frag color: r = -(-0.5) = 0.5 (~128), g = -y where y=-0.6 → 0.6 (~153).
 case_ vire_unary_minus <<'EOF'
