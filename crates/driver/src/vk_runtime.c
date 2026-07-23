@@ -227,7 +227,11 @@ static int make_vbuf(VkDevice dev, VkPhysicalDevice pd, const float *data, uint3
 
 /* The one shared piece: build the triangle graphics pipeline for a render pass +
  * extent. Layout is empty (no descriptors); shaders are the embedded SPIR-V. */
+static VkPipeline build_pipeline_d(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, int colored, VkDescriptorSetLayout dsl, const uint32_t *fcode, unsigned fn, int depth);
 static VkPipeline build_pipeline_f(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, int colored, VkDescriptorSetLayout dsl, const uint32_t *fcode, unsigned fn) {
+    return build_pipeline_d(dev,rp,w,h,out_layout,colored,dsl,fcode,fn,0);
+}
+static VkPipeline build_pipeline_d(VkDevice dev, VkRenderPass rp, uint32_t w, uint32_t h, VkPipelineLayout *out_layout, int colored, VkDescriptorSetLayout dsl, const uint32_t *fcode, unsigned fn, int depth) {
     VkShaderModule vs=shmod(dev,VK_TRI_VERT,VK_TRI_VERT_N*4), fs=shmod(dev,fcode,fn*4);
     if(!vs||!fs) return 0;
     VkPipelineShaderStageCreateInfo st[2]={
@@ -259,9 +263,12 @@ static VkPipeline build_pipeline_f(VkDevice dev, VkRenderPass rp, uint32_t w, ui
     VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr,
         .setLayoutCount=(dsl?1u:0u),.pSetLayouts=(dsl?&dsl:0)};
     if(vkCreatePipelineLayout(dev,&plci,0,out_layout)!=VK_SUCCESS) return 0;
+    /* Optional depth test (for general 3D where back-face culling isn't enough). */
+    VkPipelineDepthStencilStateCreateInfo ds={.sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable=VK_TRUE,.depthWriteEnable=VK_TRUE,.depthCompareOp=VK_COMPARE_OP_LESS};
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=st,
         .pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vps,.pRasterizationState=&rs,
-        .pMultisampleState=&ms,.pColorBlendState=&cb,.layout=*out_layout,.renderPass=rp,.subpass=0};
+        .pMultisampleState=&ms,.pColorBlendState=&cb,.pDepthStencilState=(depth?&ds:0),.layout=*out_layout,.renderPass=rp,.subpass=0};
     VkPipeline pipe=0; vkCreateGraphicsPipelines(dev,0,1,&gp,0,&pipe);
     vkDestroyShaderModule(dev,vs,0); vkDestroyShaderModule(dev,fs,0);
     return pipe;
@@ -325,13 +332,13 @@ static VkRenderPass build_rp_d(VkDevice dev, VkFormat fmt, VkImageLayout final, 
     VkRenderPass rp=0; vkCreateRenderPass(dev,&ci,0,&rp); return rp;
 }
 static VkRenderPass build_rp(VkDevice dev, VkFormat fmt, VkImageLayout final) { return build_rp_d(dev,fmt,final,0); }
-static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
+static void rec_draw_d(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
                      uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts,
-                     VkPipelineLayout pl, const float uni[4]) {
+                     VkPipelineLayout pl, const float uni[4], int depth) {
     VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&bi);
-    VkClearValue clear={.color={{0.08f,0.08f,0.10f,1.0f}}};
-    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{w,h}},.clearValueCount=1,.pClearValues=&clear};
+    VkClearValue clear[2]={{.color={{0.08f,0.08f,0.10f,1.0f}}},{.depthStencil={1.0f,0}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=rp,.framebuffer=fb,.renderArea={{0,0},{w,h}},.clearValueCount=(uint32_t)(depth?2:1),.pClearValues=clear};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
     float zero[4]={0,0,0,0};
@@ -339,6 +346,11 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
     VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
     vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
+}
+static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe,
+                     uint32_t w, uint32_t h, VkBuffer vbuf, uint32_t nverts,
+                     VkPipelineLayout pl, const float uni[4]) {
+    rec_draw_d(cmd,rp,fb,pipe,w,h,vbuf,nverts,pl,uni,0);
 }
 
 /* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
@@ -386,8 +398,30 @@ static int ctx_init(void) {
     g_ctx_ok=1; return 1;
 }
 
-static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm) {
-    enum { W=256, H=256 };
+/* Cache of the expensive, reusable render objects — the render pass, the pipeline and
+ * its layout — keyed by (vertex mode, depth, W, H). Building a pipeline compiles the
+ * SPIR-V; an animation that renders the same shaders every frame must not pay that per
+ * frame. Lives on the persistent context, so it is built once and reused. */
+typedef struct { int valid; int vmode, depth; uint32_t w, h; VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl; } RCacheEntry;
+static RCacheEntry g_rcache[8];
+static int rcache_get(VkDevice dev, int vmode, int depth, uint32_t w, uint32_t h,
+                      VkRenderPass *rp, VkPipeline *pipe, VkPipelineLayout *pl) {
+    for(int i=0;i<8;i++){ RCacheEntry *e=&g_rcache[i];
+        if(e->valid && e->vmode==vmode && e->depth==depth && e->w==w && e->h==h){ *rp=e->rp; *pipe=e->pipe; *pl=e->pl; return 1; } }
+    VkRenderPass r = depth ? build_rp_d(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,1)
+                           : build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if(!r) return 0;
+    VkPipelineLayout layout; VkPipeline p=build_pipeline_d(dev,r,w,h,&layout,vmode,0,VK_TRI_FRAG,VK_TRI_FRAG_N,depth);
+    if(!p){ vkDestroyRenderPass(dev,r,0); return 0; }
+    for(int i=0;i<8;i++){ RCacheEntry *e=&g_rcache[i]; if(!e->valid){ *e=(RCacheEntry){1,vmode,depth,w,h,r,p,layout}; break; } }
+    *rp=r; *pipe=p; *pl=layout; return 1;
+}
+
+/* Headless render resolution — square, default 256, settable from Vire via vk_resolution(n).
+ * The cache keys on it, so different sizes get their own pipeline. */
+static uint32_t g_res=256;
+static int64_t render_headless_d(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm, int depth) {
+    uint32_t W=g_res, H=g_res;
     /* Use the ONE persistent context instead of creating a device per call — so an
      * animation (e.g. examples/vire/sphere.vr) pays the setup cost once, not per frame. */
     if(!ctx_init()) return 0;
@@ -403,12 +437,29 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
     VkImageViewCreateInfo vi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
     VkImageView view; CK(vkCreateImageView(dev,&vi,0,&view));
-    VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return 0;
-    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
-    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    /* pipeline layout: fpv 2 → 2D, 5 → 2D+color, 6 → 3D+color (back-face culled). */
+    /* pipeline layout: fpv 2 → 2D, 5 → 2D+color, 6 → 3D+color (back-face culled). The
+     * render pass + pipeline are cached (keyed by mode/depth/size), so the SPIR-V is
+     * compiled once even across an animation's frames. */
     int vmode = (fpv==6)?2 : (fpv==5)?1 : 0;
-    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,vmode,0); if(!pipe) return 0;
+    VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl;
+    if(!rcache_get(dev,vmode,depth,W,H,&rp,&pipe,&pl)) return 0;
+    /* Depth attachment (optional) — for general 3D where back-face culling isn't enough. */
+    VkImage dimg=0; VkDeviceMemory dmem=0; VkImageView dview=0;
+    if(depth){
+        VkImageCreateInfo di={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,
+            .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+            .usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+        CK(vkCreateImage(dev,&di,0,&dimg));
+        VkMemoryRequirements dmr; vkGetImageMemoryRequirements(dev,dimg,&dmr);
+        uint32_t dt=find_mem(pd,dmr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(dt==~0u) return 0;
+        VkMemoryAllocateInfo dma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=dmr.size,.memoryTypeIndex=dt};
+        CK(vkAllocateMemory(dev,&dma,0,&dmem)); vkBindImageMemory(dev,dimg,dmem,0);
+        VkImageViewCreateInfo dvi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=dimg,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,.subresourceRange={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1}};
+        CK(vkCreateImageView(dev,&dvi,0,&dview));
+    }
+    VkImageView atts[2]={view,dview};
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=(uint32_t)(depth?2:1),.pAttachments=atts,.width=W,.height=H,.layers=1};
+    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
     VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*fpv,&vbuf,&vmem)) return 0;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -422,7 +473,7 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
     VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
-    rec_draw(cmd,rp,fb,pipe,W,H,vbuf,nverts,pl,uni);
+    rec_draw_d(cmd,rp,fb,pipe,W,H,vbuf,nverts,pl,uni,depth);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
     vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
     CK(vkEndCommandBuffer(cmd));
@@ -448,10 +499,17 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
-    vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
-    vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    /* persistent device/instance NOT destroyed — reused across calls. */
+    vkDestroyFramebuffer(dev,fb,0);
+    vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    if(depth){ vkDestroyImageView(dev,dview,0); vkDestroyImage(dev,dimg,0); vkFreeMemory(dev,dmem,0); }
+    /* render pass / pipeline / layout are CACHED (rcache) — not destroyed; persistent
+     * device/instance NOT destroyed either. Only the per-frame resources are freed. */
     return corner_clear ? packed : -1;
+}
+
+/* Back-compat wrapper: no depth (2D or the back-face-culled 3D path). */
+static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm) {
+    return render_headless_d(data, nverts, fpv, uni, ppm, 0);
 }
 
 /* The default triangle, from the compile-time corner buffer. */
@@ -1566,6 +1624,14 @@ int64_t jrt_vk_render_ppm(const double *verts, int64_t nfloats, int64_t idx) {
     return r>=0 ? 0 : -1;
 }
 
+/* vk_resolution(n): set the headless render resolution to n x n pixels (16..4096).
+ * The next render uses it; each size gets its own cached pipeline. Returns n. */
+int64_t jrt_vk_set_resolution(int64_t n) {
+    if(n < 16) n = 16; if(n > 4096) n = 4096;
+    g_res = (uint32_t)n;
+    return n;
+}
+
 /* vk_render3d(verts, idx, ca, sa): render 3D per-vertex-colored geometry (interleaved
  * x,y,z, r,g,b — 6 per vertex) to frame_NNN.ppm, with a rotation uniform {ca, sa, scale,
  * 1} the @vertex reads via uniform() to spin the mesh on the GPU. The 3D pipeline
@@ -1577,7 +1643,7 @@ int64_t jrt_vk_render3d(const double *verts, int64_t nfloats, int64_t idx, doubl
     for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
     char path[64]; snprintf(path,sizeof path,"frame_%03d.ppm",(int)idx);
     float uni[4]={(float)ca,(float)sa,0.9f,1.0f};
-    int64_t r=render_headless(f, nverts, 6, uni, path);
+    int64_t r=render_headless_d(f, nverts, 6, uni, path, 1);
     free(f);
     return r>=0 ? 0 : -1;
 }

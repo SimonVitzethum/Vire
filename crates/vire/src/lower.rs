@@ -3156,6 +3156,13 @@ impl<'a> FnLower<'a> {
         // vk_render3d(verts, idx, ca, sa): render 3D colored geometry (x,y,z,r,g,b per
         // vertex) to frame_<idx>.ppm, with a GPU-side rotation from (ca, sa). The @vertex
         // reads the rotation via uniform() and spins the mesh on the GPU.
+        // vk_resolution(n): set the headless render resolution to n x n (16..4096).
+        if name == "vk_resolution" && args.len() == 1 {
+            let n = self.lower_expr(&args[0]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_set_resolution".into(), args: vec![n] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_render3d" && args.len() == 4 {
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);

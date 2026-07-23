@@ -1127,6 +1127,40 @@ else
         echo "FAIL $r3_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
 fi
 
+# Depth buffer (3D path): a near RED triangle drawn FIRST, a far BLUE triangle drawn
+# SECOND (both front-facing). With the depth test, the near red must still win at the
+# centre — draw order must not matter. (Proves vk_render3d's depth buffer works, so
+# non-convex/overlapping 3D resolves correctly, not just back-face-culled convex meshes.)
+d_name=vire_depth3d
+cat > "$work/$d_name.vr" <<'EOF'
+@vertex
+fn vs(pos: Vec3) -> Vec4 { out_color(attr_color())  vec4(pos.x, 0.0 - pos.y, pos.z, 1.0) }
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut g = [
+        0.0, 0.0 - 0.6, 0.2,  1.0, 0.2, 0.2,   0.6, 0.6, 0.2, 1.0, 0.2, 0.2,   0.0 - 0.6, 0.6, 0.2, 1.0, 0.2, 0.2,
+        0.0, 0.0 - 0.7, 0.8,  0.2, 0.2, 1.0,   0.7, 0.7, 0.8, 0.2, 0.2, 1.0,   0.0 - 0.7, 0.7, 0.8, 0.2, 0.2, 1.0]
+    vk_render3d(g, 0, 1.0, 0.0)
+    print(1)
+}
+EOF
+if "$vire" build "$work/$d_name.vr" -o "$work/$d_name" >/dev/null 2>"$work/e"; then
+    ( cd "$work" && ./"$d_name" >/dev/null 2>&1 )
+    # read the centre pixel of frame_000.ppm — must be red (R high, B low)
+    if [ -f "$work/frame_000.ppm" ] && python3 - "$work/frame_000.ppm" <<'PY'
+import sys
+d=open(sys.argv[1],'rb').read(); i=d.index(b'255\n')+4; px=d[i:]; W=256
+o=(128*W+128)*3
+sys.exit(0 if (px[o]>200 and px[o+2]<120) else 1)   # red wins over blue
+PY
+    then echo "ok   $d_name"; pass=$((pass+1))
+    else echo "FAIL $d_name (near triangle did not occlude the far one — depth broken)"; fail=$((fail+1)); fi
+else
+    if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip $d_name (env)"; else
+        echo "FAIL $d_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
