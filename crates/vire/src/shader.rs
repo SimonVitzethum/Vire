@@ -44,6 +44,7 @@ fn new_cx() -> Cx {
         uses_texture: false,
         uses_texture2: false,
         uses_mat: false,
+        uses_frag_ssbo: false,
         n: 0,
     }
 }
@@ -56,8 +57,9 @@ fn new_cx() -> Cx {
 fn stage_iface(cx: &Cx, stage: u32) -> fastllvm_ir::VkIface {
     use fastllvm_ir::{VkBinding, VkIface, VK_KIND_COMBINED_IMAGE_SAMPLER, VK_KIND_STORAGE_BUFFER};
     let mut it = VkIface::default();
-    // The scene SSBO (set 0, binding 0) — mesh/task/compute. Matches `%scene Binding 0`.
-    if cx.uses_ssbo {
+    // A storage buffer at set 0, binding 0 — the mesh/task/compute scene SSBO
+    // (`meshlet_offset()`) or a fragment's read-only float buffer (`buf(i)`).
+    if cx.uses_ssbo || cx.uses_frag_ssbo {
         it.bindings.push(VkBinding { binding: 0, kind: VK_KIND_STORAGE_BUFFER, stages: stage });
     }
     // A `tex(uv)` sampler2D at binding 0, `tex2(uv)` a second at binding 1 — fragment.
@@ -175,6 +177,7 @@ struct Cx {
     uses_texture: bool,         // fragment `tex(uv)` → a sampler2D at set 0 binding 0
     uses_texture2: bool,        // fragment `tex2(uv)` → a second sampler2D at binding 1
     uses_mat: bool,             // `mat2`/`mat4` constructors → declare the matrix types
+    uses_frag_ssbo: bool,       // fragment `buf(i)` → a read-only float storage buffer (binding 0)
     n: u32,
 }
 
@@ -371,6 +374,23 @@ impl Cx {
                     let c3 = self.id("t");
                     writeln!(self.body, "{c3} = OpVectorShuffle %v3float {c4} {c4} 0 1 2").unwrap();
                     return Ok((c3, Ty::Vec(3)));
+                }
+                // Storage-buffer read (fragment): `buf(i)` reads element `i` (rounded to
+                // uint) of a read-only float storage buffer at set 0 binding 0 → a float.
+                // Lets a @fragment be data-driven from a Vire GPU buffer handle.
+                if name == "buf" {
+                    if args.len() != 1 {
+                        return Err("shader: buf(i) takes one index".into());
+                    }
+                    let (i, _) = self.expr(&args[0])?;
+                    self.uses_frag_ssbo = true;
+                    let iu = self.id("t");
+                    writeln!(self.body, "{iu} = OpConvertFToU %uint {i}").unwrap();
+                    let p = self.id("t");
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_ssbo_float %fbuf %u_0 {iu}").unwrap();
+                    let v = self.id("t");
+                    writeln!(self.body, "{v} = OpLoad %float {p}").unwrap();
+                    return Ok((v, Ty::Float));
                 }
                 // Texture sample (fragment): `tex(uv)` samples the combined image
                 // sampler at set 0 binding 0 (the host-provided texture) → a vec4.
@@ -1066,9 +1086,21 @@ pub fn compile_fragment(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Str
     let tx_decor = format!("{t1_decor}{t2_decor}");
     let tx_decl = format!("{tx_types}{t1_decl}{t2_decl}");
     let mat_decl = mat_type_decls(cx.uses_mat);
-    let iface = format!("{fc_iface}{vy_iface}{pc_iface}{tx_iface}");
-    let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}");
-    let fc_decl = format!("{pc_decl}{tx_decl}{mat_decl}{fc_decl}{vy_decl}");
+    // A read-only float storage buffer (set 0 binding 0) — declared only when `buf(i)`
+    // is used. `%uint`/`%u_0` are declared here (the fragment lacks them otherwise) and
+    // don't collide with the push constant's `%int`/`%i_0`.
+    let (sb_iface, sb_decor, sb_decl) = if cx.uses_frag_ssbo {
+        (
+            " %fbuf",
+            "               OpDecorate %_rt_float ArrayStride 4\n               OpMemberDecorate %Buf 0 Offset 0\n               OpDecorate %Buf Block\n               OpDecorate %fbuf DescriptorSet 0\n               OpDecorate %fbuf Binding 0\n",
+            "       %uint = OpTypeInt 32 0\n        %u_0 = OpConstant %uint 0\n  %_rt_float = OpTypeRuntimeArray %float\n        %Buf = OpTypeStruct %_rt_float\n%_ptr_ssbo_Buf = OpTypePointer StorageBuffer %Buf\n       %fbuf = OpVariable %_ptr_ssbo_Buf StorageBuffer\n%_ptr_ssbo_float = OpTypePointer StorageBuffer %float\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    let iface = format!("{fc_iface}{vy_iface}{pc_iface}{tx_iface}{sb_iface}");
+    let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}{sb_decor}");
+    let fc_decl = format!("{pc_decl}{tx_decl}{mat_decl}{sb_decl}{fc_decl}{vy_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_FRAGMENT);
     Ok((format!(

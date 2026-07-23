@@ -431,8 +431,14 @@ Staged (each stage runnable):
   `draw_res_geo` path). *Multiple reflected bindings DONE:* `draw_res_geo` takes a handle
   array and binds each to `VK_IFACE_BINDING[i]`, so `vk_draw_tex2(verts, h0, h1, ux..uw)`
   binds two textures to the two reflected sampler bindings of a `tex()`+`tex2()` blend
-  @fragment (`tests/vire_vulkan.sh vire_draw_tex2`, 39). *Remaining:* storage-buffer/meshlet
-  handles through the same surface (needs the GpuBuf write path + per-binding kind switch).
+  @fragment (`tests/vire_vulkan.sh vire_draw_tex2`, 39). *Storage buffer DONE:* a fragment
+  `buf(i)` builtin reads a read-only float storage buffer (a new reflected binding), and
+  `draw_res_geo` has a per-binding KIND switch — a `GpuTex` writes a sampler descriptor, a
+  `GpuBuf` writes a storage-buffer descriptor — so `vk_draw_buf(verts, handle, ux..uw)`
+  feeds a data-driven fragment from a Vire GPU buffer (`tests/vire_vulkan.sh vire_draw_buf`,
+  40). The generic graphics surface now binds textures AND buffers, one or many, all from
+  the shader interface. *Remaining:* the mesh/meshlet pipeline through a generic surface
+  (indirect draw), and `draw(pipe, mesh, uniforms)` sugar over these builtins.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

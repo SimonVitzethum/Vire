@@ -957,6 +957,30 @@ fn main() {
 }
 EOF
 
+# The generic draw with a reflected STORAGE BUFFER: vk_draw_buf(verts, handle, uni). The
+# @fragment reads buf(i) (a read-only float storage buffer at binding 0, reflected); the
+# GpuBuf handle binds there via the kind switch. data=[0.3,0.7,..] -> centroid (~76,~178).
+# One generic draw covers buffers too — textures AND buffers from the shader interface.
+case_ vire_draw_buf <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut r = buf(0.0)
+    mut g = buf(1.0)
+    vec4(r, g, 0.0, 1.0)
+}
+fn main() {
+    mut data = [0.3, 0.7, 0.9, 0.1]
+    mut h = vk_buffer_new(data)
+    mut tri = [0.0, 0.0 - 0.6, 0.6, 0.6, 0.0 - 0.6, 0.6]
+    mut px = vk_draw_buf(tri, h, 0.0, 0.0, 0.0, 1.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 68 { if r < 84 { if g > 170 { if g < 186 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 # The generic draw with TWO reflected sampler bindings: vk_draw_tex2(verts, h0, h1, uni).
 # The @fragment reads tex() (binding 0) and tex2() (binding 1); h0/h1 bind to those two
 # reflected bindings. Texture A r=0.8, texture B g=0.7 -> centroid (~204, ~179). One

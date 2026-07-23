@@ -821,16 +821,30 @@ static int64_t draw_res_geo(void **handles, uint32_t nh, const float *fdata, uin
      * binding order, and each goes to VK_IFACE_BINDING[i], so multiple reflected samplers
      * (e.g. a 2-texture blend @fragment) are bound generically from the shader interface. */
     unsigned nb = VK_IFACE_NB < nh ? VK_IFACE_NB : nh; if(nb>8) nb=8;
-    VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=(nb?nb:1u)};
-    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
+    /* Pool sized per descriptor KIND (reflected): samplers + storage buffers. */
+    unsigned nsamp=0, nbuf=0;
+    for(unsigned i=0;i<nb;i++){ if(VK_IFACE_KIND[i]==1) nsamp++; else nbuf++; }
+    VkDescriptorPoolSize dpsz[2]; unsigned nps=0;
+    if(nsamp) dpsz[nps++]=(VkDescriptorPoolSize){.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=nsamp};
+    if(nbuf)  dpsz[nps++]=(VkDescriptorPoolSize){.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=nbuf};
+    if(!nps){ dpsz[0]=(VkDescriptorPoolSize){.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1}; nps=1; }
+    VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=nps,.pPoolSizes=dpsz};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
     VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
     VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
-    VkDescriptorImageInfo dii[8]; VkWriteDescriptorSet wds[8];
+    /* Write each handle per its reflected KIND — a GpuTex to a sampler binding, a
+     * GpuBuf to a storage-buffer binding — so one path binds textures AND buffers. */
+    VkDescriptorImageInfo dii[8]; VkDescriptorBufferInfo dbi[8]; VkWriteDescriptorSet wds[8];
     for(unsigned i=0;i<nb;i++){
-        GpuTex *ht=(GpuTex*)handles[i];
-        dii[i]=(VkDescriptorImageInfo){.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=VK_IFACE_BINDING[i],.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii[i]};
+        if(VK_IFACE_KIND[i]==1){
+            GpuTex *ht=(GpuTex*)handles[i];
+            dii[i]=(VkDescriptorImageInfo){.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=VK_IFACE_BINDING[i],.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii[i]};
+        } else {
+            GpuBuf *hb=(GpuBuf*)handles[i];
+            dbi[i]=(VkDescriptorBufferInfo){.buffer=hb->buf,.offset=0,.range=VK_WHOLE_SIZE};
+            wds[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=VK_IFACE_BINDING[i],.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[i]};
+        }
     }
     if(nb) vkUpdateDescriptorSets(dev,nb,wds,0,0);
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0,dsl); if(!pipe) return -1;
@@ -885,6 +899,22 @@ int64_t jrt_vk_draw_handle(void *handle) {
  * covers the textured case: pipeline + descriptor layout from the shader, resource +
  * geometry + parameters from the program. Returns the centroid pixel 0xRRGGBB. */
 int64_t jrt_vk_draw_tex(const double *verts, int64_t nfloats, void *handle,
+                        double ux, double uy, double uz, double uw) {
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw}; void *hs[1]={handle};
+    int64_t r=draw_res_geo(hs, 1, f, nverts, uni);
+    free(f);
+    return r;
+}
+
+/* vk_draw_buf(verts, h, ux,uy,uz,uw): the generic draw with a reflected STORAGE BUFFER —
+ * the GpuBuf handle `h` binds to the storage-buffer binding the @fragment's buf(i)
+ * reflects into (kind switch in draw_res_geo), so a data-driven fragment reads the Vire
+ * GPU buffer. Program geometry + uniform as usual. Returns 0xRRGGBB. */
+int64_t jrt_vk_draw_buf(const double *verts, int64_t nfloats, void *handle,
                         double ux, double uy, double uz, double uw) {
     if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;
     uint32_t nverts=(uint32_t)(nfloats/2);

@@ -3078,6 +3078,21 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_draw_buf(verts, handle, ux,uy,uz,uw): generic draw with a reflected STORAGE
+        // BUFFER — the GpuBuf handle binds to the storage-buffer binding buf(i) reflects.
+        if name == "vk_draw_buf" && args.len() == 6 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let handle = self.lower_expr(&args[1]).0;
+            let uni: Vec<Operand> = args[2..6].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len, handle];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_buf".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_draw_tex2(verts, h0, h1, ux,uy,uz,uw): generic draw with TWO reflected
         // sampler bindings — h0 -> binding[0], h1 -> binding[1] (a 2-texture blend).
         if name == "vk_draw_tex2" && args.len() == 7 {
