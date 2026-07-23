@@ -102,7 +102,12 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   but never applied to the data-dependent heap-sift branches. **Zero correctness
   risk**, cheap experiment (regular branches saw ~0%; branchy pointer-chasing may
   differ). graph is 1.61× Rust (measured 2026-07); the runtime gap is the random-
-  adjacency Dijkstra heap (cache/branch), the target for PGO. **RAM gap resolved:** the
+  adjacency Dijkstra heap (cache/branch), the target for PGO. **Bounds checks ruled OUT
+  causally:** rebuilt with `FASTLLVM_NO_BOUNDS` (0 throw sites, identical output) closes
+  only ~7% (65→61 ms vs Rust 40 ms); Vire emits FEWER checks than Rust (2 vs 32 panic
+  sites, BFS loop 7 insns check-elided + base-in-reg vs Rust's 10 with inline check +
+  base reload). So the gap is backend throughput on irregular integer access, not a
+  safety tax — PGO/scheduling, not bounds elision. **RAM gap resolved:** the
   56 vs 31 MB delta was the benchmark's two `array(m+16)` binary-heap scratch arrays
   (1.6M entries, worst-case bound) faulting more of their unused tail than Rust's
   lazy-zero `vec!` pages. Sizing them to `array(vn+16)` (provably sufficient, identical

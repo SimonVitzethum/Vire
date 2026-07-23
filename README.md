@@ -107,8 +107,14 @@ kernels** — every one within ~9% of Rust and several faster (struct 0.90×, bi
 pointer-chasing, memory-latency-bound kernel — **no objects, no reference counting, no
 cycle collector are involved** (it allocates six integer arrays and never a heap object),
 so it is *not* an RC or object-graph residual and the object-lifetime levers below do not
-apply to it. Its runtime gap is cache/branch behaviour on the random-adjacency Dijkstra
-heap; its peak-RSS gap (56 vs 31 MB) is fully explained — and closable — below. On the **Java→native**
+apply to it. Nor is it a bounds-check tax: rebuilding it with **all** bounds checks
+removed (`FASTLLVM_NO_BOUNDS`, bit-identical output) closes only ~7% of the gap (65→61 ms
+vs Rust 40 ms), and Vire actually emits *fewer* checks than Rust here (2 vs 32 panic
+sites — its BFS inner loop is 7 instructions with the check elided and the base in a
+register, against Rust's 10 with an inline check and a per-iteration base reload). The
+residual is ordinary backend throughput on an irregular, memory-latency-bound integer
+kernel — not a price of memory safety. Its peak-RSS gap (56 vs 31 MB) is a benchmark
+scratch-array over-sizing, fully explained — and closable to parity — below. On the **Java→native**
 oracle path the same backend takes **NBody 35.7× → 1.16×** (`Math.sqrt` now lowers to the
 `sqrtsd` intrinsic, not a 60-iteration Newton call) and **binary-trees 1.73× → 0.81×,
 beating Rust** (a shape/freshness analysis drops the cycle collector for provably
