@@ -27,14 +27,16 @@ Vire program** — `@compute` build → `@task` cull → `@mesh` draw → `@frag
 that Vire compiles to the same SPIR-V as the handwritten GLSL. In a steady-state
 mesh-shader benchmark (identical SPIR-V, 5000 frames) it shows no measurable runtime
 overhead. The host side — pipeline, render pass, descriptors, synchronization — is
-handled by a **fixed Vulkan runtime the compiler links in** (a set of typed host entry
-points in [`vk_runtime.c`](crates/driver/src/vk_runtime.c)), so the application author
-writes only the ~9 lines of shader logic instead of the 85–132 lines of C++/Rust setup;
-that setup is shared runtime code, **not** yet derived from each program's typed shader
-signatures. Auto-deriving the pipeline/descriptor layout from those signatures (a real
-compiler pass, not a fixed harness) is the next step — roadmap, not shipped (see
-[TODO.md](TODO.md) V3/V4). See [benchmarks/vulkan/](benchmarks/vulkan/) and
-[language/GPU-VULKAN.md](language/GPU-VULKAN.md).
+handled by a Vulkan runtime the compiler links in ([`vk_runtime.c`](crates/driver/src/vk_runtime.c)),
+so the application author writes only the ~9 lines of shader logic instead of the 85–132
+lines of C++/Rust setup. The **descriptor-set layout is now derived from the shader**
+(V3, partial): the compiler reflects each stage's resource usage into a `VkIface`, and
+the runtime builds the `VkDescriptorSetLayout` from it via one generic reflected path —
+the binding, descriptor type, and stage mask come from the shader, not a hardcoded
+per-demo layout (verified pixel-identical across textured / multi-sampler / meshlet-SSBO
+paths). Still hardcoded and on the roadmap: the push-constant range, the full pipeline
+layout, and a `draw(pipe, mesh, uniforms)` host surface (see [TODO.md](TODO.md) V3/V4).
+See [benchmarks/vulkan/](benchmarks/vulkan/) and [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
 
 ## The idea in one paragraph
 

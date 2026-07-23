@@ -319,6 +319,64 @@ pub struct GpuKernel {
     pub launch_param: usize,
 }
 
+/// A descriptor-set binding reflected from a shader stage's declared resource
+/// usage (the `uses_*` flags in `crates/vire/src/shader.rs`). The @vulkan runtime
+/// builds the `VkDescriptorSetLayout` + `VkPipelineLayout` from these instead of a
+/// hardcoded per-demo layout — the pipeline is derived from the shader signatures
+/// (TODO V3). `kind`: 0 = storage buffer, 1 = combined image sampler. `stages` is a
+/// `VkShaderStageFlags` bitmask.
+#[derive(Debug, Clone)]
+pub struct VkBinding {
+    pub binding: u32,
+    pub kind: u8,
+    pub stages: u32,
+}
+
+/// The reflected interface of a whole @vulkan shader set (descriptor set 0 today):
+/// the bindings each stage touches, unioned, plus the push-constant range.
+#[derive(Debug, Clone, Default)]
+pub struct VkIface {
+    pub bindings: Vec<VkBinding>,
+    /// Push-constant block size in bytes (0 = none).
+    pub push_size: u32,
+    /// `VkShaderStageFlags` the push-constant block is visible to.
+    pub push_stages: u32,
+}
+
+// VkShaderStageFlagBits (subset), so the frontend and the reflected C data agree.
+pub const VK_STAGE_VERTEX: u32 = 0x1;
+pub const VK_STAGE_FRAGMENT: u32 = 0x10;
+pub const VK_STAGE_COMPUTE: u32 = 0x20;
+pub const VK_STAGE_TASK: u32 = 0x40;
+pub const VK_STAGE_MESH: u32 = 0x80;
+// Descriptor kinds.
+pub const VK_KIND_STORAGE_BUFFER: u8 = 0;
+pub const VK_KIND_COMBINED_IMAGE_SAMPLER: u8 = 1;
+
+impl VkIface {
+    /// Union another stage's interface in: same (binding, kind) OR-s the stage
+    /// flags; a new binding is appended; the push range takes the max size and
+    /// OR-s the stages.
+    pub fn merge(&mut self, other: &VkIface) {
+        for b in &other.bindings {
+            if let Some(e) = self
+                .bindings
+                .iter_mut()
+                .find(|e| e.binding == b.binding && e.kind == b.kind)
+            {
+                e.stages |= b.stages;
+            } else {
+                self.bindings.push(b.clone());
+            }
+        }
+        self.push_size = self.push_size.max(other.push_size);
+        self.push_stages |= other.push_stages;
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty() && self.push_size == 0
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub functions: Vec<Function>,
@@ -350,6 +408,11 @@ pub struct Program {
     /// body (`elem()` → new value): runs data-parallel over a Float buffer on any
     /// Vulkan device (Intel/NVIDIA/AMD), distinct from CUDA/ROCm `@gpu`. SPIR-V 1.4.
     pub gpuvk_spvasm: Option<String>,
+    /// The @vulkan shader set's reflected descriptor/push interface (unioned over
+    /// stages). The runtime builds its descriptor-set + pipeline layout from this,
+    /// so the pipeline is derived from the shader signatures rather than hardcoded.
+    /// Empty when the program uses no shader resources. See [`VkIface`].
+    pub vk_iface: VkIface,
     /// Debug builds only: function name → source name of each local (indexed by
     /// local id; `None` for compiler temporaries). Drives `DILocalVariable` +
     /// `#dbg_declare` so gdb/lldb can inspect variables. Empty otherwise.

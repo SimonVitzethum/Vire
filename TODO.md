@@ -401,8 +401,18 @@ Staged (each stage runnable):
   draw }` surface + arbitrary geometry (today the triangle is fixed), and the
   single-source `@vertex`/`@fragment` → SPIR-V shaders (the SPIR-V-emitter item
   below; shaders are bootstrap glslc SPIR-V for now).
-- [ ] **V3 — resources.** Buffers/meshes, uniforms, textures/samplers, descriptor
-  layouts auto-derived from typed shader signatures; `draw(pipe, mesh, uniforms)`.
+- [~] **V3 — resources.** Buffers/meshes, uniforms, textures/samplers exist as RC
+  handles. *Descriptor-set-layout derivation DONE:* the shader compiler reflects each
+  stage's resource usage (`uses_ssbo`/`uses_texture`/`uses_texture2`/`uses_push_constant`
+  → `fastllvm_ir::VkIface`), unions it across stages, and main.rs emits it as C data
+  (`VK_IFACE_*`) in `vk_shaders.c`; the runtime builds the `VkDescriptorSetLayout` from
+  it via one generic `mk_dsl_reflected()` instead of a hardcoded per-demo layout. Wired
+  for the textured (1 sampler), 2-sampler blend, and mesh/meshlet SSBO paths — the
+  binding, descriptor type AND stage mask now come from the shader, verified
+  pixel-identical (`tests/vire_vulkan.sh`, 36). *Remaining:* derive the **push-constant
+  range** and the **pipeline layout** from the interface too (today the runtime still
+  hardcodes the vec4 push range + the standalone compute-dispatch dsl), texture arrays,
+  and the `draw(pipe, mesh, uniforms)` host surface.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

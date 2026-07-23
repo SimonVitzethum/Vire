@@ -48,6 +48,33 @@ fn new_cx() -> Cx {
     }
 }
 
+/// The descriptor/push interface this compiled stage contributes, derived from the
+/// resource flags it set — the SAME `uses_*` that drove the SPIR-V decls, so the
+/// runtime-built layout and the shader can never disagree (that is the point of V3:
+/// the pipeline layout comes from the shader, not a hardcoded per-demo copy).
+/// `stage` is the `VkShaderStage*` bit for this stage.
+fn stage_iface(cx: &Cx, stage: u32) -> fastllvm_ir::VkIface {
+    use fastllvm_ir::{VkBinding, VkIface, VK_KIND_COMBINED_IMAGE_SAMPLER, VK_KIND_STORAGE_BUFFER};
+    let mut it = VkIface::default();
+    // The scene SSBO (set 0, binding 0) — mesh/task/compute. Matches `%scene Binding 0`.
+    if cx.uses_ssbo {
+        it.bindings.push(VkBinding { binding: 0, kind: VK_KIND_STORAGE_BUFFER, stages: stage });
+    }
+    // A `tex(uv)` sampler2D at binding 0, `tex2(uv)` a second at binding 1 — fragment.
+    if cx.uses_texture {
+        it.bindings.push(VkBinding { binding: 0, kind: VK_KIND_COMBINED_IMAGE_SAMPLER, stages: stage });
+    }
+    if cx.uses_texture2 {
+        it.bindings.push(VkBinding { binding: 1, kind: VK_KIND_COMBINED_IMAGE_SAMPLER, stages: stage });
+    }
+    // The vec4 push constant (`uniform()` / `cull_plane()`), 16 bytes at offset 0.
+    if cx.uses_push_constant {
+        it.push_size = 16;
+        it.push_stages = stage;
+    }
+    it
+}
+
 /// The GPU scene record — a typed Vire struct, shared by every stage that touches the
 /// scene buffer so they agree on the layout. `offset` is the meshlet's (x,y) centre;
 /// `cone` is its 2D facing direction (for cone/backface culling in `@task`). std430:
@@ -900,7 +927,7 @@ impl Cx {
 /// triangle corner as its `Vec2` parameter (indexed by `gl_VertexIndex` from a
 /// fixed position array) and returns a `Vec4` `gl_Position` — so a Vire vertex
 /// shader *transforms* the geometry (scale/translate/…) without a vertex buffer.
-pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
+pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@vertex` fn has no body")?;
     let param = f
         .sig
@@ -943,7 +970,8 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
     let vary_dec = format!("{vary_dec}{attr_dec}{pc_decor}");
     let vary_decl = format!("{pc_decl}{mat_decl}{vary_decl}{attr_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_VERTEX);
+    Ok((format!(
 "               OpCapability Shader
 {glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint Vertex %main \"main\" %out %pos_in{vary_iface}
@@ -986,11 +1014,11 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         vars = cx.vars,
         body = cx.body,
         out = out
-    ))
+    ), __iface))
 }
 
 /// Compile an `@fragment fn` to SPIR-V assembly, or an error message.
-pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
+pub fn compile_fragment(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@fragment` fn has no body")?;
     let mut cx = new_cx();
     let (out, ty) = cx.block_value(body)?;
@@ -1042,7 +1070,8 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}");
     let fc_decl = format!("{pc_decl}{tx_decl}{mat_decl}{fc_decl}{vy_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_FRAGMENT);
+    Ok((format!(
 "               OpCapability Shader
 {glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint Fragment %main \"main\" %color{iface}
@@ -1076,7 +1105,7 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
         vars = cx.vars,
         body = cx.body,
         out = out
-    ))
+    ), __iface))
 }
 
 /// The `uniform()` push-constant (a vec4 at offset 0) declarations for a graphics
@@ -1109,7 +1138,7 @@ fn push_constant_decls(used: bool, provide_int: bool) -> (String, String, String
 /// Vire — arithmetic, `vecN`, GLSL builtins), and `mesh_tri(i, a, b, c)` to write
 /// each triangle's vertex indices. `let` bindings may share computation. One
 /// workgroup emits one meshlet (SPIR-V 1.4).
-pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
+pub fn compile_mesh(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@mesh` fn has no body")?;
     let mut cx = new_cx();
     let mut ints: BTreeSet<i64> = BTreeSet::new();   // AccessChain indices (%i_N)
@@ -1213,7 +1242,8 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
     } else {
         (String::new(), String::new(), String::new())
     };
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_MESH);
+    Ok((format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
 {glsl_import}               OpMemoryModel Logical GLSL450
@@ -1271,7 +1301,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,
-    ))
+    ), __iface))
 }
 
 /// Compile a Vire `@task fn` (amplification shader) to a SPIR-V task shader. The body
@@ -1281,7 +1311,7 @@ pub fn compile_mesh(f: &FnDef) -> Result<String, String> {
 /// frustum test like `emit_mesh_tasks(dot(cull_plane(), center) > -r)` culls the
 /// meshlet on the GPU. `let` bindings may share work. Terminates in `OpEmitMeshTasksEXT`
 /// (SPIR-V 1.4).
-pub fn compile_task(f: &FnDef) -> Result<String, String> {
+pub fn compile_task(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@task` fn has no body")?;
     let mut cx = new_cx();
     let mut count_op: Option<String> = None;   // the emit count operand (a %uint id)
@@ -1344,7 +1374,8 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     let (res_iface, res_decor, res_decl) =
         resource_decls(cx.uses_ssbo, cx.uses_workgroup_id, false, cx.uses_payload, cx.uses_push_constant, false);
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_TASK);
+    Ok((format!(
 "               OpCapability MeshShadingEXT
                OpExtension \"SPV_EXT_mesh_shader\"
 {glsl_import}               OpMemoryModel Logical GLSL450
@@ -1380,7 +1411,7 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
         body = cx.body,
         count_op = count_op,
         payload_op = payload_op,
-    ))
+    ), __iface))
 }
 
 /// Compile a Vire `@compute fn` to a SPIR-V compute shader that BUILDS the scene
@@ -1388,7 +1419,7 @@ pub fn compile_task(f: &FnDef) -> Result<String, String> {
 /// one meshlet record and writes it with `set_meshlet(vec2)` — so the meshlet set the
 /// mesh pipeline later draws is produced on the GPU, not supplied by the host.
 /// `meshlet_index()` gives this invocation's index as a float for placement formulas.
-pub fn compile_compute(f: &FnDef) -> Result<String, String> {
+pub fn compile_compute(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@compute` fn has no body")?;
     let mut cx = new_cx();
     let tail_stmt = body.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
@@ -1450,7 +1481,8 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
     let (iface, decor, decl) =
         resource_decls(cx.uses_ssbo, false, cx.uses_global_id, false, false, true);
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_COMPUTE);
+    Ok((format!(
 "               OpCapability Shader
 {glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint GLCompute %main \"main\"{iface}
@@ -1485,7 +1517,7 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,
-    ))
+    ), __iface))
 }
 
 /// Compile a Vire `@gpuvk fn` to a SPIR-V compute shader — vendor-neutral Vulkan
@@ -1494,7 +1526,7 @@ pub fn compile_compute(f: &FnDef) -> Result<String, String> {
 /// element with `elem()` (`buffer[gl_GlobalInvocationID.x]`), and the function's
 /// value is written back to that element. A bounds guard (`gid < count`, count from a
 /// push constant) makes an over-dispatched workgroup safe. SPIR-V 1.4.
-pub fn compile_gpuvk(f: &FnDef) -> Result<String, String> {
+pub fn compile_gpuvk(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), String> {
     let body = f.body.as_ref().ok_or("shader: `@gpuvk` fn has no body")?;
     let mut cx = new_cx();
     // Bounds guard: `if gl_GlobalInvocationID.x < count { … store … }`.
@@ -1523,7 +1555,8 @@ pub fn compile_gpuvk(f: &FnDef) -> Result<String, String> {
     writeln!(cx.body, "OpBranch {mrg}").unwrap();
     writeln!(cx.body, "{mrg} = OpLabel").unwrap();
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
-    Ok(format!(
+    let __iface = stage_iface(&cx, fastllvm_ir::VK_STAGE_COMPUTE);
+    Ok((format!(
 "               OpCapability Shader
 {glsl_import}               OpMemoryModel Logical GLSL450
                OpEntryPoint GLCompute %main \"main\" %gvid %vbuf %pcv
@@ -1572,5 +1605,5 @@ pub fn compile_gpuvk(f: &FnDef) -> Result<String, String> {
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,
-    ))
+    ), __iface))
 }

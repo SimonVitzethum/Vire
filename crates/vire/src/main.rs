@@ -1275,6 +1275,28 @@ fn build_or_run(args: &[String]) {
             }
             sc.push_str(&format!("\n}};\nconst unsigned {name}_N = {};\n", w.len()));
         }
+        // The reflected descriptor/push interface (V3): the runtime builds its
+        // VkDescriptorSetLayout + VkPipelineLayout from THIS, derived from the shader
+        // stages' resource usage, instead of a hardcoded per-demo layout. Flat parallel
+        // arrays (no struct ABI to match). A 0-length array is invalid ISO C → dummy word.
+        let iface = &program.vk_iface;
+        let nb = iface.bindings.len();
+        let arr = |vals: Vec<String>| -> String {
+            if vals.is_empty() { "0".to_string() } else { vals.join(", ") }
+        };
+        sc.push_str(&format!(
+            "const unsigned VK_IFACE_NB = {nb};\n\
+             const unsigned VK_IFACE_BINDING[] = {{ {} }};\n\
+             const unsigned VK_IFACE_KIND[]    = {{ {} }};\n\
+             const unsigned VK_IFACE_STAGES[]  = {{ {} }};\n\
+             const unsigned VK_IFACE_PUSH_SIZE = {};\n\
+             const unsigned VK_IFACE_PUSH_STAGES = {};\n",
+            arr(iface.bindings.iter().map(|b| b.binding.to_string()).collect()),
+            arr(iface.bindings.iter().map(|b| (b.kind as u32).to_string()).collect()),
+            arr(iface.bindings.iter().map(|b| b.stages.to_string()).collect()),
+            iface.push_size,
+            iface.push_stages,
+        ));
         let sc_path = build_dir.join("vk_shaders.c");
         if std::fs::write(&sc_path, sc).is_err() {
             eprintln!("writing vk_shaders.c failed");

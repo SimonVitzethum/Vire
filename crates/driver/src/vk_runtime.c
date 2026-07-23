@@ -33,6 +33,40 @@ extern const uint32_t VK_GPUVK_COMP[]; extern const unsigned VK_GPUVK_COMP_N; /*
 extern const uint32_t VK_PASS1_FRAG[]; extern const unsigned VK_PASS1_FRAG_N; /* fixed red fragment for pass 1 */
 extern const uint32_t VK_PASS2_FRAG[]; extern const unsigned VK_PASS2_FRAG_N; /* fixed blue fragment (source B) */
 
+/* V3: the descriptor/push interface REFLECTED from the shader stages' resource usage
+ * (crates/vire/src/shader.rs → main.rs emits these). The descriptor-set + pipeline
+ * layout are built from this instead of a hardcoded per-demo layout. Flat parallel
+ * arrays. KIND: 0 = storage buffer, 1 = combined image sampler. STAGES is a
+ * VkShaderStageFlags bitmask (the frontend's bits equal Vulkan's). */
+extern const unsigned VK_IFACE_NB;
+extern const unsigned VK_IFACE_BINDING[];
+extern const unsigned VK_IFACE_KIND[];
+extern const unsigned VK_IFACE_STAGES[];
+extern const unsigned VK_IFACE_PUSH_SIZE;
+extern const unsigned VK_IFACE_PUSH_STAGES;
+
+/* Build the VkDescriptorSetLayout for descriptor set 0 from the reflected interface.
+ * Returns 0 (and creates nothing) when the shader declares no bindings — callers that
+ * genuinely need a set treat 0 as "no descriptors", exactly like the old dsl==0 path. */
+static VkDescriptorSetLayout mk_dsl_reflected(VkDevice dev) {
+    if (VK_IFACE_NB == 0) return 0;
+    VkDescriptorSetLayoutBinding b[16];
+    unsigned n = VK_IFACE_NB < 16 ? VK_IFACE_NB : 16;
+    for (unsigned i = 0; i < n; i++) {
+        b[i].binding = VK_IFACE_BINDING[i];
+        b[i].descriptorType = VK_IFACE_KIND[i] == 1 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                    : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_IFACE_STAGES[i];
+        b[i].pImmutableSamplers = 0;
+    }
+    VkDescriptorSetLayoutCreateInfo ci = {.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount=n, .pBindings=b};
+    VkDescriptorSetLayout dsl;
+    if (vkCreateDescriptorSetLayout(dev,&ci,0,&dsl)!=VK_SUCCESS) return 0;
+    return dsl;
+}
+
 /* Insert the correct pipeline barrier for an image layout transition — the render
  * graph's "minimal correct barriers": src/dst access masks + pipeline stages are
  * derived from (old,new) layouts, so callers don't hand-tune them. Covers the
@@ -476,10 +510,10 @@ int64_t jrt_vk_textured(void) {
         .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
     VkSampler samp; CK(vkCreateSampler(dev,&smi,0,&samp));
 
-    /* descriptor set (combined image sampler) */
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* descriptor set — layout REFLECTED from the @fragment shader's tex() usage
+     * (V3), not a hardcoded {binding 0, sampler, fragment}. The pool/set/write below
+     * bind the host texture at binding 0, matching the reflected layout. */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
@@ -766,9 +800,8 @@ int64_t jrt_vk_draw_handle(void *handle) {
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return -1;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* descriptor-set layout reflected from the @fragment's tex() usage (V3) */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
@@ -874,9 +907,8 @@ int64_t jrt_vk_texture_draw(const double *pixels, int64_t nfloats, int64_t w) {
     VkSamplerCreateInfo smi={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_NEAREST,.minFilter=VK_FILTER_NEAREST,
         .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
     VkSampler samp; CK(vkCreateSampler(dev,&smi,0,&samp));
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* descriptor-set layout reflected from the @fragment's tex() usage (V3) */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
@@ -977,12 +1009,9 @@ int64_t jrt_vk_blend2(void) {
 
     VkPipelineLayout plR; VkPipeline pipeR=build_pipeline_f(dev,rp,W,H,&plR,0,0,VK_PASS1_FRAG,VK_PASS1_FRAG_N); if(!pipeR) return -1;
     VkPipelineLayout plB; VkPipeline pipeB=build_pipeline_f(dev,rp,W,H,&plB,0,0,VK_PASS2_FRAG,VK_PASS2_FRAG_N); if(!pipeB) return -1;
-    /* blend pipeline: 2 combined image samplers (binding 0 = A, binding 1 = B) */
-    VkDescriptorSetLayoutBinding dslb[2]={
-        {.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT},
-        {.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT}};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* blend pipeline: 2 combined image samplers (binding 0 = A, binding 1 = B),
+     * reflected from the blend @fragment's tex()/tex2() usage (V3). */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkPipelineLayout plC; VkPipeline pipeC=build_pipeline(dev,rp,W,H,&plC,0,dsl); if(!pipeC) return -1;
     VkSamplerCreateInfo smi={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_NEAREST,.minFilter=VK_FILTER_NEAREST,
         .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
@@ -1096,9 +1125,8 @@ int64_t jrt_vk_chain(int64_t n) {
     }
     /* red pipeline (pass 0) and sampling pipeline (passes 1..n) */
     VkPipelineLayout pl0; VkPipeline pipeRed=build_pipeline_f(dev,rp,W,H,&pl0,0,0,VK_PASS1_FRAG,VK_PASS1_FRAG_N); if(!pipeRed) return -1;
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* descriptor-set layout reflected from the @fragment's tex() usage (V3) */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkPipelineLayout plS; VkPipeline pipeSamp=build_pipeline(dev,rp,W,H,&plS,0,dsl); if(!pipeSamp) return -1;
     VkSamplerCreateInfo smi={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_NEAREST,.minFilter=VK_FILTER_NEAREST,
         .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
@@ -1220,9 +1248,8 @@ int64_t jrt_vk_two_pass(void) {
     VkSamplerCreateInfo smi={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_NEAREST,.minFilter=VK_FILTER_NEAREST,
         .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
     VkSampler samp; CK(vkCreateSampler(dev,&smi,0,&samp));
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* descriptor-set layout reflected from the @fragment's tex() usage (V3) */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
@@ -1436,12 +1463,10 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
 
     /* Descriptor set layout (binding 0 = SSBO). The task stage reads the scene when it
      * culls, and the compute builder writes it — include whichever stages exist. */
-    VkShaderStageFlags sceneStages = VK_SHADER_STAGE_MESH_BIT_EXT
-        | (VK_TASK_TRI_N>0 ? VK_SHADER_STAGE_TASK_BIT_EXT : 0)
-        | (builder ? VK_SHADER_STAGE_COMPUTE_BIT : 0);
-    VkDescriptorSetLayoutBinding dslb={.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=sceneStages};
-    VkDescriptorSetLayoutCreateInfo dslci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=1,.pBindings=&dslb};
-    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev,&dslci,0,&dsl));
+    /* the scene SSBO's descriptor-set layout — binding, type AND the stage mask are
+     * REFLECTED from which shader stages actually read the scene buffer (V3), instead
+     * of the hand-written `MESH | maybe TASK | maybe COMPUTE`. */
+    VkDescriptorSetLayout dsl = mk_dsl_reflected(dev); if(!dsl) return -1;
     VkDescriptorPoolSize dps={.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1};
     VkDescriptorPoolCreateInfo dpci={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=1,.poolSizeCount=1,.pPoolSizes=&dps};
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));

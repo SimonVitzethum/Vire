@@ -587,37 +587,37 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             if is_shader_fn(f) {
                 if f.attrs.iter().any(|a| a.name == "fragment") {
                     match crate::shader::compile_fragment(f) {
-                        Ok(asm) => prog.frag_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.frag_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
                 if f.attrs.iter().any(|a| a.name == "vertex") {
                     match crate::shader::compile_vertex(f) {
-                        Ok(asm) => prog.vert_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.vert_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
                 if f.attrs.iter().any(|a| a.name == "mesh") {
                     match crate::shader::compile_mesh(f) {
-                        Ok(asm) => prog.mesh_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.mesh_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
                 if f.attrs.iter().any(|a| a.name == "task") {
                     match crate::shader::compile_task(f) {
-                        Ok(asm) => prog.task_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.task_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
                 if f.attrs.iter().any(|a| a.name == "compute") {
                     match crate::shader::compile_compute(f) {
-                        Ok(asm) => prog.comp_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.comp_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
                 if f.attrs.iter().any(|a| a.name == "gpuvk") {
                     match crate::shader::compile_gpuvk(f) {
-                        Ok(asm) => prog.gpuvk_spvasm = Some(asm),
+                        Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.gpuvk_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
                 }
