@@ -97,11 +97,18 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | **vcall** (dyn dispatch) | **1.00×** | **0.44×** (2.3× faster) | solver devirtualization; beats clang `virtual` |
 | **binsearch** (10M) | 1.03× | **0.78×** | midpoint check *proved* redundant + elided — safely |
 | **sort** (quicksort 2M) | 1.06× | 1.33× | uncatchable checks abort noreturn (Rust's structure) |
+| **graph** (BFS + Dijkstra, 1.6M edges) | **1.61×** | 1.50× | Vire's one loss — latency-bound pointer-chase; analyzed honestly below |
 
-Across the 12 Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
-memory-safe Vire vs memory-safe Rust is a **geometric-mean 1.00× (median 1.00×) — at
-Rust parity**, with every benchmark within ~9% of Rust and several faster (struct 0.90×,
-binary-trees 0.91×, matmul 0.98×, vcall = Rust / 0.44× clang). On the **Java→native**
+Across the Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
+memory-safe Vire vs memory-safe Rust is at **Rust parity on the compute/struct/tree
+kernels** — every one within ~9% of Rust and several faster (struct 0.90×, binary-trees
+0.91×, matmul 0.98×, vcall = Rust / 0.44× clang) — **with one honest exception: `graph`
+(BFS + Dijkstra on a 1.6M-edge digraph) is 1.61× Rust.** That case is a flat-`i64`-array,
+pointer-chasing, memory-latency-bound kernel — **no objects, no reference counting, no
+cycle collector are involved** (it allocates six integer arrays and never a heap object),
+so it is *not* an RC or object-graph residual and the object-lifetime levers below do not
+apply to it. Its runtime gap is cache/branch behaviour on the random-adjacency Dijkstra
+heap; its peak-RSS gap (56 vs 31 MB) is fully explained — and closable — below. On the **Java→native**
 oracle path the same backend takes **NBody 35.7× → 1.16×** (`Math.sqrt` now lowers to the
 `sqrtsd` intrinsic, not a 60-iteration Newton call) and **binary-trees 1.73× → 0.81×,
 beating Rust** (a shape/freshness analysis drops the cycle collector for provably
@@ -113,7 +120,15 @@ out-of-bounds access still throws**.
 **Memory (peak RSS)** is reported alongside time in every suite: Vire is **at or below
 both Rust and C++ on essentially every benchmark** — ~2 MB under clang everywhere (no
 `libstdc++`/iostream baseline), level with Rust, and even binary-trees (pure alloc/GC)
-peaks *under* both (RC frees eagerly, 0 live, no growing GC heap).
+peaks *under* both (RC frees eagerly, 0 live, no growing GC heap). The lone exception is
+`graph` (56 MB Vire / 58 MB clang++ / 31 MB Rust) — and the 25 MB gap to Rust is **not**
+a Vire runtime cost (clang++ is *above* Vire here). It is an array-paging artefact: the
+benchmark over-sizes its two binary-heap scratch arrays to `m+16` (the worst-case bound,
+1.6M entries) while the heap only ever holds ~`vn`. Rust's `vec![0i64; m+16]` leaves the
+unused tail as untouched lazy-zero pages; Vire and C++ fault more of it. Sizing those
+arrays to `vn+16` (provably sufficient, bit-identical output) drops Vire to **34.6 MB —
+Rust parity** (measured). So the residual is the benchmark's allocation, not the runtime's
+bookkeeping, and no reference counting is in play.
 
 Beyond single kernels, [benchmarks/complex/](benchmarks/complex/) runs **multi-algorithm
 workloads** (a generate→sort→search→histogram pipeline; integer k-means) and **fair
@@ -204,7 +219,18 @@ collection) is small — and, since the runtime work this project added, **spike
 **What still reaches the runtime** — measured, honest: allocation-heavy **object
 graphs** (trees, lists, ASTs) whose nodes escape into the structure. Example:
 `build(18)` for a binary tree = ~524k heap nodes, all RC-managed (and, being a
-self-referential type, kept under the cycle collector). This is the residual.
+self-referential type, kept under the cycle collector). This is the residual *mechanism*.
+
+**Honest scope of that residual.** On the one object-graph benchmark in the suite —
+binary-trees — this mechanism costs nothing measurable: Vire runs it **0.91× Rust and
+peaks under both Rust and C++** (the analyses below drive its RC to the `--no-rc`
+ceiling). The graph benchmark above is *not* an instance of this — it has no objects at
+all. So the demonstrated suite does **not** contain a workload where RC/collector traffic
+is the measured bottleneck. Such workloads exist — heavily *shared*, topology-*mutating*
+object graphs with genuinely dynamic lifetimes (mutable caches, general graph mutation) —
+and they are the honest boundary of what these numbers show: the suite demonstrates that
+the elision analyses hold on structured-lifetime object graphs, not that RC is free in
+full generality. The lever below is aimed at that un-benchmarked class.
 
 **Pushing the residual under ~0.5% — the lever and the honest ceiling.** The obvious
 lever is *auto-inferred arena inference*: where the solver can prove a whole subgraph

@@ -101,8 +101,12 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [ ] **PGO on graph (Dijkstra).** Infra (`--pgo-gen`/`--pgo-use`) is already built
   but never applied to the data-dependent heap-sift branches. **Zero correctness
   risk**, cheap experiment (regular branches saw ~0%; branchy pointer-chasing may
-  differ). graph is 1.64× Rust / 55 vs 30 MB RAM — also find which arrays are fully
-  touched (cache pressure).
+  differ). graph is 1.61× Rust (measured 2026-07); the runtime gap is the random-
+  adjacency Dijkstra heap (cache/branch), the target for PGO. **RAM gap resolved:** the
+  56 vs 31 MB delta was the benchmark's two `array(m+16)` binary-heap scratch arrays
+  (1.6M entries, worst-case bound) faulting more of their unused tail than Rust's
+  lazy-zero `vec!` pages. Sizing them to `array(vn+16)` (provably sufficient, identical
+  output) drops Vire to 34.6 MB — Rust parity. Not RC, not object layout; clang++ is 58 MB.
 
 ## Tier 3 — enablers with broad latent effect
 
