@@ -937,6 +937,26 @@ fn main() {
 }
 EOF
 
+# The generic draw surface WITH a reflected resource: vk_draw_tex(verts, handle, uni) —
+# program geometry + a texture handle + a uniform. The @fragment's tex() reflects a
+# sampler binding; the handle's texture is bound there. A 1x1 (0.2,0.9,0.3) texture
+# -> centroid (~51, ~229). One generic draw covers the textured case, layout from shader.
+case_ vire_draw_tex <<'EOF'
+@fragment
+fn fs() -> Vec4 { tex(vec2(0.5, 0.5)) }
+fn main() {
+    mut pixels = [0.2, 0.9, 0.3, 1.0]
+    mut h = vk_texture_new(pixels, 1)
+    mut tri = [0.0, 0.0 - 0.6, 0.6, 0.6, 0.0 - 0.6, 0.6]
+    mut px = vk_draw_tex(tri, h, 0.0, 0.0, 0.0, 1.0)
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 44 { if r < 60 { if g > 220 { if g < 238 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 # Unary minus in a shader body (OpFNegate). Without it a shader must write `0.0 - x`.
 # frag color: r = -(-0.5) = 0.5 (~128), g = -y where y=-0.6 → 0.6 (~153).
 case_ vire_unary_minus <<'EOF'

@@ -3062,6 +3062,22 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_draw_tex(verts, handle, ux,uy,uz,uw): the generic draw surface WITH a
+        // reflected resource — program geometry + a texture handle + a vec4 uniform. The
+        // texture binds to the sampler binding the @fragment's tex() reflects into.
+        if name == "vk_draw_tex" && args.len() == 6 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let handle = self.lower_expr(&args[1]).0;
+            let uni: Vec<Operand> = args[2..6].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len, handle];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_mesh" || name == "vk_mesh_c" || name == "vk_mesh_scene" {
             let sym = match name.as_str() {
                 "vk_mesh_c" => "jrt_vk_mesh_c",

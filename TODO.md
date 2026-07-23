@@ -423,8 +423,13 @@ Staged (each stage runnable):
   geometry AND a vec4 uniform, rendered through its own compiled @vertex/@fragment (the
   uniform reaches `uniform()`), instead of a fixed per-demo entry point
   (`examples/vire/vulkan_draw.vr`, `tests/vire_vulkan.sh vire_draw_generic`, 37).
-  *Remaining:* extend the generic surface to bind reflected resources (textures/buffers
-  via handles) so a single `draw` covers the textured/meshlet cases too.
+  *Generic draw WITH a reflected resource DONE:* `vk_draw_tex(verts, handle, ux,uy,uz,uw)`
+  binds an RC texture handle to the sampler binding the @fragment's `tex()` reflects into,
+  with program geometry + uniform — so one generic draw covers the textured case, pipeline
+  + descriptor layout from the shader, resource + geometry + parameters from the program
+  (`tests/vire_vulkan.sh vire_draw_tex`, 38; the fixed `vk_draw_handle` now shares the same
+  `draw_res_geo` path). *Remaining:* the same for storage-buffer/meshlet handles, and
+  multiple reflected bindings in one draw.
 - [ ] **V4 — render graph.** Automatic image-layout transitions + minimal barriers;
   depth, multi-pass, MSAA, swapchain-resize.
 - [~] **VS — Vire shaders (SPIR-V emitter).** *DECIDED: Vire is the shader language.*

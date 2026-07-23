@@ -794,7 +794,11 @@ void *jrt_vk_texture_new(const double *pixels, int64_t nfloats, int64_t w) {
 /* vk_draw_handle(handle): render the triangle sampling the persistent texture the handle
  * owns (no re-upload). Borrows the handle (does not release it). Returns the centroid
  * pixel 0xRRGGBB, or -1. */
-int64_t jrt_vk_draw_handle(void *handle) {
+/* Draw program geometry (`fdata` = `nverts` interleaved (x,y) f32) sampling the texture
+ * `handle`, with the vec4 `uni` pushed. The descriptor-set layout is REFLECTED from the
+ * shader (mk_dsl_reflected), and the handle's texture is written to the reflected sampler
+ * binding — so a single generic path binds the reflected resource. Persistent context. */
+static int64_t draw_res_geo(void *handle, const float *fdata, uint32_t nverts, const float uni[4]) {
     if(!handle || !g_ctx_ok) return -1;
     GpuTex *ht=(GpuTex*)handle;
     enum { W=256, H=256 };
@@ -819,11 +823,12 @@ int64_t jrt_vk_draw_handle(void *handle) {
     VkDescriptorPool dpool; CK(vkCreateDescriptorPool(dev,&dpci,0,&dpool));
     VkDescriptorSetAllocateInfo dsai={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=dpool,.descriptorSetCount=1,.pSetLayouts=&dsl};
     VkDescriptorSet dset; CK(vkAllocateDescriptorSets(dev,&dsai,&dset));
+    /* write the handle's texture to the reflected sampler binding (not a fixed 0). */
     VkDescriptorImageInfo dii={.sampler=ht->sampler,.imageView=ht->view,.imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii};
+    VkWriteDescriptorSet wds={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=dset,.dstBinding=(VK_IFACE_NB?VK_IFACE_BINDING[0]:0u),.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&dii};
     vkUpdateDescriptorSets(dev,1,&wds,0,0);
     VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,0,dsl); if(!pipe) return -1;
-    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,DEFAULT_TRI,6,&vbuf,&vmem)) return -1;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,fdata,nverts*2,&vbuf,&vmem)) return -1;
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
@@ -840,8 +845,8 @@ int64_t jrt_vk_draw_handle(void *handle) {
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
     vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pl,0,1,&dset,0,0);
-    float zero[4]={0,0,0,0}; vkCmdPushConstants(cmd,pl,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,16,zero);
-    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off); vkCmdDraw(cmd,3,1,0,0);
+    vkCmdPushConstants(cmd,pl,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,16,uni);
+    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off); vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
     vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
@@ -859,6 +864,30 @@ int64_t jrt_vk_draw_handle(void *handle) {
     vkDestroyDescriptorPool(dev,dpool,0); vkDestroyDescriptorSetLayout(dev,dsl,0);
     vkDestroyFramebuffer(dev,fb,0); vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
     return packed;   /* handle (persistent texture) NOT destroyed — lives until its RC drops */
+}
+
+/* vk_draw_handle(h): draw the built-in triangle sampling the texture handle `h`. */
+int64_t jrt_vk_draw_handle(void *handle) {
+    float zero[4]={0,0,0,0};
+    return draw_res_geo(handle, DEFAULT_TRI, 3, zero);
+}
+
+/* vk_draw_tex(verts, h, ux,uy,uz,uw): the generic draw surface WITH a reflected resource
+ * — the program supplies its own geometry AND a texture handle AND a vec4 uniform. The
+ * texture is bound to the sampler binding the @fragment's tex() reflects into, the
+ * uniform reaches uniform(), and the geometry is the program's. So one generic draw
+ * covers the textured case: pipeline + descriptor layout from the shader, resource +
+ * geometry + parameters from the program. Returns the centroid pixel 0xRRGGBB. */
+int64_t jrt_vk_draw_tex(const double *verts, int64_t nfloats, void *handle,
+                        double ux, double uy, double uz, double uw) {
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw};
+    int64_t r=draw_res_geo(handle, f, nverts, uni);
+    free(f);
+    return r;
 }
 
 /* vk_texture_draw(pixels, nfloats, w): a texture as a first-class Vire value. `pixels`
