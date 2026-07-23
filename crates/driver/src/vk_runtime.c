@@ -518,6 +518,44 @@ static void gpu_tex_drop(void *p) {
 static void gpu_tex_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; } /* no ref fields */
 static void *gpu_tex_vt[2] = { (void*)gpu_tex_drop, (void*)gpu_tex_trace };
 
+/* A second RC-bound resource type: a persistent GPU storage buffer. Same lifetime-safe
+ * model as the texture handle (a Vire object whose drop frees the GPU buffer), showing
+ * the handle infrastructure generalizes beyond textures. */
+typedef struct { int64_t refcount; void *vtable; VkBuffer buf; VkDeviceMemory mem; int64_t n; } GpuBuf;
+static void gpu_buf_drop(void *p) {
+    GpuBuf *b=(GpuBuf*)p;
+    if(b->buf) vkDestroyBuffer(g_dev,b->buf,0);
+    if(b->mem) vkFreeMemory(g_dev,b->mem,0);
+}
+static void gpu_buf_trace(void *p, void (*visit)(void *)) { (void)p; (void)visit; }
+static void *gpu_buf_vt[2] = { (void*)gpu_buf_drop, (void*)gpu_buf_trace };
+
+/* vk_buffer_new(data, n): upload `n` f64 values to a PERSISTENT GPU storage buffer and
+ * return an RC-bound handle (freed when its last Vire reference drops). */
+void *jrt_vk_buffer_new(const double *data, int64_t n) {
+    if(!data || n<=0) return 0; if(!ctx_init()) return 0;
+    VkDeviceSize sz=(VkDeviceSize)n*sizeof(float);
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=sz,.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer buf; if(vkCreateBuffer(g_dev,&bi,0,&buf)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_dev,buf,&mr);
+    uint32_t mt=find_mem(g_pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(mt==~0u) return 0;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=mt};
+    VkDeviceMemory mem; if(vkAllocateMemory(g_dev,&ma,0,&mem)!=VK_SUCCESS) return 0; vkBindBufferMemory(g_dev,buf,mem,0);
+    float *p; if(vkMapMemory(g_dev,mem,0,sz,0,(void**)&p)!=VK_SUCCESS) return 0;
+    for(int64_t i=0;i<n;i++) p[i]=(float)data[i];
+    vkUnmapMemory(g_dev,mem);
+    GpuBuf *h=(GpuBuf*)jrt_alloc((int64_t)sizeof(GpuBuf));
+    h->vtable=gpu_buf_vt; h->buf=buf; h->mem=mem; h->n=n;
+    return h;
+}
+/* vk_buffer_get(handle, i): read element i of the persistent GPU buffer (borrows). */
+double jrt_vk_buffer_get(void *handle, int64_t i) {
+    if(!handle || !g_ctx_ok) return 0.0;
+    GpuBuf *b=(GpuBuf*)handle; if(i<0 || i>=b->n) return 0.0;
+    float *p; if(vkMapMemory(g_dev,b->mem,0,VK_WHOLE_SIZE,0,(void**)&p)!=VK_SUCCESS) return 0.0;
+    double v=(double)p[i]; vkUnmapMemory(g_dev,b->mem); return v;
+}
+
 /* vk_texture_new(pixels, nfloats, w): create a PERSISTENT GPU texture from Vire data and
  * return an RC-bound handle (a Vire object). The GPU texture lives until the handle's
  * last reference drops (Vire RC → gpu_tex_drop). Returns 0 on failure. */

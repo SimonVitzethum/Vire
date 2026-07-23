@@ -835,6 +835,22 @@ fn main() {
 }
 EOF
 
+# RC-bound GPU BUFFER handle (typed handles generalize beyond textures): vk_buffer_new
+# uploads a Vire [Float] to a persistent GPU storage buffer and returns a Vire object
+# whose drop frees it; vk_buffer_get(b, i) reads element i with no re-upload. When b
+# drops the runtime frees the GPU buffer (verified 0-live). data[2]=30, data[4]=50.
+case_ vire_buffer_handle <<'EOF'
+fn main() {
+    mut data = [10.0, 20.0, 30.0, 40.0, 50.0]
+    mut b = vk_buffer_new(data)
+    mut x2 = vk_buffer_get(b, 2)
+    mut x4 = vk_buffer_get(b, 4)
+    mut ok = 0
+    if x2 > 29.0 { if x2 < 31.0 { if x4 > 49.0 { if x4 < 51.0 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

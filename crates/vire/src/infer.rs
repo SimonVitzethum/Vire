@@ -454,7 +454,8 @@ impl<'a> Ctx<'a> {
                         | "vk_mesh_scene" | "vk_mesh_scene_cull"
                         | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
                         // Returns an RC-bound GPU texture handle (a Vire object).
-                        "vk_texture_new" => return T::Ref,
+                        "vk_texture_new" | "vk_buffer_new" => return T::Ref,
+                        "vk_buffer_get" => return T::F64,
                         _ => {}
                     }
                     if let Some(sig) = self.sigs.get(n) {
