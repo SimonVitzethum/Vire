@@ -238,21 +238,40 @@ and they are the honest boundary of what these numbers show: the suite demonstra
 the elision analyses hold on structured-lifetime object graphs, not that RC is free in
 full generality. The lever below is aimed at that un-benchmarked class.
 
-**Pushing the residual under ~0.5% — the lever and the honest ceiling.** The obvious
-lever is *auto-inferred arena inference*: where the solver can prove a whole subgraph
-is built, used, and dies within one scope (`t = build(); use(t); drop`), route its
-allocations into an arena (immortal, bulk-freed, zero RC/collector). The mechanism
-already exists (the `capsule`/loop arena). An attempt to auto-fire it at function
-scope was **reverted**: (a) the interprocedural escape check conservatively rejects
-*recursive* builders — exactly the tree/AST case we'd want — so extending it safely is
-non-trivial soundness-critical work (a wrong escape verdict is a use-after-free), and
-(b) the simple non-recursive cases the escape analysis *already* stack-promotes. So it
-stays a carefully-scoped future item ([TODO.md](TODO.md), Tier 1). And there is a hard
-floor: **topology-mutating / genuinely dynamic-lifetime graphs** (general mutable
-graphs, unpredictable-lifetime caches) cannot be proven away by any static analysis —
-they structurally need dynamic RC + the collector. For the common structured-lifetime
-workloads (compilers/ASTs, request handlers, batch processing) sub-0.5% is reachable;
-in full generality it is not.
+**The lever, measured — and the corrected diagnosis.** The lever is *auto-inferred
+arena inference*: where the solver can prove a whole subgraph is built, used, and dies
+within one scope (`t = build(); use(t); drop`), route its allocations into an arena
+(immortal, bulk-freed, zero RC/collector). The mechanism already exists (the
+`capsule`/loop arena). [benchmarks/complex/sharedgraph.vr](benchmarks/complex/sharedgraph.vr)
+now measures the un-benchmarked class directly — a shared, topology-*mutating*, *cyclic*
+object graph, built and dropped per iteration. Rebuilding it three ways decomposes the
+cost (400k trials, 8M nodes): `--no-rc` ceiling **273 ms**, `--no-cycles` (RC on,
+collector off) **394 ms**, shipping (RC + collector) **729 ms** — so the collector is
+**338 ms / 46 %** and RC retain/release **121 ms / 17 %** of runtime. Fair Rust
+(`Rc<RefCell<Node>>`, cycle broken by hand) is **145 ms**; Vire is **5.0× here**. This
+is the honest cost of the class, not an estimate.
+
+An earlier attempt to auto-fire the arena at function scope was reverted, and this
+benchmark **corrects the diagnosis that reverted it.** Recursion is *not* the blocker:
+the loop-arena already fires on a recursive build/use/drop (a non-mutating variant of
+this benchmark emits `jrt_arena_push`/`pop` around a recursive `chain(20)` and reports
+*zero* heap allocations — all 8M nodes immortal in the arena). What suppresses it here is
+one thing: the ref-storing field mutation `last.next = h`, whose base the region check
+cannot prove is itself arena-local, so it conservatively bails. The precise, sound
+extension is therefore narrow — admit `obj.f = ref` inside the arena when `obj` *and* the
+stored `ref` are provably iteration-fresh (both live and die in the arena) — not the
+open-ended "recursive escape" work the revert note described. It would take this workload
+from 729 ms toward the 273 ms ceiling (5.0× → ~1.9× Rust), the single biggest lever on
+the class. It remains soundness-critical (a wrong freshness verdict is a use-after-free)
+and gated by the 0-live oracle + `GUARD_FREE` + the fuzzer; see [TODO.md](TODO.md).
+
+The **hard floor** is unchanged and real: **genuinely dynamic-lifetime graphs** (mutable
+caches, long-lived graphs mutated past any single scope) cannot be proven away by any
+static analysis — they structurally need dynamic RC + the collector. The arena lever
+covers structured-lifetime graphs (compilers/ASTs, request handlers, per-frame scene
+graphs); it does not make RC free in full generality. And even at the ceiling Vire's bare
+allocation path here is ~1.9× Rust's `Rc` path — a separate, honestly-open codegen gap,
+not something the arena closes.
 
 **No latency spikes.** The three synchronous runtime operations were made incremental/
 budgeted (see [DONE.md](DONE.md)): the cycle collector runs in bounded steps

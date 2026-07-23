@@ -67,16 +67,24 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   - Extends a proven mechanism: thread-local `arena_top`, `while_arena_safe`
     interprocedural escape check, `tests/vire_interproc_arena.sh`, 0-live oracle all
     already exist — this generalizes the trigger from explicit `capsule` to inferred.
-  - **Attempted (function-scoped auto-arena) and REVERTED — finding:** wrapping a
-    void/scalar, ref-param-free, single-exit function that passes `region_bad` gave
-    (a) nothing on the target case — `region_bad`'s recursion guard conservatively
-    rejects *recursive* builders (`build(d-1)`), exactly the tree/AST pattern — and
-    (b) only redundant wraps on non-recursive allocation the escape analysis already
-    stack-promotes (`StackNew`). It also changed `vire_interproc_arena`'s
-    push-count invariant. So the real work is **extending `region_bad` to admit
-    recursive allocators soundly** (prove a self-recursive function's returned
-    subgraph doesn't escape the caller's arena extent) — soundness-critical, do with
-    the 0-live oracle + `listdrop`-style leak tests as the gate. Not a quick win.
+  - **Diagnosis CORRECTED by measurement (2026-07, [benchmarks/complex/sharedgraph.vr](benchmarks/complex/sharedgraph.vr)):**
+    the earlier revert note blamed recursion — that is **wrong**. `region_bad`
+    already admits recursive builders (its `seen` set makes a self-recursive call
+    return `false`), and the loop-arena *already fires* on a recursive build/use/drop:
+    a non-mutating variant of sharedgraph emits `jrt_arena_push`/`pop` around a
+    recursive `chain(20)` and allocates **0 heap objects** (all 8M nodes immortal in
+    the arena). The one thing that suppresses the arena on the cyclic benchmark is the
+    **ref-storing field mutation** `last.next = h` — `region_bad_stmt` bails on any
+    `obj.f = <ref>` because it cannot prove the base `obj` is arena-local. So the real
+    work is narrow and precise: **admit `obj.f = ref` in the arena when `obj` AND the
+    stored `ref` are provably iteration-fresh** (a forward freshness dataflow over the
+    loop body, seeded by constructor/arena-returning-call results, closed under
+    field-read + copy). Both fresh ⇒ both in the arena ⇒ freed together ⇒ no dangle, no
+    leak. Measured payoff: 729 ms → ~273 ms ceiling (5.0× → ~1.9× Rust). Start in the
+    loop's own function (`in_callee = false`) only; keep callee mutations conservative.
+    **Soundness-critical** (a wrong freshness verdict = use-after-free after
+    `arena_pop`): gate on the 0-live oracle + `GUARD_FREE` (temporal) + the fuzzer, and
+    pin the `vire_interproc_arena` push-count invariant.
   - **Arena fixed costs — chunk recycling DONE** (`jrt_arena_pop`/`arena_alloc`):
     standard 64 KiB chunks are recycled through a capped per-thread free-list instead
     of `free()`d at each pop — removes the O(chunks) free burst (a latency spike) and

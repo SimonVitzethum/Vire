@@ -1,0 +1,50 @@
+// Shared, topology-MUTATING, CYCLIC object graph — the workload class the README
+// names as the hard floor (RC + cycle collector genuinely required, no static
+// lifetime). This benchmark exists to answer, empirically, whether that class is
+// actually expensive enough to motivate a lever — rather than arguing it.
+//
+// Per trial: build a 20-node chain (recursive allocator), then MUTATE its topology
+// — set `side` to a shared grandchild (a second reference → RC retain), and close a
+// back-edge cycle `last.next = h` (which RC alone cannot free → the cycle collector
+// must reclaim it). The graph is fully dead at the end of each trial.
+//
+// Measure the RC/collector cost by rebuilding three ways and taking the deltas:
+//   vire build            sharedgraph.vr   (RC + collector)      — the shipping path
+//   vire build --no-cycles sharedgraph.vr  (RC, collector off)   — isolates collector
+//   vire build --no-rc     sharedgraph.vr  (all off, leaks)      — the ceiling
+// FASTLLVM_HEAPSTATS=1 confirms 0-live on the normal build (the collector reclaims
+// the cycles) and 8M-live under --no-cycles (the cycles leak without it).
+//
+// Measured 2026-07 (400k trials, 8M nodes): normal 729 ms, --no-cycles 394 ms,
+// --no-rc 273 ms → collector 338 ms (46% of runtime), RC 121 ms (17%), base 273 ms.
+// Fair Rust (Rc<RefCell<Node>>, cycle broken by hand) = 145 ms → Vire is 5.0x here.
+// The per-iteration graph is built/used/dropped in one scope, so an auto-arena would
+// free it en bloc (no RC, no collector) — but the loop-arena is currently suppressed
+// by the ref-storing field mutation `last.next = h` (its base is not proven
+// arena-local). That is the precise, measured target for region inference.
+type Node { id: Int  next: Node  side: Node }
+
+fn chain(len: Int) -> Node {
+    if len == 0 { null } else { Node(len, chain(len - 1), null) }
+}
+
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 400000 {
+        mut h = chain(20)
+        // share + mutate topology: side = grandchild (a second, shared reference)
+        mut c = h
+        while c.next != null {
+            if c.next.next != null { c.side = c.next.next }
+            c = c.next
+        }
+        // close a back-edge cycle: walk to the last node, point it at the head
+        mut last = h
+        while last.next != null { last = last.next }
+        last.next = h
+        sum = (sum + h.id + h.side.id) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
