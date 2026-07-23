@@ -175,21 +175,28 @@ fn capsule_wraps_body_with_arena() {
 }
 
 #[test]
-fn capsule_ref_result_is_error() {
-    // An object result would point into the freed arena → hard error.
-    let (mut m, _) = parse("type P {\n x: Int\n}\nfn f(n) {\n capsule(n) {\n P(n)\n }\n}\n");
-    let _ = infer_module(&mut m);
-    let errs = lower_module(&m).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("capsule") && e.contains("object result")));
+fn capsule_ref_result_deep_copies() {
+    // UPDATE 2 (language/M0.2-CAPSULE-ARENA.md): an object RESULT is no longer a hard
+    // error — it is deep-copied OUT to the heap before the arena is popped, so it
+    // survives (no dangling arena pointer). This test pins the deliberately-lifted
+    // restriction to its new sound behavior. (Was: capsule_ref_result_is_error.)
+    let p = lower("type P {\n x: Int\n}\nfn f(n: Int) -> P {\n capsule(n) {\n P(n)\n }\n}\nfn main() { mut p = f(7)\n print(p.x) }\n");
+    let deep_heap = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_deep_copy_heap")
+    });
+    assert!(deep_heap, "object result from a capsule must be deep-copied to the heap");
 }
 
 #[test]
-fn capsule_object_input_is_error() {
-    // The dangerous case (aliased ref input) must be a HARD error,
-    // not a silent stub — otherwise capsule would promise containment without delivering it.
-    let (m, _) = parse("type P {\n x: Int\n}\nfn f(p: P) -> Int {\n capsule(p) {\n p.x\n }\n}\n");
-    let errs = lower_module(&m).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("capsule") && e.contains("object input")));
+fn capsule_object_input_deep_copies() {
+    // UPDATE 2: an object INPUT to a capsule is no longer rejected — it is deep-copied
+    // INTO the arena, so the body works on a private copy (containment preserved by
+    // copy, not by prohibition). (Was: capsule_object_input_is_error.)
+    let p = lower("type P {\n x: Int\n}\nfn f(p: P) -> Int {\n capsule(p) {\n p.x\n }\n}\nfn main() { print(f(P(42))) }\n");
+    let deep_arena = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_deep_copy_arena")
+    });
+    assert!(deep_arena, "object input to a capsule must be deep-copied into the arena");
 }
 
 #[test]
@@ -218,12 +225,15 @@ fn return_statement_yields_typed_value() {
 #[test]
 fn extern_c_call_resolves_directly() {
     // extern "C" signature registered → call lowers as a direct call (no
-    // mangling); the backend declares, clang links.
-    let p = lower("extern \"C\" {\n fn sqrt(x: F64) -> F64\n}\nfn main() {\n print(sqrt(16.0))\n}\n");
-    let calls_sqrt = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
-        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "sqrt")
+    // mangling); the backend declares, clang links. NOTE: use a name that is NOT a
+    // compiler builtin — `sqrt` is now intercepted and lowered to the jrt_math_sqrt
+    // intrinsic, which shadows an extern of the same name (that was why the old test
+    // rotted). `ext_thing` has no builtin, so it exercises pure extern resolution.
+    let p = lower("extern \"C\" {\n fn ext_thing(x: F64) -> F64\n}\nfn main() {\n print(ext_thing(16.0))\n}\n");
+    let calls = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
+        matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "ext_thing")
     });
-    assert!(calls_sqrt, "extern call must lower as Call(sqrt)");
+    assert!(calls, "extern call must lower as Call(ext_thing)");
 }
 
 #[test]

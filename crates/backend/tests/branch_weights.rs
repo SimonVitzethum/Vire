@@ -33,6 +33,7 @@ fn looping_fn() -> Function {
             BasicBlock { statements: vec![], terminator: Terminator::Return(None) },
         ],
         receiver_nonnull: false,
+        line: 0,
     }
 }
 
