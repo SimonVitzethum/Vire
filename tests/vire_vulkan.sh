@@ -1089,6 +1089,44 @@ else
         echo "FAIL $ppm_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
 fi
 
+# vk_render3d: GPU-side 3D. A @vertex reading Vec3 position rotates the geometry by the
+# frame's (cos,sin) uniform and lights it; the 3D pipeline back-face-culls. Render two
+# frames at different angles and check the PPMs are produced AND differ (GPU rotation
+# works). This is the mechanism behind examples/vire/sphere3d.vr.
+r3_name=vire_render3d
+cat > "$work/$r3_name.vr" <<'EOF'
+@vertex
+fn vs(pos: Vec3) -> Vec4 {
+    mut u = uniform()
+    mut rx = pos.x * u.x + pos.z * u.y
+    mut rz = -pos.x * u.y + pos.z * u.x
+    mut base = attr_color()
+    mut b = rz * 0.5 + 0.5
+    out_color(vec3(base.x * b, base.y * b, base.z * b))
+    vec4(rx * 0.9, -pos.y * 0.9, rz * 0.5 + 0.5, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut tri = [0.0, 0.0 - 0.6, 0.4,  1.0, 0.3, 0.3,
+               0.6, 0.6, 0.4,        0.3, 1.0, 0.3,
+               0.0 - 0.6, 0.6, 0.4,  0.3, 0.3, 1.0]
+    vk_render3d(tri, 0, 1.0, 0.0)
+    vk_render3d(tri, 1, 0.5, 0.86)
+    print(1)
+}
+EOF
+if "$vire" build "$work/$r3_name.vr" -o "$work/$r3_name" >/dev/null 2>"$work/e"; then
+    ( cd "$work" && ./"$r3_name" >/dev/null 2>&1 )
+    if [ -f "$work/frame_000.ppm" ] && [ -f "$work/frame_001.ppm" ] \
+       && ! cmp -s "$work/frame_000.ppm" "$work/frame_001.ppm"; then
+        echo "ok   $r3_name"; pass=$((pass+1))
+    else echo "FAIL $r3_name (frames missing or identical)"; fail=$((fail+1)); fi
+else
+    if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip $r3_name (env)"; else
+        echo "FAIL $r3_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

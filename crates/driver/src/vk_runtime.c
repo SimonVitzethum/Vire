@@ -233,20 +233,24 @@ static VkPipeline build_pipeline_f(VkDevice dev, VkRenderPass rp, uint32_t w, ui
     VkPipelineShaderStageCreateInfo st[2]={
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vs,.pName="main"},
         {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
-    /* Vertex buffer at binding 0. Position-only: (x,y) f32 at Location 0, stride 8.
-     * Colored (vk_mesh_c): + a per-vertex color (r,g,b) at Location 1, offset 8,
-     * stride 20 — read in the vertex shader via attr_color(). */
-    VkVertexInputBindingDescription vbind={.binding=0,.stride=(colored?5:2)*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
+    /* Vertex buffer at binding 0. `colored` selects the layout: 0 = position-only
+     * (x,y) f32; 1 = 2D + per-vertex color (x,y, r,g,b) as vk_mesh_c; 2 = 3D + color
+     * (x,y,z, r,g,b) for GPU-side 3D — Location 0 becomes a vec3, and back-face culling
+     * is enabled so a convex mesh (e.g. the sphere) hides its far side without a depth
+     * buffer. Position at Location 0, color at Location 1 (offset = position size). */
+    int is3d = (colored==2); int hascol = (colored>=1);
+    unsigned posn = is3d?3u:2u; unsigned stride = posn + (hascol?3u:0u);
+    VkVertexInputBindingDescription vbind={.binding=0,.stride=stride*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription vattr[2]={
-        {.location=0,.binding=0,.format=VK_FORMAT_R32G32_SFLOAT,.offset=0},
-        {.location=1,.binding=0,.format=VK_FORMAT_R32G32B32_SFLOAT,.offset=2*sizeof(float)}};
+        {.location=0,.binding=0,.format=(is3d?VK_FORMAT_R32G32B32_SFLOAT:VK_FORMAT_R32G32_SFLOAT),.offset=0},
+        {.location=1,.binding=0,.format=VK_FORMAT_R32G32B32_SFLOAT,.offset=posn*sizeof(float)}};
     VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount=1,.pVertexBindingDescriptions=&vbind,
-        .vertexAttributeDescriptionCount=(uint32_t)(colored?2:1),.pVertexAttributeDescriptions=vattr};
+        .vertexAttributeDescriptionCount=(uint32_t)(hascol?2:1),.pVertexAttributeDescriptions=vattr};
     VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
     VkViewport vp={0,0,(float)w,(float)h,0,1}; VkRect2D sc={{0,0},{w,h}};
     VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
-    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1.0f};
+    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=(is3d?VK_CULL_MODE_BACK_BIT:VK_CULL_MODE_NONE),.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1.0f};
     VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
@@ -402,7 +406,9 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     VkRenderPass rp=build_rp(dev,VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); if(!rp) return 0;
     VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,fpv==5,0); if(!pipe) return 0;
+    /* pipeline layout: fpv 2 → 2D, 5 → 2D+color, 6 → 3D+color (back-face culled). */
+    int vmode = (fpv==6)?2 : (fpv==5)?1 : 0;
+    VkPipelineLayout pl; VkPipeline pipe=build_pipeline(dev,rp,W,H,&pl,vmode,0); if(!pipe) return 0;
     VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*fpv,&vbuf,&vmem)) return 0;
 
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -1556,6 +1562,22 @@ int64_t jrt_vk_render_ppm(const double *verts, int64_t nfloats, int64_t idx) {
     char path[64]; snprintf(path,sizeof path,"frame_%03d.ppm",(int)idx);
     float uni[4]={0,0,0,0};
     int64_t r=render_headless(f, nverts, 5, uni, path);
+    free(f);
+    return r>=0 ? 0 : -1;
+}
+
+/* vk_render3d(verts, idx, ca, sa): render 3D per-vertex-colored geometry (interleaved
+ * x,y,z, r,g,b — 6 per vertex) to frame_NNN.ppm, with a rotation uniform {ca, sa, scale,
+ * 1} the @vertex reads via uniform() to spin the mesh on the GPU. The 3D pipeline
+ * back-face-culls (convex mesh → far side hidden without a depth buffer). Returns 0/-1. */
+int64_t jrt_vk_render3d(const double *verts, int64_t nfloats, int64_t idx, double ca, double sa) {
+    if(!verts || nfloats < 18 || (nfloats % 6)!=0) return -1;   /* >=3 (x,y,z,r,g,b) vertices */
+    uint32_t nverts=(uint32_t)(nfloats/6);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    char path[64]; snprintf(path,sizeof path,"frame_%03d.ppm",(int)idx);
+    float uni[4]={(float)ca,(float)sa,0.9f,1.0f};
+    int64_t r=render_headless(f, nverts, 6, uni, path);
     free(f);
     return r>=0 ? 0 : -1;
 }

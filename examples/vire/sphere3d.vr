@@ -1,0 +1,108 @@
+// The rotating sphere, GPU edition. Where examples/vire/sphere.vr does the rotation +
+// lighting on the CPU per frame, this builds the 3-D sphere ONCE and lets the @vertex
+// shader spin and light it on the GPU — the rotation angle is the only thing that changes
+// per frame. 3-D vertex input (x,y,z) + back-face culling (convex → far side hidden with
+// no depth buffer).
+//
+//   vire run examples/vire/sphere3d.vr               # writes frame_000.ppm .. frame_023.ppm
+//   convert -delay 4 -loop 0 frame_*.ppm sphere3d.gif
+
+// --- GPU: the @vertex rotates each vertex around Y by the frame's angle (cos/sin passed
+// in the uniform), lights it from the rotated normal, and forwards the shaded color. The
+// Y flip is the Vulkan convention (its NDC is Y-down) — needed so back-face culling keeps
+// the front, not the back.
+@vertex
+fn vs(pos: Vec3) -> Vec4 {
+    mut u = uniform()                       // (cos a, sin a, scale, 1)
+    mut ca = u.x
+    mut sa = u.y
+    mut s = u.z
+    mut rx = pos.x * ca + pos.z * sa        // rotate around Y
+    mut rz = -pos.x * sa + pos.z * ca
+    mut ry = pos.y
+    mut b = rx * 0.28 + ry * 0.38 + rz * 0.88   // Lambert; light mostly toward the viewer
+    b = b * 0.85 + 0.28
+    if b < 0.22 { b = 0.22 }
+    mut base = attr_color()
+    out_color(vec3(base.x * b, base.y * b, base.z * b))
+    vec4(rx * s, -ry * s, rz * 0.5 + 0.5, 1.0)
+}
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)
+}
+
+type V3 { x: Float  y: Float  z: Float }
+
+fn sph(la: Float, lo: Float) -> V3 {
+    mut cphi = cos(la)
+    V3(cphi * cos(lo), sin(la), cphi * sin(lo))
+}
+
+// A checker fixed to the surface (parity of the position bands), tinted by position.
+fn surfcol(p: V3) -> V3 {
+    mut ss = floor(p.x * 3.0) + floor(p.y * 3.0) + floor(p.z * 3.0)
+    mut parity = ss - 2.0 * floor(ss * 0.5)
+    mut k = 0.5
+    if parity > 0.5 { k = 1.0 }
+    V3((0.35 + 0.65 * (0.5 + 0.5 * p.x)) * k, (0.35 + 0.65 * (0.5 + 0.5 * p.y)) * k, (0.35 + 0.65 * (0.5 + 0.5 * p.z)) * k)
+}
+
+// Write one vertex: position (x,y,z) then its base surface color (r,g,b). No rotation or
+// lighting here — the GPU does that. Returns w + 6.
+fn putv(buf: farray, w: Int, p: V3) -> Int {
+    mut c = surfcol(p)
+    buf[w] = p.x
+    buf[w + 1] = p.y
+    buf[w + 2] = p.z
+    buf[w + 3] = c.x
+    buf[w + 4] = c.y
+    buf[w + 5] = c.z
+    w + 6
+}
+
+fn tri(buf: farray, w: Int, a: V3, b: V3, c: V3) -> Int {
+    mut w1 = putv(buf, w, a)
+    mut w2 = putv(buf, w1, b)
+    putv(buf, w2, c)
+}
+
+fn main() {
+    mut nlat = 16
+    mut nlon = 32
+    mut nverts = nlat * nlon * 6
+    mut buf = farray(nverts * 6)
+    mut pi = 3.14159265
+    mut two_pi = 6.28318530
+
+    // Build the 3-D sphere ONCE — the GPU transforms it every frame.
+    mut w = 0
+    mut i = 0
+    while i < nlat {
+        mut la0 = -pi * 0.5 + i * pi / nlat
+        mut la1 = -pi * 0.5 + (i + 1) * pi / nlat
+        mut j = 0
+        while j < nlon {
+            mut lo0 = j * two_pi / nlon
+            mut lo1 = (j + 1) * two_pi / nlon
+            mut p00 = sph(la0, lo0)
+            mut p10 = sph(la1, lo0)
+            mut p01 = sph(la0, lo1)
+            mut p11 = sph(la1, lo1)
+            mut w1 = tri(buf, w, p00, p10, p11)   // outward winding
+            w = tri(buf, w1, p00, p11, p01)
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Render frames — only the rotation angle changes; the GPU spins + lights the mesh.
+    mut frames = 24
+    mut fi = 0
+    while fi < frames {
+        mut ang = fi * two_pi / frames
+        vk_render3d(buf, fi, cos(ang), sin(ang))
+        fi = fi + 1
+    }
+    print(frames)
+}

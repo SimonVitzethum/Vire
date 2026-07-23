@@ -959,10 +959,15 @@ pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Strin
         .first()
         .map(|p| p.name.clone())
         .ok_or("shader: `@vertex fn` needs a Vec2 position parameter")?;
+    // The position input dimension comes from the parameter's type: `pos: Vec3` is a 3D
+    // vertex (Location 0 = vec3, for GPU-side 3D transforms), otherwise a 2D vertex.
+    let pos_dim: u8 = f.sig.params.first().and_then(|p| p.ty.as_ref())
+        .map(|t| match t.name.as_str() { "Vec3" => 3, "Vec4" => 4, _ => 2 }).unwrap_or(2);
+    let pos_vec = format!("%v{pos_dim}float");
     let mut cx = new_cx();
     // The position attribute is loaded into `%pos` by the preamble; bind the param to
     // a Function-storage variable so the body can read (and even reassign) it.
-    cx.bind(&param, "%pos", Ty::Vec(2));
+    cx.bind(&param, "%pos", Ty::Vec(pos_dim));
     let (out, ty) = cx.block_value(body)?;
     if ty != Ty::Vec(4) {
         return Err("shader: the vertex output must be a Vec4 (gl_Position)".into());
@@ -1011,7 +1016,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Strin
        %glpv = OpTypeStruct %v4float
      %outptr = OpTypePointer Output %glpv
         %out = OpVariable %outptr Output
-      %inptr = OpTypePointer Input %v2float
+      %inptr = OpTypePointer Input {pos_vec}
      %pos_in = OpVariable %inptr Input
         %int = OpTypeInt 32 1
         %i_0 = OpConstant %int 0
@@ -1024,7 +1029,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Strin
     %pf_bool = OpTypePointer Function %bool
 {vary_decl}{consts}       %main = OpFunction %void None %fnty
         %lbl = OpLabel
-{vars}        %pos = OpLoad %v2float %pos_in
+{vars}        %pos = OpLoad {pos_vec} %pos_in
 {body}         %gp = OpAccessChain %ov4ptr %out %i_0
                OpStore %gp {out}
                OpReturn
@@ -1034,6 +1039,7 @@ pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Strin
         vary_iface = vary_iface,
         vary_dec = vary_dec,
         vary_decl = vary_decl,
+        pos_vec = pos_vec,
         consts = cx.consts,
         vars = cx.vars,
         body = cx.body,

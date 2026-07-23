@@ -3153,6 +3153,21 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_render_ppm".into(), args: vec![Operand::Copy(ptr), len, idx] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_render3d(verts, idx, ca, sa): render 3D colored geometry (x,y,z,r,g,b per
+        // vertex) to frame_<idx>.ppm, with a GPU-side rotation from (ca, sa). The @vertex
+        // reads the rotation via uniform() and spins the mesh on the GPU.
+        if name == "vk_render3d" && args.len() == 4 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let idx = self.lower_expr(&args[1]).0;
+            let ca = self.lower_expr(&args[2]).0;
+            let sa = self.lower_expr(&args[3]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_render3d".into(), args: vec![Operand::Copy(ptr), len, idx, ca, sa] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_mesh" || name == "vk_mesh_c" || name == "vk_mesh_scene" {
             let sym = match name.as_str() {
                 "vk_mesh_c" => "jrt_vk_mesh_c",

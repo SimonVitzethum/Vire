@@ -61,3 +61,4 @@ the descriptor/pipeline layout derived from the shader signatures. Need a Vulkan
 |---|---|
 | [vulkan_draw.vr](vulkan_draw.vr) | the generic `vk_draw(verts, uniform)` surface — program geometry + uniform through the program's own shaders |
 | [sphere.vr](sphere.vr) | **a complete renderer: a rotating, Lambert-shaded sphere.** Vire does the geometry + 3D rotation + lighting; Vulkan rasterizes; each frame is written to `frame_NNN.ppm`. Run it, then `convert -delay 4 -loop 0 frame_*.ppm sphere.gif` to watch it spin |
+| [sphere3d.vr](sphere3d.vr) | the same sphere, **GPU edition** — 3D vertex input (`x,y,z`) + a `@vertex` that rotates and lights the mesh on the GPU. The geometry is built once; only the angle changes per frame. Back-face culling hides the far side (no depth buffer). ~2× faster than the CPU version |
