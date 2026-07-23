@@ -2112,6 +2112,22 @@ impl<'a> FnLower<'a> {
                     r = self.widen_i32(r);
                     rt = Ty::I64;
                 }
+                // Numeric promotion: mixing Int with Float in arithmetic (or a comparison)
+                // promotes the Int side to Float (i64 → f64, `sitofp`), so `i * 1.0`,
+                // `i / n * pi`, `x < 2.0` work without an explicit `as Float`. Int/Int stays
+                // integer arithmetic (integer division included) — only a genuinely-Float
+                // operand triggers promotion.
+                if lt == Ty::I64 && rt == Ty::F64 {
+                    let f = self.new_local(Ty::F64);
+                    self.emit(Statement::Assign(f, Rvalue::Convert(l)));
+                    l = Operand::Copy(f);
+                    lt = Ty::F64;
+                } else if rt == Ty::I64 && lt == Ty::F64 {
+                    let f = self.new_local(Ty::F64);
+                    self.emit(Statement::Assign(f, Rvalue::Convert(r)));
+                    r = Operand::Copy(f);
+                    rt = Ty::F64;
+                }
                 let _ = rt;
                 let is_cmp = matches!(
                     op,

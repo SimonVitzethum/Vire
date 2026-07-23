@@ -49,12 +49,29 @@ fn int_param_stays_int() {
 
 #[test]
 fn type_conflict_is_reported_not_swallowed() {
-    // `x` used as Int AND Float → conflict. Must be reported, not silently
-    // defaulted to I64 (otherwise miscompilation instead of rejection).
-    let (mut m, diags) = parse("fn bad(x) {\n mut a = x + 1\n mut b = x + 2.0\n a\n}\n");
+    // A genuine type conflict must be reported, not silently defaulted (which would
+    // miscompile instead of reject). `x` used as Int (`x + 1`) AND as a String
+    // (`use_str(x)`) → Int vs Ref, unresolvable. (Int/Float is NOT a conflict — it's
+    // numeric promotion — so the conflict here is Int-vs-object, which promotion leaves
+    // alone.)
+    let (mut m, diags) = parse(
+        "fn use_str(s: Str) -> Int {\n 0\n}\nfn bad(x) {\n mut a = x + 1\n mut b = use_str(x)\n a\n}\n",
+    );
     assert!(diags.is_empty());
     let conflicts = infer_module(&mut m);
-    assert!(!conflicts.is_empty(), "Int/Float type conflict must be reported");
+    assert!(!conflicts.is_empty(), "a real Int/object type conflict must be reported");
+}
+
+#[test]
+fn int_float_arithmetic_promotes_not_conflicts() {
+    // Mixing a concrete Int with a Float in arithmetic promotes the Int to Float — no
+    // conflict — so `i * 2.0` on an Int local (and `i < 2.5`, `i / n * pi`) needs no cast.
+    let (mut m, diags) = parse(
+        "fn main() {\n mut i = 3\n mut n = 5\n print(i * 2.0)\n print(i < 2.5)\n print(i * 1.0 / (n * 1.0))\n}\n",
+    );
+    assert!(diags.is_empty());
+    let conflicts = infer_module(&mut m);
+    assert!(conflicts.is_empty(), "concrete Int*Float should promote, not conflict: {conflicts:?}");
 }
 
 #[test]

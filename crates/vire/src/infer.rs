@@ -427,9 +427,20 @@ impl<'a> Ctx<'a> {
                         return T::Ref;
                     }
                 }
-                self.u.unify(l, r);
+                // Numeric promotion: a genuinely-mixed Int/Float operation is NOT a
+                // conflict — the Int side promotes to Float (matching the `sitofp` the
+                // lowerer inserts), and the result is Float. Only skip the unify when both
+                // sides are already concrete I64 and F64; otherwise unify as before so a
+                // free type variable still propagates (`i * 1.0` fixes `i` to Int, not Float).
+                let (rl, rr) = (self.u.resolve(l), self.u.resolve(r));
+                let mixed_num = (rl == T::I64 && rr == T::F64) || (rl == T::F64 && rr == T::I64);
+                if !mixed_num {
+                    self.u.unify(l, r);
+                }
                 if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
                     T::I32
+                } else if mixed_num {
+                    T::F64
                 } else {
                     l
                 }

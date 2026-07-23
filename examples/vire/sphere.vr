@@ -107,19 +107,19 @@ fn main() {
     mut frames = 24
     mut fi = 0
     while fi < frames {
-        mut ang = (fi as Float) / (frames as Float) * two_pi
+        mut ang = fi * two_pi / frames
         mut ca = cos(ang)
         mut sa = sin(ang)
 
         mut w = 0
         mut i = 0
         while i < nlat {
-            mut la0 = -pi * 0.5 + (i as Float) / (nlat as Float) * pi
-            mut la1 = -pi * 0.5 + ((i + 1) as Float) / (nlat as Float) * pi
+            mut la0 = -pi * 0.5 + i * pi / nlat
+            mut la1 = -pi * 0.5 + (i + 1) * pi / nlat
             mut j = 0
             while j < nlon {
-                mut lo0 = (j as Float) / (nlon as Float) * two_pi
-                mut lo1 = ((j + 1) as Float) / (nlon as Float) * two_pi
+                mut lo0 = j * two_pi / nlon
+                mut lo1 = (j + 1) * two_pi / nlon
                 mut p00 = sph(la0, lo0)
                 mut p10 = sph(la1, lo0)
                 mut p01 = sph(la0, lo1)

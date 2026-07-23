@@ -64,6 +64,12 @@ keyword than Rust.
 | Floating-point | `Float`(=`F64`), `F32` |
 | Others | `Bool`, `Char`, `Str`, `Unit`(`()`), `Ptr[T]` (only `unsafe`) |
 
+**Numeric promotion.** Mixing an integer and a float in arithmetic or a comparison
+promotes the integer to float — `i * 2.0`, `x + 0.5`, `i < 2.5`, `i * pi / n` all work
+with no `as Float`. Integer-only arithmetic stays integer, so `10 / 3 == 3` (integer
+division); to get a float divide, make one side a float (`10 * 1.0 / 3`, or `i * pi / n`).
+An explicit `x as Float` is still available when you want to be unambiguous.
+
 Integer semantics: **overflow-checked by default — also in release** (panic or
 `Result` per operator). This is deliberately *not* Rust's "debug checked, release
 wrapping": a program correct in debug that silently wraps in release is exactly
