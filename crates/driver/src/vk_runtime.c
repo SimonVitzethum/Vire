@@ -340,20 +340,54 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
 /* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
  *      image, read back; returns the centroid pixel packed as 0xRRGGBB (so callers
  *      can check the @fragment color), or -1 on failure ---- */
+/* One persistent Vulkan context, shared by every render (headless graphics AND the mesh/
+ * meshlet path). Created once, lazily; never destroyed — so GPU resources (textures,
+ * buffers, the meshlet scene) outlive a call and a program pays the device-creation cost
+ * once instead of per frame. `g_has_mesh` records whether the device could enable
+ * VK_EXT_mesh_shader; `g_draw_mesh` is its indirect-draw entry point. */
+static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_gq; static uint32_t g_gqf; static int g_ctx_ok=0;
+static int g_has_mesh=0;
+static PFN_vkCmdDrawMeshTasksIndirectEXT g_draw_mesh=0;
+static int ctx_init(void) {
+    if(g_ctx_ok) return 1;
+    /* API 1.3 instance so VK_EXT_mesh_shader (a 1.3-era device extension) is usable. */
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
+    if(vkCreateInstance(&ici,0,&g_inst)!=VK_SUCCESS) return 0;
+    uint32_t nd=0; vkEnumeratePhysicalDevices(g_inst,&nd,0); if(!nd) return 0;
+    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(g_inst,&nd,pds);
+    /* Keep the FIRST graphics device as the persistent context (stable — on a multi-GPU
+     * box, switching the graphics context to a different vendor can hit vendor-specific
+     * driver bugs). Enable mesh shaders only if THIS device supports them; if it doesn't,
+     * g_has_mesh stays 0 and the mesh path keeps its own device (no regression). */
+    g_pd=pds[0]; free(pds); int f=0;
+    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,0);
+      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,qs);
+      for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_gqf=i;f=1;break;} free(qs); }
+    if(!f) return 0;
+    g_has_mesh = has_ext(g_pd, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_gqf,.queueCount=1,.pQueuePriorities=&pr};
+    VkPhysicalDeviceMeshShaderFeaturesEXT mf={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.meshShader=VK_TRUE,.taskShader=VK_TRUE};
+    const char *dext[]={VK_EXT_MESH_SHADER_EXTENSION_NAME};
+    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci,
+        .pNext=(g_has_mesh?&mf:0),.enabledExtensionCount=(g_has_mesh?1u:0u),.ppEnabledExtensionNames=(g_has_mesh?dext:0)};
+    if(vkCreateDevice(g_pd,&dci,0,&g_dev)!=VK_SUCCESS){
+        /* mesh-device creation can fail (partial support) → retry plain graphics. */
+        if(g_has_mesh){ g_has_mesh=0; VkDeviceCreateInfo pdci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
+            if(vkCreateDevice(g_pd,&pdci,0,&g_dev)!=VK_SUCCESS) return 0; }
+        else return 0;
+    }
+    vkGetDeviceQueue(g_dev,g_gqf,0,&g_gq);
+    if(g_has_mesh) g_draw_mesh=(PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(g_dev,"vkCmdDrawMeshTasksIndirectEXT");
+    g_ctx_ok=1; return 1;
+}
+
 static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm) {
     enum { W=256, H=256 };
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
-    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return 0;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
-    VkPhysicalDevice pd=pds[0]; free(pds); uint32_t qf=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pd,&n,qs);
-      int f=0; for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){qf=i;f=1;break;} free(qs); if(!f) return 0; }
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=qf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    VkDevice dev; CK(vkCreateDevice(pd,&dci,0,&dev)); VkQueue q; vkGetDeviceQueue(dev,qf,0,&q);
+    /* Use the ONE persistent context instead of creating a device per call — so an
+     * animation (e.g. examples/vire/sphere.vr) pays the setup cost once, not per frame. */
+    if(!ctx_init()) return 0;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
 
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
         .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
@@ -410,7 +444,7 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
     vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0); vkDestroyFramebuffer(dev,fb,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    vkDestroyDevice(dev,0); vkDestroyInstance(inst,0);
+    /* persistent device/instance NOT destroyed — reused across calls. */
     return corner_clear ? packed : -1;
 }
 
@@ -603,24 +637,6 @@ int64_t jrt_vk_textured(void) {
  * use-after-free is impossible (you cannot name a dropped Vire value). This is the
  * lifetime-safe GPU resource handle. */
 extern void *jrt_alloc(int64_t size);
-static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_gq; static uint32_t g_gqf; static int g_ctx_ok=0;
-static int ctx_init(void) {
-    if(g_ctx_ok) return 1;
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
-    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    if(vkCreateInstance(&ici,0,&g_inst)!=VK_SUCCESS) return 0;
-    uint32_t nd=0; vkEnumeratePhysicalDevices(g_inst,&nd,0); if(!nd) return 0;
-    VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(g_inst,&nd,pds);
-    g_pd=pds[0]; free(pds); int f=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,qs);
-      for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_gqf=i;f=1;break;} free(qs); }
-    if(!f) return 0;
-    float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_gqf,.queueCount=1,.pQueuePriorities=&pr};
-    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci};
-    if(vkCreateDevice(g_pd,&dci,0,&g_dev)!=VK_SUCCESS) return 0;
-    vkGetDeviceQueue(g_dev,g_gqf,0,&g_gq); g_ctx_ok=1; return 1;
-}
 
 /* The handle object: a Vire header (refcount, vtable) + the persistent GPU resources. */
 typedef struct { int64_t refcount; void *vtable; VkImage image; VkDeviceMemory mem; VkImageView view; VkSampler sampler; uint32_t tw, th; } GpuTex;
