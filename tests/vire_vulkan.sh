@@ -916,6 +916,24 @@ fn main() {
 }
 EOF
 
+# Unary minus in a shader body (OpFNegate). Without it a shader must write `0.0 - x`.
+# frag color: r = -(-0.5) = 0.5 (~128), g = -y where y=-0.6 → 0.6 (~153).
+case_ vire_unary_minus <<'EOF'
+@fragment
+fn fs() -> Vec4 {
+    mut y = -0.6
+    vec4(-(0.0 - 0.5), -y, 0.0, 1.0)
+}
+fn main() {
+    mut px = vk_triangle()
+    mut r = px / 65536
+    mut g = (px / 256) % 256
+    mut ok = 0
+    if r > 120 { if r < 136 { if g > 145 { if g < 161 { ok = 1 } } } }
+    print(ok)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

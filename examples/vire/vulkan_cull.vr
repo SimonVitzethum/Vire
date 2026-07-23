@@ -15,15 +15,15 @@ fn ts() {
     mut plane = cull_plane()               // frustum plane from the host
     mut center = vec4(0.0, 0.0, 0.0, 1.0)  // meshlet bounding-sphere center (homogeneous)
     mut d = dot(plane, center)             // signed distance
-    emit_mesh_tasks(d > 0.0 - 0.6)         // emit 1 meshlet if visible (radius 0.6), else 0
+    emit_mesh_tasks(d > -0.6)         // emit 1 meshlet if visible (radius 0.6), else 0
 }
 
 @mesh
 fn ms() {
     set_mesh_outputs(3, 1)
-    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(0, vec4(0.0, -0.6, 0.0, 1.0))
     mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
-    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(-0.6, 0.6, 0.0, 1.0))
     mesh_tri(0, 0, 1, 2)
 }
 
@@ -33,7 +33,7 @@ fn fs() -> Vec4 { vec4(0.9, 0.6, 0.1, 1.0) }
 fn main() {
     // A plane through the origin keeps the meshlet; pushing it far behind culls it.
     mut visible = vk_mesh_shader(0.0, 0.0, 1.0, 0.0)
-    mut culled  = vk_mesh_shader(0.0, 0.0, 1.0, 0.0 - 2.0)
+    mut culled  = vk_mesh_shader(0.0, 0.0, 1.0, -2.0)
     print(visible / 65536)   // ~229 (orange) — rendered
     print(culled / 65536)    // ~20 (clear)   — culled on the GPU
 }

@@ -13,7 +13,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
-use crate::ast::{BinOp, Block, Expr, FnDef, Stmt};
+use crate::ast::{BinOp, Block, Expr, FnDef, Stmt, UnOp};
 
 /// Extract a non-negative integer literal (mesh/task indices and counts are constants).
 fn int_lit(e: &Expr) -> Result<i64, String> {
@@ -43,6 +43,7 @@ fn new_cx() -> Cx {
         uses_global_id: false,
         uses_texture: false,
         uses_texture2: false,
+        uses_mat: false,
         n: 0,
     }
 }
@@ -99,6 +100,7 @@ enum Ty {
     Float,
     Vec(u8),
     Bool,
+    Mat(u8), // NxN matrix of vecN columns (2 or 4) — mat2/mat4
 }
 
 impl Ty {
@@ -109,6 +111,8 @@ impl Ty {
             Ty::Vec(3) => "%v3float",
             Ty::Vec(_) => "%v4float",
             Ty::Bool => "%bool",
+            Ty::Mat(2) => "%mat2v2",
+            Ty::Mat(_) => "%mat4v4",
         }
     }
     /// The `Function`-storage pointer type for a mutable local of this type.
@@ -119,6 +123,8 @@ impl Ty {
             Ty::Vec(3) => "%pf_v3float",
             Ty::Vec(_) => "%pf_v4float",
             Ty::Bool => "%pf_bool",
+            Ty::Mat(2) => "%pf_mat2",
+            Ty::Mat(_) => "%pf_mat4",
         }
     }
 }
@@ -141,6 +147,7 @@ struct Cx {
     uses_global_id: bool,       // compute `meshlet_index()`/`set_meshlet()` → gl_GlobalInvocationID
     uses_texture: bool,         // fragment `tex(uv)` → a sampler2D at set 0 binding 0
     uses_texture2: bool,        // fragment `tex2(uv)` → a second sampler2D at binding 1
+    uses_mat: bool,             // `mat2`/`mat4` constructors → declare the matrix types
     n: u32,
 }
 
@@ -398,6 +405,26 @@ impl Cx {
                 if let Some(r) = self.glsl_builtin(name, args)? {
                     return Ok(r);
                 }
+                // Matrix constructors from column vectors: mat2(vec2, vec2), mat4(4×vec4).
+                if name == "mat2" || name == "mat4" {
+                    let cols = if name == "mat2" { 2usize } else { 4 };
+                    let ck = if name == "mat2" { 2u8 } else { 4 };
+                    if args.len() != cols {
+                        return Err(format!("shader: {name} needs {cols} column vectors"));
+                    }
+                    let mut ids = Vec::new();
+                    for a in args {
+                        let (id, t) = self.expr(a)?;
+                        if t != Ty::Vec(ck) {
+                            return Err(format!("shader: {name} columns must be vec{ck}"));
+                        }
+                        ids.push(id);
+                    }
+                    self.uses_mat = true;
+                    let id = self.id("t");
+                    writeln!(self.body, "{id} = OpCompositeConstruct {} {}", Ty::Mat(ck).spirv(), ids.join(" ")).unwrap();
+                    return Ok((id, Ty::Mat(ck)));
+                }
                 let n = match name {
                     "vec2" => 2u8,
                     "vec3" => 3,
@@ -413,7 +440,7 @@ impl Cx {
                     count += match t {
                         Ty::Float => 1,
                         Ty::Vec(k) => k,
-                        Ty::Bool => return Err("shader: a bool cannot be a vector component".into()),
+                        Ty::Bool | Ty::Mat(_) => return Err("shader: a bool/matrix cannot be a vector component".into()),
                     };
                     parts.push(id);
                 }
@@ -435,13 +462,35 @@ impl Cx {
                 let (b, tb) = self.expr(rhs)?;
                 self.binary(*op, a, ta, b, tb)
             }
+            // Unary negation `-x` (OpFNegate, works on float and vecN componentwise) and
+            // logical `!b` (OpLogicalNot). Without this a shader must write `0.0 - x`.
+            Expr::Unary { op, rhs, .. } => {
+                let (r, tr) = self.expr(rhs)?;
+                let id = self.id("t");
+                match op {
+                    UnOp::Neg => match tr {
+                        Ty::Float | Ty::Vec(_) => {
+                            writeln!(self.body, "{id} = OpFNegate {} {r}", tr.spirv()).unwrap();
+                            Ok((id, tr))
+                        }
+                        _ => Err("shader: `-` expects a float or vector".into()),
+                    },
+                    UnOp::Not => match tr {
+                        Ty::Bool => {
+                            writeln!(self.body, "{id} = OpLogicalNot %bool {r}").unwrap();
+                            Ok((id, Ty::Bool))
+                        }
+                        _ => Err("shader: `!` expects a bool".into()),
+                    },
+                }
+            }
             // Swizzle: `v.x` (→ float, OpCompositeExtract) or a multi-component swizzle
             // `v.xy`/`.xyz`/`.rgb`/… (→ vecN, OpVectorShuffle). Components may repeat.
             Expr::Field { base, name, .. } => {
                 let (id, t) = self.expr(base)?;
                 let k = match t {
                     Ty::Vec(k) => k,
-                    Ty::Float | Ty::Bool => return Err("shader: swizzle on a non-vector".into()),
+                    Ty::Float | Ty::Bool | Ty::Mat(_) => return Err("shader: swizzle on a non-vector".into()),
                 };
                 // Accept x/y/z/w and the r/g/b/a aliases.
                 let comps: Result<Vec<u8>, String> = name.chars().map(|c| match c {
@@ -524,6 +573,16 @@ impl Cx {
     }
 
     fn binary(&mut self, op: BinOp, a: String, ta: Ty, b: String, tb: Ty) -> Result<(String, Ty), String> {
+        // Matrix·vector: `m * v` → OpMatrixTimesVector (a transform). mat2·vec2 → vec2,
+        // mat4·vec4 → vec4.
+        if op == BinOp::Mul {
+            if let (Ty::Mat(k), Ty::Vec(j)) = (ta, tb) {
+                if k != j { return Err("shader: matrix·vector size mismatch".into()); }
+                let id = self.id("t");
+                writeln!(self.body, "{id} = OpMatrixTimesVector {} {a} {b}", Ty::Vec(k).spirv()).unwrap();
+                return Ok((id, Ty::Vec(k)));
+            }
+        }
         // Comparisons (scalar float → bool) feed `if`/`while` conditions.
         let cmp = match op {
             BinOp::Lt => Some("OpFOrdLessThan"),
@@ -879,9 +938,10 @@ pub fn compile_vertex(f: &FnDef) -> Result<String, String> {
         ("", "", "")
     };
     let (pc_iface, pc_decor, pc_decl) = push_constant_decls(cx.uses_push_constant, false);
+    let mat_decl = mat_type_decls(cx.uses_mat);
     let vary_iface = format!("{vary_iface}{attr_iface}{pc_iface}");
     let vary_dec = format!("{vary_dec}{attr_dec}{pc_decor}");
-    let vary_decl = format!("{pc_decl}{vary_decl}{attr_decl}");
+    let vary_decl = format!("{pc_decl}{mat_decl}{vary_decl}{attr_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
@@ -977,9 +1037,10 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
     let tx_iface = format!("{t1_iface}{t2_iface}");
     let tx_decor = format!("{t1_decor}{t2_decor}");
     let tx_decl = format!("{tx_types}{t1_decl}{t2_decl}");
+    let mat_decl = mat_type_decls(cx.uses_mat);
     let iface = format!("{fc_iface}{vy_iface}{pc_iface}{tx_iface}");
     let fc_decorate = format!("{fc_decorate}{vy_decorate}{pc_decor}{tx_decor}");
-    let fc_decl = format!("{pc_decl}{tx_decl}{fc_decl}{vy_decl}");
+    let fc_decl = format!("{pc_decl}{tx_decl}{mat_decl}{fc_decl}{vy_decl}");
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     Ok(format!(
 "               OpCapability Shader
@@ -1023,6 +1084,13 @@ pub fn compile_fragment(f: &FnDef) -> Result<String, String> {
 /// `%v4float` already declared; the access uses `%i_0` (int 0). `provide_int` adds
 /// `%int`/`%i_0` for a stage that lacks them (the fragment); the vertex passes false
 /// since it already declares them.
+/// The matrix type decls (`mat2`/`mat4` + their Function-pointer types) — declared only
+/// when a stage uses `mat2`/`mat4`. Needs `%v2float`/`%v4float` already declared.
+fn mat_type_decls(used: bool) -> String {
+    if !used { return String::new(); }
+    "    %mat2v2 = OpTypeMatrix %v2float 2\n    %mat4v4 = OpTypeMatrix %v4float 4\n    %pf_mat2 = OpTypePointer Function %mat2v2\n    %pf_mat4 = OpTypePointer Function %mat4v4\n".to_string()
+}
+
 fn push_constant_decls(used: bool, provide_int: bool) -> (String, String, String) {
     if !used {
         return (String::new(), String::new(), String::new());

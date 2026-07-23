@@ -20,7 +20,7 @@
 @compute
 fn build() {
     // Place meshlet i evenly across the view: x = -0.6 + i * 0.4.
-    mut x = 0.0 - 0.6 + meshlet_index() * 0.4
+    mut x = -0.6 + meshlet_index() * 0.4
     set_meshlet(vec2(x, 0.0))
 }
 
@@ -29,7 +29,7 @@ fn ts() {
     mut o = meshlet_offset()
     mut plane = cull_plane()
     mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))
-    emit_visible(d > 0.0 - 0.2)
+    emit_visible(d > -0.2)
 }
 
 @mesh

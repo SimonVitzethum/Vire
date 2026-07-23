@@ -12,9 +12,9 @@
 @mesh
 fn ms() {
     set_mesh_outputs(3, 1)
-    mesh_pos(0, vec4(0.0, 0.0 - 0.6, 0.0, 1.0))
+    mesh_pos(0, vec4(0.0, -0.6, 0.0, 1.0))
     mesh_pos(1, vec4(0.6, 0.6, 0.0, 1.0))
-    mesh_pos(2, vec4(0.0 - 0.6, 0.6, 0.0, 1.0))
+    mesh_pos(2, vec4(-0.6, 0.6, 0.0, 1.0))
     mesh_color(0, vec3(1.0, 0.0, 0.0))     // red top
     mesh_color(1, vec3(0.0, 1.0, 0.0))     // green corner
     mesh_color(2, vec3(0.0, 0.0, 1.0))     // blue corner

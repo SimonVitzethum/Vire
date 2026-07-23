@@ -16,7 +16,7 @@ fn ts() {
     mut o = meshlet_offset()                       // this meshlet's center from the scene
     mut plane = cull_plane()                       // frustum plane from the host
     mut d = dot(plane, vec4(o.x, o.y, 0.0, 1.0))   // signed distance
-    emit_visible(d > 0.0 - 0.2)                    // emit only if in front (radius 0.2)
+    emit_visible(d > -0.2)                    // emit only if in front (radius 0.2)
 }
 
 @mesh
@@ -33,7 +33,7 @@ fn ms() {
 fn fs() -> Vec4 { vec4(0.4, 0.7, 0.9, 1.0) }
 
 fn main() {
-    mut scene = [0.0 - 0.5, 0.0, 0.5, 0.0]         // a left and a right meshlet
+    mut scene = [-0.5, 0.0, 0.5, 0.0]         // a left and a right meshlet
     // Plane facing +x through the origin: the left meshlet (x=-0.5) is culled.
     mut mask = vk_mesh_scene_cull(scene, 1.0, 0.0, 0.0, 0.0)
     print(mask)                                    // 2 = only the right quarter drawn

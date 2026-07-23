@@ -28,7 +28,7 @@ fn fs() -> Vec4 {
 
 fn main() {
     // Four meshlets across the view — the whole batch is this one array.
-    mut scene = [0.0 - 0.6, 0.0, 0.0 - 0.2, 0.0, 0.2, 0.0, 0.6, 0.0]
+    mut scene = [-0.6, 0.0, -0.2, 0.0, 0.2, 0.0, 0.6, 0.0]
     mut mask = vk_mesh_scene(scene)
     print(mask)     // 3 = both the sampled left and right quarters were drawn
 }

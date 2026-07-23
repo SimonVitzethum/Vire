@@ -13,7 +13,7 @@
 @compute
 fn build() {
     // Meshlet i sits at x = -0.5 + i; its facing flips with i (toward, then away).
-    mut x = 0.0 - 0.5 + meshlet_index() * 1.0
+    mut x = -0.5 + meshlet_index() * 1.0
     mut facing = 1.0 - meshlet_index() * 2.0     // i=0 → +1 (toward), i=1 → -1 (away)
     set_meshlet(vec2(x, 0.0), vec2(facing, 0.0))
 }

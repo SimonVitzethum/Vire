@@ -22,13 +22,19 @@ fn word_counts(text: Str) -> Map[Str, Int] {
 
 Reads like Python — compiles to a memory-safe, RC-eliminated native binary.
 
-**`@vulkan` compiles to the same Vulkan API calls as handwritten C++ and Rust.** In a
-steady-state mesh-shader benchmark (identical SPIR-V, 5000 frames), Vire shows no
-measurable runtime overhead while reducing the application code from 85–132 lines to
-just 9 — the pipeline, render pass, descriptors, and synchronization are compiler-
-generated. The same single-source program spans the whole GPU-driven meshlet renderer
-(`@compute` build → `@task` cull → `@mesh` draw → `@fragment` shade). See
-[benchmarks/vulkan/](benchmarks/vulkan/) and [language/GPU-VULKAN.md](language/GPU-VULKAN.md).
+**`@vulkan` lets you write the whole GPU-driven meshlet renderer as one single-source
+Vire program** — `@compute` build → `@task` cull → `@mesh` draw → `@fragment` shade —
+that Vire compiles to the same SPIR-V as the handwritten GLSL. In a steady-state
+mesh-shader benchmark (identical SPIR-V, 5000 frames) it shows no measurable runtime
+overhead. The host side — pipeline, render pass, descriptors, synchronization — is
+handled by a **fixed Vulkan runtime the compiler links in** (a set of typed host entry
+points in [`vk_runtime.c`](crates/driver/src/vk_runtime.c)), so the application author
+writes only the ~9 lines of shader logic instead of the 85–132 lines of C++/Rust setup;
+that setup is shared runtime code, **not** yet derived from each program's typed shader
+signatures. Auto-deriving the pipeline/descriptor layout from those signatures (a real
+compiler pass, not a fixed harness) is the next step — roadmap, not shipped (see
+[TODO.md](TODO.md) V3/V4). See [benchmarks/vulkan/](benchmarks/vulkan/) and
+[language/GPU-VULKAN.md](language/GPU-VULKAN.md).
 
 ## The idea in one paragraph
 
