@@ -3125,6 +3125,18 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_draw_tex2".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_render_ppm(verts, idx): render colored geometry (x,y,r,g,b per vertex) to
+        // the image file frame_<idx>.ppm — for rendering an animation frame-by-frame.
+        if name == "vk_render_ppm" && args.len() == 2 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let idx = self.lower_expr(&args[1]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_render_ppm".into(), args: vec![Operand::Copy(ptr), len, idx] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_mesh" || name == "vk_mesh_c" || name == "vk_mesh_scene" {
             let sym = match name.as_str() {
                 "vk_mesh_c" => "jrt_vk_mesh_c",
@@ -3282,6 +3294,22 @@ impl<'a> FnLower<'a> {
             };
             let d = self.new_local(Ty::F64);
             self.emit(Statement::Call { dest: Some(d), func: "jrt_math_sqrt".into(), args: vec![af] });
+            return (Operand::Copy(d), Ty::F64);
+        }
+        // `sin(x)` / `cos(x)` / `floor(x)` — the backend emits the LLVM intrinsic
+        // @llvm.sin/cos/floor.f64. The argument is coerced to Float; the result is Float.
+        if (name == "sin" || name == "cos" || name == "floor") && lowered.len() == 1 {
+            let (a, at) = lowered.into_iter().next().unwrap();
+            let af = if at == Ty::F64 {
+                a
+            } else {
+                let f = self.new_local(Ty::F64);
+                self.emit(Statement::Assign(f, Rvalue::Convert(a)));
+                Operand::Copy(f)
+            };
+            let func = match name.as_str() { "sin" => "jrt_math_sin", "cos" => "jrt_math_cos", _ => "jrt_math_floor" };
+            let d = self.new_local(Ty::F64);
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![af] });
             return (Operand::Copy(d), Ty::F64);
         }
         // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float) —

@@ -1,0 +1,137 @@
+// A complete renderer: a rotating, Lambert-shaded sphere, written entirely in Vire.
+//
+// Vire does the whole geometry + 3D transform + lighting pipeline on the CPU and hands
+// shaded 2D triangles to Vulkan to rasterize; `vk_render_ppm` writes each frame to an
+// image file. Run it, then watch it spin:
+//
+//   vire run examples/vire/sphere.vr                 # writes frame_000.ppm .. frame_023.ppm
+//   convert -delay 4 -loop 0 frame_*.ppm sphere.gif  # (ImageMagick) -> an animated GIF
+//   # or view a single frame:  feh frame_006.ppm
+//
+// Per frame: build a UV sphere, rotate it around Y by the frame's angle, light it
+// (Lambert), cull the back hemisphere, project to the screen, and render the shaded
+// triangles. The lit side sweeps around as it turns — a real rotating sphere.
+
+// The GPU side: the @vertex forwards each vertex's color (Location 1) to the rasterizer,
+// the @fragment paints the interpolated color. (Vire computes the geometry + lighting;
+// these just carry the shaded color through.)
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(attr_color())
+    vec4(pos.x, pos.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 {
+    vec4(in_color(), 1.0)
+}
+
+type V3 { x: Float  y: Float  z: Float }
+
+// A point on the unit sphere at latitude `la` (-pi/2..pi/2) and longitude `lo` (0..2pi).
+fn sph(la: Float, lo: Float) -> V3 {
+    mut cphi = cos(la)
+    V3(cphi * cos(lo), sin(la), cphi * sin(lo))
+}
+
+// Rotate a point around the Y axis by angle (given as cos a / sin a).
+fn rotY(p: V3, ca: Float, sa: Float) -> V3 {
+    V3(p.x * ca + p.z * sa, p.y, -p.x * sa + p.z * ca)
+}
+
+// Lambert brightness from a surface normal (= the unit-sphere point) and a fixed light.
+fn lit(p: V3) -> Float {
+    mut d = p.x * 0.40 + p.y * 0.52 + p.z * 0.76   // dot(normal, lightDir)
+    if d < 0.12 { d = 0.12 }                        // ambient floor
+    d
+}
+
+// A base surface color FIXED to the sphere (from the un-rotated position), so the
+// pattern rotates WITH the surface — that is what makes the spin visible (a uniform
+// sphere lit only by the light looks identical from every rotation). A checker of the
+// latitude/longitude bands, tinted by position.
+fn surfcol(p: V3) -> V3 {
+    // A checkerboard fixed to the surface: parity of the summed position bands.
+    mut s = floor(p.x * 3.0) + floor(p.y * 3.0) + floor(p.z * 3.0)
+    mut parity = s - 2.0 * floor(s * 0.5)      // s mod 2 → 0 or 1
+    mut k = 0.45
+    if parity > 0.5 { k = 1.0 }
+    V3((0.35 + 0.65 * (0.5 + 0.5 * p.x)) * k, (0.35 + 0.65 * (0.5 + 0.5 * p.y)) * k, (0.35 + 0.65 * (0.5 + 0.5 * p.z)) * k)
+}
+
+// Final lit color of a corner: its surface color (from the UN-rotated position, so the
+// pattern turns with the sphere) times the Lambert brightness of its rotated normal.
+fn shade(unrot: V3, rot: V3) -> V3 {
+    mut b = lit(rot)
+    mut c = surfcol(unrot)
+    V3(c.x * b, c.y * b, c.z * b)
+}
+
+// Write one projected vertex (x, y, r, g, b) into `buf` at `w`; return w + 5. `proj` is
+// the rotated position (for the screen), `col` the final lit color.
+fn putv(buf: farray, w: Int, proj: V3, col: V3) -> Int {
+    buf[w] = proj.x * 0.9              // orthographic projection, fit to clip space
+    buf[w + 1] = proj.y * 0.9
+    buf[w + 2] = col.x
+    buf[w + 3] = col.y
+    buf[w + 4] = col.z
+    w + 5
+}
+
+// Write a triangle (three unit-sphere corners) rotated + lit into buf, OR — if it faces
+// away from the camera — write a degenerate (zero-area) triangle that rasterizes nothing.
+// Front-hemisphere-only draw means no overlap, so no depth buffer is needed.
+fn tri(buf: farray, w: Int, a: V3, b: V3, c: V3, ca: Float, sa: Float) -> Int {
+    mut ra = rotY(a, ca, sa)
+    mut rb = rotY(b, ca, sa)
+    mut rc = rotY(c, ca, sa)
+    mut facing = ra.z + rb.z + rc.z            // >0 → the face points toward the camera
+    if facing > 0.0 {
+        mut w1 = putv(buf, w, ra, shade(a, ra))
+        mut w2 = putv(buf, w1, rb, shade(b, rb))
+        putv(buf, w2, rc, shade(c, rc))
+    } else {
+        mut i = w
+        while i < w + 15 { buf[i] = 0.0  i = i + 1 }   // degenerate → invisible
+        w + 15
+    }
+}
+
+fn main() {
+    mut nlat = 14
+    mut nlon = 28
+    mut nverts = nlat * nlon * 6                 // 2 triangles (6 verts) per quad
+    mut buf = farray(nverts * 5)
+    mut pi = 3.14159265
+    mut two_pi = 6.28318530
+
+    mut frames = 24
+    mut fi = 0
+    while fi < frames {
+        mut ang = (fi as Float) / (frames as Float) * two_pi
+        mut ca = cos(ang)
+        mut sa = sin(ang)
+
+        mut w = 0
+        mut i = 0
+        while i < nlat {
+            mut la0 = -pi * 0.5 + (i as Float) / (nlat as Float) * pi
+            mut la1 = -pi * 0.5 + ((i + 1) as Float) / (nlat as Float) * pi
+            mut j = 0
+            while j < nlon {
+                mut lo0 = (j as Float) / (nlon as Float) * two_pi
+                mut lo1 = ((j + 1) as Float) / (nlon as Float) * two_pi
+                mut p00 = sph(la0, lo0)
+                mut p10 = sph(la1, lo0)
+                mut p01 = sph(la0, lo1)
+                mut p11 = sph(la1, lo1)
+                mut w1 = tri(buf, w, p00, p10, p11, ca, sa)
+                w = tri(buf, w1, p00, p11, p01, ca, sa)
+                j = j + 1
+            }
+            i = i + 1
+        }
+        vk_render_ppm(buf, fi)
+        fi = fi + 1
+    }
+    print(frames)     // rendered this many frames to frame_000.ppm ..
+}

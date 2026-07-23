@@ -226,6 +226,9 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_math_min_d", "double (double, double)"),
     ("jrt_math_sqrt", "double (double)"),
     ("llvm.sqrt.f64", "double (double)"),
+    ("llvm.sin.f64", "double (double)"),
+    ("llvm.cos.f64", "double (double)"),
+    ("llvm.floor.f64", "double (double)"),
     ("jrt_current_time_millis", "i64 ()"),
     ("jrt_nano_time", "i64 ()"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -2227,6 +2230,14 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let a = e.operand(w, &args[0]);
             let t = e.fresh();
             writeln!(w, "  {t} = call double @llvm.sqrt.f64(double {a}){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
+        }
+        // sin/cos → the LLVM intrinsic (lowered to libm), like sqrt.
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_math_sin" || func == "jrt_math_cos" || func == "jrt_math_floor" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            let intr = match func.as_str() { "jrt_math_sin" => "llvm.sin.f64", "jrt_math_cos" => "llvm.cos.f64", _ => "llvm.floor.f64" };
+            writeln!(w, "  {t} = call double @{intr}(double {a}){}", e.dbg()).unwrap();
             store_dest(w, e, *d, &t, false);
         }
         Statement::Call { dest, func, args } => {

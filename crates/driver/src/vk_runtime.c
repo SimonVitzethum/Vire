@@ -340,7 +340,7 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
 /* ---- headless: render `nverts` triangle-list vertices (interleaved f32 x,y) to an
  *      image, read back; returns the centroid pixel packed as 0xRRGGBB (so callers
  *      can check the @fragment color), or -1 on failure ---- */
-static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4]) {
+static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
@@ -391,6 +391,16 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
     VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
     CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
     unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
+    /* Optional full-frame output: write the framebuffer as a binary PPM (P6, RGB) — a
+     * viewable image, so a Vire program can render an animation frame-by-frame to files. */
+    if(ppm){
+        FILE *fp=fopen(ppm,"wb");
+        if(fp){
+            fprintf(fp,"P6\n%u %u\n255\n",W,H);
+            for(uint32_t i=0;i<W*H;i++) fwrite(&px[i*4],1,3,fp); /* RGB, drop alpha */
+            fclose(fp);
+        }
+    }
     int cx=W/2, cy=(int)(H*0.55); unsigned char *c=&px[(cy*W+cx)*4], *tl=&px[(5*W+5)*4];
     /* centroid = the triangle (fragment color); corner must be the clear color. */
     int64_t packed = ((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
@@ -407,7 +417,7 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
 /* The default triangle, from the compile-time corner buffer. */
 int64_t jrt_vk_triangle(double a, double b, double c, double d) {
     float uni[4]={(float)a,(float)b,(float)c,(float)d};
-    return render_headless(DEFAULT_TRI, 3, 2, uni);
+    return render_headless(DEFAULT_TRI, 3, 2, uni, 0);
 }
 
 /* vk_frame_bg(r,g,b): the target of the declarative `frame { bg(r,g,b) }` — render a
@@ -1501,7 +1511,7 @@ static int64_t mesh_render(const double *verts, int64_t nfloats, uint32_t fpv) {
     float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
     for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
     float uni[4]={0,0,0,0};
-    int64_t r=render_headless(f, nverts, fpv, uni);
+    int64_t r=render_headless(f, nverts, fpv, uni, 0);
     free(f);
     return r;
 }
@@ -1517,6 +1527,23 @@ int64_t jrt_vk_mesh(const double *verts, int64_t nfloats) { return mesh_render(v
  * rasterizer interpolates (the classic RGB-corner triangle). Typed stage I/O. */
 int64_t jrt_vk_mesh_c(const double *verts, int64_t nfloats) { return mesh_render(verts, nfloats, 5); }
 
+/* vk_render_ppm(verts, idx): render per-vertex-COLORED geometry (interleaved x,y, r,g,b —
+ * 5 per vertex, as vk_mesh_c) to the image file `frame_NNN.ppm` (idx = NNN). The @vertex
+ * forwards attr_color() via out_color(); the @fragment reads in_color(). Lets a Vire
+ * program render an animation frame-by-frame to viewable files (e.g. a rotating sphere:
+ * make a GIF with `convert frame_*.ppm out.gif`). Returns 0 on success, -1 on failure. */
+int64_t jrt_vk_render_ppm(const double *verts, int64_t nfloats, int64_t idx) {
+    if(!verts || nfloats < 15 || (nfloats % 5)!=0) return -1;   /* >=3 (x,y,r,g,b) vertices */
+    uint32_t nverts=(uint32_t)(nfloats/5);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    char path[64]; snprintf(path,sizeof path,"frame_%03d.ppm",(int)idx);
+    float uni[4]={0,0,0,0};
+    int64_t r=render_headless(f, nverts, 5, uni, path);
+    free(f);
+    return r>=0 ? 0 : -1;
+}
+
 /* vk_draw(verts, ux,uy,uz,uw): the generic draw surface — the program supplies BOTH the
  * geometry (a flat [Float] array of interleaved (x,y), like vk_mesh) AND a vec4 uniform.
  * The runtime renders it through the compiled @vertex/@fragment shaders; the uniform is
@@ -1530,7 +1557,7 @@ int64_t jrt_vk_draw(const double *verts, int64_t nfloats, double ux, double uy, 
     float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
     for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
     float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw};
-    int64_t r=render_headless(f, nverts, 2, uni);
+    int64_t r=render_headless(f, nverts, 2, uni, 0);
     free(f);
     return r;
 }

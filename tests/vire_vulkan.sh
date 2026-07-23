@@ -1051,6 +1051,44 @@ fn main() {
 }
 EOF
 
+# vk_render_ppm: render two colored frames of a rotating triangle to image files and
+# check (a) the PPM files are produced and (b) they DIFFER — i.e. the animation renders
+# distinct frames (the mechanism behind examples/vire/sphere.vr). Also exercises sin/cos.
+ppm_name=vire_render_ppm
+cat > "$work/$ppm_name.vr" <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 { out_color(attr_color())  vec4(pos.x, pos.y, 0.0, 1.0) }
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() {
+    mut f = 0
+    while f < 2 {
+        mut a = (f as Float) * 1.2
+        mut ca = cos(a)
+        mut sa = sin(a)
+        // one triangle rotated by the frame angle, per-vertex colored
+        mut tri = [ca * 0.6, sa * 0.6, 1.0, 0.2, 0.2,
+                   0.0 - sa * 0.6, ca * 0.6, 0.2, 1.0, 0.2,
+                   0.0 - ca * 0.6, 0.0 - sa * 0.6, 0.2, 0.2, 1.0]
+        vk_render_ppm(tri, f)
+        f = f + 1
+    }
+    print(1)
+}
+EOF
+if "$vire" build "$work/$ppm_name.vr" -o "$work/$ppm_name" >/dev/null 2>"$work/e"; then
+    ( cd "$work" && ./"$ppm_name" >/dev/null 2>&1 )
+    if [ -f "$work/frame_000.ppm" ] && [ -f "$work/frame_001.ppm" ] \
+       && ! cmp -s "$work/frame_000.ppm" "$work/frame_001.ppm"; then
+        echo "ok   $ppm_name"; pass=$((pass+1))
+    else
+        echo "FAIL $ppm_name (frames missing or identical)"; fail=$((fail+1))
+    fi
+else
+    if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip $ppm_name (env)"; else
+        echo "FAIL $ppm_name (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

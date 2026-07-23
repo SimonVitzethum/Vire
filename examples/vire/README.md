@@ -49,3 +49,15 @@ the repo `TODO.md`.
 | [compile_time.vr](compile_time.vr) | `const`/`comptime`, `@derive`, and a hygienic item macro |
 | [inferred.vr](inferred.vr) | type inference — no annotation on any local or return, one parameter fully inferred from use |
 | [object_graph.vr](object_graph.vr) | `type` objects with references, built + traversed recursively; heap balances to 0 live (RC/ownership proven) |
+
+## Graphics (`@vulkan`)
+
+Vire-authored shaders (`@vertex`/`@fragment`/`@mesh`/`@task`/`@compute`) → SPIR-V, with
+the descriptor/pipeline layout derived from the shader signatures. Need a Vulkan device +
+`spirv-as`. See [language/GPU-VULKAN.md](../../language/GPU-VULKAN.md) and the many
+`vulkan_*.vr` files.
+
+| File | Shows |
+|---|---|
+| [vulkan_draw.vr](vulkan_draw.vr) | the generic `vk_draw(verts, uniform)` surface — program geometry + uniform through the program's own shaders |
+| [sphere.vr](sphere.vr) | **a complete renderer: a rotating, Lambert-shaded sphere.** Vire does the geometry + 3D rotation + lighting; Vulkan rasterizes; each frame is written to `frame_NNN.ppm`. Run it, then `convert -delay 4 -loop 0 frame_*.ppm sphere.gif` to watch it spin |

@@ -446,11 +446,11 @@ impl<'a> Ctx<'a> {
                     match n.as_str() {
                         "gpu_sync" => return T::Void,
                         "gpu_sqrt" | "gpu_fabs" | "gpu_floor" | "gpu_ceil" | "gpu_fmin"
-                        | "gpu_fmax" => return T::F64,
+                        | "gpu_fmax" | "sqrt" | "sin" | "cos" | "floor" => return T::F64,
                         "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_frame_bg" | "vk_window" | "vk_bench" | "vk_textured" | "vk_two_pass" | "vk_chain" | "vk_blend2" | "vk_frame" | "vk_window_mesh" | "vk_texture_draw" | "vk_draw_handle"
-                        | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader" | "vk_draw" | "vk_draw_tex" | "vk_draw_tex2" | "vk_draw_buf" | "vk_draw_tex_buf"
+                        | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader" | "vk_draw" | "vk_draw_tex" | "vk_draw_tex2" | "vk_draw_buf" | "vk_draw_tex_buf" | "vk_render_ppm"
                         | "vk_mesh_scene" | "vk_mesh_scene_cull"
                         | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
                         // Returns an RC-bound GPU texture handle (a Vire object).
