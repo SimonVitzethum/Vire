@@ -1,0 +1,29 @@
+// Type inference — the ergonomics claim, demonstrated instead of asserted.
+//
+// Not one type annotation appears on a local or a return, and one parameter
+// (`v` in `lensq`) has no annotation at all: the monomorphic unifier fixes it
+// to `Vec2` from the way it is used. Run it:  vire run examples/vire/inferred.vr
+//
+// (The graphics/thread examples in this folder annotate every signature for
+//  readability; that is a style choice, not a language requirement — as this
+//  file shows.)
+
+type Vec2 { x: Int y: Int }
+
+fn dot(a: Vec2, b: Vec2) {           // no return type — inferred Int
+    a.x * b.x + a.y * b.y
+}
+
+fn lensq(v) {                         // no annotation at all — v inferred Vec2
+    dot(v, v)
+}
+
+fn scale(x) {                         // inferred Float, purely from the literal below
+    x * 2.0
+}
+
+fn main() {
+    mut p = Vec2(3, 4)
+    print(lensq(p))                   // 3*3 + 4*4 = 25
+    print(scale(1.5))                 // 3.0
+}

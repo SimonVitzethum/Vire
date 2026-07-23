@@ -3768,6 +3768,18 @@ impl<'a> FnLower<'a> {
         if rty != Ty::Void {
             // Phi replacement: shared result local, assigned in both end blocks.
             let res = self.new_local(rty);
+            // The result inherits the object class / array element kind of its
+            // branches (both agree for a well-formed value-if). Without this,
+            // `mut n = if c { a } else { b }` forgets that `n` is an object, so a
+            // later `n.field` fails "type of the object unknown" — the same gap
+            // that made a self-recursive object builder (after recursion-inlining
+            // rewrites the tail self-call into an if/else) unusable.
+            if let Some(c) = self.class_of_operand(&tv).or_else(|| self.class_of_operand(&ev)) {
+                self.local_class.insert(res.0, c);
+            }
+            if let Some(k) = self.arr_of_operand(&tv).or_else(|| self.arr_of_operand(&ev)) {
+                self.local_arr.insert(res.0, k);
+            }
             self.blocks[te].statements.push(Statement::Assign(res, Rvalue::Use(tv)));
             self.blocks[ee].statements.push(Statement::Assign(res, Rvalue::Use(ev)));
             self.term(te, Terminator::Goto(merge));

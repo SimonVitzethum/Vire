@@ -1,0 +1,47 @@
+// Objects, references, recursion, and reference counting — the "contested half"
+// of the thesis, in the examples folder rather than buried in benchmarks/.
+//
+// `type Node` is a heap object with two references to more nodes. Building the
+// tree allocates; the whole-program solver proves the lifetimes and inserts the
+// minimal reference counting (nodes here are tree-shaped and provably owned, so
+// most RC is elided). Verify the heap balances to zero live objects:
+//
+//   vire build examples/vire/object_graph.vr -o /tmp/og
+//   FASTLLVM_HEAPSTATS=1 /tmp/og        # -> "... 0 still live"  (sound)
+//
+// See also benchmarks/vire-lang/btree.vr (the allocation-stress version) and the
+// capsule deep-copy path, which handles shared subgraphs and cycles with RC.
+
+type Node { val: Int left: Node right: Node }
+
+fn leaf(v: Int) -> Node {
+    Node(v, null, null)
+}
+
+// Build a balanced tree of the given depth; each internal node's value is the
+// sum of its children — so the root ends up holding the whole subtree's sum.
+fn build(depth: Int, base: Int) -> Node {
+    if depth == 0 {
+        leaf(base)
+    } else {
+        mut l = build(depth - 1, base)
+        mut r = build(depth - 1, base + 1)
+        Node(l.val + r.val, l, r)
+    }
+}
+
+// Independent check: walk to the leaves and re-sum only them. Because each
+// internal node stored the sum of its two children, this must equal root.val.
+fn leafsum(n: Node) -> Int {
+    if n.left == null {
+        n.val                         // a leaf
+    } else {
+        leafsum(n.left) + leafsum(n.right)
+    }
+}
+
+fn main() {
+    mut root = build(10, 0)           // depth 10 → 1024 leaves
+    print(root.val)                   // root holds the sum of all leaves
+    print(leafsum(root))              // independent traversal — same value
+}

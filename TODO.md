@@ -196,6 +196,16 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   that appears only in return position defaults to `Int`).
 - [~] **Iterator-mutation check** ([REFERENCE.md](language/REFERENCE.md) §9a) — local
   non-mutation analysis; not provable → compile error.
+- [x] **`if`/`else` as a value keeps its object class.** `mut n = if c { a } else { b }`
+  now propagates the branches' object class (and array element kind) onto the result
+  local, so a following `n.field` resolves. This also unblocked self-recursive object
+  builders: recursion-inlining ([inline.rs](crates/vire/src/inline.rs)) rewrites the
+  tail self-call into an `if`/`else`, so a Vire binary tree that bound the recursive
+  result and read a field of it failed "type of the object unknown" before the fix
+  ([lower.rs](crates/vire/src/lower.rs) `lower_if`). Regression: `tests/vire_heap.sh
+  if_expr_object_class` (value + 0-live); example: `examples/vire/object_graph.vr`.
+  *Still open:* no local type annotation (`mut x: T = …`) exists as a fallback, so
+  cases the monomorphic unifier can't reach have no manual escape hatch yet.
 
 ## Stdlib + FFI
 

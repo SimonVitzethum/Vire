@@ -306,6 +306,31 @@ fn work(n: Int) -> Int {
 fn main() { print(work(100000)) }
 EOF
 
+# --- if-expression result keeps its object class: `mut n = if c { a } else { b }`
+# must remember n is a Node so `n.field` resolves. Also covers the self-recursive
+# object builder (recursion-inlining rewrites the tail self-call into an if/else,
+# so this is exactly what made a Vire binary tree fail before the fix). ---
+case_ if_expr_object_class 5120 <<'EOF'
+type Node { val: Int left: Node right: Node }
+fn leaf(v: Int) -> Node { Node(v, null, null) }
+fn build(depth: Int, base: Int) -> Node {
+    if depth == 0 {
+        leaf(base)
+    } else {
+        mut l = build(depth - 1, base)
+        mut r = build(depth - 1, base + 1)
+        Node(l.val + r.val, l, r)
+    }
+}
+fn leafsum(n: Node) -> Int {
+    if n.left == null { n.val } else { leafsum(n.left) + leafsum(n.right) }
+}
+fn main() {
+    mut root = build(10, 0)
+    if root.val == leafsum(root) { print(root.val) } else { print(0 - 1) }
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

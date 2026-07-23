@@ -47,3 +47,5 @@ the repo `TODO.md`.
 | [collections.vr](collections.vr) | growable `list()`, hash `map()`/`set()`, `Str` methods |
 | [iterators.vr](iterators.vr) | `fold`/`sum`/`map`/`filter`/`each` over ranges & lists |
 | [compile_time.vr](compile_time.vr) | `const`/`comptime`, `@derive`, and a hygienic item macro |
+| [inferred.vr](inferred.vr) | type inference — no annotation on any local or return, one parameter fully inferred from use |
+| [object_graph.vr](object_graph.vr) | `type` objects with references, built + traversed recursively; heap balances to 0 live (RC/ownership proven) |
