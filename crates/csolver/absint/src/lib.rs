@@ -27,6 +27,7 @@ pub mod engine;
 pub mod env;
 pub mod induction;
 pub mod interval;
+pub mod pointsto;
 pub mod relational;
 pub mod zone;
 
@@ -36,5 +37,6 @@ pub use induction::{analyze_induction, EqExitIndVar, InductionAnalysis, PtrIndVa
 pub use engine::{solve, Solution};
 pub use env::IntervalState;
 pub use interval::{Bound, Interval};
+pub use pointsto::{ModulePointsTo, PointsTo, ProgramPointsTo};
 pub use relational::{analyze_zones, ZoneAnalysis};
 pub use zone::Zone;

@@ -100,9 +100,11 @@ pub(crate) fn discharge_inner(
     globals: &HashMap<String, GlobalDef>,
     prov_grants: &HashMap<u32, HashSet<u32>>,
     global_fn_ptrs: &HashMap<String, Vec<(u64, FuncId)>>,
+    global_ptr_fields: &HashMap<String, Vec<(u64, String)>>,
     analysis_in: Option<&IntervalAnalysis>,
     reg_ptr_hints: &HashMap<RegId, PtrHint>,
     mmio_region: Option<csolver_ir::MmioHandler>,
+    devirt: &HashMap<RegId, String>,
 ) -> SymbolicReport {
     // Reuse the caller's interval analysis when supplied (the verifier already
     // computes it for interval-based discharge), so it is not recomputed here —
@@ -164,6 +166,7 @@ pub(crate) fn discharge_inner(
         exported: limits.exported,
         assume_valid_params: limits.assume_valid_params,
         reg_ptr_hints,
+        devirt,
         mmio_region,
         visits: 0,
         truncated: false,
@@ -291,7 +294,14 @@ pub(crate) fn discharge_inner(
                 // at a value no caller can produce. Not applied to an adversarial entry,
                 // whose parameters are attacker-controlled. Prove-only (a `caller-range`
                 // assumption), so an out-of-range witness is not a real counterexample.
-                if !limits.exported {
+                // A parameter wider than the bit-precise domain (`MAX_WIDTH` = 128 bits — an
+                // `i256`/`i512` crypto big-integer) cannot be encoded as a `BitVector`: building
+                // the precondition constants would panic (`ctx.int(width>128, …)`). Skip the
+                // seeding for such a parameter — it stays a free symbol (sound: no bound asserted,
+                // never a false verdict). This unblocks whole-program scans of corpora containing
+                // wide-integer code (crypto), where `scalar_pre` is populated and single-file
+                // verification — which has none — never reached this construction.
+                if !limits.exported && width <= csolver_solver::bitblast::MAX_WIDTH {
                     if let Some(Some((lo, hi))) = scalar_pre.get(i) {
                         let mask = |v: i128| if width >= 128 { v as u128 } else { (v as u128) & ((1u128 << width) - 1) };
                         let lo_e = ex.ctx.int(width, mask(*lo));
@@ -455,8 +465,28 @@ pub(crate) fn discharge_inner(
         .collect();
     names.sort();
     names.dedup();
-    for name in names {
-        let g = globals[&name];
+    // Transitively include the **global targets** of constant `.field = &other_global`
+    // initializers, so a `G->field->fn()` dispatch reaches `other_global`'s region and its
+    // function-pointer table even when `other_global` is not referenced by name in this function.
+    // A bounded closure (each name is expanded once); re-sorted for deterministic region ids.
+    {
+        let mut i = 0;
+        while i < names.len() {
+            if let Some(fields) = global_ptr_fields.get(&names[i]) {
+                for (_, target) in fields.clone() {
+                    if globals.contains_key(&target) && !names.contains(&target) {
+                        names.push(target);
+                    }
+                }
+            }
+            i += 1;
+        }
+        names.sort();
+        names.dedup();
+    }
+    let mut name_rid: HashMap<String, usize> = HashMap::new();
+    for name in &names {
+        let g = globals[name];
         let rid = regions.len();
         let size = ex.ctx.int(PTR_WIDTH, g.size as u128);
         let truth = ex.ctx.boolean(true);
@@ -479,10 +509,36 @@ pub(crate) fn discharge_inner(
         });
         // A constant ops-struct/vtable global carries a devirtualisation table:
         // record it against the region id so a field load can resolve its target.
-        if let Some(table) = global_fn_ptrs.get(&name) {
+        if let Some(table) = global_fn_ptrs.get(name) {
             ex.global_fnptrs.insert(rid, table.iter().copied().collect());
         }
-        ex.global_rids.insert(name, (rid, g.align.max(1) as u64));
+        ex.global_rids.insert(name.clone(), (rid, g.align.max(1) as u64));
+        name_rid.insert(name.clone(), rid);
+    }
+    // Seed the constant `.field = &other_global` initializer stores: a load of `G.field` then
+    // reads back a pointer to `other_global`'s region (via the ordinary store-load forwarding), so
+    // the `G->field->fn()` dispatch resolves `field` to that region and the subsequent fn-ptr load
+    // devirtualises through its table. Sound and unconditional — a constant global's initializer
+    // is ground truth. Deterministic (iterates the sorted `names`).
+    for name in &names {
+        let (Some(fields), Some(&src_rid)) =
+            (global_ptr_fields.get(name), name_rid.get(name)) else { continue };
+        for (offset, target) in fields {
+            let Some(&tgt_rid) = name_rid.get(target) else { continue };
+            let zero = ex.ctx.int(PTR_WIDTH, 0);
+            let off = ex.ctx.int(PTR_WIDTH, *offset as u128);
+            let talign = (globals[target].align as u64).max(1);
+            initial_heap.push(StoreRecord {
+                target: SymPointer { prov: Prov::Region(src_rid), offset: off, align: 1, borrow: None },
+                value: SymValue::Ptr(SymPointer {
+                    prov: Prov::Region(tgt_rid),
+                    offset: zero,
+                    align: talign,
+                    borrow: None,
+                }),
+                size: (PTR_WIDTH / 8) as u64,
+            });
+        }
     }
 
     // MMIO dispatch precondition (`Module::mmio_handlers`): a `MemoryRegionOps.read/.write`

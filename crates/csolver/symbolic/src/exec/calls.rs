@@ -175,6 +175,21 @@ impl Explorer<'_> {
             }
             _ => None,
         };
+        // Closed-world points-to devirtualisation (call-target resolution ONLY). When the region-
+        // precise `fn_ptrs` above did not resolve, the whole-program points-to may know the single
+        // function this indirect target register designates (a heap/param `obj->ops->fn()`). We use
+        // it purely to pick the callee — the loaded pointer keeps its real (opaque) provenance, so
+        // its null/uninit/bounds checks below are untouched: a genuinely null/uninitialised target
+        // still faults first, and the resolved effect is used only on the paths that proceed.
+        let devirt_name: Option<String> = match callee {
+            Callee::Indirect(Operand::Reg(r)) if resolved_fid.is_none() => {
+                self.devirt.get(r).cloned()
+            }
+            _ => None,
+        };
+        if devirt_name.is_some() {
+            self.assumptions.insert("closed-world-devirt");
+        }
         // Valid indirect target (a CFI slice): an indirect call is a definite control-flow-
         // integrity bug when the target pointer is provably (a) **null** (a null/uninit
         // callback) or (b) into a **stack or heap region** — executing data as code (the
@@ -185,7 +200,7 @@ impl Explorer<'_> {
         // witness on a feasible path.
         if let Callee::Indirect(op) = callee {
             let mut violation = false;
-            if resolved_fid.is_none() {
+            if resolved_fid.is_none() && devirt_name.is_none() {
                 if let SymValue::Ptr(p) = self.eval_value(op, state) {
                     violation = match &p.prov {
                         Prov::Null => true,
@@ -216,7 +231,12 @@ impl Explorer<'_> {
             .or_else(|| match callee {
                 Callee::Symbol(name) => self.name_summaries.get(name).cloned(),
                 _ => None,
-            });
+            })
+            // A points-to-devirtualised indirect call resolves to its target's whole-program
+            // summary by name (precise effects instead of havoc). A name with no summary — e.g. a
+            // file-local `static` callee, excluded from the name-keyed summaries to avoid cross-file
+            // collisions — still falls through to the opaque havoc below (sound, just less precise).
+            .or_else(|| devirt_name.as_ref().and_then(|n| self.name_summaries.get(n).cloned()));
 
         // Double-free through a freeing *wrapper*: a callee that definitely frees its
         // parameter `k` (`Summary.frees_arg`) re-frees a base an earlier freeing call
@@ -421,6 +441,29 @@ impl Explorer<'_> {
                         borrow: None,
                     })
                 }
+                // The callee returns a valid typed reference (a field accessor,
+                // `return sk->sk_prot;`) on every path — the frontend recovered the pointee
+                // size as a `RefWitness`. Hand the caller a sized valid-reference region (the
+                // same region the `RefWitness` arm builds), so accesses through the result are
+                // decided instead of the opaque `POrigin::Call`. A raw-pointer field (`assumed`)
+                // is valid only under `--assume-valid-params`; without the opt-in the call
+                // still havocs (no false PASS). A real `&T` field is unconditional.
+                Some(&RetSummary::ValidRef { size, align, writable, assumed }) => {
+                    if assumed && !self.assume_valid_params {
+                        self.fresh_value(ret_ty, POrigin::Call)
+                    } else {
+                        if assumed {
+                            self.assumptions.insert(PARAM_VALID);
+                        }
+                        let rid = self.materialize_ref_region(size, writable, assumed, state);
+                        SymValue::Ptr(SymPointer {
+                            prov: Prov::Region(rid),
+                            offset: self.ctx.int(PTR_WIDTH, 0),
+                            align: (align as u64).max(1),
+                            borrow: None,
+                        })
+                    }
+                }
                 // No precise summary, but the result type is a reference: it is
                 // valid by Rust's type invariant (a safe callee cannot return a
                 // dangling `&T`). Materialise a valid-reference region instead of
@@ -523,9 +566,27 @@ impl Explorer<'_> {
         {
             return v;
         }
-        let Some(hint) = self.reg_ptr_hints.get(&dst).copied().filter(|h| h.size > 0) else {
+        let Some(hint) = self.reg_ptr_hints.get(&dst).copied() else {
             return v;
         };
+        // **container_of / intrusive-list member** (a hand-rolled walk whose container carries no
+        // `struct T` gep): the pointer is a member at `container_offset` inside a `container_size`-
+        // byte node. Materialise the *whole node* and place the pointer at that offset, so the
+        // backward `container_of` subtraction (`ptr - container_offset`) lands at the node base
+        // (in-object). The node validity/size rests on the same `--assume-valid-params` opt-in.
+        if let Some((csize, coff)) = hint.container() {
+            self.assumptions.insert(PARAM_VALID);
+            let rid = self.materialize_ref_region(Some(csize), true, true, state);
+            return SymValue::Ptr(SymPointer {
+                prov: Prov::Region(rid),
+                offset: self.ctx.int(PTR_WIDTH, coff as u128),
+                align: 1,
+                borrow: None,
+            });
+        }
+        if hint.size == 0 {
+            return v;
+        }
         self.assumptions.insert(PARAM_VALID);
         let tail = self.limits.assume_struct_tail && hint.tail > hint.size;
         if tail {

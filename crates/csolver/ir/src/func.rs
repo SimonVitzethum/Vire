@@ -279,6 +279,13 @@ pub struct Module {
     /// an opaque havoc. Only external references that resolve to a defined
     /// function are kept; the rest stay opaque (sound).
     pub global_fn_ptrs: HashMap<String, Vec<(u64, FuncId)>>,
+    /// Per **constant global**, the byte offsets whose initializer stores the address of *another
+    /// global* — `(offset, target global name)`. `static struct dev D = { .ops = &d_ops };` records
+    /// `D → (offsetof(ops), "d_ops")`. A load of such a field, at a matching concrete offset from
+    /// `D`'s region, resolves the loaded pointer to `d_ops`'s region — so the `D->ops->fn()`
+    /// dispatch chain devirtualises (the loaded ops pointer then carries `d_ops`'s function-pointer
+    /// table). Sound and unconditional: a constant global's initializer is ground truth.
+    pub global_ptr_fields: HashMap<String, Vec<(u64, String)>>,
     /// **Pointee byte size of a register**, recovered from the struct type of the `gep` that
     /// indexes it: a `getelementptr %struct.T, ptr %r, …` proves `%r` designates a `%struct.T`,
     /// so `sizeof(%struct.T)` bounds every access through `%r`. Keyed by `(function, register)`.
@@ -290,6 +297,20 @@ pub struct Module {
     /// how big that object is. Empty for frontends that carry no type information — the sound
     /// default (the region stays unsized).
     pub reg_ptr_hints: HashMap<(FuncId, RegId), PtrHint>,
+    /// **Whole-program field-type evidence**: `(LLVM struct name, byte offset) → (pointee size,
+    /// align)`, recovered from a *typed use* of a field-load result — a `%p = load obj->f` whose
+    /// `%p` is then indexed as a `struct T` (`getelementptr %struct.T, ptr %p`) proves field `f`
+    /// of that struct holds a `struct T *`. This types the fields DWARF cannot (`void *`,
+    /// `union`, `private_data`): the type recovered in *any* file applies in *every* file. Unioned
+    /// whole-program; a field with conflicting evidence is dropped (see `FieldTypeFacts`). The LLVM
+    /// struct name is the stable cross-module key (unlike the anonymous MSIR `Type::Struct`). A
+    /// `0`-size entry is a **poison** marker (conflicting evidence within this module).
+    pub field_ptr_evidence: HashMap<(String, u64), (u64, u32)>,
+    /// Which struct field each pointer **load-result register** reads: `(FuncId, RegId) → (LLVM
+    /// struct name, byte offset)`. Pairs a register that is otherwise untyped in *its* function
+    /// with the whole-program [`field_ptr_evidence`](Self::field_ptr_evidence), so the verifier can
+    /// size it from the type recovered elsewhere (the closed-world field-type overlay).
+    pub field_load_sites: HashMap<(FuncId, RegId), (String, u64)>,
     /// Functions registered as a **memory-mapped-I/O dispatch handler** — the `.read`/`.write`
     /// of a `MemoryRegionOps` passed to `memory_region_init_io(mr, owner, ops, opaque, name,
     /// size)`. Such a handler is *only* ever called by the memory core's dispatch, which
@@ -348,6 +369,27 @@ pub struct PtrHint {
     /// Honoured only under `--assume-struct-tail`; otherwise the region keeps `size` and every
     /// access into the tail stays UNKNOWN — soundly, since the tail's real size is unknown.
     pub tail: u64,
+    /// **Container size** for a `container_of`/intrusive-list pointer: when this register is used
+    /// as `c = ptr − container_offset` (a byte `getelementptr` with a negative constant) whose
+    /// result `c` is then indexed as a `struct T`, the register points *into* a `struct T` of this
+    /// many bytes, at [`container_offset`](Self::container_offset). `0` when it is not a container
+    /// member. Lets the loop-pointer materialisation put a `list_for_each_entry` cursor at the
+    /// right offset inside its whole node, so the backward `container_of` offset stays in-object
+    /// (otherwise it underflows the region — the dominant list-walk `valid_pointer_arith` residual).
+    pub container_size: u64,
+    /// The byte offset of this pointer *within* its [`container_size`](Self::container_size)-byte
+    /// node — `offsetof(T, member)`, recovered from the `container_of` subtraction. Meaningful
+    /// only when `container_size > 0`.
+    pub container_offset: u64,
+    /// **Observed access extent**: the largest byte extent (`offset + access_size`) the function
+    /// itself dereferences through this pointer — a direct `load`/`store` (offset 0) or one behind
+    /// a *constant* offset. When the pointer has no type-derived `size`, this bounds the region a
+    /// valid instance must span to make the code's own accesses in-bounds (the untyped
+    /// `list_for_each`-style cursor and hand-rolled walk cursors that carry no `struct T` gep).
+    /// Honoured only under the opt-in region assumptions (`--assume-valid-params` /
+    /// `--assume-valid-loop-ptrs`) and as an `assumed` region — a constant access past it is never
+    /// refuted (no false FAIL), only an input-driven overrun is; `0` when nothing is observed.
+    pub access_extent: u64,
 }
 
 impl PtrHint {
@@ -374,6 +416,14 @@ impl PtrHint {
         } else {
             1u64 << self.size.trailing_zeros().min(4)
         }
+    }
+
+    /// The container `(size, member_offset)` when this hint records a `container_of` pointer — a
+    /// register that points at `member_offset` inside a `size`-byte node. `None` for an ordinary
+    /// pointee hint. Consumed by the loop-pointer materialisation to place a `list_for_each_entry`
+    /// cursor inside its whole node so the backward container offset stays in-object.
+    pub fn container(&self) -> Option<(u64, u64)> {
+        (self.container_size > 0).then_some((self.container_size, self.container_offset))
     }
 }
 
@@ -404,7 +454,10 @@ impl Module {
             raw_ptr_hints: HashMap::new(),
             prov_grants: HashMap::new(),
             global_fn_ptrs: HashMap::new(),
+            global_ptr_fields: HashMap::new(),
             reg_ptr_hints: HashMap::new(),
+            field_ptr_evidence: HashMap::new(),
+            field_load_sites: HashMap::new(),
             mmio_handlers: HashMap::new(),
         }
     }
@@ -504,6 +557,15 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
         for ((fid, reg), hint) in m.reg_ptr_hints {
             merged.reg_ptr_hints.insert((remap[&fid], reg), hint);
         }
+        for ((fid, reg), site) in m.field_load_sites {
+            merged.field_load_sites.insert((remap[&fid], reg), site);
+        }
+        // Field-type evidence is keyed by symbol name + offset (no id remap). Union with
+        // disagreement → poison (a `0`-size entry): two files typing the same field differently
+        // means it is not consistently one type, so it must not be sized from either.
+        for (k, (size, align)) in m.field_ptr_evidence {
+            merge_field_evidence(&mut merged.field_ptr_evidence, k, size, align);
+        }
         for (name, h) in m.mmio_handlers {
             merged.mmio_handlers.insert(name, h);
         }
@@ -516,12 +578,41 @@ pub fn merge_modules(mods: Vec<Module>, name: impl Into<String>) -> Module {
                 .entry(k)
                 .or_insert_with(|| v.into_iter().map(|(off, fid)| (off, remap[&fid])).collect());
         }
+        // Global-to-global pointer fields need no id remapping (keyed and valued by symbol name).
+        for (k, v) in m.global_ptr_fields {
+            merged.global_ptr_fields.entry(k).or_insert(v);
+        }
         for (k, v) in m.prov_grants {
             merged.prov_grants.entry(k).or_default().extend(v);
         }
         merged.unanalyzed.extend(m.unanalyzed);
     }
     merged
+}
+
+/// Fold one field-type observation into the whole-program evidence map, keyed by `(struct name,
+/// offset)`. Agreement keeps the size; **any** disagreement (a different non-zero size, or an
+/// existing poison) sets the entry to the poison marker `(0, 0)` so the field is never sized — the
+/// same soundness rule as the points-to (a field that is not consistently one type is left untyped).
+pub fn merge_field_evidence(
+    map: &mut HashMap<(String, u64), (u64, u32)>,
+    key: (String, u64),
+    size: u64,
+    align: u32,
+) {
+    match map.get(&key) {
+        None => {
+            map.insert(key, (size, align));
+        }
+        Some(&(existing, _)) => {
+            if existing == 0 {
+                // already poisoned — stays poisoned
+            } else if existing != size || size == 0 {
+                map.insert(key, (0, 0));
+            }
+            // else: same non-zero size — agreement, keep it
+        }
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,41 @@ pub(crate) fn dwarf_field_loads(
     out
 }
 
+/// Which struct field each register **addresses**, keyed by the **LLVM struct name** — the stable
+/// cross-module identity the anonymous MSIR `Type::Struct` lacks. A `getelementptr %struct.S, ptr
+/// %base, i64 0, i32 K` gives its result the field `(S, offsetof(S, K))`. Pairs a field-load result
+/// with the whole-program `Module::field_ptr_evidence` so an otherwise-untyped loaded pointer can be
+/// sized from the type the field is used as elsewhere in the program.
+pub(crate) fn field_at_llvm(f: &LFunc) -> HashMap<String, (String, u64)> {
+    let mut out = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::GepChain { dst, agg_ty, indices, struct_name, .. } = inst {
+            if let Some(s) = struct_name.as_deref() {
+                if matches!(indices.first(), Some(LValue::Int(0))) {
+                    if let Some(off) = gepchain_const_offset(&lower_type(agg_ty), &indices[1..]) {
+                        out.insert(dst.clone(), (s.to_string(), off));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Which **LLVM struct** each register points at (by name): a `getelementptr %struct.S, ptr %base,
+/// …` proves `%base` designates a `struct S`. First seed wins. Lets a *bare* `load ptr, ptr %base`
+/// — clang's form for the **first field** (offset 0), which carries no `getelementptr` — be paired
+/// with field `(S, 0)`, so `p->first` chains resolve like explicit-gep fields.
+pub(crate) fn struct_of_llvm(f: &LFunc) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::GepChain { base: LValue::Local(b), struct_name: Some(s), .. } = inst {
+            out.entry(b.clone()).or_insert_with(|| s.clone());
+        }
+    }
+    out
+}
+
 /// The byte size of the struct each local is **indexed as**: a `gep %struct.T, ptr %b, …`
 /// proves `%b` points at a `%struct.T`, so `sizeof(%struct.T)` bounds every access through
 /// `%b` — recovered straight from the IR, no DWARF needed. The type is authoritative for the
@@ -202,6 +237,99 @@ pub(crate) fn typed_gep_pointee_sizes(f: &LFunc) -> HashMap<&str, (u64, Option<&
         }
     }
     pointee
+}
+
+/// The **observed access extent** of each pointer register: the largest byte extent
+/// (`offset + access_size`) the function itself dereferences through it — a direct `load`/`store`
+/// (offset 0) or one behind a *constant* `i8` byte offset. This bounds the region an untyped
+/// pointer must span to make the code's own accesses in-bounds — the `list_for_each`-style cursor
+/// and hand-rolled walk cursors that carry no `struct T` gep and therefore no type-derived size.
+/// Honoured only under the opt-in region assumptions and as an `assumed` region (a constant
+/// access past it is never refuted), so it only ever *adds* recall, never a false FAIL.
+pub(crate) fn reg_access_extents(f: &LFunc) -> HashMap<String, u64> {
+    // A constant byte offset `g = getelementptr i8, base, K` (K ≥ 0) — so an access through `g` is
+    // an access at offset `K` through `base`.
+    let mut offset_of: HashMap<&str, (&str, u64)> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::Gep {
+            dst,
+            elem: LType::Int(8),
+            base: LValue::Local(b),
+            index: LValue::Int(k),
+        } = inst
+        {
+            if *k >= 0 {
+                offset_of.insert(dst.as_str(), (b.as_str(), *k as u64));
+            }
+        }
+    }
+    let mut out: HashMap<String, u64> = HashMap::new();
+    let record = |ptr: &LValue, ty: &LType, out: &mut HashMap<String, u64>| {
+        let LValue::Local(p) = ptr else { return };
+        let Some(sz) = lower_type(ty).size_bytes(&LAYOUT).filter(|&s| s > 0) else { return };
+        let e = out.entry(p.clone()).or_insert(0);
+        *e = (*e).max(sz);
+        // If `p` is a constant byte offset of `base`, the same access reaches `off + sz` of `base`.
+        if let Some(&(base, off)) = offset_of.get(p.as_str()) {
+            if let Some(ext) = off.checked_add(sz) {
+                let e = out.entry(base.to_string()).or_insert(0);
+                *e = (*e).max(ext);
+            }
+        }
+    };
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            LInst::Load { ty, ptr, .. } => record(ptr, ty, &mut out),
+            LInst::Store { ty, ptr, .. } => record(ptr, ty, &mut out),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Recover **container-of / intrusive-list** hints: a register `p` used as `c = getelementptr
+/// i8, p, -C` (a byte gep with a negative constant) whose result `c` is then indexed as a
+/// `struct T` (`gep %struct.T, c, …`, so `c ∈ typed_gep_pointee_sizes`) points *into* a `struct
+/// T` — at byte offset `C` (the intrusive member's `offsetof`). This is exactly `container_of(p,
+/// T, member)`: `p = &node.member`, `c = node`. Returns `member local → (sizeof(T), C)`.
+///
+/// The dominant `list_for_each_entry` shape: the cursor `p` walks `list_head`s, and each is a
+/// member at offset `C` of its enclosing node. Sizing `p`'s region as the *whole* node with the
+/// cursor at offset `C` (see the loop-pointer materialisation) keeps the backward `container_of`
+/// subtraction in-object — otherwise `p - C` underflows a `list_head`-sized region (a false
+/// `valid_pointer_arith` UNKNOWN, the residual that dominates real kernel list walks).
+pub(crate) fn container_loop_hints(f: &LFunc) -> HashMap<String, (u64, u64)> {
+    let pointee = typed_gep_pointee_sizes(f);
+    // Fallback container size for a hand-rolled walk whose container carries no `struct T` gep:
+    // the byte range the code dereferences through the container itself.
+    let extents = reg_access_extents(f);
+    let mut out: HashMap<String, (u64, u64)> = HashMap::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        if let LInst::Gep {
+            dst,
+            elem: LType::Int(8),
+            base: LValue::Local(base),
+            index: LValue::Int(off),
+        } = inst
+        {
+            if *off < 0 {
+                // `dst` (the container) is a member at offset `|off|` below `base` (the cursor).
+                // Prefer the container's *typed* size (`struct T` gep); fall back to the observed
+                // access extent through the container (an untyped hand-rolled walk, e.g. af_alg's
+                // `container_of(next, alg_type_list, list)` whose container is only bare-`load`ed).
+                let size = pointee
+                    .get(dst.as_str())
+                    .map(|&(s, _)| s)
+                    .or_else(|| extents.get(dst.as_str()).copied())
+                    .filter(|&s| s > 0);
+                if let Some(size) = size {
+                    // First hit wins (a stable, deterministic choice).
+                    out.entry(base.clone()).or_insert((size, (-*off) as u64));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Recover a pointee size for a **loaded pointer** directly from the struct type of the gep

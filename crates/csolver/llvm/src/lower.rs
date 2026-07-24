@@ -73,11 +73,27 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
         if !resolved.is_empty() {
             module.global_fn_ptrs.insert(g.name.clone(), resolved);
         }
+        // The *other* symbol fields — those naming a **global** (not a function) — record the
+        // constant `.field = &other_global` initializer so a `G->field->…` chain devirtualises:
+        // a load of this field resolves the loaded pointer to `other_global`'s region (which then
+        // carries its own function-pointer table). Sound: a constant global's initializer is
+        // ground truth. Only kept for a *constant* global (a `writable` one may be reassigned).
+        if !g.writable {
+            let ptr_fields: Vec<(u64, String)> = g
+                .fn_ptrs
+                .iter()
+                .filter(|(_, name)| !func_ids.contains_key(name))
+                .cloned()
+                .collect();
+            if !ptr_fields.is_empty() {
+                module.global_ptr_fields.insert(g.name.clone(), ptr_fields);
+            }
+        }
     }
     for (i, f) in m.funcs.iter().enumerate() {
         let fid = FuncId(i as u32);
         match lower_function(f, fid, &func_ids, &m.debuginfo) {
-            Ok((func, contracts, raw_ptr_hints, reg_ptr_hints)) => {
+            Ok((func, contracts, raw_ptr_hints, reg_ptr_hints, field_evidence, field_load_sites)) => {
                 for (idx, c) in contracts {
                     module.param_contracts.insert((fid, idx), c);
                 }
@@ -86,6 +102,12 @@ pub fn lower_module(m: &LModule, name: &str) -> Result<Module> {
                 }
                 for (reg, hint) in reg_ptr_hints {
                     module.reg_ptr_hints.insert((fid, reg), hint);
+                }
+                for ((s, off), (size, align)) in field_evidence {
+                    csolver_ir::merge_field_evidence(&mut module.field_ptr_evidence, (s, off), size, align);
+                }
+                for (reg, site) in field_load_sites {
+                    module.field_load_sites.insert((fid, reg), site);
                 }
                 if f.internal {
                     module.internal.insert(fid);
@@ -262,7 +284,14 @@ fn lower_function(
     id: FuncId,
     func_ids: &HashMap<String, FuncId>,
     debuginfo: &crate::debuginfo::DebugInfo,
-) -> Result<(Function, Vec<(u32, PtrContract)>, Vec<(u32, (u64, u32))>, Vec<(RegId, PtrHint)>)> {
+) -> Result<(
+    Function,
+    Vec<(u32, PtrContract)>,
+    Vec<(u32, (u64, u32))>,
+    Vec<(RegId, PtrHint)>,
+    Vec<((String, u64), (u64, u32))>,
+    Vec<(RegId, (String, u64))>,
+)> {
     let mut ctx = Ctx {
         regs: HashMap::new(),
         next_reg: 0,
@@ -487,7 +516,7 @@ fn lower_function(
                     asserted.get(local.as_str()).map_or(0, |&a| a.max(derived(size)))
                 };
                 let tail = tails.get(local.as_str()).copied().unwrap_or(0);
-                reg_ptr_hints.insert(r, PtrHint { size, align, tail });
+                reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0, access_extent: 0 });
             }
         }
     }
@@ -504,7 +533,7 @@ fn lower_function(
         {
             if let Some(size) = len.checked_mul(elem).filter(|&s| s > 0) {
                 // A slice hint never shrinks a region already recovered by a more specific rule.
-                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0 });
+                reg_ptr_hints.entry(r).or_insert(PtrHint { size, align, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
             }
         }
     }
@@ -515,11 +544,89 @@ fn lower_function(
                 .or_else(|| asserted.get(local).map(|&a| a.max(derived(size))))
                 .unwrap_or(0);
             let tail = tails.get(local).copied().unwrap_or(0);
-            reg_ptr_hints.insert(r, PtrHint { size, align, tail });
+            reg_ptr_hints.insert(r, PtrHint { size, align, tail, container_size: 0, container_offset: 0, access_extent: 0 });
+        }
+    }
+    // container_of / intrusive-list cursors: record the enclosing node's size and the member
+    // offset on the cursor's hint (creating a hint if the cursor has no pointee type of its own).
+    // The loop-pointer materialisation places the cursor at `container_offset` inside a
+    // `container_size`-byte node so the backward `container_of` subtraction stays in-object.
+    for (local, (csize, coff)) in container_loop_hints(f) {
+        if let Some(&r) = ctx.regs.get(local.as_str()) {
+            let e = reg_ptr_hints
+                .entry(r)
+                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
+            e.container_size = csize;
+            e.container_offset = coff;
+        }
+    }
+    // Observed access extents: size an untyped pointer (a hand-rolled list-walk cursor) to the
+    // byte range the code actually dereferences through it, so the loop-pointer materialisation
+    // can bound it instead of leaving it unsized. Only fills the `access_extent` field; a
+    // type-derived `size` still wins in the consumer.
+    for (local, ext) in reg_access_extents(f) {
+        if ext == 0 {
+            continue;
+        }
+        if let Some(&r) = ctx.regs.get(local.as_str()) {
+            let e = reg_ptr_hints
+                .entry(r)
+                .or_insert(PtrHint { size: 0, align: 0, tail: 0, container_size: 0, container_offset: 0, access_extent: 0 });
+            e.access_extent = e.access_extent.max(ext);
         }
     }
     let reg_ptr_hints: Vec<(RegId, PtrHint)> = reg_ptr_hints.into_iter().collect();
-    Ok((function, contracts, raw_ptr_hints, reg_ptr_hints))
+
+    // Whole-program field-type evidence (see `Module::field_ptr_evidence`): a `%p = load obj->f`
+    // whose result `%p` is later indexed as a `struct T` proves field `f` of `obj`'s struct holds
+    // a `struct T *`. Emit that as `(struct name, offset) → size` evidence, and record which field
+    // each such load-result reads so the verifier can size it from evidence recovered elsewhere.
+    let field_at = field_at_llvm(f);
+    let struct_of = struct_of_llvm(f);
+    let pointee_sizes = typed_gep_pointee_sizes(f);
+    // The struct field a pointer operand addresses: an explicit `gep`'d field, or — when the
+    // operand is *itself* a struct pointer — the field at offset 0 (clang's bare form for the
+    // first field, which carries no `getelementptr`).
+    let field_of = |slot: &str| -> Option<(String, u64)> {
+        field_at
+            .get(slot)
+            .cloned()
+            .or_else(|| struct_of.get(slot).map(|s| (s.clone(), 0)))
+    };
+    // A typed pointer value's pointee size + declared align (from a `struct T` gep on it).
+    let typed_pointee = |local: &str| -> Option<(u64, u32)> {
+        let &(size, tname) = pointee_sizes.get(local)?;
+        (size > 0).then(|| {
+            let align = tname.and_then(|n| debuginfo.composite_align_by_llvm_name(n)).unwrap_or(0);
+            (size, align)
+        })
+    };
+    let mut field_evidence: Vec<((String, u64), (u64, u32))> = Vec::new();
+    let mut field_load_sites: Vec<(RegId, (String, u64))> = Vec::new();
+    for inst in f.blocks.iter().flat_map(|b| &b.insts) {
+        match inst {
+            // A `%p = load obj->f` records the load-site (to size `%p` from whole-program evidence)
+            // and, when `%p` is itself typed here, contributes evidence for field `f`.
+            LInst::Load { dst, ty: LType::Ptr, ptr: LValue::Local(slot), .. } => {
+                let Some((s, off)) = field_of(slot) else { continue };
+                if let Some(&r) = ctx.regs.get(dst) {
+                    field_load_sites.push((r, (s.clone(), off)));
+                }
+                if let Some((size, align)) = typed_pointee(dst) {
+                    field_evidence.push(((s, off), (size, align)));
+                }
+            }
+            // A `store &(typed value), obj->f` establishes the field's type directly (the driver-init
+            // pattern `obj->ops = &foo_ops`), even when no function loads and re-types it.
+            LInst::Store { val: LValue::Local(vsrc), ptr: LValue::Local(slot), .. } => {
+                if let (Some((s, off)), Some((size, align))) = (field_of(slot), typed_pointee(vsrc)) {
+                    field_evidence.push(((s, off), (size, align)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((function, contracts, raw_ptr_hints, reg_ptr_hints, field_evidence, field_load_sites))
 }
 
 

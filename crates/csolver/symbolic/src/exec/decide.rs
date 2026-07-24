@@ -28,6 +28,67 @@ impl Explorer<'_> {
         false
     }
 
+    /// Under `--assume-field-invariants`, an array/buffer access whose **index is bounded above by
+    /// a guard on the path** (`if (i >= n) return -EINVAL; … arr[i]`) is assumed in-bounds — the
+    /// pervasive kernel idiom where the guard's bound `n` is the array's own length (a constant like
+    /// `CH_TYPES`, or a runtime count field `dev->n_subdevices`). The relationship `len(arr) == n`
+    /// is a struct invariant the source maintains but the type system does not record, so the
+    /// per-path solver, which havocs the loaded `arr`/`n`, cannot prove it and reports a spurious
+    /// OOB at `i = UINT_MAX`. This trusts the guard: if the access offset is upper-bounded by any
+    /// fact on the path, treat the access as in-bounds. Prove-only, opt-in, unsound in general (a
+    /// guard against the *wrong* bound is a real bug it would hide) — surfaced as `field-invariants`.
+    pub(crate) fn assume_guarded_index(&mut self, offset: ExprId, state: &PathState) -> bool {
+        if !self.limits.assume_field_invariants {
+            return false;
+        }
+        let syms: HashSet<ExprId> = self.ctx.symbols_of(offset).into_iter().collect();
+        if syms.is_empty() {
+            return false; // a constant offset is not an index — nothing to guard.
+        }
+        // The branch guards live in `pathcond`; `facts` holds derived predicates — scan both, as
+        // `prove` does, so `if (i >= n) …` (a `pathcond` entry) is found.
+        if state
+            .pathcond
+            .iter()
+            .chain(state.facts.iter())
+            .any(|&f| self.fact_upper_bounds(f, &syms))
+        {
+            self.assumptions.insert(FIELD_INVARIANTS);
+            return true;
+        }
+        false
+    }
+
+    /// Whether path fact `f` places an **upper bound** on some symbol in `syms` — i.e. it is an
+    /// unsigned/signed `<`/`≤` whose smaller side (or the larger side of a `>`/`≥`, or the negation
+    /// of the opposite) mentions one of those symbols. This is the guard `i < n` (or `!(i >= n)`)
+    /// that dominates a subsequent `arr[i]`. Used only by [`Self::assume_guarded_index`].
+    fn fact_upper_bounds(&self, f: ExprId, syms: &HashSet<ExprId>) -> bool {
+        let shares = |e: ExprId| self.ctx.symbols_of(e).iter().any(|s| syms.contains(s));
+        match self.ctx.node(f) {
+            Node::Cmp { op, a, b } => match *op {
+                // `a < b` / `a <= b`: `a` is bounded above.
+                SCmp::Ult | SCmp::Ule | SCmp::Slt | SCmp::Sle => shares(*a),
+                // `a > b` / `a >= b`: `b` is bounded above.
+                SCmp::Ugt | SCmp::Uge | SCmp::Sgt | SCmp::Sge => shares(*b),
+                _ => false,
+            },
+            // `!(i >= n)` ⇒ `i < n`: recurse on the comparison with the predicate negated.
+            Node::Not(inner) => {
+                if let Node::Cmp { op, a, b } = self.ctx.node(*inner) {
+                    match op.negate() {
+                        SCmp::Ult | SCmp::Ule | SCmp::Slt | SCmp::Sle => shares(*a),
+                        SCmp::Ugt | SCmp::Uge | SCmp::Sgt | SCmp::Sge => shares(*b),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `expr` contains at least one `fld…` leaf — a symbol minted for a scalar read of
     /// unknown memory (see `fresh_value`). Mirrors the [`Explorer::goal_is_genuine`] walk.
     fn expr_has_field_load(&self, expr: ExprId) -> bool {
@@ -55,6 +116,53 @@ impl Explorer<'_> {
             }
         }
         false
+    }
+
+    /// Assert the **non-negative interval bounds** of the scalar operands `ops` (from the sound
+    /// block-level interval analysis at `block`) onto `state.facts`, returning the number pushed
+    /// so the caller can `truncate` them after the decision. Only finite, non-negative bounds
+    /// that fit the operand's *signed* width are asserted — the same faithful, unsigned-safe
+    /// encoding the loop-invariant seeding uses — so an asserted fact always holds on every real
+    /// execution (the interval domain is a sound over-approximation). This lets the div-by-zero /
+    /// shift-in-range / no-overflow checks prove an obligation whose operands the analysis bounds
+    /// (e.g. a loop index `∈ [0, n]`, a masked amount `∈ [0, 63]`) instead of leaving it UNKNOWN.
+    /// Sound: a true fact can only *add* a proof or prune an infeasible refutation — never a false
+    /// PASS (nothing is asserted that a real run could violate) or a false FAIL.
+    pub(crate) fn push_bound_facts(&mut self, block: BlockId, idx: usize, ops: &[&Operand], state: &mut PathState) -> usize {
+        let mut n = 0;
+        for op in ops {
+            let Operand::Reg(r) = op else { continue };
+            // Instruction-precise interval: the block-entry invariant with the earlier
+            // instructions of this block folded on, so an operand masked/derived within the same
+            // block (`x & 0xFF`) carries its bound, not only a block parameter.
+            let iv = self.analysis.interval_at(self.f, block, idx, *r);
+            let val = self.eval_scalar(op, state);
+            let w = self.ctx.width(val);
+            if w == 0 || w > csolver_solver::bitblast::MAX_WIDTH {
+                continue;
+            }
+            // Largest value representable as a *positive* signed w-bit constant; a non-negative
+            // bound above it would wrap into negative territory under the signed `Sle`, so it is
+            // skipped (it carries no usable information there anyway).
+            let smax: i128 = if w >= 128 { i128::MAX } else { (1i128 << (w - 1)) - 1 };
+            if let Some(Bound::Fin(lo)) = iv.lower() {
+                if (0..=smax).contains(&lo) {
+                    let k = self.ctx.int(w, lo as u128);
+                    let fact = self.ctx.cmp(SCmp::Sle, k, val);
+                    state.facts.push(fact);
+                    n += 1;
+                }
+            }
+            if let Some(Bound::Fin(hi)) = iv.upper() {
+                if (0..=smax).contains(&hi) {
+                    let k = self.ctx.int(w, hi as u128);
+                    let fact = self.ctx.cmp(SCmp::Sle, val, k);
+                    state.facts.push(fact);
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     pub(crate) fn decide(

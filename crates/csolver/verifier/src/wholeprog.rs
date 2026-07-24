@@ -10,7 +10,8 @@
 //! proven equivalent in `contracts` / `csolver_symbolic`).
 
 use crate::contracts::{ContractFacts, FieldFacts, ScalarFacts};
-use csolver_ir::{FieldContract, FuncId, Module, PtrContract};
+use csolver_absint::ProgramPointsTo;
+use csolver_ir::{FieldContract, FuncId, Module, PtrContract, RegId};
 use csolver_symbolic::{Summary, SummaryFacts};
 use std::collections::HashMap;
 
@@ -28,6 +29,21 @@ pub struct WholeProgramFacts {
     /// precondition for each, keyed by name, so the per-file overlay applies it wherever the
     /// handler is actually defined.
     mmio_handlers: HashMap<String, csolver_ir::MmioHandler>,
+    /// Whole-program **field-type evidence**: `(LLVM struct name, byte offset) → (pointee size,
+    /// align)`, unioned across every file with disagreement poisoning the field (a `0` size). Types
+    /// the `void*`/`union`/`private_data` fields DWARF cannot, from a typed use recovered in *any*
+    /// file — the closed-world field-type overlay (see [`ProgramFacts::field_types`]).
+    field_types: HashMap<(String, u64), (u64, u32)>,
+    /// Which field each pointer load-result register reads, `(function name, RegId) → (struct name,
+    /// offset)` — re-keyed by the caller's **external name** so the per-file overlay can pair a load
+    /// with the whole-program evidence. Restricted to external functions (a static's name may recur).
+    field_load_sites: HashMap<(String, RegId), (String, u64)>,
+    /// Whole-program field-sensitive points-to, folded in the same streaming order. Powers the
+    /// closed-world devirtualisation of heap/param-rooted `obj->ops->fn()` dispatch: it resolves
+    /// which single function a loaded function-pointer register provably designates (see
+    /// [`ProgramPointsTo`]). Only *used* (finalized) under closed-world — store-completeness, the
+    /// premise that a resolved singleton is exact, holds only over the whole program.
+    pointsto: ProgramPointsTo,
 }
 
 impl WholeProgramFacts {
@@ -47,6 +63,22 @@ impl WholeProgramFacts {
         for (name, h) in &m.mmio_handlers {
             self.mmio_handlers.entry(name.clone()).or_insert(*h);
         }
+        self.pointsto.push_module(m);
+        for (k, &(size, align)) in &m.field_ptr_evidence {
+            csolver_ir::merge_field_evidence(&mut self.field_types, k.clone(), size, align);
+        }
+        // Re-key each load site by the caller's external name (a static's name may recur across
+        // files, so it is never matched cross-file — the same discipline as the other overlays).
+        let id_meta: HashMap<FuncId, (&str, bool)> = m
+            .functions
+            .iter()
+            .map(|f| (f.id, (f.name.as_str(), m.internal.contains(&f.id))))
+            .collect();
+        for (&(fid, reg), site) in &m.field_load_sites {
+            if let Some(&(name, false)) = id_meta.get(&fid) {
+                self.field_load_sites.entry((name.to_string(), reg)).or_insert_with(|| site.clone());
+            }
+        }
     }
 
     /// Absorb a fact set built in parallel over a *later* range of files, so shards
@@ -61,11 +93,34 @@ impl WholeProgramFacts {
         for (name, h) in other.mmio_handlers {
             self.mmio_handlers.entry(name).or_insert(h);
         }
+        self.pointsto.merge(other.pointsto);
+        for (k, (size, align)) in other.field_types {
+            csolver_ir::merge_field_evidence(&mut self.field_types, k, size, align);
+        }
+        for (k, site) in other.field_load_sites {
+            self.field_load_sites.entry(k).or_insert(site);
+        }
     }
 
     /// Finalize all four passes. Pointer contracts feed member-provenance, exactly
     /// as in the linked pipeline (`verify_module`).
-    pub fn finalize(self, closed_world: bool) -> ProgramFacts {
+    pub fn finalize(self, closed_world: bool, assume_valid_params: bool) -> ProgramFacts {
+        // Devirtualisation map — built only closed-world. A points-to singleton is exact only when
+        // the program's stores are complete (no unseen file may write `obj->ops`); that premise is
+        // the closed-world assumption itself. Open-world, the map is empty and devirt is off.
+        let name_devirt = if closed_world {
+            self.pointsto.finalize().name_keyed_devirt()
+        } else {
+            HashMap::new()
+        };
+        // Field-type overlay is sound only closed-world: typing a field from a use recovered in
+        // another file assumes the field consistently holds that type program-wide (the closed-world
+        // store-completeness). Open-world the maps are empty and the overlay is a no-op.
+        let (field_types, field_load_sites) = if closed_world {
+            (self.field_types, self.field_load_sites)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         // Grab the external name → global-id map before `finalize` consumes the
         // builder, so each finalized fact can be paired back to its function's name
         // for on-demand cross-file resolution (2b). All four builders assign ids in the
@@ -81,7 +136,7 @@ impl WholeProgramFacts {
             .filter_map(|(name, id)| summaries.get(id).map(|s| (name.clone(), s.clone())))
             .collect();
         let scalars = self.scalars.finalize(closed_world);
-        let ptr_contracts = self.contracts.finalize(closed_world);
+        let ptr_contracts = self.contracts.finalize(closed_world, assume_valid_params);
         let field_contracts = self.fields.finalize(&ptr_contracts, closed_world);
         // Re-key each whole-program precondition by the **external name** of its
         // function, so pass 2 can overlay it onto the matching function in a per-file
@@ -121,6 +176,9 @@ impl WholeProgramFacts {
             name_ptr_contracts,
             name_field_contracts,
             name_mmio: self.mmio_handlers,
+            name_devirt,
+            field_types,
+            field_load_sites,
         }
     }
 }
@@ -154,6 +212,16 @@ pub struct ProgramFacts {
     /// how the handler is invoked, not a caller convention, so unlike `name_scalars` it is not
     /// gated on non-exported linkage.
     pub name_mmio: HashMap<String, csolver_ir::MmioHandler>,
+    /// Closed-world indirect-call devirtualisation, keyed by `(external caller name, register)` →
+    /// the single function that register provably points to (heap/param `obj->ops->fn()`). Empty
+    /// open-world. Consumed by the executor to resolve an indirect call to a direct callee summary
+    /// (call-target only — the loaded pointer's memory-safety checks are untouched).
+    pub name_devirt: HashMap<(String, RegId), String>,
+    /// Whole-program field-type map `(struct name, offset) → (pointee size, align)` (a `0` size is
+    /// a poisoned/ambiguous field). Empty open-world.
+    pub field_types: HashMap<(String, u64), (u64, u32)>,
+    /// Load-result register → the field it reads, `(external caller, RegId) → (struct, offset)`.
+    pub field_load_sites: HashMap<(String, RegId), (String, u64)>,
 }
 
 impl ProgramFacts {
@@ -168,6 +236,9 @@ impl ProgramFacts {
             name_ptr_contracts: &self.name_ptr_contracts,
             name_field_contracts: &self.name_field_contracts,
             name_mmio: &self.name_mmio,
+            name_devirt: &self.name_devirt,
+            field_types: &self.field_types,
+            field_load_sites: &self.field_load_sites,
         }
     }
 }
@@ -192,4 +263,10 @@ pub struct WholeProgramContext<'a> {
     pub name_field_contracts: &'a HashMap<(String, u32), Vec<FieldContract>>,
     /// Whole-program MMIO dispatch handlers, keyed by function name (applied even when exported).
     pub name_mmio: &'a HashMap<String, csolver_ir::MmioHandler>,
+    /// Closed-world indirect-call devirtualisation, keyed by `(external caller name, register)`.
+    pub name_devirt: &'a HashMap<(String, RegId), String>,
+    /// Whole-program field-type map `(struct name, offset) → (pointee size, align)`.
+    pub field_types: &'a HashMap<(String, u64), (u64, u32)>,
+    /// Load-result register → field it reads, `(external caller, RegId) → (struct, offset)`.
+    pub field_load_sites: &'a HashMap<(String, RegId), (String, u64)>,
 }
