@@ -60,7 +60,7 @@ pub fn analyze_json(src: &str, _file: &str) -> String {
             // inferred type feeds editor hover.
             let (conflicts, exprtypes) = crate::infer_module_typed(&mut module);
             for e in conflicts {
-                push_plain(&mut diags, &e);
+                push_span(&mut diags, &e.level, e.span, &e.msg);
             }
             for (span, ty) in exprtypes {
                 let name = ty.name();

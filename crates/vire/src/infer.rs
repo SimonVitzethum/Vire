@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::diag::Span;
+use crate::diag::{Diag, Span};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum T {
@@ -73,12 +73,17 @@ struct Unifier {
     parent: Vec<T>, // parent[v] for Var(v); non-Var = bound concrete type
     /// Collisions of two concrete types — these are mistyped programs that
     /// MUST be reported (otherwise silently miscompiled to the I64 default).
-    conflicts: Vec<(T, T)>,
+    /// The span is the source location of the expression being inferred when the
+    /// conflict was detected, so the diagnostic can point at it (not just 1:1).
+    conflicts: Vec<(T, T, Span)>,
+    /// Source span of the expression currently being inferred (set by infer_expr),
+    /// attached to any conflict recorded during it.
+    cur_span: Span,
 }
 
 impl Unifier {
     fn new() -> Self {
-        Unifier { parent: Vec::new(), conflicts: Vec::new() }
+        Unifier { parent: Vec::new(), conflicts: Vec::new(), cur_span: Span(0, 0) }
     }
     fn fresh(&mut self) -> T {
         let id = self.parent.len() as u32;
@@ -110,7 +115,7 @@ impl Unifier {
             // Conflict of two concrete types: do NOT swallow silently — record and
             // report. The default fallback (I64) must not quietly wave through a
             // mistyped program.
-            _ => self.conflicts.push((ra, rb)),
+            _ => self.conflicts.push((ra, rb, self.cur_span)),
         }
     }
 }
@@ -124,14 +129,14 @@ struct Sig {
 /// Infers parameter/return types and writes them into the AST. Returns
 /// conflict diagnostics (mistyped programs) — these MUST be reported, because
 /// the default fallback (I64) would otherwise silently miscompile them.
-pub fn infer_module(m: &mut Module) -> Vec<String> {
+pub fn infer_module(m: &mut Module) -> Vec<Diag> {
     infer_module_typed(m).0
 }
 
 /// Like `infer_module`, but also returns the typed-AST side-table: the resolved
 /// type of every expression, keyed by source span. This is the Phase-1 foundation
 /// for the compile-time programming layer.
-pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
+pub fn infer_module_typed(m: &mut Module) -> (Vec<Diag>, ExprTypes) {
     let mut u = Unifier::new();
     // Per-expression type record (type variables; resolved to concrete at the end).
     let mut rec: HashMap<Span, T> = HashMap::new();
@@ -234,14 +239,16 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
         }
     }
     // 4. Report type conflicts (deduplicated). Best-effort inference, but a
-    //    detected conflict is a real type error, not noise.
-    let mut msgs: Vec<String> = u
+    //    detected conflict is a real type error, not noise. Each carries the span
+    //    of the expression it was detected at, so the diagnostic points at the code.
+    let mut seen = std::collections::HashSet::new();
+    let mut msgs: Vec<Diag> = u
         .conflicts
         .iter()
-        .map(|(a, b)| format!("type conflict: {} vs {} (inference)", ty_name(*a), ty_name(*b)))
+        .map(|(a, b, sp)| Diag::error(&format!("type conflict: {} vs {} (inference)", ty_name(*a), ty_name(*b)), *sp))
+        .filter(|d| seen.insert((d.msg.clone(), d.span.0, d.span.1)))
         .collect();
-    msgs.sort();
-    msgs.dedup();
+    msgs.sort_by_key(|d| (d.span.0, d.msg.clone()));
 
     // Resolve the recorded type variables to concrete types → the typed AST.
     let exprtypes: ExprTypes = rec.iter().map(|(s, t)| (*s, InferTy::of(u.resolve(*t)))).collect();
@@ -355,7 +362,13 @@ impl<'a> Ctx<'a> {
                 }
             }
             Stmt::Expr(e) => {
-                self.infer_expr(e);
+                // An `if`/`match` in statement position discards its value, so its
+                // branches (arms) need not share a type — infer them independently.
+                if let Expr::If { cond, then, elifs, els, .. } = e {
+                    self.infer_if(cond, then, elifs, els, false);
+                } else {
+                    self.infer_expr(e);
+                }
             }
             Stmt::Return(e, _) => {
                 if let Some(e) = e {
@@ -396,8 +409,34 @@ impl<'a> Ctx<'a> {
     /// Infer an expression's type AND record it in the typed-AST side-table,
     /// keyed by the node's span.
     fn infer_expr(&mut self, e: &Expr) -> T {
+        self.u.cur_span = expr_span(e);
         let t = self.infer_expr_inner(e);
+        // Restore after recursion so a conflict is blamed on the innermost node.
+        self.u.cur_span = expr_span(e);
         self.types.insert(expr_span(e), t);
+        t
+    }
+
+    /// Infer an `if`/`elif`/`else` chain. `unify_branches` = the value is used, so all
+    /// branches must have the same type; when false (statement position, value
+    /// discarded) each branch is inferred independently — a `{ print() }`/`{ 5 }` mix
+    /// is fine (no bogus `Unit vs Int` conflict).
+    fn infer_if(&mut self, cond: &Expr, then: &Block, elifs: &[(Expr, Block)], els: &Option<Block>, unify_branches: bool) -> T {
+        self.infer_expr(cond);
+        let t = self.infer_block(then, false);
+        for (ec, eb) in elifs {
+            self.infer_expr(ec);
+            let bt = self.infer_block(eb, false);
+            if unify_branches {
+                self.u.unify(t, bt);
+            }
+        }
+        if let Some(e) = els {
+            let et = self.infer_block(e, false);
+            if unify_branches {
+                self.u.unify(t, et);
+            }
+        }
         t
     }
 
@@ -482,20 +521,7 @@ impl<'a> Ctx<'a> {
                 }
                 self.u.fresh()
             }
-            Expr::If { cond, then, elifs, els, .. } => {
-                self.infer_expr(cond);
-                let t = self.infer_block(then, false);
-                for (ec, eb) in elifs {
-                    self.infer_expr(ec);
-                    let bt = self.infer_block(eb, false);
-                    self.u.unify(t, bt);
-                }
-                if let Some(e) = els {
-                    let et = self.infer_block(e, false);
-                    self.u.unify(t, et);
-                }
-                t
-            }
+            Expr::If { cond, then, elifs, els, .. } => self.infer_if(cond, then, elifs, els, true),
             Expr::Block(b) => self.infer_block(b, false),
             // `x as T` → target type (argument free, it is converted).
             Expr::Cast { inner, ty, .. } => {

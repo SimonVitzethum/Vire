@@ -988,7 +988,7 @@ impl Parser {
             }
             Tok::Str(s) => {
                 self.bump();
-                Expr::Str(s, sp)
+                self.interpolate(&s, sp)
             }
             Tok::Char(c) => {
                 self.bump();
@@ -1195,6 +1195,19 @@ impl Parser {
         let mut elifs = Vec::new();
         let mut els = None;
         loop {
+            // Allow `else`/`elif` to start on the line *after* the closing `}`
+            // (`}\n else {`), not only `} else {`. Skip the soft-newline terminators
+            // ONLY when an else/elif actually follows — otherwise a bare `if`
+            // statement's own terminating newline must stay unconsumed.
+            let mut k = 0;
+            while matches!(self.peek_at(k), Tok::Newline) {
+                k += 1;
+            }
+            if matches!(self.peek_at(k), Tok::Kw(Kw::Elif) | Tok::Kw(Kw::Else)) {
+                for _ in 0..k {
+                    self.bump();
+                }
+            }
             if self.eat_kw(Kw::Elif) {
                 let c = self.parse_expr(0);
                 let b = self.parse_block();
@@ -1230,6 +1243,101 @@ impl Parser {
         }
         self.expect(&Tok::RBrace, "'}'");
         Expr::Match { scrutinee: Box::new(scrutinee), arms, span: sp }
+    }
+
+    /// String interpolation (C1): `"a{expr}b"` desugars to `"a" + str(expr) + "b"`.
+    /// - `{{` / `}}` are literal braces.
+    /// - `{}` (empty) is left literal — the logger's positional placeholder still works.
+    /// - a `{…}` whose contents don't parse cleanly as an expression is kept literal,
+    ///   so existing brace-containing strings never break (backward-compatible).
+    /// Only expression-position strings pass through here; extern/native/header strings
+    /// are read raw elsewhere and are never interpolated.
+    fn interpolate(&mut self, s: &str, sp: Span) -> Expr {
+        if !s.contains('{') {
+            // No interpolation possible; still fold `}}` → `}` for symmetry.
+            if s.contains("}}") {
+                return Expr::Str(s.replace("}}", "}"), sp);
+            }
+            return Expr::Str(s.to_string(), sp);
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut lit = String::new();
+        let mut i = 0;
+        let flush = |lit: &mut String, parts: &mut Vec<Expr>| {
+            if !lit.is_empty() {
+                parts.push(Expr::Str(std::mem::take(lit), sp));
+            }
+        };
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '{' {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    lit.push('{');
+                    i += 2;
+                    continue;
+                }
+                // Find the matching close brace on this segment.
+                if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '}') {
+                    let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
+                    if !inner.trim().is_empty() {
+                        if let Some(e) = self.try_parse_fragment(&inner) {
+                            flush(&mut lit, &mut parts);
+                            parts.push(Expr::Call {
+                                callee: Box::new(Expr::Ident("str".into(), sp)),
+                                args: vec![e],
+                                span: sp,
+                            });
+                            i += 1 + rel + 1;
+                            continue;
+                        }
+                    }
+                }
+                // `{}` (empty), no close, or an unparseable fragment → literal `{`.
+                lit.push('{');
+                i += 1;
+            } else if c == '}' {
+                if i + 1 < chars.len() && chars[i + 1] == '}' {
+                    lit.push('}');
+                    i += 2;
+                } else {
+                    lit.push('}');
+                    i += 1;
+                }
+            } else {
+                lit.push(c);
+                i += 1;
+            }
+        }
+        if parts.is_empty() {
+            return Expr::Str(lit, sp); // nothing interpolated
+        }
+        flush(&mut lit, &mut parts);
+        let mut it = parts.into_iter();
+        let mut acc = it.next().unwrap();
+        for p in it {
+            acc = Expr::Binary { op: BinOp::Add, lhs: Box::new(acc), rhs: Box::new(p), span: sp };
+        }
+        acc
+    }
+
+    /// Lex+parse an interpolation fragment as a standalone expression. Returns `None`
+    /// (→ keep the braces literal) if it doesn't lex/parse cleanly or leaves tokens
+    /// over, so a non-expression `{…}` never turns into a hard error.
+    fn try_parse_fragment(&self, src: &str) -> Option<Expr> {
+        let (toks, diags) = crate::lexer::lex(src);
+        if !diags.is_empty() {
+            return None;
+        }
+        let mut p = Parser::new(toks);
+        let e = p.parse_expr(0);
+        if !p.diags.is_empty() {
+            return None;
+        }
+        if !matches!(p.peek(), Tok::Eof | Tok::Newline) {
+            return None;
+        }
+        Some(e)
     }
 
     fn parse_pattern(&mut self) -> Pattern {

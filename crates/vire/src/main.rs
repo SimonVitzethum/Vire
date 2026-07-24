@@ -127,7 +127,7 @@ fn main() {
             }
             let (conflicts, types) = vire::infer_module_typed(&mut module);
             for c in &conflicts {
-                eprintln!("{c}");
+                eprintln!("{}", c.render(&src));
             }
             let mut rows: Vec<(vire::diag::Span, vire::InferTy)> = types.into_iter().collect();
             rows.sort_by_key(|(s, _)| *s);
@@ -586,7 +586,7 @@ fn check(args: &[String]) {
     // Inference → comptime → lowering (the errors editors most want to see).
     for e in vire::infer_module(&mut module) {
         had_error = true;
-        emit_plain(&e);
+        emit_span(&e.level, e.span, &e.msg);
     }
     for e in vire::eval_comptime(&mut module) {
         had_error = true;
@@ -1066,7 +1066,7 @@ fn build_or_run(args: &[String]) {
     let type_conflicts = vire::infer_module(&mut module);
     if !type_conflicts.is_empty() {
         for c in &type_conflicts {
-            eprintln!("error: {c}");
+            eprintln!("{}", c.render(&src));
         }
         exit(1);
     }
