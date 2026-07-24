@@ -462,6 +462,7 @@ impl<'a> Ctx<'a> {
                         | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
                         | "gpu_warp_reduce_add" | "vk_triangle" | "vk_frame_bg" | "vk_window" | "vk_bench" | "vk_textured" | "vk_two_pass" | "vk_chain" | "vk_blend2" | "vk_frame" | "vk_window_mesh" | "vk_texture_draw" | "vk_draw_handle"
                         | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader" | "vk_draw" | "vk_draw_tex" | "vk_draw_tex2" | "vk_draw_buf" | "vk_draw_tex_buf" | "vk_render_ppm" | "vk_render3d" | "vk_resolution" | "vk_pipeline_depth" | "vk_motion" | "vk_gpu_count" | "vk_gpu_list" | "vk_gpu_select" | "vk_jitter" | "vk_depth"
+                        | "vk_render_res" | "vk_display_res" | "vk_upscale"
                         | "vk_mesh_scene" | "vk_mesh_scene_cull"
                         | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
                         // Returns an RC-bound GPU texture handle (a Vire object).

@@ -943,6 +943,105 @@ int64_t jrt_vk_depth(const double *verts, int64_t nfloats, double ux, double uy,
     return r;
 }
 
+/* ---- Upscaler context: render-resolution / display-resolution split + temporal history ----
+ * The last piece of the FSR/DLSS bundle. A temporal upscaler renders the scene at a LOW
+ * render resolution, then reconstructs a HIGH display resolution using the colour + motion +
+ * depth + jitter this file already produces, accumulated across frames in a persistent history
+ * buffer. This provides that scaffold: the render/display resolution SPLIT, a persistent
+ * history buffer (allocate-once, survives frames), and a working reference reconstruction
+ * (bilinear upscale + temporal exponential-moving-average). This is the exact seam where
+ * FSR2/DLSS drops in — they replace the bilinear+EMA with their motion-guided algorithm fed
+ * by the SAME inputs at these SAME two resolutions. The reference filter here runs on the host
+ * so it stays simple and verifiable; the GPU render is real. */
+static uint32_t g_render_res=128, g_display_res=256;
+static float *g_hist=0; static uint32_t g_hist_dim=0; static int g_hist_valid=0;
+
+int64_t jrt_vk_render_res(int64_t n){ if(n<16)n=16; if(n>4096)n=4096; g_render_res=(uint32_t)n; g_hist_valid=0; return n; }
+int64_t jrt_vk_display_res(int64_t m){ if(m<16)m=16; if(m>4096)m=4096; g_display_res=(uint32_t)m; g_hist_valid=0; return m; }
+
+/* Render the program's geometry (user @vertex/@fragment) at NxN, copy the whole colour image
+ * to `out` (N*N*4 bytes RGBA8). Returns 1 on success. */
+static int render_color_host(uint32_t N, const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], unsigned char *out){
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
+    int vmode=(fpv==6)?2:(fpv==5)?1:0;
+    VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl;
+    if(!rcache_get(dev,vmode,0,N,N,&rp,&pipe,&pl)) return 0;
+    VkImage img; VkDeviceMemory im; VkImageView view;
+    if(!mv_make_target(dev,pd,N,N,VK_FORMAT_R8G8B8A8_UNORM,&img,&im,&view)) return 0;
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=1,.pAttachments=&view,.width=N,.height=N,.layers=1};
+    VkFramebuffer fb; if(vkCreateFramebuffer(dev,&fbi,0,&fb)!=VK_SUCCESS) return 0;
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*fpv,&vbuf,&vmem)) return 0;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=(VkDeviceSize)N*N*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf; if(vkCreateBuffer(dev,&bi,0,&buf)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return 0;
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    VkDeviceMemory bmem; if(vkAllocateMemory(dev,&bm,0,&bmem)!=VK_SUCCESS) return 0; vkBindBufferMemory(dev,buf,bmem,0);
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPool cp; if(vkCreateCommandPool(dev,&cpi,0,&cp)!=VK_SUCCESS) return 0;
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; if(vkAllocateCommandBuffers(dev,&cai,&cmd)!=VK_SUCCESS) return 0;
+    rec_draw_d(cmd,rp,fb,pipe,N,N,vbuf,nverts,pl,uni,0);
+    VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={N,N,1}};
+    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
+    vkEndCommandBuffer(cmd);
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence; vkCreateFence(dev,&fci,0,&fence);
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    vkQueueSubmit(q,1,&si,fence); vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull);
+    unsigned char *px; vkMapMemory(dev,bmem,0,(VkDeviceSize)N*N*4,0,(void**)&px);
+    memcpy(out, px, (size_t)N*N*4);
+    vkUnmapMemory(dev,bmem);
+    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0); vkDestroyFramebuffer(dev,fb,0);
+    vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    return 1;
+}
+
+/* One upscale step: render at g_render_res, bilinear-upscale to g_display_res, temporally
+ * accumulate into the persistent history (EMA), return the display centroid's packed RGB. */
+static int64_t render_upscale(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4]){
+    uint32_t N=g_render_res, M=g_display_res;
+    if(!ctx_init()) return -1;
+    unsigned char *lo=malloc((size_t)N*N*4); if(!lo) return -1;
+    if(!render_color_host(N,data,nverts,fpv,uni,lo)){ free(lo); return -1; }
+    /* (re)allocate the persistent history buffer at display resolution. */
+    if(!g_hist || g_hist_dim!=M){ free(g_hist); g_hist=malloc((size_t)M*M*4*sizeof(float)); if(!g_hist){ free(lo); return -1; } g_hist_dim=M; g_hist_valid=0; }
+    const float A=0.5f;   /* EMA weight of the new frame */
+    for(uint32_t y=0;y<M;y++){
+        float sy=((float)y+0.5f)*(float)N/(float)M-0.5f; int y0=(int)(sy+1000.0f)-1000; float fy=sy-y0;
+        int y1=y0+1; if(y0<0)y0=0; if(y1<0)y1=0; if(y0>(int)N-1)y0=N-1; if(y1>(int)N-1)y1=N-1;
+        for(uint32_t x=0;x<M;x++){
+            float sx=((float)x+0.5f)*(float)N/(float)M-0.5f; int x0=(int)(sx+1000.0f)-1000; float fx=sx-x0;
+            int x1=x0+1; if(x0<0)x0=0; if(x1<0)x1=0; if(x0>(int)N-1)x0=N-1; if(x1>(int)N-1)x1=N-1;
+            for(int c=0;c<4;c++){
+                float p00=lo[(y0*N+x0)*4+c], p01=lo[(y0*N+x1)*4+c], p10=lo[(y1*N+x0)*4+c], p11=lo[(y1*N+x1)*4+c];
+                float top=p00+(p01-p00)*fx, bot=p10+(p11-p10)*fx, v=top+(bot-top)*fy;
+                float *h=&g_hist[(y*M+x)*4+c];
+                *h = g_hist_valid ? (*h*(1.0f-A)+v*A) : v;
+            }
+        }
+    }
+    g_hist_valid=1; free(lo);
+    int cx=M/2, cy=(int)(M*0.55); float *c=&g_hist[(cy*M+cx)*4];
+    int64_t r=(int64_t)(c[0]+0.5f)&0xff, g=(int64_t)(c[1]+0.5f)&0xff, b=(int64_t)(c[2]+0.5f)&0xff;
+    return (r<<16)|(g<<8)|b;
+}
+
+/* vk_upscale(verts, ux,uy,uz,uw): render the geometry at the render resolution and reconstruct
+ * the display resolution (bilinear + temporal EMA into the persistent history). Returns the
+ * display centroid's packed RGB. Call repeatedly for an animation; the history accumulates. */
+int64_t jrt_vk_upscale(const double *verts, int64_t nfloats, double ux, double uy, double uz, double uw){
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;  /* 2D (x,y) geometry, like vk_draw */
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float uni[4]={(float)ux,(float)uy,(float)uz,(float)uw};
+    int64_t r=render_upscale(f,nverts,2,uni);
+    free(f);
+    return r;
+}
+
 /* vk_frame_bg(r,g,b): the target of the declarative `frame { bg(r,g,b) }` — render a
  * frame cleared to (r,g,b) with no geometry, return the centroid (= the background). */
 int64_t jrt_vk_frame_bg(double r, double g, double b) {

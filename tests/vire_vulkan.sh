@@ -1287,6 +1287,34 @@ fn main() {
 }
 EOF
 
+# Upscaler context (vk_render_res / vk_display_res / vk_upscale): the last FSR/DLSS piece —
+# the render-resolution / display-resolution SPLIT plus a persistent temporal-history buffer.
+# vk_upscale renders the geometry at the (low) render res, bilinear-upscales to the (high)
+# display res, and accumulates into the history (EMA). Here a flat green fragment (0.2,0.8,0.3
+# → 51,204,76) rendered at 128 and reconstructed at 256 must converge to that green at the
+# display centroid — proving the split, the persistent history, and the reconstruction. This
+# is the seam where FSR2/DLSS replaces the bilinear+EMA with their algorithm on the same inputs.
+case_ vire_upscale <<'EOF'
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.8, 0.3, 1.0) }
+fn main() {
+    mut rr = vk_render_res(128)
+    mut dr = vk_display_res(256)
+    mut tri = farray(6)
+    tri[0]=0.0  tri[1]=0.6  tri[2]=0.6  tri[3]=0.0-0.6  tri[4]=0.0-0.6  tri[5]=0.0-0.6
+    mut u1 = vk_upscale(tri, 0.0, 0.0, 0.0, 1.0)
+    mut u2 = vk_upscale(tri, 0.0, 0.0, 0.0, 1.0)
+    mut u3 = vk_upscale(tri, 0.0, 0.0, 0.0, 1.0)
+    mut r = u3 / 65536
+    mut g = (u3 / 256) % 256
+    mut ok = 0
+    if rr == 128 { if dr == 256 {
+        if r > 40 { if r < 62 { if g > 194 { if g < 214 { ok = 1 } } } }
+    } }
+    print(ok)
+}
+EOF
+
 # Frame pipelining (vk_pipeline_depth): with depth n>1, up to n frames run on the GPU at
 # once and vk_draw's RETURN lags by n-1 frames — an opt-in for animations that write images
 # and ignore the return. The soundness invariant: the IMAGES are identical to the synchronous

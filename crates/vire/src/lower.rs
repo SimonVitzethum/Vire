@@ -3343,6 +3343,28 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_set_resolution".into(), args: vec![n] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_render_res(n) / vk_display_res(m): the upscaler's render vs display resolution split.
+        if (name == "vk_render_res" || name == "vk_display_res") && args.len() == 1 {
+            let n = self.lower_expr(&args[0]).0;
+            let d = self.new_local(Ty::I64);
+            let func = if name == "vk_display_res" { "jrt_vk_display_res" } else { "jrt_vk_render_res" };
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![n] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // vk_upscale(verts, ux,uy,uz,uw): render at render-res, reconstruct display-res (bilinear
+        // + temporal history), return the display centroid's packed RGB.
+        if name == "vk_upscale" && args.len() == 5 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let uni: Vec<Operand> = args[1..5].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_upscale".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_gpu_count(): number of Vulkan devices. vk_gpu_list(): print them, return count.
         if (name == "vk_gpu_count" || name == "vk_gpu_list") && args.is_empty() {
             let d = self.new_local(Ty::I64);
