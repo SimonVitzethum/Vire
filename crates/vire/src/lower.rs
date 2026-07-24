@@ -596,6 +596,10 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         Ok((asm, iface)) => { prog.vk_iface.merge(&iface); prog.vert_spvasm = Some(asm); }
                         Err(e) => errs.push(e),
                     }
+                    // Also compile the auto motion-vector variant (used by vk_motion). It only
+                    // exists when the vertex transforms via uniform(); otherwise motion is 0 and
+                    // we leave it None (not an error — vk_motion just reports no motion).
+                    if let Ok(asm) = crate::shader::compile_vertex_mv(f) { prog.mv_vert_spvasm = Some(asm); }
                 }
                 if f.attrs.iter().any(|a| a.name == "mesh") {
                     match crate::shader::compile_mesh(f) {
@@ -3227,6 +3231,20 @@ impl<'a> FnLower<'a> {
         // vk_draw(verts, ux, uy, uz, uw): the generic draw surface — program-supplied
         // geometry ([Float] of interleaved x,y) + a vec4 uniform, rendered through the
         // compiled @vertex/@fragment shaders (the uniform reaches the shader's uniform()).
+        // vk_motion(verts, ux,uy,uz,uw): render `verts` through the compiler's auto
+        // motion-vector shader; returns the centroid's packed encoded motion vector.
+        if name == "vk_motion" && args.len() == 5 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let len = self.array_len_i64(arr);
+            let uni: Vec<Operand> = args[1..5].iter().map(|a| self.lower_expr(a).0).collect();
+            let d = self.new_local(Ty::I64);
+            let mut call_args = vec![Operand::Copy(ptr), len];
+            call_args.extend(uni);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_motion".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_draw" && args.len() == 5 {
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);

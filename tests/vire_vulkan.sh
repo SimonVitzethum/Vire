@@ -1181,6 +1181,34 @@ fn main() {
 }
 EOF
 
+# Auto motion vectors (vk_motion) — the "crown jewel": the compiler emits a variant of the
+# program's @vertex that evaluates the SAME transform against both the current and the
+# previous-frame uniform, writing screen-space motion (ndc_cur − ndc_prev, encoded *0.5+0.5)
+# as the pixel colour. Here the @vertex translates by uniform().x; advancing the uniform by
+# 0.1 in x between two frames must yield motion.x ≈ 0.1 (→ R ≈ 140) and motion.y ≈ 0 (→ G ≈
+# 128), verified against the CPU reference. Proves the temporal input FSR2/DLSS need is
+# derived by the compiler from the transform it can see.
+case_ vire_motion_vectors <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    mut u = uniform()
+    vec4(pos.x + u.x, pos.y + u.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.8, 0.3, 1.0) }
+fn main() {
+    mut tri = farray(6)
+    tri[0]=0.0  tri[1]=0.5  tri[2]=0.5  tri[3]=0.0-0.5  tri[4]=0.0-0.5  tri[5]=0.0-0.5
+    mut a = vk_motion(tri, 0.0, 0.0, 0.0, 1.0)   // establish the previous frame
+    mut b = vk_motion(tri, 0.1, 0.0, 0.0, 1.0)   // motion.x = 0.1 NDC
+    mut r = b / 65536
+    mut g = (b / 256) % 256
+    mut ok = 0
+    if r > 133 { if r < 147 { if g > 121 { if g < 135 { ok = 1 } } } }  // R≈140 (0.1), G≈128 (0)
+    print(ok)
+}
+EOF
+
 # Frame pipelining (vk_pipeline_depth): with depth n>1, up to n frames run on the GPU at
 # once and vk_draw's RETURN lags by n-1 frames — an opt-in for animations that write images
 # and ignore the return. The soundness invariant: the IMAGES are identical to the synchronous

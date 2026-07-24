@@ -80,6 +80,8 @@ extern const uint32_t VK_BUILD_COMP[]; extern const unsigned VK_BUILD_COMP_N; /*
 extern const uint32_t VK_GPUVK_COMP[]; extern const unsigned VK_GPUVK_COMP_N; /* N=0 → no @gpuvk map */
 extern const uint32_t VK_PASS1_FRAG[]; extern const unsigned VK_PASS1_FRAG_N; /* fixed red fragment for pass 1 */
 extern const uint32_t VK_PASS2_FRAG[]; extern const unsigned VK_PASS2_FRAG_N; /* fixed blue fragment (source B) */
+extern const uint32_t VK_MV_VERT[]; extern const unsigned VK_MV_VERT_N; /* auto motion-vector vertex (N=0 → none) */
+extern const uint32_t VK_MV_FRAG[]; extern const unsigned VK_MV_FRAG_N; /* MV passthrough fragment */
 
 /* V3: the descriptor/push interface REFLECTED from the shader stages' resource usage
  * (crates/vire/src/shader.rs → main.rs emits these). The descriptor-set + pipeline
@@ -716,6 +718,127 @@ static int64_t render_headless(const float *data, uint32_t nverts, uint32_t fpv,
 int64_t jrt_vk_triangle(double a, double b, double c, double d) {
     float uni[4]={(float)a,(float)b,(float)c,(float)d};
     return render_headless(DEFAULT_TRI, 3, 2, uni, 0);
+}
+
+/* ---- Auto motion vectors (vk_motion) --------------------------------------------------
+ * The compiler emits a variant of the program's @vertex (VK_MV_VERT) that evaluates the
+ * SAME transform against BOTH the current uniform (push-constant vec4 #0) and the previous
+ * frame's (vec4 #1), and writes the screen-space motion `ndc_cur − ndc_prev` (encoded
+ * *0.5+0.5) as the pixel colour via a passthrough fragment (VK_MV_FRAG). The runtime just
+ * double-buffers the uniform. Returns the centroid's packed RGB = the encoded motion. This
+ * is exactly the per-pixel velocity FSR2/DLSS need — derivable ONLY because a single-source
+ * compiler sees the transform. Capability + verification path (transient resources, own
+ * pipeline); the real FSR path would route this varying into an R16G16F target. */
+static float g_prev_uni[4]={0,0,0,0}; static int g_prev_uni_valid=0;
+static VkPipeline g_mv_pipe=0; static VkPipelineLayout g_mv_pl=0; static VkRenderPass g_mv_rp=0;
+
+static int build_mv_pipeline(VkDevice dev, uint32_t w, uint32_t h){
+    if(g_mv_pipe) return 1;
+    if(VK_MV_VERT_N==0 || VK_MV_FRAG_N==0) return 0;   /* @vertex didn't transform via uniform() */
+    g_mv_rp = build_rp(dev, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    if(!g_mv_rp) return 0;
+    VkShaderModule vs=shmod(dev,VK_MV_VERT,VK_MV_VERT_N*4), fs=shmod(dev,VK_MV_FRAG,VK_MV_FRAG_N*4);
+    if(!vs||!fs) return 0;
+    VkPipelineShaderStageCreateInfo st[2]={
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vs,.pName="main"},
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fs,.pName="main"}};
+    VkVertexInputBindingDescription vbind={.binding=0,.stride=2*sizeof(float),.inputRate=VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vattr={.location=0,.binding=0,.format=VK_FORMAT_R32G32_SFLOAT,.offset=0};
+    VkPipelineVertexInputStateCreateInfo vi={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount=1,.pVertexBindingDescriptions=&vbind,.vertexAttributeDescriptionCount=1,.pVertexAttributeDescriptions=&vattr};
+    VkPipelineInputAssemblyStateCreateInfo ia={.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkViewport vp={0,0,(float)w,(float)h,0,1}; VkRect2D sc={{0,0},{w,h}};
+    VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
+    VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1.0f};
+    VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
+    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
+    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT,.offset=0,.size=32}; /* cur vec4 + prev vec4 */
+    VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
+    if(vkCreatePipelineLayout(dev,&plci,0,&g_mv_pl)!=VK_SUCCESS){ vkDestroyShaderModule(dev,vs,0); vkDestroyShaderModule(dev,fs,0); return 0; }
+    VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=st,
+        .pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vps,.pRasterizationState=&rs,
+        .pMultisampleState=&ms,.pColorBlendState=&cb,.layout=g_mv_pl,.renderPass=g_mv_rp,.subpass=0};
+    int ok = vkCreateGraphicsPipelines(dev,0,1,&gp,0,&g_mv_pipe)==VK_SUCCESS;
+    vkDestroyShaderModule(dev,vs,0); vkDestroyShaderModule(dev,fs,0);
+    return ok;
+}
+
+static int64_t render_mv(const float *data, uint32_t nverts, const float cur[4]){
+    uint32_t W=g_res, H=g_res;
+    if(!ctx_init()) return -1;
+    VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
+    if(!build_mv_pipeline(dev,W,H)) return -1;
+    /* transient color image + view + framebuffer (this is a capability/verify path) */
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImage img; CK(vkCreateImage(dev,&ii,0,&img));
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,img,&mr);
+    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return -1;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
+    VkImageViewCreateInfo vwi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    VkImageView view; CK(vkCreateImageView(dev,&vwi,0,&view));
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=g_mv_rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
+    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
+    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*2,&vbuf,&vmem)) return -1;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=(VkDeviceSize)W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return -1;
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    VkDeviceMemory bmem; CK(vkAllocateMemory(dev,&bm,0,&bmem)); vkBindBufferMemory(dev,buf,bmem,0);
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
+    VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
+    /* push constants: current uniform then previous (first call: prev = current → 0 motion). */
+    float pc[8]={cur[0],cur[1],cur[2],cur[3],
+        g_prev_uni_valid?g_prev_uni[0]:cur[0], g_prev_uni_valid?g_prev_uni[1]:cur[1],
+        g_prev_uni_valid?g_prev_uni[2]:cur[2], g_prev_uni_valid?g_prev_uni[3]:cur[3]};
+    VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cmd,&cbi);
+    VkClearValue clear={.color={{0.0f,0.0f,0.0f,1.0f}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=g_mv_rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
+    vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,g_mv_pipe);
+    vkCmdPushConstants(cmd,g_mv_pl,VK_SHADER_STAGE_VERTEX_BIT,0,32,pc);
+    VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
+    vkCmdDraw(cmd,nverts,1,0,0);
+    vkCmdEndRenderPass(cmd);
+    VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
+    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
+    CK(vkEndCommandBuffer(cmd));
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+    CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
+    unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
+    int cx=W/2, cy=(int)(H*0.55); unsigned char *c=&px[(cy*W+cx)*4];
+    int64_t packed = ((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
+    vkUnmapMemory(dev,bmem);
+    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
+    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0); vkDestroyFramebuffer(dev,fb,0);
+    vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    /* remember this frame's uniform as the previous for the next call. */
+    g_prev_uni[0]=cur[0]; g_prev_uni[1]=cur[1]; g_prev_uni[2]=cur[2]; g_prev_uni[3]=cur[3]; g_prev_uni_valid=1;
+    return packed;
+}
+
+/* vk_motion(verts, ux,uy,uz,uw): render `verts` (x,y pairs) through the auto motion-vector
+ * shader with uniform (ux,uy,uz,uw); returns the centroid's packed encoded motion vector.
+ * Decode a component: ((chan/255) − 0.5) * 2 = NDC motion. Returns -1 if the program's
+ * @vertex has no uniform() transform (→ nothing to differentiate). */
+int64_t jrt_vk_motion(const double *verts, int64_t nfloats, double ux, double uy, double uz, double uw){
+    if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;   /* >=3 (x,y) vertices */
+    uint32_t nverts=(uint32_t)(nfloats/2);
+    float *f=malloc((size_t)nfloats*sizeof(float)); if(!f) return -1;
+    for(int64_t i=0;i<nfloats;i++) f[i]=(float)verts[i];
+    float cur[4]={(float)ux,(float)uy,(float)uz,(float)uw};
+    int64_t r=render_mv(f,nverts,cur);
+    free(f);
+    return r;
 }
 
 /* vk_frame_bg(r,g,b): the target of the declarative `frame { bg(r,g,b) }` — render a

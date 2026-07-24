@@ -1235,6 +1235,16 @@ fn build_or_run(args: &[String]) {
             .unwrap_or_else(fastllvm_backend::spirv::triangle_vertex_spvasm);
         let vw = assemble(&vert_asm, "vk_vert", None);
         let fw = assemble(&frag_asm, "vk_frag", None);
+        // Auto motion-vector shader pair (vk_motion): the vertex evaluates the transform
+        // twice (current/previous uniform) → per-pixel motion as the varying; the fragment
+        // passes it through. Empty when the program has no uniform-transforming @vertex.
+        let mvw: Vec<u32> = match &program.mv_vert_spvasm {
+            Some(asm) => assemble(asm, "vk_mv_vert", None),
+            None => Vec::new(),
+        };
+        let mvfw: Vec<u32> = if program.mv_vert_spvasm.is_some() {
+            assemble(&vire::shader::mv_fragment_spvasm(), "vk_mv_frag", None)
+        } else { Vec::new() };
         // A fixed red fragment for the FIRST pass of the two-pass render-graph demo
         // (vk_two_pass): pass 1 fills an offscreen texture, pass 2 (the program's
         // @fragment) samples it. Always generated; small.
@@ -1265,7 +1275,7 @@ fn build_or_run(args: &[String]) {
             None => Vec::new(),
         };
         let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw), ("VK_GPUVK_COMP", &gw), ("VK_PASS1_FRAG", &p1w), ("VK_PASS2_FRAG", &p2w)] {
+        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw), ("VK_GPUVK_COMP", &gw), ("VK_PASS1_FRAG", &p1w), ("VK_PASS2_FRAG", &p2w), ("VK_MV_VERT", &mvw), ("VK_MV_FRAG", &mvfw)] {
             sc.push_str(&format!("const uint32_t {name}[] = {{"));
             // A 0-length array is invalid ISO C; emit a dummy word (the _N stays 0).
             if w.is_empty() {

@@ -45,6 +45,7 @@ fn new_cx() -> Cx {
         uses_texture2: false,
         uses_mat: false,
         uses_frag_ssbo: false,
+        uniform_member: 0,
         n: 0,
     }
 }
@@ -182,6 +183,8 @@ struct Cx {
     uses_texture2: bool,        // fragment `tex2(uv)` → a second sampler2D at binding 1
     uses_mat: bool,             // `mat2`/`mat4` constructors → declare the matrix types
     uses_frag_ssbo: bool,       // fragment `buf(i)` → a read-only float storage buffer (binding 0)
+    uniform_member: u32,        // which push-constant vec4 `uniform()` reads (0=current, 1=previous
+                                // frame) — the auto motion-vector pass evaluates the body twice.
     n: u32,
 }
 
@@ -435,8 +438,11 @@ impl Cx {
                         return Err(format!("shader: {name}() takes no arguments"));
                     }
                     self.uses_push_constant = true;
+                    // Motion-vector pass evaluates the body twice: member 0 = current-frame
+                    // uniform, member 1 = previous frame. `%i_0`/`%i_1` index the pc struct.
+                    let member = if self.uniform_member == 0 { "%i_0" } else { "%i_1" };
                     let p = self.id("t");
-                    writeln!(self.body, "{p} = OpAccessChain %_ptr_pc_v4float %pcv %i_0").unwrap();
+                    writeln!(self.body, "{p} = OpAccessChain %_ptr_pc_v4float %pcv {member}").unwrap();
                     let id = self.id("t");
                     writeln!(self.body, "{id} = OpLoad %v4float {p}").unwrap();
                     return Ok((id, Ty::Vec(4)));
@@ -1045,6 +1051,142 @@ pub fn compile_vertex(f: &FnDef) -> Result<(String, fastllvm_ir::VkIface), Strin
         body = cx.body,
         out = out
     ), __iface))
+}
+
+/// The auto motion-vector variant of a `@vertex fn` (the "crown jewel"): the compiler
+/// SEES the clip-position computation, so it evaluates the SAME body twice — once against
+/// the current-frame uniform (push-constant member 0), once against the previous frame's
+/// (member 1) — and writes the screen-space motion vector `ndc_cur − ndc_prev` as the
+/// Location-0 varying (encoded `*0.5+0.5` into [0,1] so it survives an 8-bit readback / an
+/// R16G16F target). `gl_Position` still gets the current clip position, so the frame
+/// rasterises normally. This is exactly the per-frame input FSR2/DLSS need and cannot be
+/// derived without knowing the transform — which a single-source compiler does.
+pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
+    let body = f.body.as_ref().ok_or("shader: `@vertex` fn has no body")?;
+    let param = f.sig.params.first().map(|p| p.name.clone())
+        .ok_or("shader: `@vertex fn` needs a Vec2 position parameter")?;
+    let pos_dim: u8 = f.sig.params.first().and_then(|p| p.ty.as_ref())
+        .map(|t| match t.name.as_str() { "Vec3" => 3, "Vec4" => 4, _ => 2 }).unwrap_or(2);
+    let pos_vec = format!("%v{pos_dim}float");
+    let mut cx = new_cx();
+    // Evaluate the body against the CURRENT uniform (member 0) → current clip position.
+    cx.bind(&param, "%pos", Ty::Vec(pos_dim));
+    cx.uniform_member = 0;
+    let (clip_cur, ty1) = cx.block_value(body)?;
+    if ty1 != Ty::Vec(4) { return Err("shader: the vertex output must be a Vec4 (gl_Position)".into()); }
+    // Re-run the SAME body against the PREVIOUS uniform (member 1) → previous clip position.
+    cx.bind(&param, "%pos", Ty::Vec(pos_dim));
+    cx.uniform_member = 1;
+    let (clip_prev, ty2) = cx.block_value(body)?;
+    if ty2 != Ty::Vec(4) { return Err("shader: the vertex output must be a Vec4 (gl_Position)".into()); }
+    if !cx.uses_push_constant {
+        return Err("shader: @vertex for motion vectors must transform via uniform() (no uniform → no motion)".into());
+    }
+    // Motion vector = perspective-divided current − previous, encoded to [0,1].
+    let half = cx.constant(0.5);
+    let (cw, pw, cxy, pxy, cwv, pwv, ncur, nprev, mv, halfv, mvh, enc2, ex, ey, enc) = (
+        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"),
+        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"));
+    write!(cx.body,
+"{cw} = OpCompositeExtract %float {clip_cur} 3
+{pw} = OpCompositeExtract %float {clip_prev} 3
+{cxy} = OpVectorShuffle %v2float {clip_cur} {clip_cur} 0 1
+{pxy} = OpVectorShuffle %v2float {clip_prev} {clip_prev} 0 1
+{cwv} = OpCompositeConstruct %v2float {cw} {cw}
+{pwv} = OpCompositeConstruct %v2float {pw} {pw}
+{ncur} = OpFDiv %v2float {cxy} {cwv}
+{nprev} = OpFDiv %v2float {pxy} {pwv}
+{mv} = OpFSub %v2float {ncur} {nprev}
+{halfv} = OpCompositeConstruct %v2float {half} {half}
+{mvh} = OpFMul %v2float {mv} {halfv}
+{enc2} = OpFAdd %v2float {mvh} {halfv}
+{ex} = OpCompositeExtract %float {enc2} 0
+{ey} = OpCompositeExtract %float {enc2} 1
+{enc} = OpCompositeConstruct %v3float {ex} {ey} {half}
+").unwrap();
+    let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
+    let mat_decl = mat_type_decls(cx.uses_mat);
+    Ok(format!(
+"               OpCapability Shader
+{glsl_import}               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main \"main\" %out %pos_in %vcol %pcv
+               OpDecorate %glpv Block
+               OpMemberDecorate %glpv 0 BuiltIn Position
+               OpDecorate %pos_in Location 0
+               OpDecorate %vcol Location 0
+               OpDecorate %pcblock Block
+               OpMemberDecorate %pcblock 0 Offset 0
+               OpMemberDecorate %pcblock 1 Offset 16
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v2float = OpTypeVector %float 2
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+       %glpv = OpTypeStruct %v4float
+     %outptr = OpTypePointer Output %glpv
+        %out = OpVariable %outptr Output
+      %inptr = OpTypePointer Input {pos_vec}
+     %pos_in = OpVariable %inptr Input
+        %int = OpTypeInt 32 1
+        %i_0 = OpConstant %int 0
+        %i_1 = OpConstant %int 1
+     %ov4ptr = OpTypePointer Output %v4float
+     %ov3ptr = OpTypePointer Output %v3float
+       %vcol = OpVariable %ov3ptr Output
+       %bool = OpTypeBool
+    %pcblock = OpTypeStruct %v4float %v4float
+%_ptr_pc_block = OpTypePointer PushConstant %pcblock
+        %pcv = OpVariable %_ptr_pc_block PushConstant
+%_ptr_pc_v4float = OpTypePointer PushConstant %v4float
+   %pf_float = OpTypePointer Function %float
+ %pf_v2float = OpTypePointer Function %v2float
+ %pf_v3float = OpTypePointer Function %v3float
+ %pf_v4float = OpTypePointer Function %v4float
+    %pf_bool = OpTypePointer Function %bool
+{mat_decl}{consts}       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+{vars}        %pos = OpLoad {pos_vec} %pos_in
+{body}         %gp = OpAccessChain %ov4ptr %out %i_0
+               OpStore %gp {clip_cur}
+               OpStore %vcol {enc}
+               OpReturn
+               OpFunctionEnd
+",
+        consts = cx.consts, vars = cx.vars, body = cx.body))
+}
+
+/// The fixed fragment paired with the motion-vector vertex: pass the interpolated
+/// Location-0 varying (the encoded MV) straight to the colour target so it can be read
+/// back. In the full FSR path this same varying feeds an R16G16F motion target instead.
+pub fn mv_fragment_spvasm() -> String {
+"               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main \"main\" %color %vin
+               OpExecutionMode %main OriginUpperLeft
+               OpDecorate %color Location 0
+               OpDecorate %vin Location 0
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+      %float = OpTypeFloat 32
+    %v3float = OpTypeVector %float 3
+    %v4float = OpTypeVector %float 4
+      %optr = OpTypePointer Output %v4float
+      %color = OpVariable %optr Output
+      %iptr = OpTypePointer Input %v3float
+       %vin = OpVariable %iptr Input
+        %one = OpConstant %float 1
+       %main = OpFunction %void None %fnty
+        %lbl = OpLabel
+          %c = OpLoad %v3float %vin
+         %cx = OpCompositeExtract %float %c 0
+         %cy = OpCompositeExtract %float %c 1
+         %cz = OpCompositeExtract %float %c 2
+          %o = OpCompositeConstruct %v4float %cx %cy %cz %one
+               OpStore %color %o
+               OpReturn
+               OpFunctionEnd
+".to_string()
 }
 
 /// Compile an `@fragment fn` to SPIR-V assembly, or an error message.
