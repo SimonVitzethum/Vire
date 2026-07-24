@@ -44,7 +44,7 @@ pub fn analyze_json(src: &str, _file: &str) -> String {
             push_plain(&mut diags, &e);
         }
         for e in crate::expand_item_macros(&mut module) {
-            push_plain(&mut diags, &e);
+            push_span(&mut diags, &e.level, e.span, &e.msg);
         }
         if let Err(errs) = crate::expand_macros(&mut module) {
             for e in errs {

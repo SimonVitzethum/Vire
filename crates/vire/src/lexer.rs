@@ -20,6 +20,8 @@ pub enum Tok {
     // brackets & separators
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Colon, Semi, Arrow, FatArrow, Dot, DotDot, DotDotEq, At, Question, Bang,
+    /// `##` — hygienic token-paste (identifier concatenation) inside macro bodies.
+    HashHash,
     // operators
     Plus, Minus, Star, Slash, Percent, PlusPct, MinusPct, StarPct,
     EqEq, Ne, Lt, Le, Gt, Ge,
@@ -415,6 +417,13 @@ impl<'a> Lexer<'a> {
             b':' => Tok::Colon,
             b';' => Tok::Semi,
             b'@' => Tok::At,
+            b'#' => {
+                // `##` is the token-paste operator (macro bodies); a lone `#`
+                // has no meaning in Vire.
+                two!(b'#', Tok::HashHash);
+                self.diags.push(Diag::error("unexpected character '#' (did you mean `##` for token pasting?)", Span(self.pos - 1, self.pos)));
+                Tok::Newline
+            }
             b'?' => Tok::Question,
             b'^' => Tok::Caret,
             b'.' => {

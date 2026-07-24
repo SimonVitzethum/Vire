@@ -228,7 +228,7 @@ impl Expander {
         }
         let rename: HashMap<String, String> = locals.iter().map(|l| (l.clone(), format!("{l}$h{id}"))).collect();
         let pmap: HashMap<String, Expr> = params.iter().cloned().zip(args.iter().cloned()).collect();
-        subst_expr(&mut b, &pmap, &rename);
+        subst_expr(&mut b, &pmap, &HashMap::new(), &rename);
         b
     }
 }
@@ -350,11 +350,24 @@ fn collect_binders_pat(p: &Pattern, out: &mut HashSet<String>) {
 
 // --- Substitution: parameter → argument, local binders → fresh names --------
 
-pub(crate) fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
-    // Ident: parameter substitution (whole node) takes precedence, otherwise renaming.
+pub(crate) fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, patmap: &HashMap<String, Pattern>, rename: &HashMap<String, String>) {
+    // Ident: parameter substitution (whole node) takes precedence, otherwise
+    // `##` token-paste resolution, otherwise hygiene renaming.
     if let Expr::Ident(n, _) = e {
         if let Some(arg) = pmap.get(n) {
             *e = arg.clone();
+            return;
+        }
+        if n.contains('\u{1}') {
+            // Pasted call target / reference: each fragment is either an ident
+            // parameter (→ its argument's name) or a literal.
+            *n = n
+                .split('\u{1}')
+                .map(|frag| match pmap.get(frag) {
+                    Some(Expr::Ident(a, _)) => a.clone(),
+                    _ => frag.to_string(),
+                })
+                .collect();
             return;
         }
         if let Some(fresh) = rename.get(n) {
@@ -363,76 +376,76 @@ pub(crate) fn subst_expr(e: &mut Expr, pmap: &HashMap<String, Expr>, rename: &Ha
         return;
     }
     match e {
-        Expr::Unary { rhs, .. } => subst_expr(rhs, pmap, rename),
+        Expr::Unary { rhs, .. } => subst_expr(rhs, pmap, patmap, rename),
         Expr::Binary { lhs, rhs, .. } => {
-            subst_expr(lhs, pmap, rename);
-            subst_expr(rhs, pmap, rename);
+            subst_expr(lhs, pmap, patmap, rename);
+            subst_expr(rhs, pmap, patmap, rename);
         }
         Expr::Call { callee, args, .. } => {
-            subst_expr(callee, pmap, rename);
-            args.iter_mut().for_each(|a| subst_expr(a, pmap, rename));
+            subst_expr(callee, pmap, patmap, rename);
+            args.iter_mut().for_each(|a| subst_expr(a, pmap, patmap, rename));
         }
-        Expr::Field { base, .. } => subst_expr(base, pmap, rename),
+        Expr::Field { base, .. } => subst_expr(base, pmap, patmap, rename),
         Expr::Index { base, index, .. } => {
-            subst_expr(base, pmap, rename);
-            subst_expr(index, pmap, rename);
+            subst_expr(base, pmap, patmap, rename);
+            subst_expr(index, pmap, patmap, rename);
         }
         Expr::If { cond, then, elifs, els, .. } => {
-            subst_expr(cond, pmap, rename);
-            subst_block(then, pmap, rename);
+            subst_expr(cond, pmap, patmap, rename);
+            subst_block(then, pmap, patmap, rename);
             for (c, b) in elifs {
-                subst_expr(c, pmap, rename);
-                subst_block(b, pmap, rename);
+                subst_expr(c, pmap, patmap, rename);
+                subst_block(b, pmap, patmap, rename);
             }
             if let Some(b) = els {
-                subst_block(b, pmap, rename);
+                subst_block(b, pmap, patmap, rename);
             }
         }
         Expr::Match { scrutinee, arms, .. } => {
-            subst_expr(scrutinee, pmap, rename);
+            subst_expr(scrutinee, pmap, patmap, rename);
             for (p, g, b) in arms {
-                subst_pat(p, rename);
+                subst_pat(p, patmap, rename);
                 if let Some(g) = g {
-                    subst_expr(g, pmap, rename);
+                    subst_expr(g, pmap, patmap, rename);
                 }
-                subst_expr(b, pmap, rename);
+                subst_expr(b, pmap, patmap, rename);
             }
         }
-        Expr::Block(b) => subst_block(b, pmap, rename),
+        Expr::Block(b) => subst_block(b, pmap, patmap, rename),
         Expr::Lambda { params, body, .. } => {
             for p in params.iter_mut() {
                 if let Some(fresh) = rename.get(p) {
                     *p = fresh.clone();
                 }
             }
-            subst_expr(body, pmap, rename);
+            subst_expr(body, pmap, patmap, rename);
         }
-        Expr::List(xs, _) => xs.iter_mut().for_each(|x| subst_expr(x, pmap, rename)),
+        Expr::List(xs, _) => xs.iter_mut().for_each(|x| subst_expr(x, pmap, patmap, rename)),
         Expr::Comprehension { elem, var, iter, cond, .. } => {
             if let Some(fresh) = rename.get(var) {
                 *var = fresh.clone();
             }
-            subst_expr(elem, pmap, rename);
-            subst_expr(iter, pmap, rename);
+            subst_expr(elem, pmap, patmap, rename);
+            subst_expr(iter, pmap, patmap, rename);
             if let Some(c) = cond {
-                subst_expr(c, pmap, rename);
+                subst_expr(c, pmap, patmap, rename);
             }
         }
         Expr::MapLit(kvs, _) => kvs.iter_mut().for_each(|(k, v)| {
-            subst_expr(k, pmap, rename);
-            subst_expr(v, pmap, rename);
+            subst_expr(k, pmap, patmap, rename);
+            subst_expr(v, pmap, patmap, rename);
         }),
-        Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => subst_expr(inner, pmap, rename),
+        Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => subst_expr(inner, pmap, patmap, rename),
         Expr::Range { start, end, .. } => {
-            subst_expr(start, pmap, rename);
-            subst_expr(end, pmap, rename);
+            subst_expr(start, pmap, patmap, rename);
+            subst_expr(end, pmap, patmap, rename);
         }
-        Expr::Capsule { body, .. } => subst_block(body, pmap, rename),
+        Expr::Capsule { body, .. } => subst_block(body, pmap, patmap, rename),
         _ => {}
     }
 }
 
-pub(crate) fn subst_block(b: &mut Block, pmap: &HashMap<String, Expr>, rename: &HashMap<String, String>) {
+pub(crate) fn subst_block(b: &mut Block, pmap: &HashMap<String, Expr>, patmap: &HashMap<String, Pattern>, rename: &HashMap<String, String>) {
     for s in &mut b.stmts {
         match s {
             Stmt::Let { name, value, .. } => {
@@ -440,44 +453,53 @@ pub(crate) fn subst_block(b: &mut Block, pmap: &HashMap<String, Expr>, rename: &
                     *name = fresh.clone();
                 }
                 if let Some(e) = value {
-                    subst_expr(e, pmap, rename);
+                    subst_expr(e, pmap, patmap, rename);
                 }
             }
             Stmt::Assign { target, value, .. } => {
-                subst_expr(target, pmap, rename);
-                subst_expr(value, pmap, rename);
+                subst_expr(target, pmap, patmap, rename);
+                subst_expr(value, pmap, patmap, rename);
             }
-            Stmt::Expr(e) => subst_expr(e, pmap, rename),
+            Stmt::Expr(e) => subst_expr(e, pmap, patmap, rename),
             Stmt::Return(v, _) => {
                 if let Some(e) = v {
-                    subst_expr(e, pmap, rename);
+                    subst_expr(e, pmap, patmap, rename);
                 }
             }
             Stmt::While { cond, body, .. } => {
-                subst_expr(cond, pmap, rename);
-                subst_block(body, pmap, rename);
+                subst_expr(cond, pmap, patmap, rename);
+                subst_block(body, pmap, patmap, rename);
             }
             Stmt::For { pat, iter, body, .. } => {
-                subst_pat(pat, rename);
-                subst_expr(iter, pmap, rename);
-                subst_block(body, pmap, rename);
+                subst_pat(pat, patmap, rename);
+                subst_expr(iter, pmap, patmap, rename);
+                subst_block(body, pmap, patmap, rename);
             }
             Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
     if let Some(t) = &mut b.tail {
-        subst_expr(t, pmap, rename);
+        subst_expr(t, pmap, patmap, rename);
     }
 }
 
-fn subst_pat(p: &mut Pattern, rename: &HashMap<String, String>) {
+fn subst_pat(p: &mut Pattern, patmap: &HashMap<String, Pattern>, rename: &HashMap<String, String>) {
+    // A `pat` parameter appears as a bare binding (`p`) or a nullary ctor spelling
+    // in the macro body; replace the whole node with the argument pattern.
     match p {
         Pattern::Bind(n, _) => {
+            if let Some(pat) = patmap.get(n) {
+                *p = pat.clone();
+                return;
+            }
             if let Some(fresh) = rename.get(n) {
                 *n = fresh.clone();
             }
         }
-        Pattern::Ctor { args, .. } | Pattern::Tuple(args, _) | Pattern::Or(args, _) => args.iter_mut().for_each(|a| subst_pat(a, rename)),
+        Pattern::Ctor { name, args, .. } if args.is_empty() && patmap.contains_key(name) => {
+            *p = patmap[name].clone();
+        }
+        Pattern::Ctor { args, .. } | Pattern::Tuple(args, _) | Pattern::Or(args, _) => args.iter_mut().for_each(|a| subst_pat(a, patmap, rename)),
         _ => {}
     }
 }

@@ -110,6 +110,13 @@ pub enum ParamKind {
     Type,
     Ident,
     Expr,
+    /// A `{ … }` block argument — spliced where the parameter appears in an
+    /// expression position (e.g. a generated function body). Kind-checked: the
+    /// argument must be a brace block, never a bare expression.
+    Block,
+    /// A pattern argument (`Some(x)`, `(a, b)`, `_`, a literal) — spliced into
+    /// pattern positions (`match` arms, `for`). Kind-checked via `expr_to_pattern`.
+    Pat,
 }
 
 /// A kind-typed item-macro parameter, e.g. `T: type`.

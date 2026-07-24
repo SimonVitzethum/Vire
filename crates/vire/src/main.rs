@@ -151,7 +151,7 @@ fn main() {
                 exit(1);
             }
             for e in vire::expand_item_macros(&mut module) {
-                eprintln!("macro: {e}");
+                eprintln!("{}", e.render(&src));
             }
             if let Err(es) = vire::expand_macros(&mut module) {
                 for e in es {
@@ -568,7 +568,7 @@ fn check(args: &[String]) {
     }
     for e in vire::expand_item_macros(&mut module) {
         had_error = true;
-        emit_plain(&e);
+        emit_span(&e.level, e.span, &e.msg);
     }
     if let Err(errs) = vire::expand_macros(&mut module) {
         for e in errs {
@@ -771,7 +771,9 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
-            "--noverify" => noverify = true,
+            // Disable the inline-C/asm memory-safety verifier for native blocks.
+            // `--unsafe-c` / `--no-verify-c` are explicit aliases of `--noverify`.
+            "--noverify" | "--unsafe-c" | "--no-verify-c" => noverify = true,
             // Force the threads runtime even without `spawn` (atomic RC + pthreads).
             // `spawn` enables it automatically; this is for explicit control.
             "--threads" => threads_flag = true,
@@ -1037,7 +1039,7 @@ fn build_or_run(args: &[String]) {
     let item_macro_errs = vire::expand_item_macros(&mut module);
     if !item_macro_errs.is_empty() {
         for e in &item_macro_errs {
-            eprintln!("error: {e}");
+            eprintln!("{}", e.render(&src));
         }
         exit(1);
     }

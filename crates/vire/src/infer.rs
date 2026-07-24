@@ -249,7 +249,7 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<String>, ExprTypes) {
 }
 
 /// Source span of an expression node (the side-table key).
-fn expr_span(e: &Expr) -> Span {
+pub(crate) fn expr_span(e: &Expr) -> Span {
     match e {
         Expr::Int(_, s)
         | Expr::Float(_, s)

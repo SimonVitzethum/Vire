@@ -9,11 +9,15 @@ pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
     pub diags: Vec<Diag>,
+    /// True while parsing the body items of an item macro — enables the `##`
+    /// token-paste operator to defer concatenation until expansion (when the
+    /// parameter substitution is known).
+    in_macro_body: bool,
 }
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, diags: Vec::new() }
+        Parser { toks, pos: 0, diags: Vec::new(), in_macro_body: false }
     }
 
     // --- Token primitives ---
@@ -71,6 +75,26 @@ impl Parser {
                 self.diags.push(Diag::error(&format!("expected identifier, found {other:?}"), self.span()));
                 "_".into()
             }
+        }
+    }
+    /// Read an identifier, honoring the `##` token-paste operator (`A ## B`).
+    /// Fragments are joined with the reserved sentinel `\u{1}`; item-macro
+    /// expansion resolves each fragment (a parameter → its `ident` argument,
+    /// otherwise literal) and concatenates them into one identifier. Outside a
+    /// macro body every fragment is literal, so they are joined immediately —
+    /// no sentinel ever reaches lowering.
+    fn paste_ident(&mut self) -> String {
+        let mut parts = vec![self.ident()];
+        while self.at(&Tok::HashHash) {
+            self.bump();
+            parts.push(self.ident());
+        }
+        if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else if self.in_macro_body {
+            parts.join("\u{1}")
+        } else {
+            parts.concat()
         }
     }
     fn at_kw(&self, k: Kw) -> bool {
@@ -250,7 +274,7 @@ impl Parser {
     fn parse_fn_sig(&mut self) -> FnSig {
         let sp = self.span();
         self.expect(&Tok::Kw(Kw::Fn), "'fn'");
-        let name = self.ident();
+        let name = self.paste_ident();
         let generics = self.parse_generics();
         let params = self.parse_params();
         // Return type: `-> T` OR the shorter `> T`. After `)` there is no
@@ -283,7 +307,7 @@ impl Parser {
     fn parse_type_def(&mut self) -> TypeDef {
         let sp = self.span();
         self.expect(&Tok::Kw(Kw::Type), "'type'");
-        let name = self.ident();
+        let name = self.paste_ident();
         let generics = self.parse_generics();
         let mut fields = Vec::new();
         let mut variants = Vec::new();
@@ -355,8 +379,10 @@ impl Parser {
                     match k.as_str() {
                         "ident" => Some(ParamKind::Ident),
                         "expr" => Some(ParamKind::Expr),
+                        "block" => Some(ParamKind::Block),
+                        "pat" => Some(ParamKind::Pat),
                         _ => {
-                            self.err("macro parameter kind must be `type`, `ident`, or `expr`");
+                            self.err("macro parameter kind must be `type`, `ident`, `expr`, `block`, or `pat`");
                             Some(ParamKind::Expr)
                         }
                     }
@@ -385,12 +411,23 @@ impl Parser {
             self.expect(&Tok::LBrace, "'{' or '=' after macro parameters");
             self.stmt_end();
             let mut items = Vec::new();
+            let prev = self.in_macro_body;
+            self.in_macro_body = true;
             while !self.at(&Tok::RBrace) && !matches!(self.peek(), Tok::Eof) {
+                let before = self.pos;
                 if let Some(it) = self.parse_item() {
                     items.push(it);
                 }
                 self.stmt_end();
+                // Always make progress: a malformed body item (e.g. a stray token
+                // that starts no item) must never spin the loop — otherwise the
+                // diagnostics vec grows without bound until OOM.
+                if self.pos == before {
+                    self.err("unexpected token in macro body");
+                    self.bump();
+                }
             }
+            self.in_macro_body = prev;
             self.expect(&Tok::RBrace, "'}'");
             Item::ItemMacro { name, params, items, span: sp }
         }
@@ -585,7 +622,9 @@ impl Parser {
                 self.bump();
                 "Self".into()
             }
-            _ => self.ident(),
+            // `Base ## Box` — a pasted type name (e.g. referencing a type a macro
+            // generated). Paste-aware like fn/type-def names.
+            _ => self.paste_ident(),
         };
         let mut args = Vec::new();
         if self.eat(&Tok::LBracket) {
@@ -1032,7 +1071,9 @@ impl Parser {
                     let body = self.parse_lambda_body();
                     Expr::Lambda { params: vec![p], body: Box::new(body), span: sp }
                 } else {
-                    Expr::Ident(self.ident(), sp)
+                    // `paste_ident` folds `Base ## _get` into one identifier so a
+                    // pasted name works as a call target / value reference.
+                    Expr::Ident(self.paste_ident(), sp)
                 }
             }
             Tok::LParen => self.parse_paren_or_lambda(),

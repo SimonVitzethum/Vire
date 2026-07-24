@@ -249,6 +249,26 @@ x = timed("compute") { heavy() }                 // x inherits the checked type 
 // timed("l", 5)           // ERROR at call: `body: block` expected, `5` is expression
 ```
 
+**Item macros** produce *declarations* — `macro name(P: kind, …) { <items> }`,
+invoked as `name!(…)`. Parameter kinds are `type`, `ident`, `expr`, `block`
+(a `{ … }` argument), and `pat` (a pattern). Token pasting `A ## B` builds a
+fresh identifier from an `ident` parameter and literal parts (AST-level, no
+re-lexing), which gives each invocation distinct top-level names:
+
+```vire
+macro boxed(Base: ident, T: type) {
+    type Base ## Box { value: T }                 // fooBox, barBox, …
+    fn Base ## _wrap(v: T) -> Base ## Box { Base ## Box(v) }
+}
+boxed!(foo, Int)
+boxed!(bar, Float)
+// foo_wrap(42) : fooBox     bar_wrap(3.5) : barBox
+```
+
+A wrong-kind argument, an unknown macro, an arity mismatch, or a duplicate
+generated name is a **compile error with a source span** (the offending
+argument / invocation site), never a blind splice or a cryptic backend failure.
+
 For 95% of the "macro" cases (constants, conditional compilation, derivations,
 code generation) one uses `const`/`comptime`/`@derive` (Point 7) — which are likewise
 fully type-checked. Macros remain for genuine **syntactic** abstraction. In

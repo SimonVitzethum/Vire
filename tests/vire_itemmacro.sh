@@ -123,6 +123,77 @@ else
     echo "FAIL generic type arg in type param"; fail=$((fail+1))
 fi
 
+# `block` param: a `{ … }` argument spliced as a generated function body.
+cat > "$work/block.vr" <<'EOF'
+macro deffn(Name: ident, Body: block) {
+    fn Name() -> Int = Body
+}
+deffn!(compute, {
+    mut x = 20
+    x + 22
+})
+fn main() { print(compute()) }
+EOF
+check "block param (body splice)" "42" "$work/block.vr"
+
+# `block` kind-check: a bare expression where a block is required is rejected.
+printf 'macro d(N: ident, B: block) { fn N() -> Int = B }\nd!(f, 1 + 2)\nfn main(){print(1)}\n' > "$work/block_bad.vr"
+errck "kind check: expr for block param" "must be a .* block" "$work/block_bad.vr"
+
+# `pat` param: a pattern spliced into a `match` arm (identical to hand-written).
+cat > "$work/pat.vr" <<'EOF'
+type Res { Val(x: Int)  Nope }
+macro matcher(fname: ident, p: pat, out: expr) {
+    fn fname(o: Res) -> Int {
+        match o {
+            p -> out
+            _ -> 0 - 1
+        }
+    }
+}
+matcher!(get_or_neg, Val(k), k)
+fn main() { print(get_or_neg(Val(7)))  print(get_or_neg(Nope)) }
+EOF
+check "pat param (match arm splice)" "7
+-1" "$work/pat.vr"
+
+# Token pasting: `Base ## _suffix` builds distinct generated names per invocation
+# (solves the name-collision limitation) and works as a call target too.
+cat > "$work/paste.vr" <<'EOF'
+macro pair(Base: ident, T: type) {
+    fn Base ## _make(v: T) -> T { v }
+    fn Base ## _id(v: T) -> T { Base ## _make(v) }
+}
+pair!(foo, Int)
+pair!(bar, Float)
+fn main() { print(foo_id(42))  print(bar_id(3.5)) }
+EOF
+check "token pasting (## builds distinct names)" "42
+3.5" "$work/paste.vr"
+
+# Token pasting in TYPE position: a generated type referenced by its pasted name
+# as a return/field type (not just defined).
+cat > "$work/paste_ty.vr" <<'EOF'
+macro boxed(Base: ident, T: type) {
+    type Base ## Box { value: T }
+    fn Base ## _wrap(v: T) -> Base ## Box { Base ## Box(v) }
+}
+boxed!(foo, Int)
+boxed!(bar, Float)
+fn main() {
+    mut a = foo_wrap(42)
+    mut b = bar_wrap(3.5)
+    print(a.value)  print(b.value)
+}
+EOF
+check "token pasting in type position" "42
+3.5" "$work/paste_ty.vr"
+
+# ROBUSTNESS (regression): a malformed macro body must ERROR, never spin the
+# parse loop into an out-of-memory (was: unbounded diagnostics growth → OOM).
+printf 'macro d(N: ident, B: block) { fn N() -> Int B }\nd!(f, {1})\nfn main(){print(f())}\n' > "$work/oom.vr"
+errck "malformed macro body errors (no OOM)" "unexpected token in macro body" "$work/oom.vr"
+
 # A diverging (self-invoking) macro is caught by the round limit, not a hang.
 cat > "$work/diverge.vr" <<'EOF'
 macro loop(N: ident) {

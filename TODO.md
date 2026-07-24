@@ -327,9 +327,23 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [ ] `@derive` via reflection (generic + nested-user-type — see (b) above).
 - [ ] `comptime for`, `emit`. **No** runtime reflection (AOT).
 
-### [4] Own optional preprocessor *(= comptime/@if/macros)*
-- [ ] Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic
-  spans into the expansion (typed `expr`/`ident`/`type` + hygiene already done).
+### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
+- [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic
+  spans into the expansion — DONE (2026-07-24).** Item-macro kind system extended
+  with `block` (a `{ … }` argument, kind-checked, spliced as e.g. a generated fn
+  body) and `pat` (a pattern argument — `_`/literal/binding/`Ctor(...)` — spliced
+  into `match`/`for` positions via `expr_to_pattern` + a `patmap` threaded through
+  substitution). **Token pasting** `Base ## _suffix` (`##` = `Tok::HashHash`) builds
+  distinct generated names per invocation (solves the name-collision limitation) and
+  works as a call target; resolved AST-level (fragments = ident params, else literal),
+  deferred via a `\u{1}` sentinel only inside macro bodies so nothing escapes to
+  lowering. **Diagnostic spans**: `expand_item_macros` now returns `Vec<Diag>` —
+  kind errors point at the offending argument, arity/unknown at the invocation site,
+  duplicates at a representative def; substituted idents carry the call-site span.
+  Also fixed a real **OOM**: a malformed macro body spun the parse loop (unbounded
+  diagnostics growth); the body-item loop now always advances. Tests in
+  `tests/vire_itemmacro.sh` (16, +5); typed `expr`/`ident`/`type` + hygiene were
+  already done.
 
 ### [6] Logger — remaining
 - [ ] `with log.span(...)` (scoped context fields).

@@ -201,7 +201,7 @@ fn inline_calls_expr(e: &mut Expr, name: &str, params: &[String], orig: &Block, 
             collect_binders_block(orig, &mut locals);
             let rename: HashMap<String, String> = locals.iter().map(|l| (l.clone(), format!("{l}$ri{id}"))).collect();
             let mut b = orig.clone();
-            subst_block(&mut b, &pmap, &rename);
+            subst_block(&mut b, &pmap, &HashMap::new(), &rename);
             Some(Expr::Block(b))
         } else {
             None
