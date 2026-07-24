@@ -175,11 +175,18 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   `IB::Add`/… — identical to `+`); `x +% 1` on i64::MAX wraps to MIN. And integer
   reductions **already auto-vectorize** (a contiguous i64 sum loop emits 35 `vpaddq`).
   Nothing to build.
-- [ ] **Explicit SIMD intrinsic path** for reductions LLVM won't auto-vectorize
-  (e.g. vectorized argmin — kmeans nearest-centroid is 0.55× Rust / **1.28× C++**;
-  no compiler emits SIMD for the branchy argmin). Emit `@llvm.vector.reduce.*` /
-  explicit `<N x i64>` ops, or a comptime SIMD library. Opens a general capability,
-  not just one bench.
+- [x] **SIMD argmin — BUILT, MEASURED, REVERTED (2026-07-24): it does not help at any
+  size.** The item assumed vectorizing the branchy argmin would close kmeans' 1.28× C++
+  gap. Built an `argmin(arr)` builtin → `jrt_argmin` with a hand-written 4-wide AVX2
+  compare/blend path (i64, correct first-min tie-break, `target("avx2")` + runtime
+  `__builtin_cpu_supports` gate, scalar fallback). Isolated microbenchmark (1.25M calls,
+  stable): AVX2 vs scalar is **0.67× at n=8, 0.92× n=32, 0.99× n=128, 1.00–1.01× at
+  n≥512** — never a win. Small n: the horizontal-reduce/setup overhead exceeds the tiny
+  scalar loop; large n: argmin is memory-bandwidth-bound, so scalar already saturates.
+  This is exactly why no compiler auto-vectorizes it. And the kmeans gap is not argmin
+  anyway: `dist[c]` in the argmin is already bounds-elided, and `FASTLLVM_NO_BOUNDS`
+  closes only 0.8 ms of the 33→26 ms gap — it is deep codegen (same bucket as regex/
+  pquicksort), not vectorization. Reverted rather than ship a slower-or-equal SIMD path.
 
 ## Perf — residual / parked (low ROI, keep for context)
 
