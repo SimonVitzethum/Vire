@@ -66,6 +66,10 @@ fn main() {
         check(&args[1..]);
         return;
     }
+    if args[0] == "fmt" {
+        fmt_cmd(&args[1..]);
+        return;
+    }
     if args.len() < 2 {
         eprintln!("Usage: vire (parse|lex) FILE.vr");
         exit(2);
@@ -510,6 +514,44 @@ fn python_config() -> Option<(String, String)> {
 /// printing each diagnostic as `FILE:line:col: severity: message` for editor
 /// integration. Lex/parse diagnostics carry precise spans; stage errors without a
 /// span are reported at 1:1. Prints nothing and exits 0 when the file is clean.
+/// `vire fmt FILE.vr` — print the canonically-formatted source to stdout.
+/// `vire fmt -i FILE.vr` rewrites the file in place. A parse error is fatal (a
+/// malformed file is left untouched). The formatter round-trips: `fmt(fmt(x))`
+/// equals `fmt(x)`, so it doubles as parser-fuzz insurance.
+fn fmt_cmd(args: &[String]) {
+    let in_place = args.iter().any(|a| a == "-i" || a == "--in-place");
+    let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
+        eprintln!("Usage: vire fmt [-i] FILE.vr");
+        exit(2);
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            exit(1);
+        }
+    };
+    let syntax = load_syntax(&src, path, None);
+    let (module, diags) = vire::parse_with_syntax(&src, syntax);
+    let errs: Vec<_> = diags.iter().filter(|d| d.level == vire::diag::Level::Error).collect();
+    if !errs.is_empty() {
+        for d in &errs {
+            eprintln!("{}", d.render(&src));
+        }
+        eprintln!("fmt: not formatting (parse errors above)");
+        exit(1);
+    }
+    let out = vire::format_module(&module);
+    if in_place {
+        if let Err(e) = std::fs::write(path, &out) {
+            eprintln!("{path}: {e}");
+            exit(1);
+        }
+    } else {
+        print!("{out}");
+    }
+}
+
 fn check(args: &[String]) {
     let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
         eprintln!("Usage: vire check FILE.vr");

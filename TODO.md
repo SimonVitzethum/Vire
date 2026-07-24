@@ -266,7 +266,12 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Front-end completeness
 
-- [ ] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance.
+- [x] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance — **DONE (2026-07-24).**
+  `vire fmt FILE.vr` prints canonical source (`-i` rewrites in place). Two invariants, both
+  tested: idempotency (`fmt(fmt(x))==fmt(x)`) and round-trip run equality (running the formatted
+  file prints the same). Strings are re-escaped incl. `{`→`{{` (interpolation is parse-time).
+  Verified idempotent over all 36 compiling `examples/vire/*.vr`. Module `fmt.rs`; test
+  `tests/vire_fmt.sh`.
 - [~] **Error messages** — panic-mode recovery collects multiple diagnostics; still
   open: fix suggestions and pointing near the true cause.
 - [~] **Trait resolution + coherence.** Duplicate/overlapping method defs per type
