@@ -1960,7 +1960,11 @@ impl<'a> FnLower<'a> {
                             let d = self.new_local(kind.value_ty());
                             self.emit(Statement::Assign(d, Rvalue::Convert(v)));
                             v = Operand::Copy(d);
-                        } else if kind == ArrKind::Long && vt != Ty::I64 {
+                        } else if kind.value_ty() == Ty::I64 && vt != Ty::I64 {
+                            // Long AND U8 (byte) arrays carry their element as i64
+                            // in the IR. Widen the stored value (e.g. a byte from
+                            // `65 + i`, char_at, or arithmetic) so the store's
+                            // value/element widths agree.
                             v = to_i64(v);
                         }
                         let idx32 = self.to_i32(idx);

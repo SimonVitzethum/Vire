@@ -2937,9 +2937,16 @@ fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: 
             writeln!(w, "  {x} = sext {} {raw} to i32", arr_store_ty(k)).unwrap();
             x
         }
-        ArrKind::Bool | ArrKind::Char | ArrKind::U8 => {
+        ArrKind::Bool | ArrKind::Char => {
             let x = e.fresh();
             writeln!(w, "  {x} = zext {} {raw} to i32", arr_store_ty(k)).unwrap();
+            x
+        }
+        // Vire-only: a U8 element is Int (i64). Zero-extend the byte straight
+        // to i64 so the loaded value matches value_ty() == I64 (unsigned 0..255).
+        ArrKind::U8 => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = zext {} {raw} to i64", arr_store_ty(k)).unwrap();
             x
         }
         _ => raw,
@@ -2956,9 +2963,15 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     // Truncate the value to the storage width (byte/char/short).
     let sv = match k {
-        ArrKind::Bool | ArrKind::Byte | ArrKind::U8 | ArrKind::Char | ArrKind::Short => {
+        ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
             let x = e.fresh();
             writeln!(w, "  {x} = trunc i32 {v} to {}", arr_store_ty(k)).unwrap();
+            x
+        }
+        // Vire-only: U8 carries its value as i64 (Int) — truncate from i64.
+        ArrKind::U8 => {
+            let x = e.fresh();
+            writeln!(w, "  {x} = trunc i64 {v} to {}", arr_store_ty(k)).unwrap();
             x
         }
         _ => v.to_string(),
@@ -2989,9 +3002,15 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
                 writeln!(w, "  {x} = sext {sty} {raw} to i32").unwrap();
                 x
             }
-            ArrKind::Bool | ArrKind::Char | ArrKind::U8 => {
+            ArrKind::Bool | ArrKind::Char => {
                 let x = e.fresh();
                 writeln!(w, "  {x} = zext {sty} {raw} to i32").unwrap();
+                x
+            }
+            // Vire-only: U8 element is Int (i64) — zero-extend straight to i64.
+            ArrKind::U8 => {
+                let x = e.fresh();
+                writeln!(w, "  {x} = zext {sty} {raw} to i64").unwrap();
                 x
             }
             _ => raw.to_string(),
@@ -3088,9 +3107,15 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let sty = arr_store_ty(k);
     let trunc_val = |w: &mut String, e: &mut FnEmitter| -> String {
         match k {
-            ArrKind::Bool | ArrKind::Byte | ArrKind::U8 | ArrKind::Char | ArrKind::Short => {
+            ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
                 let x = e.fresh();
                 writeln!(w, "  {x} = trunc i32 {v} to {sty}").unwrap();
+                x
+            }
+            // Vire-only: U8 carries its value as i64 (Int) — truncate from i64.
+            ArrKind::U8 => {
+                let x = e.fresh();
+                writeln!(w, "  {x} = trunc i64 {v} to {sty}").unwrap();
                 x
             }
             _ => v.to_string(),

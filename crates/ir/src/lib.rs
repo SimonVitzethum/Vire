@@ -183,6 +183,11 @@ impl ArrKind {
             ArrKind::Float => Ty::F32,
             ArrKind::Double => Ty::F64,
             ArrKind::Ref => Ty::Ref,
+            // U8 is Vire-only (Java `byte[]` is ArrKind::Byte). Vire's `Int` is
+            // i64, so a U8 element reads/writes as i64 — value 0..255, unsigned.
+            // This keeps the frontend, IR, and backend on one width and removes
+            // the i32/i64 impedance mismatch at every byte↔Int boundary.
+            ArrKind::U8 => Ty::I64,
             _ => Ty::I32,
         }
     }

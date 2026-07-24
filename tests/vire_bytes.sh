@@ -66,6 +66,46 @@ check "str_from/find_byte clamp (sound)" "2
 0
 -1" "$work/clamp.vr"
 
+# --- byte<->Int interop: a U8 element IS an Int (i64), 0..255 -----------
+# Storing a computed Int into a byte array, loading a byte into an i64
+# context (compare/min/assign), byte load as an Int argument, byte-load
+# arithmetic, and a nested index freq[needle[k]] all must width-agree.
+cat > "$work/interop.vr" <<'EOF'
+fn g(c: Int) -> Int { if c >= 97 and c <= 122 { return 1 } 0 }
+fn minb(a: Array[Byte], n: Int) -> Int {
+    mut best = 999                      // i64 local
+    mut i = 0
+    while i < n { v = a[i]  if v < best { best = v } i = i + 1 }
+    best
+}
+fn nested(freq: Array[Byte], nd: Array[Byte], n: Int) -> Int {
+    mut k = 0  mut best = 999
+    while k < n { fq = freq[nd[k]]  if fq < best { best = fq } k = k + 1 }
+    best
+}
+fn main() {
+    mut nd = barray(3)
+    mut i = 0
+    while i < 3 { v = 65 + i  nd[i] = v  i = i + 1 }   // store computed Int
+    print(nd[0])                                        // 65
+    print(nd[2])                                        // 67
+    mut a = barray(2)  a[0]=5  a[1]=9
+    print(minb(a, 2))                                   // 5  (byte in i64 ctx)
+    print(g(a[0]))                                       // 0  (byte as Int arg; 5 not a-z)
+    mut b = a[1] + 1                                    // byte-load arithmetic
+    print(b)                                             // 10
+    mut freq = barray(10)  freq[5]=3  freq[9]=7
+    mut keys = barray(2)  keys[0]=5  keys[1]=9
+    print(nested(freq, keys, 2))                        // 3  (nested index)
+}
+EOF
+check "byte<->Int interop (store/compare/arg/arith/nested index)" "65
+67
+5
+0
+10
+3" "$work/interop.vr"
+
 # --- peek_u8: raw byte load over a Ptr (from cstr) ----------------------
 cat > "$work/peek.vr" <<'EOF'
 fn main() {
