@@ -122,6 +122,30 @@ fn main() {
 }
 EOF
 
+# parallel_for workers ALLOCATING concurrently — the slab allocator must be
+# thread-safe. Each of 200 iterations allocates a barray + a Str (str_from) 50×;
+# that is ~20k concurrent slab alloc/free across cores. Before the slab lock this
+# raced the global freelists → heap corruption → SIGSEGV (repro: VireGREP's
+# parallel recursive walk on 50+ files). Run x30: a race would crash or miscount.
+ok_case parallel_alloc 10000 30 <<'EOF'
+fn work(i: Int, total: Atomic) -> Int {
+    mut j = 0
+    while j < 50 {
+        mut b = barray(40)
+        b[0] = i
+        mut s = str_from(b, 0, 1)      // a second (Str) allocation
+        total.fetch_add(s.len())        // +1 per inner iteration
+        j = j + 1
+    }
+    0
+}
+fn main() {
+    mut total = Atomic(0)
+    parallel_for(200, total, work)      // 200 * 50 = 10000
+    print(total.load())
+}
+EOF
+
 # parallel_for shared must be a Sync type
 err_case parallel_for_send "cannot send" <<'EOF'
 type Bag { n: Int }

@@ -211,6 +211,22 @@ typedef struct Slab {
     struct Slab *next;
     int64_t cell; /* cell size of this slab */
 } Slab;
+/* The slab's freelists / bump cursors / base-set are process-global mutable state.
+ * Under threads, concurrent jrt_alloc (and free_obj → slab_free) from spawn/
+ * parallel_for workers race on them → freelist corruption → SIGSEGV. Serialize the
+ * slab with a mutex — but ONLY in a threaded build (FASTLLVM_THREADS is defined
+ * exactly when the program uses threads, like the atomic counters above), so a
+ * single-threaded program keeps a zero-overhead allocator (the macros compile away).
+ * The large-object path (plat_alloc == calloc) and refcounts are already thread-safe. */
+#ifdef FASTLLVM_THREADS
+#include <pthread.h>
+static pthread_mutex_t g_slab_lock = PTHREAD_MUTEX_INITIALIZER;
+#define SLAB_LOCK() pthread_mutex_lock(&g_slab_lock)
+#define SLAB_UNLOCK() pthread_mutex_unlock(&g_slab_lock)
+#else
+#define SLAB_LOCK() ((void)0)
+#define SLAB_UNLOCK() ((void)0)
+#endif
 static void *slab_freelist[SLAB_CLASSES + 1];
 static char *slab_cur[SLAB_CLASSES + 1];
 static size_t slab_off[SLAB_CLASSES + 1];
@@ -252,18 +268,26 @@ static int slab_set_has(uintptr_t base) {
 }
 static void *slab_alloc(size_t n) {
     if (n == 0) n = 16;
-    if (n > (size_t)SLAB_CLASSES * 8) return plat_alloc(n); /* large → calloc */
+    if (n > (size_t)SLAB_CLASSES * 8) return plat_alloc(n); /* large → calloc (thread-safe) */
     int c = (int)((n + 7) / 8);
     size_t cell = (size_t)c * 8;
+    /* Critical section: pop a freelist cell OR bump the current slab. The returned
+     * cell is exclusively this thread's afterwards, so the memset (zeroing) is done
+     * outside the lock to keep the section minimal. */
+    SLAB_LOCK();
     void *p = slab_freelist[c];
     if (p) {
         slab_freelist[c] = *(void **)p;
+        SLAB_UNLOCK();
         memset(p, 0, cell);
         return p;
     }
     if (!slab_cur[c] || slab_off[c] + cell > SLAB_SIZE) {
         char *s = (char *)plat_aligned(SLAB_SIZE, SLAB_SIZE);
-        if (!s) return plat_alloc(n);
+        if (!s) {
+            SLAB_UNLOCK();
+            return plat_alloc(n);
+        }
         ((Slab *)s)->next = (Slab *)slab_cur[c];
         ((Slab *)s)->cell = (int64_t)cell;
         slab_set_insert((uintptr_t)s);
@@ -272,17 +296,24 @@ static void *slab_alloc(size_t n) {
     }
     p = slab_cur[c] + slab_off[c];
     slab_off[c] += cell;
+    SLAB_UNLOCK();
     memset(p, 0, cell); /* aligned_alloc is NOT zeroed; objects need Java default zero fields */
     return p;
 }
 static void slab_free(void *p) {
     if (!p) return;
     uintptr_t base = (uintptr_t)p & SLAB_MASK;
+    /* slab_set_has reads the base-set (which slab_set_insert may realloc), and the
+     * freelist push mutates it — both under the lock. plat_free is libc-thread-safe,
+     * so it runs outside the section. */
+    SLAB_LOCK();
     if (slab_set_has(base)) {
         int c = (int)(((Slab *)base)->cell / 8);
         *(void **)p = slab_freelist[c];
         slab_freelist[c] = p;
+        SLAB_UNLOCK();
     } else {
+        SLAB_UNLOCK();
         plat_free(p);
     }
 }
