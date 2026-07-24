@@ -532,6 +532,12 @@ fn ann_ty(t: Option<&Type>) -> Option<T> {
         "Str" => T::Ref,
         "I32" | "U32" => T::I32,
         "Int" | "I64" | "U64" => T::I64,
+        // `Ptr` is an opaque raw FFI pointer: i64-wide, NOT an RC'd object (matches
+        // lower::ty_of and class_of, which already treat it as i64/no-class). Typing it
+        // as `Ref` here was the sole inconsistency — it made `if p != 0` (a null check)
+        // a Ref-vs-Int conflict. As i64 it compares with / is arithmetic-compatible with
+        // integer literals, exactly like the raw pointer it is.
+        "Ptr" => T::I64,
         "Unit" => T::Void,
         _ => T::Ref,
     })

@@ -65,6 +65,22 @@ fn main() { mut a = farray(4)  mut p = cstr(a)  print(p) }
 EOF
 reject "cstr(array) rejected" "$work/bad_arr.vr"
 
+# --- Ptr is an opaque i64: comparing it with an integer literal (a null check)
+# must type-check (was: "type conflict: object/ref vs Int" — Ptr inferred as Ref). --
+cat > "$work/ptrcmp.vr" <<'EOF'
+fn use_it(p: Ptr) -> Int {
+    if p == 0 { return 0 - 1 }
+    if p != 0 { return 1 }
+    0
+}
+fn main() {
+    print(use_it(cstr("x")))   // 1   (non-null)
+    print(use_it(0))           // -1  (null)
+}
+EOF
+check "Ptr compared with Int literal (null check)" "1
+-1" "$work/ptrcmp.vr"
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
