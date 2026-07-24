@@ -97,7 +97,7 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | **vcall** (dyn dispatch) | **1.00×** | **0.44×** (2.3× faster) | solver devirtualization; beats clang `virtual` |
 | **binsearch** (10M) | 1.03× | **0.78×** | midpoint check *proved* redundant + elided — safely |
 | **sort** (quicksort 2M) | 1.06× | 1.33× | uncatchable checks abort noreturn (Rust's structure) |
-| **graph** (BFS + Dijkstra, 1.6M edges) | **1.12×** | **~1.00×** | was 1.61× — a region-array eager-zero fault, now fixed; RSS + compute at parity, residual is bounds checks |
+| **graph** (BFS + Dijkstra, 1.6M edges) | **~1.00×** | **~1.00×** | was 1.61× — a region-array eager-zero fault, now fixed; RSS + time both at parity |
 
 Across the Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
 memory-safe Vire vs memory-safe Rust is at **Rust parity on the compute/struct/tree
@@ -118,10 +118,10 @@ set — including the tail of the two worst-case-sized binary-heap scratch array
 algorithm never touches — whereas Rust's `vec![0; n]` gets lazy zero pages. The runtime
 now fills region arrays lazily (memset only the reused prefix below a dirty high-water
 mark; the fresh `mmap(MAP_ANONYMOUS)` tail stays zero and unfaulted). Result: **RSS 56 →
-30 MB (= Rust's 30), cold 55.8 → 44.4 ms (Rust 39.7)** — the memory gap gone, the compute
-gap gone; the remaining 1.12× is the bounds checks (which Rust also carries but schedules
-for free here). Codegen is byte-identical; verified by the Java 0-live oracle (67/67) and
-the differential fuzzer. On the **Java→native**
+30 MB (= Rust's 30), time 38.8 ms vs Rust 39.9 (best of 10) — parity on both**, bounds
+checks included (an earlier 1.12× reading was a small-sample artefact). Codegen is
+byte-identical; verified by the Java 0-live oracle (67/67) and the differential fuzzer.
+On the **Java→native**
 oracle path the same backend takes **NBody 35.7× → 1.16×** (`Math.sqrt` now lowers to the
 `sqrtsd` intrinsic, not a 60-iteration Newton call) and **binary-trees 1.73× → 0.81×,
 beating Rust** (a shape/freshness analysis drops the cycle collector for provably

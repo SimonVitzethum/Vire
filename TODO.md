@@ -102,12 +102,13 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Tier 2 — targeted, safe, medium ROI
 
-- [ ] **NBody SoA `noalias`/`restrict` on disjoint static arrays.** NBody is the
-  single remaining >1.1× compute case (**1.16× Rust / 1.31× C++**): seven same-typed
-  `double[]` globals LLVM can't prove disjoint → reloads. Unlike the ruled-out
-  per-access case (latency-bound), these are *statically distinct allocations* →
-  provably safe to mark. Target parity. (Note: inlining `advance` makes it *worse*,
-  7.5× — do not.)
+- [x] **NBody — already at parity (2026-07, re-measured).** The "1.16× / seven
+  double[] reloads" entry was stale (predates the `Math.sqrt`→`sqrtsd` intrinsic + fma
+  scheduling). Measured now: fastjavac 1211 ms vs a faithful Rust port 1165 ms = **1.04×**,
+  identical output. Disassembly of `advance()`: the 7 array base pointers are already kept
+  in registers and the body uses `vfmadd` with no visible redundant reloads. The
+  scoped-noalias work is not warranted — there is no reload pathology left to remove.
+  (Note kept: inlining `advance` makes it *worse*, 7.5× — do not.)
 - [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
   field array). Extends the mature `crates/solver/src/bounds.rs`. **Soundness risk
   ~zero** — elision only removes a check when provably safe; a real OOB still throws.
@@ -124,11 +125,10 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   tail stays zero + unfaulted. RSS 56→30 MB (= Rust), cold 55.8→44.4 ms (Rust 39.7). The
   residual 1.12× is the bounds checks. Gated: Java 67/67, fuzzer, +2 `vire_heap` zero-init
   tests. General win — helps every region-array-heavy program, not just graph.
-- [ ] **PGO on graph (Dijkstra) — optional, for the last 1.12×.** Infra
-  (`--pgo-gen`/`--pgo-use`) exists but was never applied to the data-dependent heap-sift
-  branches. Now that memory + compute are at parity, the only residual is the bounds-check
-  scheduling; PGO on the branchy pointer-chase might close it. Low priority (already at
-  parity on compute; Rust also carries these checks).
+- [x] **graph — at parity, no residual (2026-07, best-of-10 re-measure).** The "1.12×
+  bounds-check residual" was a small-sample artefact. Bounds checks ON: 38.8 ms vs Rust
+  39.9 (and vs Vire no-bounds 39.8) — parity, marginally ahead. The lazy-region fix closed
+  graph fully; nothing left to do. (PGO infra remains available but is not needed here.)
 
 ## Tier 3 — enablers with broad latent effect
 
