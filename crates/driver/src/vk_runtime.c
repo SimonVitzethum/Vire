@@ -498,71 +498,142 @@ static int rcache_get(VkDevice dev, int vmode, int depth, uint32_t w, uint32_t h
     *rp=r; *pipe=p; *pl=layout; VK_UNLOCK(); return 1;
 }
 
+/* Persistent per-frame render resources — the color/depth images + views, framebuffer, the
+ * readback and vertex staging buffers, the command pool/buffer and the fence. Creating these
+ * per frame costs ~0.1ms/frame (measured: 200-frame animation spent ~21ms of ~197ms here);
+ * an animation reuses ONE entry keyed by (W,H,depth) so per-frame work drops to a vertex
+ * memcpy + command re-record + submit. The readback and vertex buffers stay persistently
+ * mapped (host-coherent). Lives on the persistent context, like g_rcache.
+ * Single-render-at-a-time: entries hold mutable per-frame state (command buffer, vertex
+ * buffer), so concurrent same-key renders are NOT supported — Vire drives vk_draw serially. */
+typedef struct {
+    int valid; uint32_t w,h; int depth;
+    VkImage img; VkDeviceMemory im; VkImageView view;
+    VkImage dimg; VkDeviceMemory dmem; VkImageView dview;
+    VkFramebuffer fb;
+    VkBuffer sbuf; VkDeviceMemory smem; unsigned char *px;   /* readback, persistently mapped */
+    VkBuffer vbuf; VkDeviceMemory vmem; void *vmap; uint32_t vcap; /* vertex, grow-only, mapped */
+    VkCommandPool cp; VkCommandBuffer cmd; VkFence fence;
+} FCacheEntry;
+static FCacheEntry g_fcache[8];
+
+/* Grow-only host-visible vertex buffer inside an entry — (re)creates only when it must grow. */
+static int fc_ensure_vbuf(VkDevice dev, VkPhysicalDevice pd, FCacheEntry *e, uint32_t nfloats){
+    if(e->vbuf && e->vcap>=nfloats) return 1;
+    if(e->vbuf){ vkUnmapMemory(dev,e->vmem); vkDestroyBuffer(dev,e->vbuf,0); vkFreeMemory(dev,e->vmem,0); e->vbuf=0; e->vmem=0; e->vmap=0; }
+    uint32_t cap = nfloats?nfloats:2;
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=(VkDeviceSize)cap*sizeof(float),.usage=VK_BUFFER_USAGE_VERTEX_BUFFER_BIT};
+    if(vkCreateBuffer(dev,&bi,0,&e->vbuf)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev,e->vbuf,&mr);
+    uint32_t t=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(t==~0u) return 0;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=t};
+    if(vkAllocateMemory(dev,&ma,0,&e->vmem)!=VK_SUCCESS) return 0;
+    vkBindBufferMemory(dev,e->vbuf,e->vmem,0);
+    if(vkMapMemory(dev,e->vmem,0,VK_WHOLE_SIZE,0,&e->vmap)!=VK_SUCCESS) return 0;
+    e->vcap=cap; return 1;
+}
+
+/* Fetch (or build) the persistent resources for (W,H,depth); ensures the vertex buffer holds
+ * >= nfloats. rp comes from rcache (depends only on depth here), so a fixed-depth framebuffer
+ * stays render-pass-compatible across vmodes. Returns NULL on failure or when all 8 slots are
+ * taken by other sizes (unrealistic — matches g_rcache's fixed slot count). */
+static FCacheEntry* fcache_get(VkDevice dev, VkPhysicalDevice pd, uint32_t qf, int depth, uint32_t W, uint32_t H, VkRenderPass rp, uint32_t nfloats){
+    VK_LOCK();
+    FCacheEntry *e=0;
+    for(int i=0;i<8;i++){ FCacheEntry *c=&g_fcache[i]; if(c->valid && c->w==W && c->h==H && c->depth==depth){ e=c; break; } }
+    if(e){ int ok=fc_ensure_vbuf(dev,pd,e,nfloats); VK_UNLOCK(); return ok?e:0; }
+    for(int i=0;i<8;i++){ if(!g_fcache[i].valid){ e=&g_fcache[i]; break; } }
+    if(!e){ VK_UNLOCK(); return 0; }
+    memset(e,0,sizeof(*e));
+    /* color image + memory + view */
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    if(vkCreateImage(dev,&ii,0,&e->img)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,e->img,&mr);
+    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u){ VK_UNLOCK(); return 0; }
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    if(vkAllocateMemory(dev,&ma,0,&e->im)!=VK_SUCCESS){ VK_UNLOCK(); return 0; } vkBindImageMemory(dev,e->img,e->im,0);
+    VkImageViewCreateInfo vi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=e->img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    if(vkCreateImageView(dev,&vi,0,&e->view)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    /* depth image + memory + view (optional) */
+    if(depth){
+        VkImageCreateInfo di={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,
+            .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+            .usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+        if(vkCreateImage(dev,&di,0,&e->dimg)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+        VkMemoryRequirements dmr; vkGetImageMemoryRequirements(dev,e->dimg,&dmr);
+        uint32_t dt=find_mem(pd,dmr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(dt==~0u){ VK_UNLOCK(); return 0; }
+        VkMemoryAllocateInfo dma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=dmr.size,.memoryTypeIndex=dt};
+        if(vkAllocateMemory(dev,&dma,0,&e->dmem)!=VK_SUCCESS){ VK_UNLOCK(); return 0; } vkBindImageMemory(dev,e->dimg,e->dmem,0);
+        VkImageViewCreateInfo dvi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=e->dimg,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,.subresourceRange={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1}};
+        if(vkCreateImageView(dev,&dvi,0,&e->dview)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    }
+    /* framebuffer */
+    VkImageView atts[2]={e->view,e->dview};
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=(uint32_t)(depth?2:1),.pAttachments=atts,.width=W,.height=H,.layers=1};
+    if(vkCreateFramebuffer(dev,&fbi,0,&e->fb)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    /* readback staging buffer — persistently mapped */
+    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=(VkDeviceSize)W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if(vkCreateBuffer(dev,&bi,0,&e->sbuf)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,e->sbuf,&br);
+    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u){ VK_UNLOCK(); return 0; }
+    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
+    if(vkAllocateMemory(dev,&bm,0,&e->smem)!=VK_SUCCESS){ VK_UNLOCK(); return 0; } vkBindBufferMemory(dev,e->sbuf,e->smem,0);
+    if(vkMapMemory(dev,e->smem,0,(VkDeviceSize)W*H*4,0,(void**)&e->px)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    /* command pool (resettable buffers) + one primary command buffer + fence */
+    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=qf};
+    if(vkCreateCommandPool(dev,&cpi,0,&e->cp)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=e->cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+    if(vkAllocateCommandBuffers(dev,&cai,&e->cmd)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if(vkCreateFence(dev,&fci,0,&e->fence)!=VK_SUCCESS){ VK_UNLOCK(); return 0; }
+    /* vertex buffer */
+    if(!fc_ensure_vbuf(dev,pd,e,nfloats)){ VK_UNLOCK(); return 0; }
+    e->valid=1; e->w=W; e->h=H; e->depth=depth;
+    VK_UNLOCK(); return e;
+}
+
 /* Headless render resolution — square, default 256, settable from Vire via vk_resolution(n).
  * The cache keys on it, so different sizes get their own pipeline. */
 static uint32_t g_res=256;
+/* --- coarse per-phase timing (behind FASTLLVM_VK_TIME) — measure the persistent-resource lever --- */
+static double g_t_create=0, g_t_render=0, g_t_back=0; static long g_t_n=0; static int g_t_on=-1;
+static double ts_ms(struct timespec a, struct timespec b){ return (b.tv_sec-a.tv_sec)*1e3 + (b.tv_nsec-a.tv_nsec)*1e-6; }
+static void vk_time_report(void){ if(g_t_n) fprintf(stderr,"[vk-time] %ld frames: create=%.1fms render=%.1fms readback+destroy=%.1fms (per-frame create=%.3fms)\n", g_t_n, g_t_create, g_t_render, g_t_back, g_t_create/g_t_n); }
+
 static int64_t render_headless_d(const float *data, uint32_t nverts, uint32_t fpv, const float uni[4], const char *ppm, int depth) {
     uint32_t W=g_res, H=g_res;
     /* Use the ONE persistent context instead of creating a device per call — so an
      * animation (e.g. examples/vire/sphere.vr) pays the setup cost once, not per frame. */
     if(!ctx_init()) return 0;
     VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
+    if(g_t_on<0){ g_t_on=getenv("FASTLLVM_VK_TIME")?1:0; if(g_t_on) atexit(vk_time_report); }
+    struct timespec _t0,_t1,_t2,_t3; if(g_t_on) clock_gettime(CLOCK_MONOTONIC,&_t0);
 
-    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
-        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
-        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
-    VkImage img; CK(vkCreateImage(dev,&ii,0,&img));
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,img,&mr);
-    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return 0;
-    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
-    VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
-    VkImageViewCreateInfo vi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-    VkImageView view; CK(vkCreateImageView(dev,&vi,0,&view));
     /* pipeline layout: fpv 2 → 2D, 5 → 2D+color, 6 → 3D+color (back-face culled). The
      * render pass + pipeline are cached (keyed by mode/depth/size), so the SPIR-V is
      * compiled once even across an animation's frames. */
     int vmode = (fpv==6)?2 : (fpv==5)?1 : 0;
     VkRenderPass rp; VkPipeline pipe; VkPipelineLayout pl;
     if(!rcache_get(dev,vmode,depth,W,H,&rp,&pipe,&pl)) return 0;
-    /* Depth attachment (optional) — for general 3D where back-face culling isn't enough. */
-    VkImage dimg=0; VkDeviceMemory dmem=0; VkImageView dview=0;
-    if(depth){
-        VkImageCreateInfo di={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,
-            .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
-            .usage=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
-        CK(vkCreateImage(dev,&di,0,&dimg));
-        VkMemoryRequirements dmr; vkGetImageMemoryRequirements(dev,dimg,&dmr);
-        uint32_t dt=find_mem(pd,dmr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(dt==~0u) return 0;
-        VkMemoryAllocateInfo dma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=dmr.size,.memoryTypeIndex=dt};
-        CK(vkAllocateMemory(dev,&dma,0,&dmem)); vkBindImageMemory(dev,dimg,dmem,0);
-        VkImageViewCreateInfo dvi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=dimg,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_D32_SFLOAT,.subresourceRange={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1}};
-        CK(vkCreateImageView(dev,&dvi,0,&dview));
-    }
-    VkImageView atts[2]={view,dview};
-    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=rp,.attachmentCount=(uint32_t)(depth?2:1),.pAttachments=atts,.width=W,.height=H,.layers=1};
-    VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
-    VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*fpv,&vbuf,&vmem)) return 0;
-
-    VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
-    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
-    uint32_t bt=find_mem(pd,br.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(bt==~0u) return 0;
-    VkMemoryAllocateInfo bm={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=br.size,.memoryTypeIndex=bt};
-    VkDeviceMemory bmem; CK(vkAllocateMemory(dev,&bm,0,&bmem)); vkBindBufferMemory(dev,buf,bmem,0);
-
-    VkCommandPoolCreateInfo cpi={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=qf};
-    VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
-    VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
-    VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
-    rec_draw_d(cmd,rp,fb,pipe,W,H,vbuf,nverts,pl,uni,depth);
+    /* All the per-frame images/buffers/pool/fence are cached too (keyed by W,H,depth) — an
+     * animation allocates them once and reuses them, so per frame we only upload the vertex
+     * data, re-record, and submit. See fcache_get. */
+    FCacheEntry *fc = fcache_get(dev,pd,qf,depth,W,H,rp,nverts*fpv);
+    if(!fc) return 0;
+    memcpy(fc->vmap, data, (size_t)nverts*fpv*sizeof(float)); /* host-coherent: no flush */
+    vkResetCommandBuffer(fc->cmd,0);
+    rec_draw_d(fc->cmd,rp,fc->fb,pipe,W,H,fc->vbuf,nverts,pl,uni,depth);
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
-    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
-    CK(vkEndCommandBuffer(cmd));
-    VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
-    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
-    CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
-    unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
+    vkCmdCopyImageToBuffer(fc->cmd,fc->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,fc->sbuf,1,&rg);
+    CK(vkEndCommandBuffer(fc->cmd));
+    vkResetFences(dev,1,&fc->fence);
+    VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&fc->cmd};
+    if(g_t_on) clock_gettime(CLOCK_MONOTONIC,&_t1);
+    CK(vkQueueSubmit(q,1,&si,fc->fence)); CK(vkWaitForFences(dev,1,&fc->fence,VK_TRUE,~0ull));
+    if(g_t_on) clock_gettime(CLOCK_MONOTONIC,&_t2);
+    unsigned char *px = fc->px;   /* readback buffer stays persistently mapped (host-coherent) */
     /* Optional full-frame output: write the framebuffer as a binary PPM (P6, RGB) — a
      * viewable image, so a Vire program can render an animation frame-by-frame to files. */
     if(ppm){
@@ -577,14 +648,9 @@ static int64_t render_headless_d(const float *data, uint32_t nverts, uint32_t fp
     /* centroid = the triangle (fragment color); corner must be the clear color. */
     int64_t packed = ((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
     int corner_clear = tl[0]<60 && tl[1]<60 && tl[2]<60;
-    vkUnmapMemory(dev,bmem);
-    vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
-    vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
-    vkDestroyFramebuffer(dev,fb,0);
-    vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
-    if(depth){ vkDestroyImageView(dev,dview,0); vkDestroyImage(dev,dimg,0); vkFreeMemory(dev,dmem,0); }
-    /* render pass / pipeline / layout are CACHED (rcache) — not destroyed; persistent
-     * device/instance NOT destroyed either. Only the per-frame resources are freed. */
+    /* Nothing is destroyed per frame: images/framebuffer/buffers/pool/fence live in the
+     * fcache, the render pass/pipeline in the rcache, the device/instance in the context. */
+    if(g_t_on){ clock_gettime(CLOCK_MONOTONIC,&_t3); g_t_create+=ts_ms(_t0,_t1); g_t_render+=ts_ms(_t1,_t2); g_t_back+=ts_ms(_t2,_t3); g_t_n++; }
     return corner_clear ? packed : -1;
 }
 
