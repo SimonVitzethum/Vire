@@ -1379,6 +1379,38 @@ else
     if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip validation (env)"; else echo "FAIL validation (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
 fi
 
+# Windowed (swapchain) validation-clean — pins three fixes on the vk_window present path:
+#  (1) a per-swapchain-image render-finished semaphore (a single shared one tripped
+#      "signaled by VkQueue but may still be in use by VkSwapchainKHR");
+#  (2) the windowed instance at API 1.3 so the SPIR-V-1.6 vertex/fragment shaders validate
+#      (a 1.1 instance rejected them: "Invalid SPIR-V binary version 1.6 for ... SPIR-V 1.3");
+#  (3) the --debug debug messenger destroyed before its instance (else a leaked-object report).
+# Needs a display; skipped headless. Presents a bounded 20 frames of a Vire-authored
+# @vertex/@fragment (varying) window and asserts 0 validation messages.
+if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    win_prog="$work/win.vr"
+    cat > "$win_prog" <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    out_color(vec3(pos.x + 0.5, pos.y + 0.5, 0.15))
+    vec4(pos.x, pos.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(in_color(), 1.0) }
+fn main() { mut ok = vk_window(20)  print(ok) }
+EOF
+    if "$vire" build --debug "$win_prog" -o "$work/win_dbg" >/dev/null 2>"$work/e"; then
+        timeout 40 "$work/win_dbg" >/dev/null 2>"$work/winerr"
+        wmsg="$(grep -c '\[vk-validation\]' "$work/winerr" 2>/dev/null)"; wmsg="${wmsg:-0}"
+        if [ "$wmsg" -eq 0 ]; then echo "ok   windowed_validation_clean (20 frames, 0 messages)"; pass=$((pass+1))
+        else echo "FAIL windowed_validation_clean ($wmsg messages):"; grep '\[vk-validation\]' "$work/winerr" | sort -u | head -4; fail=$((fail+1)); fi
+    else
+        if grep -qi "vulkan\|glfw\|spirv" "$work/e"; then echo "skip windowed_validation (env)"; else echo "FAIL windowed_validation (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+    fi
+else
+    echo "skip windowed_validation (no display)"
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

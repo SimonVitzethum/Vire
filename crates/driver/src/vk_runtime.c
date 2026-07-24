@@ -64,9 +64,21 @@ static VkResult vk_val_instance(VkInstanceCreateInfo *ici, VkInstance *out) {
     }
     return VK_SUCCESS;
 }
+/* Destroy the debug messenger before its instance — otherwise vkDestroyInstance reports it as
+ * a leaked object (a --debug-only teardown leak on paths that destroy their instance). */
+static void vk_val_cleanup(VkInstance inst){
+    if(g_vk_messenger){
+        PFN_vkDestroyDebugUtilsMessengerEXT dk =
+            (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(inst,"vkDestroyDebugUtilsMessengerEXT");
+        if(dk) dk(inst, g_vk_messenger, 0);
+        g_vk_messenger=0;
+    }
+}
 #define VK_CREATE_INSTANCE(ici, out) vk_val_instance((ici), (out))
+#define VK_DESTROY_VAL(inst) vk_val_cleanup(inst)
 #else
 #define VK_CREATE_INSTANCE(ici, out) vkCreateInstance((ici), 0, (out))
+#define VK_DESTROY_VAL(inst) ((void)0)
 #endif
 
 /* Shader SPIR-V is generated at Vire build time (crates/backend/src/spirv.rs ->
@@ -2512,7 +2524,10 @@ static int64_t vk_window_impl(const float *verts, uint32_t nverts, int64_t frame
     if(!win){ glfwTerminate(); return 0; }
 
     uint32_t next=0; const char **ext=glfwGetRequiredInstanceExtensions(&next);
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
+    /* API 1.3 (like every other instance here): the Vire vertex/fragment shaders are assembled
+     * as SPIR-V 1.6, which needs a Vulkan 1.3 environment — a 1.1 instance made the validation
+     * layer reject them ("Invalid SPIR-V binary version 1.6 for target environment SPIR-V 1.3"). */
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app,.enabledExtensionCount=next,.ppEnabledExtensionNames=ext};
     VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     VkSurfaceKHR surf; if(glfwCreateWindowSurface(inst,win,0,&surf)!=VK_SUCCESS) return 0;
@@ -2574,8 +2589,16 @@ static int64_t vk_window_impl(const float *verts, uint32_t nverts, int64_t frame
     }
     VkSemaphoreCreateInfo semi={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,.flags=VK_FENCE_CREATE_SIGNALED_BIT};
-    VkSemaphore avail,done; VkFence inflight;
-    CK(vkCreateSemaphore(dev,&semi,0,&avail)); CK(vkCreateSemaphore(dev,&semi,0,&done)); CK(vkCreateFence(dev,&fci,0,&inflight));
+    /* The render-finished semaphore MUST be per swapchain image: present of image `idx` holds
+     * it until presentation completes, and image `idx` is only re-rendered after it is
+     * re-acquired — so a per-image semaphore is never re-signalled while a present still uses
+     * it. A single shared `done` here tripped the validation layer ("signaled by VkQueue but
+     * may still be in use by VkSwapchainKHR"). `avail` (image-available) stays single: the
+     * inflight fence fully serialises the loop, so the prior submit has already waited on it. */
+    VkSemaphore avail; VkSemaphore *done=malloc((size_t)nimg*sizeof(VkSemaphore)); VkFence inflight;
+    CK(vkCreateSemaphore(dev,&semi,0,&avail));
+    for(uint32_t i=0;i<nimg;i++) CK(vkCreateSemaphore(dev,&semi,0,&done[i]));
+    CK(vkCreateFence(dev,&fci,0,&inflight));
 
     int64_t count=0;
     while(!glfwWindowShouldClose(win) && (frames==0 || count<frames)) {
@@ -2589,19 +2612,19 @@ static int64_t vk_window_impl(const float *verts, uint32_t nverts, int64_t frame
           rec_draw(cmds[idx],rp,fbs[idx],pipe,W,H,vbuf,nverts,pl,uni); vkEndCommandBuffer(cmds[idx]); }
         VkPipelineStageFlags wait=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.waitSemaphoreCount=1,.pWaitSemaphores=&avail,.pWaitDstStageMask=&wait,
-            .commandBufferCount=1,.pCommandBuffers=&cmds[idx],.signalSemaphoreCount=1,.pSignalSemaphores=&done};
+            .commandBufferCount=1,.pCommandBuffers=&cmds[idx],.signalSemaphoreCount=1,.pSignalSemaphores=&done[idx]};
         if(vkQueueSubmit(q,1,&si,inflight)!=VK_SUCCESS) break;
-        VkPresentInfoKHR pi={.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,.waitSemaphoreCount=1,.pWaitSemaphores=&done,.swapchainCount=1,.pSwapchains=&sw,.pImageIndices=&idx};
+        VkPresentInfoKHR pi={.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,.waitSemaphoreCount=1,.pWaitSemaphores=&done[idx],.swapchainCount=1,.pSwapchains=&sw,.pImageIndices=&idx};
         vkQueuePresentKHR(q,&pi);
         count++;
     }
     vkDeviceWaitIdle(dev);
     for(uint32_t i=0;i<nimg;i++){ vkDestroyFramebuffer(dev,fbs[i],0); vkDestroyImageView(dev,views[i],0); }
-    vkDestroySemaphore(dev,avail,0); vkDestroySemaphore(dev,done,0); vkDestroyFence(dev,inflight,0);
+    vkDestroySemaphore(dev,avail,0); for(uint32_t i=0;i<nimg;i++) vkDestroySemaphore(dev,done[i],0); free(done); vkDestroyFence(dev,inflight,0);
     vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0);
     vkDestroyCommandPool(dev,cp,0); vkDestroyPipeline(dev,pipe,0); vkDestroyPipelineLayout(dev,pl,0);
     vkDestroyRenderPass(dev,rp,0); vkDestroySwapchainKHR(dev,sw,0); vkDestroyDevice(dev,0);
-    vkDestroySurfaceKHR(inst,surf,0); vkDestroyInstance(inst,0);
+    vkDestroySurfaceKHR(inst,surf,0); VK_DESTROY_VAL(inst); vkDestroyInstance(inst,0);
     glfwDestroyWindow(win); glfwTerminate();
     free(imgs); free(views); free(fbs); free(cmds);
     return 1;
