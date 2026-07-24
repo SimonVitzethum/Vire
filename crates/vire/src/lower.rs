@@ -3324,6 +3324,13 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_set_resolution".into(), args: vec![n] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_pipeline_depth(n): keep n frames in flight (opt-in; vk_draw's return lags by n-1).
+        if name == "vk_pipeline_depth" && args.len() == 1 {
+            let n = self.lower_expr(&args[0]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_pipeline_depth".into(), args: vec![n] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         if name == "vk_render3d" && args.len() == 4 {
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);

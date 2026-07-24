@@ -1181,6 +1181,42 @@ fn main() {
 }
 EOF
 
+# Frame pipelining (vk_pipeline_depth): with depth n>1, up to n frames run on the GPU at
+# once and vk_draw's RETURN lags by n-1 frames — an opt-in for animations that write images
+# and ignore the return. The soundness invariant: the IMAGES are identical to the synchronous
+# (depth 1) path, and the trailing n-1 frames are flushed at exit. This renders 8 distinct
+# frames via the builtin vk_pipeline_depth(4), then compares against the SAME binary forced to
+# depth 1 (env FASTLLVM_VK_PIPE=1 overrides the builtin) — byte-identical PPMs prove the ring +
+# deferred harvest + exit flush are correct.
+pipe_prog="$work/pipe.vr"
+cat > "$pipe_prog" <<'EOF'
+fn main() {
+    mut d = vk_pipeline_depth(4)
+    mut i = 0
+    while i < 8 {
+        mut t = i * 1.0 / 8.0
+        mut v = farray(15)
+        v[0] = 0.0 - 0.5 + t   v[1] = 0.5           v[2] = 1.0   v[3] = t     v[4] = 0.0
+        v[5] = 0.5             v[6] = 0.0 - 0.5      v[7] = t     v[8] = 1.0   v[9] = 0.2
+        v[10] = 0.0 - 0.5      v[11] = 0.0 - 0.5     v[12] = 0.1  v[13] = t    v[14] = 1.0
+        mut r = vk_render_ppm(v, i)
+        i = i + 1
+    }
+    print(1)
+}
+EOF
+if "$vire" build "$pipe_prog" -o "$work/pipe" >/dev/null 2>"$work/e"; then
+    mkdir -p "$work/p1" "$work/p4"
+    ( cd "$work/p1" && FASTLLVM_VK_PIPE=1 "$work/pipe" >/dev/null 2>&1 )
+    ( cd "$work/p4" && "$work/pipe" >/dev/null 2>&1 )
+    n1="$(ls "$work/p1"/*.ppm 2>/dev/null | wc -l)"; n4="$(ls "$work/p4"/*.ppm 2>/dev/null | wc -l)"
+    if [ "$n1" = "8" ] && [ "$n4" = "8" ] && diff -rq "$work/p1" "$work/p4" >/dev/null 2>&1; then
+        echo "ok   vire_pipeline_depth (8 frames, depth4 images == depth1, all flushed)"; pass=$((pass+1))
+    else echo "FAIL vire_pipeline_depth (n1=$n1 n4=$n4; pipelined images differ from synchronous)"; fail=$((fail+1)); fi
+else
+    if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip vire_pipeline_depth (env)"; else echo "FAIL vire_pipeline_depth (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+fi
+
 # Zero-cost validation gating (V5): `--debug` turns on the Khronos validation layer +
 # debug-utils messenger in vk_runtime.c; release compiles it out entirely. This pins
 # BOTH directions: (a) a --debug build runs validation-CLEAN (0 `[vk-validation]`
