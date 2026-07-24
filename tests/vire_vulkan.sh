@@ -1226,6 +1226,44 @@ fn main() {
 }
 EOF
 
+# Camera jitter (vk_jitter): the runtime PROVIDES the Halton(2,3) sub-pixel offset FSR/DLSS
+# need for temporal accumulation, and the auto motion-vector render adds it to gl_Position
+# (colour only). Two properties: (1) the sequence is the exact Halton values — vk_jitter(0) →
+# jx=0.0, jy=−0.1667 (radical inverse of 1 in base 2 / base 3, minus 0.5); (2) SOUNDNESS:
+# jitter must NOT corrupt the motion target — with a nonzero jitter applied, a 0.1 x-motion
+# still reads exactly mx≈1000, my≈0, because motion is computed from the UN-jittered clip.
+case_ vire_jitter <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    mut u = uniform()
+    vec4(pos.x + u.x, pos.y + u.y, 0.0, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.8, 0.3, 1.0) }
+fn main() {
+    mut j0 = vk_jitter(0)
+    mut jx0 = j0 / 10000000 - 500000     // expect 0 (Halton(1,2)=0.5, −0.5)
+    mut jy0 = j0 % 10000000 - 500000     // expect −166667 (Halton(1,3)=0.333, −0.5)
+    mut tri = farray(6)
+    tri[0]=0.0  tri[1]=0.5  tri[2]=0.5  tri[3]=0.0-0.5  tri[4]=0.0-0.5  tri[5]=0.0-0.5
+    mut jj = vk_jitter(1)                 // a nonzero jitter is now active
+    mut a = vk_motion(tri, 0.0, 0.0, 0.0, 1.0)
+    mut b = vk_motion(tri, 0.1, 0.0, 0.0, 1.0)
+    mut mx = b / 1000000 - 50000
+    mut my = b % 1000000 - 50000
+    mut jlo = 0 - 166767
+    mut jhi = 0 - 166567
+    mut lo = 0 - 25
+    mut ok = 0
+    if jx0 == 0 {
+        if jy0 > jlo { if jy0 < jhi {
+            if mx > 975 { if mx < 1025 { if my > lo { if my < 25 { ok = 1 } } } }
+        } }
+    }
+    print(ok)
+}
+EOF
+
 # Frame pipelining (vk_pipeline_depth): with depth n>1, up to n frames run on the GPU at
 # once and vk_draw's RETURN lags by n-1 frames — an opt-in for animations that write images
 # and ignore the return. The soundness invariant: the IMAGES are identical to the synchronous

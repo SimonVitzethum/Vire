@@ -744,6 +744,9 @@ int64_t jrt_vk_triangle(double a, double b, double c, double d) {
  * centroid's motion packed as fixed-point. Own MRT pipeline; transient resources. */
 static float g_prev_uni[4]={0,0,0,0}; static int g_prev_uni_valid=0;
 static VkPipeline g_mv_pipe=0; static VkPipelineLayout g_mv_pl=0; static VkRenderPass g_mv_rp=0;
+/* Current sub-pixel jitter offset (in [-0.5,0.5] pixels), set by vk_jitter(); render_mv adds
+ * it to gl_Position (colour only), and it is what a program hands the upscaler to un-jitter. */
+static double g_jitter[2]={0,0};
 #define MV_FMT VK_FORMAT_R16G16_SFLOAT
 
 /* IEEE half → float, for reading back the R16G16F motion target on the host. */
@@ -785,7 +788,7 @@ static int build_mv_pipeline(VkDevice dev, uint32_t w, uint32_t h){
     VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba[2]={{.colorWriteMask=0xf},{.colorWriteMask=0xf}}; /* one per attachment */
     VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=2,.pAttachments=cba};
-    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT,.offset=0,.size=32}; /* cur vec4 + prev vec4 */
+    VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT,.offset=0,.size=48}; /* cur + prev + jitter vec4 */
     VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
     if(vkCreatePipelineLayout(dev,&plci,0,&g_mv_pl)!=VK_SUCCESS){ vkDestroyShaderModule(dev,vs,0); vkDestroyShaderModule(dev,fs,0); return 0; }
     VkGraphicsPipelineCreateInfo gp={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=2,.pStages=st,
@@ -834,17 +837,21 @@ static int64_t render_mv(const float *data, uint32_t nverts, const float cur[4])
     VkCommandPool cp; CK(vkCreateCommandPool(dev,&cpi,0,&cp));
     VkCommandBufferAllocateInfo cai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=cp,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
     VkCommandBuffer cmd; CK(vkAllocateCommandBuffers(dev,&cai,&cmd));
-    /* push constants: current uniform then previous (first call: prev = current → 0 motion). */
-    float pc[8]={cur[0],cur[1],cur[2],cur[3],
+    /* push constants: current uniform, previous (first call: prev = current → 0 motion), and
+     * the camera jitter as an NDC offset (g_jitter is in pixels → *2/extent). Jitter shifts
+     * gl_Position (colour) only; the motion target is computed from un-jittered positions. */
+    float jnx=(float)(g_jitter[0]*2.0/(double)W), jny=(float)(g_jitter[1]*2.0/(double)H);
+    float pc[12]={cur[0],cur[1],cur[2],cur[3],
         g_prev_uni_valid?g_prev_uni[0]:cur[0], g_prev_uni_valid?g_prev_uni[1]:cur[1],
-        g_prev_uni_valid?g_prev_uni[2]:cur[2], g_prev_uni_valid?g_prev_uni[3]:cur[3]};
+        g_prev_uni_valid?g_prev_uni[2]:cur[2], g_prev_uni_valid?g_prev_uni[3]:cur[3],
+        jnx, jny, 0.0f, 0.0f};
     VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&cbi);
     VkClearValue clears[2]={{.color={{0.0f,0.0f,0.0f,1.0f}}},{.color={{0.0f,0.0f,0.0f,0.0f}}}};
     VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=g_mv_rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=2,.pClearValues=clears};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,g_mv_pipe);
-    vkCmdPushConstants(cmd,g_mv_pl,VK_SHADER_STAGE_VERTEX_BIT,0,32,pc);
+    vkCmdPushConstants(cmd,g_mv_pl,VK_SHADER_STAGE_VERTEX_BIT,0,48,pc);
     VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
     vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
@@ -1980,6 +1987,26 @@ static uint32_t vk_enum_devices(int print){
     }
     vkDestroyInstance(inst,0);
     return nd;
+}
+
+/* Halton low-discrepancy sequence element (radical inverse of i in `base`), in [0,1). The
+ * runtime provides the FSR/DLSS camera jitter this way — a Halton(2,3) sub-pixel offset per
+ * frame, so temporal accumulation samples every sub-pixel position over a few frames. */
+static double halton(int i, int base){
+    double f=1.0, r=0.0; int idx=i;
+    while(idx>0){ f/=base; r+=f*(idx%base); idx/=base; }
+    return r;
+}
+/* vk_jitter(i): compute the Halton(2,3) sub-pixel jitter for frame i, store it as the current
+ * jitter, and return it packed as fixed-point: jx=ret/10000000-500000, jy=ret%10000000-500000,
+ * each /1e6 = offset in pixels ([-0.5,0.5]). The runtime PROVIDES the sequence; the render adds
+ * it to gl_Position (see the auto motion-vector vertex) and the same offset feeds the upscaler. */
+int64_t jrt_vk_jitter(int64_t i){
+    double jx=halton((int)i+1,2)-0.5, jy=halton((int)i+1,3)-0.5;
+    g_jitter[0]=jx; g_jitter[1]=jy;
+    long mx=(long)((jx+0.5)*1e6+0.5), my=(long)((jy+0.5)*1e6+0.5);
+    if(mx<0)mx=0; if(mx>9999999)mx=9999999; if(my<0)my=0; if(my>9999999)my=9999999;
+    return (int64_t)mx*10000000 + (int64_t)my;
 }
 
 /* vk_gpu_count(): number of Vulkan devices on this machine. */

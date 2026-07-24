@@ -3349,6 +3349,15 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // vk_jitter(i): compute + store the Halton(2,3) sub-pixel jitter for frame i; returns
+        // it packed (jx=ret/1e7-500000, jy=ret%1e7-500000, each /1e6 = pixels). The next
+        // vk_motion render adds it to gl_Position; the same offset feeds the upscaler.
+        if name == "vk_jitter" && args.len() == 1 {
+            let n = self.lower_expr(&args[0]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_jitter".into(), args: vec![n] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // vk_gpu_select(i): choose device i for the graphics context (before the first render).
         if name == "vk_gpu_select" && args.len() == 1 {
             let n = self.lower_expr(&args[0]).0;

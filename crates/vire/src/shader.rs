@@ -1103,6 +1103,22 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
 {mvy} = OpCompositeExtract %float {mv} 1
 {enc} = OpCompositeConstruct %v3float {mvx} {mvy} {zero}
 ").unwrap();
+    // Camera jitter (push-constant member 2, .xy in NDC) added to gl_Position ONLY — the
+    // colour render samples a different sub-pixel each frame for the upscaler; motion above
+    // is computed from the UN-jittered clip positions, so jitter never corrupts it.
+    let (jptr, jit, jx, jy, cwp, jxw, jyw, joff, gpos) = (
+        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"));
+    write!(cx.body,
+"{jptr} = OpAccessChain %_ptr_pc_v4float %pcv %i_2
+{jit} = OpLoad %v4float {jptr}
+{jx} = OpCompositeExtract %float {jit} 0
+{jy} = OpCompositeExtract %float {jit} 1
+{cwp} = OpCompositeExtract %float {clip_cur} 3
+{jxw} = OpFMul %float {jx} {cwp}
+{jyw} = OpFMul %float {jy} {cwp}
+{joff} = OpCompositeConstruct %v4float {jxw} {jyw} {zero} {zero}
+{gpos} = OpFAdd %v4float {clip_cur} {joff}
+").unwrap();
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     let mat_decl = mat_type_decls(cx.uses_mat);
     Ok(format!(
@@ -1116,6 +1132,7 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
                OpDecorate %pcblock Block
                OpMemberDecorate %pcblock 0 Offset 0
                OpMemberDecorate %pcblock 1 Offset 16
+               OpMemberDecorate %pcblock 2 Offset 32
        %void = OpTypeVoid
        %fnty = OpTypeFunction %void
       %float = OpTypeFloat 32
@@ -1130,11 +1147,12 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
         %int = OpTypeInt 32 1
         %i_0 = OpConstant %int 0
         %i_1 = OpConstant %int 1
+        %i_2 = OpConstant %int 2
      %ov4ptr = OpTypePointer Output %v4float
      %ov3ptr = OpTypePointer Output %v3float
        %vcol = OpVariable %ov3ptr Output
        %bool = OpTypeBool
-    %pcblock = OpTypeStruct %v4float %v4float
+    %pcblock = OpTypeStruct %v4float %v4float %v4float
 %_ptr_pc_block = OpTypePointer PushConstant %pcblock
         %pcv = OpVariable %_ptr_pc_block PushConstant
 %_ptr_pc_v4float = OpTypePointer PushConstant %v4float
@@ -1147,7 +1165,7 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
         %lbl = OpLabel
 {vars}        %pos = OpLoad {pos_vec} %pos_in
 {body}         %gp = OpAccessChain %ov4ptr %out %i_0
-               OpStore %gp {clip_cur}
+               OpStore %gp {gpos}
                OpStore %vcol {enc}
                OpReturn
                OpFunctionEnd
