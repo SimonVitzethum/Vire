@@ -1675,6 +1675,11 @@ fn build_or_run(args: &[String]) {
         }
     }
     // Vulkan glue: the generated headless-render runtime translation unit.
+    // Zero-cost validation gating (V5): `--debug` builds turn on the Khronos validation
+    // layer + debug-utils messenger in vk_runtime.c; release omits the macro entirely.
+    if want_vulkan && debug_flag {
+        cmd.arg("-DFASTLLVM_VK_VALIDATE");
+    }
     for p in &vk_paths {
         cmd.arg(p);
     }

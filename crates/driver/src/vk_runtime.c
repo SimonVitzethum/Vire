@@ -21,6 +21,54 @@
 
 #define CK(x) do { if((x)!=VK_SUCCESS) return 0; } while(0)
 
+/* Zero-cost validation gating (V5). Under `--debug` the Vire build compiles this TU
+ * with -DFASTLLVM_VK_VALIDATE: `VK_CREATE_INSTANCE` enables the Khronos validation
+ * layer + a `VK_EXT_debug_utils` messenger that prints API misuse to stderr, catching
+ * Vulkan usage bugs at dev time. In release the macro is undefined and every line here
+ * vanishes — `VK_CREATE_INSTANCE` is a bare `vkCreateInstance`, no layer, no messenger,
+ * no cost. The messenger rides on the persistent instance (never destroyed), so it
+ * needs no teardown. */
+#ifdef FASTLLVM_VK_VALIDATE
+static VkDebugUtilsMessengerEXT g_vk_messenger = 0;
+static VKAPI_ATTR VkBool32 VKAPI_CALL vk_val_cb(
+        VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+        VkDebugUtilsMessageTypeFlagsEXT type,
+        const VkDebugUtilsMessengerCallbackDataEXT *data, void *ud) {
+    (void)type; (void)ud;
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+        fprintf(stderr, "[vk-validation] %s\n", data && data->pMessage ? data->pMessage : "(null)");
+    return VK_FALSE;
+}
+static VkResult vk_val_instance(VkInstanceCreateInfo *ici, VkInstance *out) {
+    const char *exts[32];
+    unsigned ne = 0;
+    for (unsigned i = 0; i < ici->enabledExtensionCount && ne < 31; i++) exts[ne++] = ici->ppEnabledExtensionNames[i];
+    exts[ne++] = "VK_EXT_debug_utils";
+    static const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
+    ici->enabledLayerCount = 1;
+    ici->ppEnabledLayerNames = layers;
+    ici->enabledExtensionCount = ne;
+    ici->ppEnabledExtensionNames = exts;
+    VkResult r = vkCreateInstance(ici, 0, out);
+    if (r != VK_SUCCESS) return r;
+    PFN_vkCreateDebugUtilsMessengerEXT mk =
+        (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(*out, "vkCreateDebugUtilsMessengerEXT");
+    if (mk) {
+        VkDebugUtilsMessengerCreateInfoEXT mi = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = vk_val_cb,
+        };
+        mk(*out, &mi, 0, &g_vk_messenger);
+    }
+    return VK_SUCCESS;
+}
+#define VK_CREATE_INSTANCE(ici, out) vk_val_instance((ici), (out))
+#else
+#define VK_CREATE_INSTANCE(ici, out) vkCreateInstance((ici), 0, (out))
+#endif
+
 /* Shader SPIR-V is generated at Vire build time (crates/backend/src/spirv.rs ->
  * spirv-as) into vk_shaders.c and linked alongside — the @fragment color comes
  * from the Vire source. Declared extern here (word counts as *_N). */
@@ -111,7 +159,7 @@ int64_t jrt_vk_gpuvk_run(double *data, int64_t n) {
     if(VK_GPUVK_COMP_N == 0) return -1;
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_2};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd){ vkDestroyInstance(inst,0); return -2; }
     VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
     VkPhysicalDevice pd=0; uint32_t qf=0;
@@ -398,7 +446,7 @@ static int ctx_init_unlocked(void) {
     /* API 1.3 instance so VK_EXT_mesh_shader (a 1.3-era device extension) is usable. */
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    if(vkCreateInstance(&ici,0,&g_inst)!=VK_SUCCESS) return 0;
+    if(VK_CREATE_INSTANCE(&ici,&g_inst)!=VK_SUCCESS) return 0;
     uint32_t nd=0; vkEnumeratePhysicalDevices(g_inst,&nd,0); if(!nd) return 0;
     VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(g_inst,&nd,pds);
     /* Keep the FIRST graphics device as the persistent context (stable — on a multi-GPU
@@ -1504,7 +1552,7 @@ int64_t jrt_vk_bench(int64_t frames) {
     enum { W=256, H=256 };
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -2;
     VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
     VkPhysicalDevice pd=0; uint32_t qf=0;
@@ -1661,7 +1709,7 @@ static int64_t scene_render(const double *offs, int64_t nfloats, const float pla
     if(nmesh==0) return -1;
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -2;
     VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
     VkPhysicalDevice pd=0; uint32_t qf=0;
@@ -1850,7 +1898,7 @@ int64_t jrt_vk_mesh_shader(double px_, double py_, double pz_, double pw_) {
     float plane[4]={(float)px_,(float)py_,(float)pz_,(float)pw_};
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return -2;
     VkPhysicalDevice *pds=malloc(nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
     VkPhysicalDevice pd=0; uint32_t qf=0;
@@ -1956,7 +2004,7 @@ static int64_t vk_window_impl(const float *verts, uint32_t nverts, int64_t frame
     uint32_t next=0; const char **ext=glfwGetRequiredInstanceExtensions(&next);
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_1};
     VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app,.enabledExtensionCount=next,.ppEnabledExtensionNames=ext};
-    VkInstance inst; CK(vkCreateInstance(&ici,0,&inst));
+    VkInstance inst; CK(VK_CREATE_INSTANCE(&ici,&inst));
     VkSurfaceKHR surf; if(glfwCreateWindowSurface(inst,win,0,&surf)!=VK_SUCCESS) return 0;
 
     uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0); if(!nd) return 0;

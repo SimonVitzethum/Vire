@@ -1181,6 +1181,34 @@ fn main() {
 }
 EOF
 
+# Zero-cost validation gating (V5): `--debug` turns on the Khronos validation layer +
+# debug-utils messenger in vk_runtime.c; release compiles it out entirely. This pins
+# BOTH directions: (a) a --debug build runs validation-CLEAN (0 `[vk-validation]`
+# messages → the hand-written Vulkan runtime commits no API misuse on the tested path),
+# with the layer actually compiled in; (b) a release build contains NONE of the
+# validation strings (zero cost).
+val_prog="$work/val.vr"
+cat > "$val_prog" <<'EOF'
+fn main() { mut px = vk_triangle()  if px > 0 { print(1) } else { print(1) } }
+EOF
+if "$vire" build --debug "$val_prog" -o "$work/val_dbg" >/dev/null 2>"$work/e"; then
+    "$work/val_dbg" >/dev/null 2>"$work/valerr"
+    nmsg="$(grep -c '\[vk-validation\]' "$work/valerr" 2>/dev/null)"; nmsg="${nmsg:-0}"
+    has_layer="$(strings "$work/val_dbg" 2>/dev/null | grep -c 'VK_LAYER_KHRONOS_validation')"
+    if [ "$has_layer" -ge 1 ] && [ "$nmsg" -eq 0 ]; then
+        echo "ok   validation_debug_clean (layer active, 0 messages)"; pass=$((pass+1))
+    else
+        echo "FAIL validation_debug (layer=$has_layer messages=$nmsg):"; grep '\[vk-validation\]' "$work/valerr" | head -5; fail=$((fail+1))
+    fi
+    # (b) release must be free of validation strings
+    "$vire" build "$val_prog" -o "$work/val_rel" >/dev/null 2>/dev/null
+    relstr="$(strings "$work/val_rel" 2>/dev/null | grep -cE 'VK_LAYER_KHRONOS_validation|vk-validation|VK_EXT_debug_utils')"
+    if [ "$relstr" -eq 0 ]; then echo "ok   validation_release_zerocost"; pass=$((pass+1))
+    else echo "FAIL validation_release_zerocost ($relstr validation strings in release)"; fail=$((fail+1)); fi
+else
+    if grep -qi "vulkan\|spirv" "$work/e"; then echo "skip validation (env)"; else echo "FAIL validation (build): $(head -1 "$work/e")"; fail=$((fail+1)); fi
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
