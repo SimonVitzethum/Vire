@@ -926,6 +926,12 @@ static JStr *str_from_buf(const char *buf, int n) {
  * case; typed sum-type errors go through `match` — see REFERENCE §11). The result is immortal
  * (refcount -1), like a string literal, so the i64-erased Result error slot needs no RC and the
  * 0-live heap oracle stays balanced. */
+/* Byte-scan builtins (Vire: barray/find_byte/str_from + ByteView). HOSTED-ONLY —
+ * find_byte/bview_find use libc `memchr` (from <string.h>, which the freestanding
+ * build does not include), and a bare-metal/seL4 target never byte-scans. A
+ * freestanding program calls none of these, so excluding the definitions keeps
+ * `fastjavac --freestanding` compiling. */
+#ifndef FASTLLVM_FREESTANDING
 /* `str_from(a, start, len)` — a Str from a byte array's [start, start+len) range. Bounds are
  * clamped to [0, alen] so an out-of-range request yields a shorter/empty string, never an OOB
  * read (sound). `data` is the array's element pointer (jrt_array_data), `alen` its length. */
@@ -1009,6 +1015,7 @@ int64_t jrt_bview_len(void *view) {
     (void)p;
     return len;
 }
+#endif /* !FASTLLVM_FREESTANDING (byte-scan builtins) */
 
 /* Reinterpret an i64-erased Result payload slot as a Str (`result.error()`): the slot holds a
  * JStr* for string-message errors. 0 (a zeroed/absent payload) → the empty string, so calling
