@@ -1199,11 +1199,11 @@ EOF
 
 # Auto motion vectors (vk_motion) — the "crown jewel": the compiler emits a variant of the
 # program's @vertex that evaluates the SAME transform against both the current and the
-# previous-frame uniform, writing screen-space motion (ndc_cur − ndc_prev, encoded *0.5+0.5)
-# as the pixel colour. Here the @vertex translates by uniform().x; advancing the uniform by
-# 0.1 in x between two frames must yield motion.x ≈ 0.1 (→ R ≈ 140) and motion.y ≈ 0 (→ G ≈
-# 128), verified against the CPU reference. Proves the temporal input FSR2/DLSS need is
-# derived by the compiler from the transform it can see.
+# previous-frame uniform and writes the screen-space motion (ndc_cur − ndc_prev) into an
+# R16G16F target — the exact per-pixel velocity FSR2/DLSS consume. Here the @vertex
+# translates by uniform().x; advancing the uniform by 0.1 in x between two frames must yield
+# motion.x = 0.1 and motion.y = 0, read back at FULL half-float precision (packed fixed-point:
+# mx=ret/1e6-50000, my=ret%1e6-50000, each /1e4 = NDC). Verified against the CPU reference.
 case_ vire_motion_vectors <<'EOF'
 @vertex
 fn vs(pos: Vec2) -> Vec4 {
@@ -1216,11 +1216,12 @@ fn main() {
     mut tri = farray(6)
     tri[0]=0.0  tri[1]=0.5  tri[2]=0.5  tri[3]=0.0-0.5  tri[4]=0.0-0.5  tri[5]=0.0-0.5
     mut a = vk_motion(tri, 0.0, 0.0, 0.0, 1.0)   // establish the previous frame
-    mut b = vk_motion(tri, 0.1, 0.0, 0.0, 1.0)   // motion.x = 0.1 NDC
-    mut r = b / 65536
-    mut g = (b / 256) % 256
+    mut b = vk_motion(tri, 0.1, 0.0, 0.0, 1.0)   // motion.x = 0.1 NDC exactly
+    mut mx = b / 1000000 - 50000                 // fixed-point *1e4 → expect ~1000
+    mut my = b % 1000000 - 50000                 // expect ~0
+    mut lo = 0 - 25
     mut ok = 0
-    if r > 133 { if r < 147 { if g > 121 { if g < 135 { ok = 1 } } } }  // R≈140 (0.1), G≈128 (0)
+    if mx > 975 { if mx < 1025 { if my > lo { if my < 25 { ok = 1 } } } }
     print(ok)
 }
 EOF

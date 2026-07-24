@@ -736,20 +736,39 @@ int64_t jrt_vk_triangle(double a, double b, double c, double d) {
 /* ---- Auto motion vectors (vk_motion) --------------------------------------------------
  * The compiler emits a variant of the program's @vertex (VK_MV_VERT) that evaluates the
  * SAME transform against BOTH the current uniform (push-constant vec4 #0) and the previous
- * frame's (vec4 #1), and writes the screen-space motion `ndc_cur − ndc_prev` (encoded
- * *0.5+0.5) as the pixel colour via a passthrough fragment (VK_MV_FRAG). The runtime just
- * double-buffers the uniform. Returns the centroid's packed RGB = the encoded motion. This
- * is exactly the per-pixel velocity FSR2/DLSS need — derivable ONLY because a single-source
- * compiler sees the transform. Capability + verification path (transient resources, own
- * pipeline); the real FSR path would route this varying into an R16G16F target. */
+ * frame's (vec4 #1) and carries the screen-space motion `ndc_cur − ndc_prev` as a varying.
+ * The fragment (VK_MV_FRAG) writes it to TWO attachments: a viewable RGBA8 colour AND an
+ * R16G16F motion target — the exact per-pixel velocity FSR2/DLSS consume, derivable ONLY
+ * because a single-source compiler sees the transform. The runtime double-buffers the
+ * uniform, reads back the motion target with full half-float precision, and returns the
+ * centroid's motion packed as fixed-point. Own MRT pipeline; transient resources. */
 static float g_prev_uni[4]={0,0,0,0}; static int g_prev_uni_valid=0;
 static VkPipeline g_mv_pipe=0; static VkPipelineLayout g_mv_pl=0; static VkRenderPass g_mv_rp=0;
+#define MV_FMT VK_FORMAT_R16G16_SFLOAT
+
+/* IEEE half → float, for reading back the R16G16F motion target on the host. */
+static float half_to_float(uint16_t h){
+    uint32_t sign=(uint32_t)(h&0x8000u)<<16, exp=(h>>10)&0x1fu, mant=h&0x3ffu, bits;
+    if(exp==0){ if(mant==0) bits=sign;
+        else { exp=127-15+1; while(!(mant&0x400u)){ mant<<=1; exp--; } mant&=0x3ffu; bits=sign|(exp<<23)|(mant<<13); } }
+    else if(exp==0x1fu){ bits=sign|0x7f800000u|(mant<<13); }
+    else { bits=sign|((exp-15+127)<<23)|(mant<<13); }
+    float f; memcpy(&f,&bits,4); return f;
+}
 
 static int build_mv_pipeline(VkDevice dev, uint32_t w, uint32_t h){
     if(g_mv_pipe) return 1;
     if(VK_MV_VERT_N==0 || VK_MV_FRAG_N==0) return 0;   /* @vertex didn't transform via uniform() */
-    g_mv_rp = build_rp(dev, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    if(!g_mv_rp) return 0;
+    /* MRT render pass: attachment 0 = viewable RGBA8, attachment 1 = R16G16F motion. */
+    VkAttachmentDescription att[2]={
+        {.format=VK_FORMAT_R8G8B8A8_UNORM,.samples=VK_SAMPLE_COUNT_1_BIT,.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR,.storeOp=VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED,.finalLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+        {.format=MV_FMT,.samples=VK_SAMPLE_COUNT_1_BIT,.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR,.storeOp=VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED,.finalLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}};
+    VkAttachmentReference refs[2]={{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},{1,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}};
+    VkSubpassDescription sp={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=2,.pColorAttachments=refs};
+    VkRenderPassCreateInfo rpci={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=2,.pAttachments=att,.subpassCount=1,.pSubpasses=&sp};
+    if(vkCreateRenderPass(dev,&rpci,0,&g_mv_rp)!=VK_SUCCESS) return 0;
     VkShaderModule vs=shmod(dev,VK_MV_VERT,VK_MV_VERT_N*4), fs=shmod(dev,VK_MV_FRAG,VK_MV_FRAG_N*4);
     if(!vs||!fs) return 0;
     VkPipelineShaderStageCreateInfo st[2]={
@@ -764,8 +783,8 @@ static int build_mv_pipeline(VkDevice dev, uint32_t w, uint32_t h){
     VkPipelineViewportStateCreateInfo vps={.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,.viewportCount=1,.pViewports=&vp,.scissorCount=1,.pScissors=&sc};
     VkPipelineRasterizationStateCreateInfo rs={.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,.polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1.0f};
     VkPipelineMultisampleStateCreateInfo ms={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
-    VkPipelineColorBlendAttachmentState cba={.colorWriteMask=0xf};
-    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=1,.pAttachments=&cba};
+    VkPipelineColorBlendAttachmentState cba[2]={{.colorWriteMask=0xf},{.colorWriteMask=0xf}}; /* one per attachment */
+    VkPipelineColorBlendStateCreateInfo cb={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,.attachmentCount=2,.pAttachments=cba};
     VkPushConstantRange pcr={.stageFlags=VK_SHADER_STAGE_VERTEX_BIT,.offset=0,.size=32}; /* cur vec4 + prev vec4 */
     VkPipelineLayoutCreateInfo plci={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.pushConstantRangeCount=1,.pPushConstantRanges=&pcr};
     if(vkCreatePipelineLayout(dev,&plci,0,&g_mv_pl)!=VK_SUCCESS){ vkDestroyShaderModule(dev,vs,0); vkDestroyShaderModule(dev,fs,0); return 0; }
@@ -777,25 +796,34 @@ static int build_mv_pipeline(VkDevice dev, uint32_t w, uint32_t h){
     return ok;
 }
 
+/* Create a device-local color-attachment+transfer-src image + view of `fmt`. */
+static int mv_make_target(VkDevice dev, VkPhysicalDevice pd, uint32_t W, uint32_t H, VkFormat fmt, VkImage *img, VkDeviceMemory *mem, VkImageView *view){
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=fmt,
+        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
+        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    if(vkCreateImage(dev,&ii,0,img)!=VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,*img,&mr);
+    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return 0;
+    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
+    if(vkAllocateMemory(dev,&ma,0,mem)!=VK_SUCCESS) return 0; vkBindImageMemory(dev,*img,*mem,0);
+    VkImageViewCreateInfo vwi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=*img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=fmt,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+    return vkCreateImageView(dev,&vwi,0,view)==VK_SUCCESS;
+}
+
 static int64_t render_mv(const float *data, uint32_t nverts, const float cur[4]){
     uint32_t W=g_res, H=g_res;
     if(!ctx_init()) return -1;
     VkDevice dev=g_dev; VkPhysicalDevice pd=g_pd; VkQueue q=g_gq; uint32_t qf=g_gqf;
     if(!build_mv_pipeline(dev,W,H)) return -1;
-    /* transient color image + view + framebuffer (this is a capability/verify path) */
-    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,
-        .extent={W,H,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.tiling=VK_IMAGE_TILING_OPTIMAL,
-        .usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
-    VkImage img; CK(vkCreateImage(dev,&ii,0,&img));
-    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev,img,&mr);
-    uint32_t it=find_mem(pd,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); if(it==~0u) return -1;
-    VkMemoryAllocateInfo ma={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=mr.size,.memoryTypeIndex=it};
-    VkDeviceMemory im; CK(vkAllocateMemory(dev,&ma,0,&im)); vkBindImageMemory(dev,img,im,0);
-    VkImageViewCreateInfo vwi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=img,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=VK_FORMAT_R8G8B8A8_UNORM,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-    VkImageView view; CK(vkCreateImageView(dev,&vwi,0,&view));
-    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=g_mv_rp,.attachmentCount=1,.pAttachments=&view,.width=W,.height=H,.layers=1};
+    /* two render targets: viewable colour (RGBA8) + exact motion (R16G16F). */
+    VkImage cimg,mimg; VkDeviceMemory cmem,mmem; VkImageView cview,mview;
+    if(!mv_make_target(dev,pd,W,H,VK_FORMAT_R8G8B8A8_UNORM,&cimg,&cmem,&cview)) return -1;
+    if(!mv_make_target(dev,pd,W,H,MV_FMT,&mimg,&mmem,&mview)) return -1;
+    VkImageView atts[2]={cview,mview};
+    VkFramebufferCreateInfo fbi={.sType=VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,.renderPass=g_mv_rp,.attachmentCount=2,.pAttachments=atts,.width=W,.height=H,.layers=1};
     VkFramebuffer fb; CK(vkCreateFramebuffer(dev,&fbi,0,&fb));
     VkBuffer vbuf; VkDeviceMemory vmem; if(!make_vbuf(dev,pd,data,nverts*2,&vbuf,&vmem)) return -1;
+    /* readback staging for the motion target (R16G16F = 4 bytes/pixel). */
     VkBufferCreateInfo bi={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=(VkDeviceSize)W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkBuffer buf; CK(vkCreateBuffer(dev,&bi,0,&buf));
     VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev,buf,&br);
@@ -812,37 +840,43 @@ static int64_t render_mv(const float *data, uint32_t nverts, const float cur[4])
         g_prev_uni_valid?g_prev_uni[2]:cur[2], g_prev_uni_valid?g_prev_uni[3]:cur[3]};
     VkCommandBufferBeginInfo cbi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd,&cbi);
-    VkClearValue clear={.color={{0.0f,0.0f,0.0f,1.0f}}};
-    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=g_mv_rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=1,.pClearValues=&clear};
+    VkClearValue clears[2]={{.color={{0.0f,0.0f,0.0f,1.0f}}},{.color={{0.0f,0.0f,0.0f,0.0f}}}};
+    VkRenderPassBeginInfo rpbi={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,.renderPass=g_mv_rp,.framebuffer=fb,.renderArea={{0,0},{W,H}},.clearValueCount=2,.pClearValues=clears};
     vkCmdBeginRenderPass(cmd,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,g_mv_pipe);
     vkCmdPushConstants(cmd,g_mv_pl,VK_SHADER_STAGE_VERTEX_BIT,0,32,pc);
     VkDeviceSize off=0; vkCmdBindVertexBuffers(cmd,0,1,&vbuf,&off);
     vkCmdDraw(cmd,nverts,1,0,0);
     vkCmdEndRenderPass(cmd);
+    /* read back the MOTION target (exact), not the colour. */
     VkBufferImageCopy rg={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.imageExtent={W,H,1}};
-    vkCmdCopyImageToBuffer(cmd,img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
+    vkCmdCopyImageToBuffer(cmd,mimg,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buf,1,&rg);
     CK(vkEndCommandBuffer(cmd));
     VkFenceCreateInfo fci={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence; CK(vkCreateFence(dev,&fci,0,&fence));
     VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
     CK(vkQueueSubmit(q,1,&si,fence)); CK(vkWaitForFences(dev,1,&fence,VK_TRUE,~0ull));
-    unsigned char *px; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&px));
-    int cx=W/2, cy=(int)(H*0.55); unsigned char *c=&px[(cy*W+cx)*4];
-    int64_t packed = ((int64_t)c[0]<<16)|((int64_t)c[1]<<8)|(int64_t)c[2];
+    uint16_t *hp; CK(vkMapMemory(dev,bmem,0,W*H*4,0,(void**)&hp));
+    int cx=W/2, cy=(int)(H*0.55); uint16_t *m=&hp[(cy*W+cx)*2];
+    float mvx=half_to_float(m[0]), mvy=half_to_float(m[1]);
     vkUnmapMemory(dev,bmem);
     vkDestroyFence(dev,fence,0); vkDestroyCommandPool(dev,cp,0); vkDestroyBuffer(dev,buf,0); vkFreeMemory(dev,bmem,0);
     vkDestroyBuffer(dev,vbuf,0); vkFreeMemory(dev,vmem,0); vkDestroyFramebuffer(dev,fb,0);
-    vkDestroyImageView(dev,view,0); vkDestroyImage(dev,img,0); vkFreeMemory(dev,im,0);
+    vkDestroyImageView(dev,cview,0); vkDestroyImage(dev,cimg,0); vkFreeMemory(dev,cmem,0);
+    vkDestroyImageView(dev,mview,0); vkDestroyImage(dev,mimg,0); vkFreeMemory(dev,mmem,0);
     /* remember this frame's uniform as the previous for the next call. */
     g_prev_uni[0]=cur[0]; g_prev_uni[1]=cur[1]; g_prev_uni[2]=cur[2]; g_prev_uni[3]=cur[3]; g_prev_uni_valid=1;
-    return packed;
+    /* pack exact motion as fixed-point: each component *1e4 + 50000 (biased for sign), so the
+     * caller decodes mx=ret/1000000-50000, my=ret%1000000-50000, motion = m/1e4 (NDC). */
+    long mx=(long)(mvx*1e4f+(mvx>=0?0.5f:-0.5f))+50000, my=(long)(mvy*1e4f+(mvy>=0?0.5f:-0.5f))+50000;
+    if(mx<0)mx=0; if(mx>999999)mx=999999; if(my<0)my=0; if(my>999999)my=999999;
+    return (int64_t)mx*1000000 + (int64_t)my;
 }
 
 /* vk_motion(verts, ux,uy,uz,uw): render `verts` (x,y pairs) through the auto motion-vector
- * shader with uniform (ux,uy,uz,uw); returns the centroid's packed encoded motion vector.
- * Decode a component: ((chan/255) − 0.5) * 2 = NDC motion. Returns -1 if the program's
- * @vertex has no uniform() transform (→ nothing to differentiate). */
+ * shader with uniform (ux,uy,uz,uw); returns the centroid's EXACT motion (from the R16G16F
+ * target) packed as fixed-point: mx=ret/1000000-50000, my=ret%1000000-50000, each /1e4 = NDC
+ * motion. Returns -1 if the program's @vertex has no uniform() transform. */
 int64_t jrt_vk_motion(const double *verts, int64_t nfloats, double ux, double uy, double uz, double uw){
     if(!verts || nfloats < 6 || (nfloats % 2)!=0) return -1;   /* >=3 (x,y) vertices */
     uint32_t nverts=(uint32_t)(nfloats/2);

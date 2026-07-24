@@ -1082,11 +1082,13 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
     if !cx.uses_push_constant {
         return Err("shader: @vertex for motion vectors must transform via uniform() (no uniform → no motion)".into());
     }
-    // Motion vector = perspective-divided current − previous, encoded to [0,1].
-    let half = cx.constant(0.5);
-    let (cw, pw, cxy, pxy, cwv, pwv, ncur, nprev, mv, halfv, mvh, enc2, ex, ey, enc) = (
-        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"),
-        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"));
+    // Motion vector = perspective-divided current − previous, carried RAW (signed) in the
+    // varying; the fragment writes it to the R16G16F motion target and also a viewable
+    // encoding to the colour target.
+    let zero = cx.constant(0.0);
+    let (cw, pw, cxy, pxy, cwv, pwv, ncur, nprev, mv, mvx, mvy, enc) = (
+        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"),
+        cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"), cx.id("t"));
     write!(cx.body,
 "{cw} = OpCompositeExtract %float {clip_cur} 3
 {pw} = OpCompositeExtract %float {clip_prev} 3
@@ -1097,12 +1099,9 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
 {ncur} = OpFDiv %v2float {cxy} {cwv}
 {nprev} = OpFDiv %v2float {pxy} {pwv}
 {mv} = OpFSub %v2float {ncur} {nprev}
-{halfv} = OpCompositeConstruct %v2float {half} {half}
-{mvh} = OpFMul %v2float {mv} {halfv}
-{enc2} = OpFAdd %v2float {mvh} {halfv}
-{ex} = OpCompositeExtract %float {enc2} 0
-{ey} = OpCompositeExtract %float {enc2} 1
-{enc} = OpCompositeConstruct %v3float {ex} {ey} {half}
+{mvx} = OpCompositeExtract %float {mv} 0
+{mvy} = OpCompositeExtract %float {mv} 1
+{enc} = OpCompositeConstruct %v3float {mvx} {mvy} {zero}
 ").unwrap();
     let glsl_import = if cx.uses_glsl { "       %glsl = OpExtInstImport \"GLSL.std.450\"\n" } else { "" };
     let mat_decl = mat_type_decls(cx.uses_mat);
@@ -1156,15 +1155,17 @@ pub fn compile_vertex_mv(f: &FnDef) -> Result<String, String> {
         consts = cx.consts, vars = cx.vars, body = cx.body))
 }
 
-/// The fixed fragment paired with the motion-vector vertex: pass the interpolated
-/// Location-0 varying (the encoded MV) straight to the colour target so it can be read
-/// back. In the full FSR path this same varying feeds an R16G16F motion target instead.
+/// The fixed fragment paired with the motion-vector vertex, for the MRT motion path: the
+/// interpolated Location-0 varying carries the RAW screen-space motion (signed). This writes
+/// TWO attachments — Location 0 = a viewable colour (motion encoded `*0.5+0.5`), Location 1 =
+/// the exact motion as `vec4(mv.xy, 0, 0)` into an R16G16F target (what FSR2/DLSS consume).
 pub fn mv_fragment_spvasm() -> String {
 "               OpCapability Shader
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Fragment %main \"main\" %color %vin
+               OpEntryPoint Fragment %main \"main\" %color %motion %vin
                OpExecutionMode %main OriginUpperLeft
                OpDecorate %color Location 0
+               OpDecorate %motion Location 1
                OpDecorate %vin Location 0
        %void = OpTypeVoid
        %fnty = OpTypeFunction %void
@@ -1173,17 +1174,25 @@ pub fn mv_fragment_spvasm() -> String {
     %v4float = OpTypeVector %float 4
       %optr = OpTypePointer Output %v4float
       %color = OpVariable %optr Output
+     %motion = OpVariable %optr Output
       %iptr = OpTypePointer Input %v3float
        %vin = OpVariable %iptr Input
         %one = OpConstant %float 1
+       %zero = OpConstant %float 0
+       %half = OpConstant %float 0.5
        %main = OpFunction %void None %fnty
         %lbl = OpLabel
           %c = OpLoad %v3float %vin
-         %cx = OpCompositeExtract %float %c 0
-         %cy = OpCompositeExtract %float %c 1
-         %cz = OpCompositeExtract %float %c 2
-          %o = OpCompositeConstruct %v4float %cx %cy %cz %one
-               OpStore %color %o
+         %mx = OpCompositeExtract %float %c 0
+         %my = OpCompositeExtract %float %c 1
+       %ehx0 = OpFMul %float %mx %half
+        %ehx = OpFAdd %float %ehx0 %half
+       %ehy0 = OpFMul %float %my %half
+        %ehy = OpFAdd %float %ehy0 %half
+        %col = OpCompositeConstruct %v4float %ehx %ehy %half %one
+        %mot = OpCompositeConstruct %v4float %mx %my %zero %zero
+               OpStore %color %col
+               OpStore %motion %mot
                OpReturn
                OpFunctionEnd
 ".to_string()
