@@ -2345,6 +2345,12 @@ typedef struct {
 #define REGION_RESERVE ((size_t)1 << 32) /* 4 GiB virtual per thread (lazy) */
 static REGION_TLS char *r_base = NULL;
 static REGION_TLS size_t r_used = 0;
+/* High-water mark of region memory ever handed out (and thus possibly dirtied).
+ * Bytes at [r_dirty, ...) are fresh mmap(MAP_ANONYMOUS) pages: already zero AND not
+ * yet resident. Zeroing them would fault in memory the program may never touch, so
+ * region-array default-init only memsets the reused prefix below r_dirty. Monotone:
+ * region_leave rewinds r_used (reuse) but never r_dirty (that memory stays dirty). */
+static REGION_TLS size_t r_dirty = 0;
 static REGION_TLS size_t *r_marks = NULL;
 static REGION_TLS int r_depth = 0, r_mcap = 0;
 
@@ -2401,8 +2407,24 @@ void *jrt_region_array(int64_t count, int64_t elem_size, void *vtable) {
         plat_abort();
     }
     JArray *a = (JArray *)(r_base + r_used);
+    size_t start = r_used;
     r_used += size;
-    memset(a, 0, size); /* array default values */
+#ifdef REGION_MMAP
+    /* Default-zero the array — but only the portion that was previously handed out
+     * and is now being REUSED (a prefix below the dirty high-water mark). The fresh
+     * tail comes straight from the mmap(MAP_ANONYMOUS) reservation: already zero and,
+     * crucially, NOT yet resident. memset'ing it would fault in the whole array (real
+     * RSS + fault time for elements the program may never touch — the graph-benchmark
+     * pathology). Reads still see zero everywhere: memset covers the reused prefix,
+     * the OS zero-page covers the fresh tail. */
+    if (start < r_dirty) {
+        size_t dend = r_used < r_dirty ? r_used : r_dirty;
+        memset(a, 0, dend - start);
+    }
+    if (r_used > r_dirty) r_dirty = r_used;
+#else
+    memset(a, 0, size); /* malloc fallback: memory is not zero-initialised */
+#endif
     a->refcount = -1;   /* immortal → RC/collector no-op; freed by region_leave */
     a->vtable = vtable;
     a->length = count;

@@ -97,24 +97,31 @@ Cross-compiler on this machine (best-of-5, output-verified; Vire vs clang++ 22, 
 | **vcall** (dyn dispatch) | **1.00×** | **0.44×** (2.3× faster) | solver devirtualization; beats clang `virtual` |
 | **binsearch** (10M) | 1.03× | **0.78×** | midpoint check *proved* redundant + elided — safely |
 | **sort** (quicksort 2M) | 1.06× | 1.33× | uncatchable checks abort noreturn (Rust's structure) |
-| **graph** (BFS + Dijkstra, 1.6M edges) | **1.61×** | 1.50× | Vire's one loss — latency-bound pointer-chase; analyzed honestly below |
+| **graph** (BFS + Dijkstra, 1.6M edges) | **1.12×** | **~1.00×** | was 1.61× — a region-array eager-zero fault, now fixed; RSS + compute at parity, residual is bounds checks |
 
 Across the Vire benchmarks (suite + [benchmarks/vire-lang/](benchmarks/vire-lang/)),
 memory-safe Vire vs memory-safe Rust is at **Rust parity on the compute/struct/tree
 kernels** — every one within ~9% of Rust and several faster (struct 0.90×, binary-trees
-0.91×, matmul 0.98×, vcall = Rust / 0.44× clang) — **with one honest exception: `graph`
-(BFS + Dijkstra on a 1.6M-edge digraph) is 1.61× Rust.** That case is a flat-`i64`-array,
-pointer-chasing, memory-latency-bound kernel — **no objects, no reference counting, no
-cycle collector are involved** (it allocates six integer arrays and never a heap object),
-so it is *not* an RC or object-graph residual and the object-lifetime levers below do not
-apply to it. Nor is it a bounds-check tax: rebuilding it with **all** bounds checks
-removed (`FASTLLVM_NO_BOUNDS`, bit-identical output) closes only ~7% of the gap (65→61 ms
-vs Rust 40 ms), and Vire actually emits *fewer* checks than Rust here (2 vs 32 panic
-sites — its BFS inner loop is 7 instructions with the check elided and the base in a
-register, against Rust's 10 with an inline check and a per-iteration base reload). The
-residual is ordinary backend throughput on an irregular, memory-latency-bound integer
-kernel — not a price of memory safety. Its peak-RSS gap (56 vs 31 MB) is a benchmark
-scratch-array over-sizing, fully explained — and closable to parity — below. On the **Java→native**
+0.91×, matmul 0.98×, vcall = Rust / 0.44× clang). **`graph` (BFS + Dijkstra on a 1.6M-edge
+digraph) was the one loss at 1.61×; it is now 1.12×, and the diagnosis is worth keeping**
+because two plausible explanations were wrong. It is a flat-`i64`-array, pointer-chasing
+kernel — **no objects, no reference counting, no cycle collector** (six integer arrays,
+never a heap object), so *not* an RC/object-graph residual. Nor was it a bounds-check tax:
+with **all** bounds checks removed (`FASTLLVM_NO_BOUNDS`, bit-identical output) the gap
+barely moved, and Vire emits *fewer* checks than Rust here (2 vs 32 panic sites — its BFS
+inner loop is 7 instructions, check elided and base in a register, against Rust's 10 with
+an inline check and a per-iteration base reload). The actual cause, found by isolating
+steady-state compute (8 warm reps over pre-allocated arrays): **compute was already 0.93×
+Rust — Vire was *faster*.** The entire gap was one-time paging. `jrt_region_array`
+default-zeroed each array with a full `memset`, which faulted in the whole 56 MB working
+set — including the tail of the two worst-case-sized binary-heap scratch arrays the
+algorithm never touches — whereas Rust's `vec![0; n]` gets lazy zero pages. The runtime
+now fills region arrays lazily (memset only the reused prefix below a dirty high-water
+mark; the fresh `mmap(MAP_ANONYMOUS)` tail stays zero and unfaulted). Result: **RSS 56 →
+30 MB (= Rust's 30), cold 55.8 → 44.4 ms (Rust 39.7)** — the memory gap gone, the compute
+gap gone; the remaining 1.12× is the bounds checks (which Rust also carries but schedules
+for free here). Codegen is byte-identical; verified by the Java 0-live oracle (67/67) and
+the differential fuzzer. On the **Java→native**
 oracle path the same backend takes **NBody 35.7× → 1.16×** (`Math.sqrt` now lowers to the
 `sqrtsd` intrinsic, not a 60-iteration Newton call) and **binary-trees 1.73× → 0.81×,
 beating Rust** (a shape/freshness analysis drops the cycle collector for provably
@@ -126,15 +133,10 @@ out-of-bounds access still throws**.
 **Memory (peak RSS)** is reported alongside time in every suite: Vire is **at or below
 both Rust and C++ on essentially every benchmark** — ~2 MB under clang everywhere (no
 `libstdc++`/iostream baseline), level with Rust, and even binary-trees (pure alloc/GC)
-peaks *under* both (RC frees eagerly, 0 live, no growing GC heap). The lone exception is
-`graph` (56 MB Vire / 58 MB clang++ / 31 MB Rust) — and the 25 MB gap to Rust is **not**
-a Vire runtime cost (clang++ is *above* Vire here). It is an array-paging artefact: the
-benchmark over-sizes its two binary-heap scratch arrays to `m+16` (the worst-case bound,
-1.6M entries) while the heap only ever holds ~`vn`. Rust's `vec![0i64; m+16]` leaves the
-unused tail as untouched lazy-zero pages; Vire and C++ fault more of it. Sizing those
-arrays to `vn+16` (provably sufficient, bit-identical output) drops Vire to **34.6 MB —
-Rust parity** (measured). So the residual is the benchmark's allocation, not the runtime's
-bookkeeping, and no reference counting is in play.
+peaks *under* both (RC frees eagerly, 0 live, no growing GC heap). `graph` used to be the
+exception (56 MB) until the `jrt_region_array` lazy-fill fix above: it now peaks at **30
+MB, level with Rust's 30 and under clang++'s 58** — a region array only makes resident the
+pages the program actually touches, exactly like Rust's `vec!`.
 
 Beyond single kernels, [benchmarks/complex/](benchmarks/complex/) runs **multi-algorithm
 workloads** (a generate→sort→search→histogram pipeline; integer k-means) and **fair

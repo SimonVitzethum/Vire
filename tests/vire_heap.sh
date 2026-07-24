@@ -378,6 +378,32 @@ fn main() {
 }
 EOF
 
+# Region-array default-zero contract (jrt_region_array lazy fill). A large region
+# array is backed by a fresh mmap(MAP_ANONYMOUS) reservation; the allocator only
+# memsets the reused prefix (below the dirty high-water mark) and leaves the fresh
+# tail lazy. Correctness requires an untouched far element to still read 0 (the OS
+# zero-page). This is the exact behaviour that took graph's RSS 56→30 MB; if the
+# lazy path ever regressed to reading stale non-zero data, this catches it.
+case_ region_zero_far 5 <<'EOF'
+fn main() {
+    mut a = array(1000000)
+    a[0] = 5
+    print(a[0] + a[999999])
+}
+EOF
+
+# Sequential large region arrays (the graph pattern): each must default-zero its own
+# far, never-written element. Exercises monotonic region growth across allocations.
+case_ region_zero_seq 0 <<'EOF'
+fn main() {
+    mut a = array(500000)
+    mut b = array(500000)
+    mut c = array(500000)
+    a[0] = 1  b[0] = 2  c[0] = 3
+    print(a[400000] + b[400000] + c[400000])
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

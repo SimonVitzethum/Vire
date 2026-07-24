@@ -112,20 +112,23 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   field array). Extends the mature `crates/solver/src/bounds.rs`. **Soundness risk
   ~zero** — elision only removes a check when provably safe; a real OOB still throws.
   Closes residual toward ~1.1×.
-- [ ] **PGO on graph (Dijkstra).** Infra (`--pgo-gen`/`--pgo-use`) is already built
-  but never applied to the data-dependent heap-sift branches. **Zero correctness
-  risk**, cheap experiment (regular branches saw ~0%; branchy pointer-chasing may
-  differ). graph is 1.61× Rust (measured 2026-07); the runtime gap is the random-
-  adjacency Dijkstra heap (cache/branch), the target for PGO. **Bounds checks ruled OUT
-  causally:** rebuilt with `FASTLLVM_NO_BOUNDS` (0 throw sites, identical output) closes
-  only ~7% (65→61 ms vs Rust 40 ms); Vire emits FEWER checks than Rust (2 vs 32 panic
-  sites, BFS loop 7 insns check-elided + base-in-reg vs Rust's 10 with inline check +
-  base reload). So the gap is backend throughput on irregular integer access, not a
-  safety tax — PGO/scheduling, not bounds elision. **RAM gap resolved:** the
-  56 vs 31 MB delta was the benchmark's two `array(m+16)` binary-heap scratch arrays
-  (1.6M entries, worst-case bound) faulting more of their unused tail than Rust's
-  lazy-zero `vec!` pages. Sizing them to `array(vn+16)` (provably sufficient, identical
-  output) drops Vire to 34.6 MB — Rust parity. Not RC, not object layout; clang++ is 58 MB.
+- [x] **graph WON — was 1.61× Rust, now 1.12× (compute at parity) (2026-07).** The
+  cause was neither RC, nor object layout, nor bounds checks (all ruled out causally:
+  `FASTLLVM_NO_BOUNDS` closed <7%; Vire emits 2 throw sites vs Rust's 32). Isolating
+  steady-state compute (8 warm reps over pre-allocated arrays) showed Vire's compute is
+  **0.93× Rust — faster**; the whole 1.61× was one-time paging. `jrt_region_array`
+  default-zeroed each array with a full `memset`, faulting the entire 56 MB working set
+  (incl. the untouched tail of the `array(m+16)` worst-case scratch arrays), while Rust's
+  `vec![0;n]` gets lazy zero pages. **Fix (runtime, codegen-identical):** memset only the
+  reused prefix below a dirty high-water mark (`r_dirty`); the fresh `mmap(MAP_ANONYMOUS)`
+  tail stays zero + unfaulted. RSS 56→30 MB (= Rust), cold 55.8→44.4 ms (Rust 39.7). The
+  residual 1.12× is the bounds checks. Gated: Java 67/67, fuzzer, +2 `vire_heap` zero-init
+  tests. General win — helps every region-array-heavy program, not just graph.
+- [ ] **PGO on graph (Dijkstra) — optional, for the last 1.12×.** Infra
+  (`--pgo-gen`/`--pgo-use`) exists but was never applied to the data-dependent heap-sift
+  branches. Now that memory + compute are at parity, the only residual is the bounds-check
+  scheduling; PGO on the branchy pointer-chase might close it. Low priority (already at
+  parity on compute; Rust also carries these checks).
 
 ## Tier 3 — enablers with broad latent effect
 
