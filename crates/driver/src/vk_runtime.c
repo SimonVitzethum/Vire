@@ -413,6 +413,7 @@ static void rec_draw(VkCommandBuffer cmd, VkRenderPass rp, VkFramebuffer fb, VkP
  * VK_EXT_mesh_shader; `g_draw_mesh` is its indirect-draw entry point. */
 static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static VkQueue g_gq; static uint32_t g_gqf; static int g_ctx_ok=0;
 static int g_has_mesh=0;
+static int g_gpu_pref=-1;   /* vk_gpu_select() choice; -1 = auto (first graphics device) */
 static PFN_vkCmdDrawMeshTasksIndirectEXT g_draw_mesh=0;
 /* The persistent context + pipeline cache are shared mutable state, and the render queue
  * (g_gq) is not externally synchronised — so `vk_*` rendering is SINGLE-THREADED. Under
@@ -455,11 +456,23 @@ static int ctx_init_unlocked(void) {
      * box, switching the graphics context to a different vendor can hit vendor-specific
      * driver bugs). Enable mesh shaders only if THIS device supports them; if it doesn't,
      * g_has_mesh stays 0 and the mesh path keeps its own device (no regression). */
-    g_pd=pds[0]; free(pds); int f=0;
-    { uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,0);
-      VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&n,qs);
-      for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_gqf=i;f=1;break;} free(qs); }
-    if(!f) return 0;
+    /* Pick the physical device: the user's vk_gpu_select() choice if it is valid and has a
+     * graphics queue, else the first graphics-capable device. On this box device 0 = Intel
+     * iGPU, 1 = RTX 5070 — vk_gpu_select(1) moves the persistent context onto the NVIDIA GPU
+     * (required for DLSS/Streamline; our shaders are validation-clean so NVIDIA accepts them). */
+    int chosen=-1;
+    if(g_gpu_pref>=0 && (uint32_t)g_gpu_pref<nd){
+        uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pds[g_gpu_pref],&n,0);
+        VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pds[g_gpu_pref],&n,qs);
+        for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){ chosen=(int)g_gpu_pref; g_gqf=i; break; } free(qs);
+    }
+    for(uint32_t d=0; d<nd && chosen<0; d++){
+        uint32_t n=0; vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&n,0);
+        VkQueueFamilyProperties *qs=malloc(n*sizeof*qs); vkGetPhysicalDeviceQueueFamilyProperties(pds[d],&n,qs);
+        for(uint32_t i=0;i<n;i++) if(qs[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){ chosen=(int)d; g_gqf=i; break; } free(qs);
+    }
+    if(chosen<0){ free(pds); return 0; }
+    g_pd=pds[chosen]; free(pds);
     g_has_mesh = has_ext(g_pd, VK_EXT_MESH_SHADER_EXTENSION_NAME);
     float pr=1; VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_gqf,.queueCount=1,.pQueuePriorities=&pr};
     VkPhysicalDeviceMeshShaderFeaturesEXT mf={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,.meshShader=VK_TRUE,.taskShader=VK_TRUE};
@@ -1910,6 +1923,42 @@ int64_t jrt_vk_pipeline_depth(int64_t n) {
     if(n < 1) n = 1; if(n > FRING_MAX) n = FRING_MAX;
     g_pipe_depth = (int)n;
     return n;
+}
+
+/* Enumerate the Vulkan physical devices via a throwaway instance; optionally print them.
+ * Used by vk_gpu_count()/vk_gpu_list(). Returns the device count (0 on failure). */
+static uint32_t vk_enum_devices(int print){
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app};
+    VkInstance inst; if(vkCreateInstance(&ici,0,&inst)!=VK_SUCCESS) return 0;
+    uint32_t nd=0; vkEnumeratePhysicalDevices(inst,&nd,0);
+    if(nd){
+        VkPhysicalDevice *pds=malloc((size_t)nd*sizeof*pds); vkEnumeratePhysicalDevices(inst,&nd,pds);
+        if(print) for(uint32_t i=0;i<nd;i++){
+            VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i],&p);
+            const char *t = p.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU?"discrete":
+                            p.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU?"integrated":
+                            p.deviceType==VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU?"virtual":
+                            p.deviceType==VK_PHYSICAL_DEVICE_TYPE_CPU?"cpu":"other";
+            printf("gpu %u: %s (%s)\n", i, p.deviceName, t);
+        }
+        free(pds);
+    }
+    vkDestroyInstance(inst,0);
+    return nd;
+}
+
+/* vk_gpu_count(): number of Vulkan devices on this machine. */
+int64_t jrt_vk_gpu_count(void){ return (int64_t)vk_enum_devices(0); }
+/* vk_gpu_list(): print each device as `gpu i: NAME (type)` and return the count. */
+int64_t jrt_vk_gpu_list(void){ return (int64_t)vk_enum_devices(1); }
+/* vk_gpu_select(i): choose device i for the persistent graphics context. Must be called
+ * BEFORE the first render (the context is built once, lazily). Returns i on success, -1 if
+ * the context is already up (too late) or i is out of range. */
+int64_t jrt_vk_gpu_select(int64_t i){
+    if(g_ctx_ok) return -1;                       /* context already built — cannot switch */
+    if(i < 0 || (uint32_t)i >= vk_enum_devices(0)) return -1;
+    g_gpu_pref=(int)i; return i;
 }
 
 /* vk_render3d(verts, idx, ca, sa): render 3D per-vertex-colored geometry (interleaved

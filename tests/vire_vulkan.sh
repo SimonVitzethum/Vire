@@ -1181,6 +1181,22 @@ fn main() {
 }
 EOF
 
+# GPU query + select: vk_gpu_count()/vk_gpu_list() enumerate the machine's Vulkan devices,
+# vk_gpu_select(i) picks which one the persistent graphics context uses (before the first
+# render). Portable assertion: at least one device, selecting device 0 succeeds, and it
+# renders. (On the dev box device 1 = RTX 5070 — selecting it moves rendering onto NVIDIA,
+# the prerequisite for DLSS/Streamline; our shaders are validation-clean so it accepts them.)
+case_ vire_gpu_select <<'EOF'
+fn main() {
+    mut n = vk_gpu_count()
+    mut sel = vk_gpu_select(0)
+    mut px = vk_triangle()
+    mut ok = 0
+    if n > 0 { if sel == 0 { if px > 0 { ok = 1 } } }
+    print(ok)
+}
+EOF
+
 # Auto motion vectors (vk_motion) — the "crown jewel": the compiler emits a variant of the
 # program's @vertex that evaluates the SAME transform against both the current and the
 # previous-frame uniform, writing screen-space motion (ndc_cur − ndc_prev, encoded *0.5+0.5)
