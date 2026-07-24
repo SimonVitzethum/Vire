@@ -200,8 +200,18 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [ ] **Expand the differential fuzzer** (`tests/fuzz_gen.py`) — floats
   (fp-contract-matched), nested control-flow, break/continue, strings. (Correctness
   insurance, not perf, but belongs with the perf work.)
-- [ ] **Analysis caching / incremental compile** — compile time measured super-linear
-  ~O(n^1.4); orthogonal to runtime perf but the main compile-*speed* lever left.
+- [x] **Compile-time super-linearity FIXED — now O(n) (2026-07-24).** The ~O(n^1.4) was
+  not inherent: profiled it (added a `FASTLLVM_TIME_PASSES` per-pass profiler) to
+  `narrow_fields`, which was ~50% of the solver+backend cost and super-linear (67→408 ms
+  for 4× functions). Cause: one whole-program range fixpoint over a GLOBAL local-range
+  map that outgrew L2 → cache-miss-bound → super-linear time on linear work. Fixed by
+  running the LOCAL analysis per function (self-contained: GetField/Call yield ⊤) on a
+  small cache-resident map, collecting field ranges once per function (behaviour-
+  identical). Result: whole solver+backend is now **linear** — 129/260/530 ms at
+  1000/2000/4000 functions (2.0× per doubling; was 155/349/787 ≈ 2.25×). Extrapolated to
+  100k LOC: ~1.9 s (was ~5–7 s). All remaining passes (elide_bounds, backend::emit) now
+  scale linearly too. Analysis caching / true incrementality is a further lever but no
+  longer needed to keep compile linear.
 - [x] **Runtime GC latency — incremental cycle collector DONE** (`jrt_collect_step`):
   bounded incremental stepping (continuous, buffer-bounded RAM, no big-pass spike).
   Two soundness bugs found + fixed (MarkRoots must free only BLACK rc==0, not GRAY
