@@ -889,6 +889,28 @@ static JStr *str_from_buf(const char *buf, int n) {
     return r;
 }
 
+/* Go-style error context: `result.wrap(msg)` on an Err builds "msg: <inner>" as the new error
+ * message, preserving the chain in the text. Both operands are Str (the common message-error
+ * case; typed sum-type errors go through `match` — see REFERENCE §11). The result is immortal
+ * (refcount -1), like a string literal, so the i64-erased Result error slot needs no RC and the
+ * 0-live heap oracle stays balanced. */
+/* Reinterpret an i64-erased Result payload slot as a Str (`result.error()`): the slot holds a
+ * JStr* for string-message errors. 0 (a zeroed/absent payload) → the empty string, so calling
+ * .error() on an Ok is safe. Scoped to string errors — typed sum-type errors use match. */
+JStr *jrt_as_str(int64_t p) {
+    return p ? (JStr *)(intptr_t)p : str_from_buf("", 0);
+}
+
+JStr *jrt_err_wrap(const JStr *msg, const JStr *inner) {
+    int64_t ml = msg ? msg->len : 0, il = inner ? inner->len : 0;
+    JStr *r = str_alloc(ml + 2 + il);
+    if (ml) jrt_memcpy(r->bytes, msg->bytes, (size_t)ml);
+    r->bytes[ml] = ':'; r->bytes[ml + 1] = ' ';
+    if (il) jrt_memcpy(r->bytes + ml + 2, inner->bytes, (size_t)il);
+    r->refcount = -1;
+    return r;
+}
+
 JStr *jrt_int_to_str(int32_t v) {
     char buf[16];
     return str_from_buf(buf, fmt_i64(buf, v));

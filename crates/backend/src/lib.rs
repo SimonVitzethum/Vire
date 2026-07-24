@@ -2785,6 +2785,14 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 if !obj_imm {
                     writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
                 }
+            } else if ty == Ty::I64 && operand_ty(e.f, value) == Ty::Ref {
+                // A pointer value (a string literal @jstr.*, a class const, or a Ref local —
+                // an object/string stored into the i64-ERASED Result/Option payload slot). LLVM
+                // rejects `store i64 @jstr.0`; convert the pointer explicitly. The matching read
+                // side inttoptrs it back (see GetField).
+                let vi = e.fresh();
+                writeln!(w, "  {vi} = ptrtoint ptr {v} to i64").unwrap();
+                writeln!(w, "  store i64 {vi}, ptr {p}{tb}").unwrap();
             } else {
                 writeln!(w, "  store {} {v}, ptr {p}{tb}", llty(ty)).unwrap();
             }

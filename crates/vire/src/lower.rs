@@ -2744,6 +2744,77 @@ impl<'a> FnLower<'a> {
             }
             // Methods on growing lists ($List) and maps ($Map).
             if let Some(sent) = self.class_of_operand(&obj) {
+                // Go-style error context: `result.wrap(msg)`. On `Err` (tag 1) it prepends
+                // "msg: " to the (string) error, keeping the message chain; on `Ok` it passes
+                // the Result through unchanged. Mirrors the `?`/Result representation. Scoped to
+                // string-message errors (the common Go case); typed sum-type errors are handled
+                // by `match` (REFERENCE §11). Result stays the return type, so `.wrap(m)?` works.
+                if sent == "Result" && name == "wrap" {
+                    if args.len() != 1 {
+                        self.errs.push(format!("wrap(msg) takes one Str argument, got {}", args.len()));
+                    }
+                    let (msg, _) = args.first().map(|e| self.lower_expr(e)).unwrap_or((Operand::ConstNull, Ty::Ref));
+                    let tag = self.new_local(Ty::I64);
+                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                    let is_err = self.new_local(Ty::I32);
+                    self.emit(Statement::Assign(is_err, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(1))));
+                    let errb = self.new_block();
+                    let okb = self.new_block();
+                    let merge = self.new_block();
+                    let cur = self.cur;
+                    self.term(cur, Terminator::Branch { cond: Operand::Copy(is_err), then_blk: errb, else_blk: okb });
+                    let res = self.new_local(Ty::Ref);
+                    self.local_class.insert(res.0, "Result".into());
+                    // Err branch → Err(jrt_err_wrap(msg, old_error)).
+                    self.cur = errb.0 as usize;
+                    let olderr = self.new_local(Ty::I64);
+                    self.emit(Statement::GetField { dest: olderr, obj: obj.clone(), class: "Result".into(), field: "Err_error".into() });
+                    let joined = self.new_local(Ty::Ref);
+                    self.emit(Statement::Call { dest: Some(joined), func: "jrt_err_wrap".into(), args: vec![msg, Operand::Copy(olderr)] });
+                    let newres = self.new_local(Ty::Ref);
+                    self.local_class.insert(newres.0, "Result".into());
+                    self.emit(Statement::New { dest: newres, class: "Result".into() });
+                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: "Result".into(), field: "__tag".into(), value: Operand::ConstI64(1) });
+                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: "Result".into(), field: "Err_error".into(), value: to_i64(Operand::Copy(joined)) });
+                    self.emit(Statement::Assign(res, Rvalue::Use(Operand::Copy(newres))));
+                    self.term(self.cur, Terminator::Goto(merge));
+                    // Ok branch → the original Result, unchanged.
+                    self.cur = okb.0 as usize;
+                    self.emit(Statement::Assign(res, Rvalue::Use(obj.clone())));
+                    self.term(self.cur, Terminator::Goto(merge));
+                    self.cur = merge.0 as usize;
+                    return (Operand::Copy(res), Ty::Ref);
+                }
+                // `result.error()` — the Err message as a Str (`""` when Ok). Reads the
+                // i64-erased Err_error slot back as a JStr* (the string-message error case,
+                // Go's `err.Error()`); typed sum-type errors are handled by `match`. This is
+                // how a wrapped error chain is observed until two-parameter Result payloads are
+                // typed (single-param Option already round-trips; see the generic sum machinery).
+                if sent == "Result" && name == "error" {
+                    let tag = self.new_local(Ty::I64);
+                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                    let is_err = self.new_local(Ty::I32);
+                    self.emit(Statement::Assign(is_err, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(1))));
+                    let errb = self.new_block();
+                    let okb = self.new_block();
+                    let merge = self.new_block();
+                    self.term(self.cur, Terminator::Branch { cond: Operand::Copy(is_err), then_blk: errb, else_blk: okb });
+                    let res = self.new_local(Ty::Ref);
+                    self.local_class.insert(res.0, "Str".into());
+                    self.cur = errb.0 as usize;
+                    let raw = self.new_local(Ty::I64);
+                    self.emit(Statement::GetField { dest: raw, obj: obj.clone(), class: "Result".into(), field: "Err_error".into() });
+                    let s = self.new_local(Ty::Ref);
+                    self.emit(Statement::Call { dest: Some(s), func: "jrt_as_str".into(), args: vec![Operand::Copy(raw)] });
+                    self.emit(Statement::Assign(res, Rvalue::Use(Operand::Copy(s))));
+                    self.term(self.cur, Terminator::Goto(merge));
+                    self.cur = okb.0 as usize;
+                    let empty = self.intern("");
+                    self.emit(Statement::Assign(res, Rvalue::Use(Operand::ConstStr(empty))));
+                    self.term(self.cur, Terminator::Goto(merge));
+                    self.cur = merge.0 as usize;
+                    return (Operand::Copy(res), Ty::Ref);
+                }
                 // `$Atomic` = a locally-constructed `Atomic(..)`; `Atomic` = a value
                 // arriving typed as such (e.g. a worker parameter `c: Atomic`).
                 if sent == "$Atomic" || sent == "Atomic" {

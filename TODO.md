@@ -336,7 +336,21 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [ ] Sinks (colored console / JSON / file), chosen at build time.
 
 ### [7] Go-style error handling — remaining
-- [ ] `.wrap(msg)` (context, chain), typed errors with attached debug path.
+- [x] **`.wrap(msg)` + `.error()` — DONE (2026-07-24).** `result.wrap(msg)` on an `Err` prepends
+  "msg: " to the (string) error, keeping the chain (`.wrap("outer").wrap("outermost")` →
+  "outermost: outer: file not found"); on `Ok` it passes through, so `.wrap(m)?` works. `.error()`
+  returns the message as a `Str` (Go's `err.Error()`; `""` when Ok) — the way a wrapped chain is
+  observed. `?`/`match` already worked. Runtime `jrt_err_wrap` (immortal join, no RC on the erased
+  slot) + `jrt_as_str`; lowering in lower.rs (branch/merge on the tag). Also fixed a real backend
+  crash: storing a pointer payload (a string literal) into the i64-ERASED Result/Option slot now
+  emits `ptrtoint`, not an invalid `store i64 @jstr.0`. Test `tests/vire_errors.sh`; gate GREEN.
+- [ ] **Two-parameter typed Result payloads** (the honest remaining gap). Single-param generics
+  are monomorphized type-correctly (`Option[Str]` round-trips a string via `Option$Str`), but
+  `Result[T,E]` (two params) stays i64-erased, so `match Err(e) -> print(e)` yields the pointer as
+  a number — use `.error()` for the message meanwhile. Extend the generic sum-type instantiation
+  (`generic_stypes`, `class_of_ann`) to two type args (`Result$T$E`) + infer the unconstrained arg.
+  Soundness-sensitive (payload layout) — do NOT rush; gate on the heap oracle. Then `Err(e)` binds
+  a typed `e`, typed sum-type errors + attached debug path follow.
 
 ### [8] Debug symbols + crash paths — remaining
 - [ ] freestanding: compact symbol table instead of libc `backtrace`; map the entry
