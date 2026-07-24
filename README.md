@@ -266,22 +266,25 @@ stored `ref` are provably *iteration-fresh* — every reaching definition comes 
 constructor, a call with fresh arguments, a field-read of a fresh object, `null`, or a
 scalar (a greatest-fixpoint freshness dataflow over the loop body). Both fresh ⇒ both live
 and die in the arena ⇒ the store creates no dangling pointer and captures no non-arena ref.
-On sharedgraph the arena now fires: **729 ms → 352 ms (2.08×; 5.0× → 2.4× Rust)**, zero
-heap allocations, zero collector work — verified 0-live and `GUARD_FREE`-clean. It stays
-soundness-critical (a wrong freshness verdict would be a use-after-free), so it is pinned
-in **both** directions by `tests/vire_interproc_arena.sh` (promote: fresh cyclic mutation;
-decline: mutation whose base is an outer object, whose value is an outer ref, or whose base
-is only conditionally fresh) plus the Java 0-live oracle, `GUARD_FREE`, and the fuzzer. It
-does *not* reach the 273 ms ceiling — the arena's per-iteration push/pop and bump-alloc are
-real — but it removes the entire 46 %-collector + 17 %-RC cost on the class.
+On sharedgraph the arena fires, and a second pass elides the reference counting the arena
+makes redundant: the objects are arena-immortal, so the `jrt_retain`/`jrt_release` calls
+the emitter left in the hot loops were pure no-ops (an `rc<0` early return) costing 282 ms
+of call traffic. `crates/backend/src/lib.rs` now proves which refs are arena-immortal —
+`New` at arena depth>0, a user call there with immortal args, and (interprocedurally, via
+`arena_ctx_fns`) recursive builders like `chain`/`make` whose every call site is in-arena —
+and skips RC on them. **sharedgraph: 729 → 75 ms = 0.51× Rust** (the class from the original
+5.0× to twice as fast as Rust); **binary-trees: 205 → 46 ms** (its `make()` is arena-context
+too). Zero heap, zero collector, correct, 0-live, `GUARD_FREE`-clean. Soundness-critical (a
+wrong "always in an arena" verdict would drop a real RC → use-after-free), so it is pinned:
+dispatch-reachable and heap-escaping (capsule-export) functions are excluded, a builder
+called *both* in and out of an arena is proven NOT arena-context (a `vire_heap` regression
+case), and the Java 0-live oracle + `GUARD_FREE` + the differential fuzzer gate the rest.
 
 The **hard floor** is unchanged and real: **genuinely dynamic-lifetime graphs** (mutable
 caches, long-lived graphs mutated past any single scope) cannot be proven away by any
 static analysis — they structurally need dynamic RC + the collector. The arena lever
 covers structured-lifetime graphs (compilers/ASTs, request handlers, per-frame scene
-graphs); it does not make RC free in full generality. And even at the ceiling Vire's bare
-allocation path here is ~1.9× Rust's `Rc` path — a separate, honestly-open codegen gap,
-not something the arena closes.
+graphs); it does not make RC free in full generality.
 
 **No latency spikes.** The three synchronous runtime operations were made incremental/
 budgeted (see [DONE.md](DONE.md)): the cycle collector runs in bounded steps

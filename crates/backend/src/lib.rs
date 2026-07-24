@@ -1017,8 +1017,14 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
             matches!(st, Statement::InstanceOfPending { .. })
                 || matches!(st, Statement::Call { func, .. } if func == "jrt_take_pending")
         });
+    // Functions that provably always run inside an auto-arena → their allocations are
+    // immortal and their ref params immortal (interprocedural RC elision for recursive
+    // builders such as `chain`/`make`). Heap-escaping functions (capsule exports) are
+    // excluded from both the arena-context set and the immortal-call rule.
+    let heap_esc = heap_escaping_fns(program);
+    let arena_ctx = arena_ctx_fns(program, &heap_esc);
     for (fi, f) in program.functions.iter().enumerate() {
-        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name));
+        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name), arena_ctx.contains(&f.name), &heap_esc);
     }
 
     // Thread trampoline: called by the runtime (pthread or synchronous),
@@ -1389,10 +1395,15 @@ impl FnEmitter<'_> {
 /// the MIN over its predecessors (sound: immortal only if depth>0 on EVERY path), so a
 /// `New` reached at depth>0 is always arena. `arena_push`/`pop` are balanced and
 /// structured (the lowering emits them around loop/capsule bodies), so this converges.
-fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
+/// Entry arena-depth per block: the number of open `jrt_arena_push` scopes when the
+/// block is entered, taken as the MIN over predecessors (sound — a New is arena only if
+/// depth>0 on EVERY path). `None` = unreachable. push/pop are balanced/structured, so
+/// this converges. Used both for immortal-alloc seeding and the interprocedural
+/// arena-context analysis (which call sites are inside an arena).
+fn arena_block_depths(f: &Function) -> Vec<Option<i32>> {
     let nb = f.blocks.len();
     if nb == 0 {
-        return (BTreeSet::new(), BTreeSet::new());
+        return Vec::new();
     }
     let net: Vec<i32> = f
         .blocks
@@ -1420,7 +1431,6 @@ fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
             Terminator::Return(_) => vec![],
         }
     };
-    // Entry arena-depth per reachable block: min over predecessors' exit depth.
     let mut entry: Vec<Option<i32>> = vec![None; nb];
     entry[0] = Some(0);
     let mut wl = vec![0usize];
@@ -1428,7 +1438,7 @@ fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
     while let Some(b) = wl.pop() {
         guard += 1;
         if guard > nb * nb + nb + 16 {
-            break; // malformed/unbalanced arena → bail conservatively (no seeds lost below)
+            break; // malformed/unbalanced arena → bail conservatively
         }
         let ex = entry[b].unwrap() + net[b];
         for s in succs(b) {
@@ -1439,6 +1449,15 @@ fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
             }
         }
     }
+    entry
+}
+
+fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    let nb = f.blocks.len();
+    if nb == 0 {
+        return (BTreeSet::new(), BTreeSet::new());
+    }
+    let entry = arena_block_depths(f);
     // `new_dests`: New/NewArray at depth>0 — always immortal (arena allocation).
     // `call_dests`: Call dests at depth>0 — immortal IFF their arguments are all
     // immortal/scalar (decided in the fixpoint below): a callee running inside the
@@ -1469,12 +1488,140 @@ fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
     (new_dests, call_dests)
 }
 
-fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
+/// Functions whose body provably ALWAYS runs inside an auto-arena — so every object
+/// they allocate is immortal and their reference parameters are immortal. A recursive
+/// builder like `chain`/`make` qualifies: it is only ever called from inside an arena.
+/// Interprocedural least fixpoint (sound):
+///   arena_ctx(f) ⇐ f is not dispatch-reachable (not a class method, not a CallPoly
+///   target — those can be invoked outside any arena via a path we don't scan), has ≥1
+///   NON-self direct call site, every non-self site is at arena-depth>0 OR inside an
+///   already-arena_ctx caller, and every site passes only scalar/null args (a ref arg
+///   could carry a non-arena reference — conservatively excluded). Self-recursive sites
+///   are assumed in-arena (coinductive: if f always starts in an arena, its own
+///   recursion does too) but must still pass safe args. A free function is reachable
+///   only through the direct calls we scan, so this call-site set is COMPLETE for it.
+/// User functions that transitively return explicit HEAP memory — i.e. call a heap
+/// export (`jrt_deep_copy_heap` / `jrt_arena_export_array`, the capsule boundary). Their
+/// result must never be treated as arena-immortal, and they must never be arena-context,
+/// even if reached from inside an arena: the exported object lives on the heap and keeps
+/// its reference counting. (The region check already keeps capsules out of auto-arenas;
+/// this makes the backend self-sufficient, covering nested/hand-written capsule cases.)
+fn heap_escaping_fns(program: &Program) -> BTreeSet<String> {
+    const HEAP_EXPORTS: &[&str] = &["jrt_deep_copy_heap", "jrt_arena_export_array"];
+    let mut esc: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for f in &program.functions {
+            if esc.contains(&f.name) {
+                continue;
+            }
+            let escapes = f.blocks.iter().flat_map(|b| &b.statements).any(|st| match st {
+                Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => HEAP_EXPORTS.contains(&func.as_str()) || esc.contains(func),
+                _ => false,
+            });
+            if escapes {
+                esc.insert(f.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    esc
+}
+
+fn arena_ctx_fns(program: &Program, heap_esc: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut dispatch: BTreeSet<&str> = BTreeSet::new();
+    for c in &program.classes {
+        for m in &c.methods {
+            dispatch.insert(m.mangled.as_str());
+        }
+    }
+    // A heap-escaping function is never arena-context (its result is heap, not arena).
+    for name in heap_esc {
+        dispatch.insert(name.as_str());
+    }
+    struct Site<'a> {
+        caller: &'a str,
+        in_arena: bool,
+        safe_args: bool,
+        is_self: bool,
+    }
+    let mut sites: BTreeMap<&str, Vec<Site>> = BTreeMap::new();
+    for f in &program.functions {
+        let depths = arena_block_depths(f);
+        for (bi, bb) in f.blocks.iter().enumerate() {
+            let mut depth = depths.get(bi).copied().flatten().unwrap_or(0);
+            for st in &bb.statements {
+                match st {
+                    Statement::CallPoly { targets, .. } => {
+                        for (_, sym) in targets {
+                            dispatch.insert(sym.as_str());
+                        }
+                    }
+                    Statement::Call { func, .. } if func == "jrt_arena_push" => depth += 1,
+                    Statement::Call { func, .. } if func == "jrt_arena_pop" => depth -= 1,
+                    Statement::Call { func, args, .. } | Statement::CallGuarded { func, args, .. } if !func.starts_with("jrt_") => {
+                        let safe_args = args.iter().all(|a| match a {
+                            Operand::Copy(l) => f.locals[l.0 as usize] != Ty::Ref, // ref arg unsafe
+                            _ => true,                                              // scalar / null
+                        });
+                        sites.entry(func.as_str()).or_default().push(Site {
+                            caller: f.name.as_str(),
+                            in_arena: depth > 0,
+                            safe_args,
+                            is_self: func == &f.name,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut ctx: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for f in &program.functions {
+            let name = f.name.as_str();
+            if ctx.contains(name) || dispatch.contains(name) {
+                continue;
+            }
+            let Some(ss) = sites.get(name) else { continue };
+            if !ss.iter().any(|s| !s.is_self) {
+                continue; // no non-self call site → no arena seed
+            }
+            let non_self_ok = ss.iter().filter(|s| !s.is_self).all(|s| s.safe_args && (s.in_arena || ctx.contains(s.caller)));
+            let self_ok = ss.iter().filter(|s| s.is_self).all(|s| s.safe_args);
+            if non_self_ok && self_ok {
+                ctx.insert(name.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ctx
+}
+
+fn immortal_only_locals(f: &Function, arena_ctx: bool, heap_esc: &BTreeSet<String>) -> BTreeSet<u32> {
     let n = f.locals.len();
     let n_params = f.params.len();
     // Objects allocated inside an auto-arena are immortal seeds (like StackNew); a user
     // call inside the arena yields immortal memory when its arguments are immortal/scalar.
-    let (arena_new, arena_call) = arena_immortal_dests(f);
+    // When the WHOLE function is arena-context, every New and every ref parameter is
+    // immortal (the body always runs in an arena).
+    let (mut arena_new, arena_call) = arena_immortal_dests(f);
+    if arena_ctx {
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                if let Statement::New { dest, .. } | Statement::NewArray { dest, .. } = st {
+                    arena_new.insert(dest.0);
+                }
+            }
+        }
+    }
     // Is a call argument safe (cannot introduce a non-arena ref into the result)?
     // A ref must be immortal; a scalar / immortal literal always is.
     let op_imm = |op: &Operand, imm: &[bool]| match op {
@@ -1483,7 +1630,11 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
         _ => true, // scalar constant — carries no reference
     };
     let mut imm = vec![false; n];
-    for l in n_params..n {
+    // In an arena-context function the ref PARAMETERS are immortal too (they were
+    // passed immortal from an in-arena caller); otherwise only locals start as
+    // immortal candidates (params are conservatively owned).
+    let start = if arena_ctx { 0 } else { n_params };
+    for l in start..n {
         if f.locals[l] == Ty::Ref {
             imm[l] = true;
         }
@@ -1518,7 +1669,9 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
                     // A user call inside the arena whose arguments are all immortal/scalar
                     // returns arena memory (the callee, vetted by the region check, only
                     // allocates into the active arena and never returns a non-arena arg).
-                    Statement::Call { dest: Some(d), args, .. } if arena_call.contains(&d.0) && args.iter().all(|a| op_imm(a, &imm)) => (Some(d.0), true),
+                    // In an arena-context function EVERY user call is in-arena. A
+                    // heap-escaping callee is excluded — its result is heap, not arena.
+                    Statement::Call { dest: Some(d), func, args } if !func.starts_with("jrt_") && !heap_esc.contains(func) && (arena_ctx || arena_call.contains(&d.0)) && args.iter().all(|a| op_imm(a, &imm)) => (Some(d.0), true),
                     Statement::Call { dest, .. }
                     | Statement::CallGuarded { dest, .. }
                     | Statement::CallVirtual { dest, .. }
@@ -2054,7 +2207,7 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
         .collect()
 }
 
-fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool, local_names: Option<&Vec<Option<String>>>) {
+fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool, local_names: Option<&Vec<Option<String>>>, arena_ctx: bool, heap_esc: &BTreeSet<String>) {
     let ps: Vec<String> = f
         .params
         .iter()
@@ -2163,7 +2316,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     }
     writeln!(w, "  br label %bb0").unwrap();
 
-    let imm = immortal_only_locals(f);
+    let imm = immortal_only_locals(f, arena_ctx, heap_esc);
     let empty_writes = BTreeSet::new();
     let sw = ctx.static_writes.get(&f.name).unwrap_or(&empty_writes);
     let empty_fw = (BTreeSet::new(), true); // unknown → conservative (no borrow)

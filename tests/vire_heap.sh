@@ -404,6 +404,28 @@ fn main() {
 }
 EOF
 
+# Interprocedural arena-RC-elision soundness: a builder `mk` is called BOTH outside any
+# arena (its result escapes to a long-lived heap object) AND inside an arena loop. The
+# arena-context analysis must NOT treat `mk` as always-in-arena (it has a non-arena call
+# site) — else the escaping heap object's RC would be elided → use-after-free / leak.
+# Correct value + 0 live proves `mk`'s heap path kept its reference counting.
+case_ builder_mixed_context 999900866 <<'EOF'
+type Node { id: Int  next: Node }
+fn mk(v: Int) -> Node { Node(v, null) }
+fn main() {
+    mut keep = mk(999)
+    mut sum = 0
+    mut t = 0
+    while t < 200000 {
+        mut h = mk(t)
+        sum = (sum + h.id) % 1000000007
+        t = t + 1
+    }
+    sum = (sum + keep.id) % 1000000007
+    print(sum)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"
