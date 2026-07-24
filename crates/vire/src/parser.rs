@@ -877,6 +877,12 @@ impl Parser {
                 self.bump();
                 let inner = if self.at(&Tok::LBrace) {
                     Expr::Block(self.parse_block())
+                } else if self.at_kw(Kw::For) {
+                    // `comptime for i in a..b { … }` — a comptime block wrapping the
+                    // for-loop, which the comptime pass UNROLLS into runtime statements
+                    // (the loop variable substituted by each literal). Bounded metaprog.
+                    let for_stmt = self.parse_stmt();
+                    Expr::Block(Block { stmts: vec![for_stmt], tail: None, span: sp })
                 } else {
                     self.parse_expr(1) // fold the entire following expression
                 };

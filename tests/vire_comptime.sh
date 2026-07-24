@@ -211,6 +211,32 @@ else
     echo "FAIL @when unknown platform rejected"; fail=$((fail+1))
 fi
 
+# `comptime for` — UNROLL the body once per compile-time index (loop var → literal),
+# emitting straight-line runtime statements. Range may come from a const.
+cat > "$work/cfor.vr" <<'EOF'
+const N = 4
+fn main() {
+    mut sum = 0
+    comptime for i in 0..N { sum = sum + i * i }   // 0+1+4+9 = 14
+    comptime for k in 1..=3 { print(k * 10) }      // 10, 20, 30
+    print(sum)
+}
+EOF
+check "comptime for unroll (const bound + inclusive range)" "10
+20
+30
+14" "$work/cfor.vr"
+
+# A `comptime for` over a non-constant range is a clear error (not a crash).
+cat > "$work/cfor_rt.vr" <<'EOF'
+fn main() { mut n = 3  comptime for i in 0..n { print(i) } }
+EOF
+if "$vire" run "$work/cfor_rt.vr" 2>&1 | grep -q 'not constant-foldable'; then
+    echo "ok   comptime for over runtime range rejected"; pass=$((pass+1))
+else
+    echo "FAIL comptime for runtime range"; fail=$((fail+1))
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

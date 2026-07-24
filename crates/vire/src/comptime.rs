@@ -492,6 +492,11 @@ impl Walker<'_> {
                 // runtime statements), rather than evaluating it to a scalar.
                 if let Expr::If { cond, then, elifs, els, .. } = inner.as_ref() {
                     fold_comptime_if(cond, then, elifs, els, &mut ip)
+                } else if let Some((pat, iter, body)) = as_comptime_for(inner.as_ref()) {
+                    // `comptime for` → unroll the body once per (comptime) index into a
+                    // block of runtime statements. Defers (unchanged) if the range isn't
+                    // a compile-time constant or is unreasonably large.
+                    fold_comptime_for(pat, iter, body, &mut ip, span)
                 } else if let Expr::Call { callee, args, .. } = inner.as_ref() {
                     // `comptime assert(cond[, "message"])` — a compile-time check: the
                     // condition is evaluated now; a false/zero result is a compile error.
@@ -643,6 +648,64 @@ impl Walker<'_> {
 /// bool, returning it as a block expression (the untaken branches are dropped and
 /// never lowered). `None` if the condition is not a compile-time constant → the
 /// node is left for lowering.
+/// Recognize the `comptime for` shape produced by the parser: a comptime block
+/// wrapping exactly one `for` statement.
+fn as_comptime_for(inner: &Expr) -> Option<(&Pattern, &Expr, &Block)> {
+    if let Expr::Block(b) = inner {
+        if b.tail.is_none() && b.stmts.len() == 1 {
+            if let Stmt::For { pat, iter, body, .. } = &b.stmts[0] {
+                return Some((pat, iter, body));
+            }
+        }
+    }
+    None
+}
+
+/// Unroll `comptime for VAR in a..b { BODY }` into one block containing BODY
+/// repeated for each index, with VAR substituted by its literal value. Returns
+/// `None` (defer) when the range is not a compile-time constant, the pattern is
+/// not a simple binding, or the trip count is unreasonable (a guard against a
+/// runaway unroll). Pure AST expansion — the result is type-checked like any code.
+fn fold_comptime_for(pat: &Pattern, iter: &Expr, body: &Block, ip: &mut Interp, span: Span) -> Option<Expr> {
+    let (start, end, incl) = if let Expr::Range { start, end, inclusive, .. } = iter {
+        (ip.eval(start)?, ip.eval(end)?, *inclusive)
+    } else {
+        return None;
+    };
+    let (s, e) = match (start, end) {
+        (CVal::Int(s), CVal::Int(e)) => (s, e),
+        _ => return None,
+    };
+    let last = if incl { e } else { e - 1 };
+    // Loop variable name (or `_` for a value-less unroll).
+    let var = match pat {
+        Pattern::Bind(n, _) => Some(n.clone()),
+        Pattern::Wildcard(_) => None,
+        _ => return None,
+    };
+    let count: i64 = if last >= s { last - s + 1 } else { 0 };
+    if !(0..=4096).contains(&count) {
+        return None; // too large / degenerate → leave for normal lowering
+    }
+    let mut stmts: Vec<Stmt> = Vec::new();
+    let mut i = s;
+    while i <= last {
+        let mut b = body.clone();
+        if let Some(v) = &var {
+            // Substitute the loop variable with its literal via the tested subst.
+            let mut pmap = std::collections::HashMap::new();
+            pmap.insert(v.clone(), lit(CVal::Int(i), span));
+            crate::expand::subst_block(&mut b, &pmap, &std::collections::HashMap::new(), &std::collections::HashMap::new());
+        }
+        stmts.extend(b.stmts);
+        if let Some(t) = b.tail {
+            stmts.push(Stmt::Expr(*t));
+        }
+        i += 1;
+    }
+    Some(Expr::Block(Block { stmts, tail: None, span }))
+}
+
 fn fold_comptime_if(
     cond: &Expr,
     then: &Block,
