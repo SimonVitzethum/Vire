@@ -708,6 +708,36 @@ impl Parser {
                 let body = self.parse_block();
                 Stmt::While { cond, body, span: sp }
             }
+            // `with log.span(k, v, …) { … }` — scoped logger context: every `log.*`
+            // inside the block prepends these fields. Compile-time only (the push/pop
+            // are markers the lowering consumes → zero runtime cost). Desugars to a
+            // block bracketed by `__log_span_push(args)` / `__log_span_pop()`.
+            Tok::Kw(Kw::With) => {
+                self.bump();
+                let head = self.parse_expr(0); // expects `log.span(args)`
+                let args = match &head {
+                    Expr::Call { callee, args, .. } if matches!(callee.as_ref(), Expr::Field { base, name, .. } if name == "span" && matches!(base.as_ref(), Expr::Ident(n, _) if n == "log")) => {
+                        args.clone()
+                    }
+                    _ => {
+                        self.err("`with` expects `with log.span(field, value, …) { … }`");
+                        vec![]
+                    }
+                };
+                let body = self.parse_block();
+                let call = |n: &str, a: Vec<Expr>| Expr::Call { callee: Box::new(Expr::Ident(n.into(), sp)), args: a, span: sp };
+                let mut stmts = vec![Stmt::Expr(call("__log_span_push", args))];
+                stmts.extend(body.stmts);
+                // The block's tail (its last expression) must run BEFORE the pop — the
+                // parser turns a trailing `log.*` into the block value; fold it in as a
+                // statement so the whole body is inside the span. The `with` is a
+                // statement, so the block value is discarded anyway.
+                if let Some(t) = body.tail {
+                    stmts.push(Stmt::Expr(*t));
+                }
+                stmts.push(Stmt::Expr(call("__log_span_pop", vec![])));
+                Stmt::Expr(Expr::Block(Block { stmts, tail: None, span: sp }))
+            }
             Tok::Kw(Kw::For) => {
                 self.bump();
                 let pat = self.parse_pattern();

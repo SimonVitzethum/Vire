@@ -356,8 +356,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   already done.
 
 ### [6] Logger — remaining
-- [ ] `with log.span(...)` (scoped context fields).
-- [ ] Sinks (colored console / JSON / file), chosen at build time.
+- [x] **`with log.span(field, value, …) { … }` — DONE (2026-07-24).** Scoped context:
+  every `log.*` inside the block prepends `[field=value …]`. Nests and unwinds. Compile-time
+  only — desugars to `__log_span_push`/`__log_span_pop` markers the lowering consumes into a
+  field stack (zero runtime cost, like disabled levels). Test: vire_log.sh `with log.span`.
+- [x] **Colored console sink — DONE (2026-07-24).** `--log-color` (`FASTLLVM_LOG_COLOR`) wraps
+  the `[LEVEL]` tag in an ANSI colour by severity (error=red/warn=yellow/info=green/debug=dim);
+  opt-in, plain otherwise. Test: vire_log.sh `--log-color`.
+- [ ] JSON + file sinks (need message restructuring / a runtime file handle) — follow-up.
 
 ### [7] Go-style error handling — remaining
 - [x] **`.wrap(msg)` + `.error()` — DONE (2026-07-24).** `result.wrap(msg)` on an `Err` prepends

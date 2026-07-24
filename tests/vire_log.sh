@@ -50,6 +50,39 @@ else
     echo "FAIL placeholder/arg mismatch rejected"; fail=$((fail+1))
 fi
 
+# `with log.span(k, v, …)` — scoped context prepended to every log inside; nests
+# and unwinds (compile-time only, zero runtime cost).
+cat > "$work/span.vr" <<'EOF'
+fn main() {
+    mut rid = 7
+    log.info("start")
+    with log.span("req", rid) {
+        log.info("a")
+        with log.span("user", "ann") { log.warn("slow {}ms", 12) }
+        log.info("b")
+    }
+    log.info("end")
+}
+EOF
+check "with log.span (nested context, unwinds)" "[INFO] start
+[INFO] [req=7] a
+[WARN] [req=7 user=ann] slow 12ms
+[INFO] [req=7] b
+[INFO] end" "$work/span.vr"
+
+# `--log-color` sink: the level tag is wrapped in an ANSI colour (opt-in; plain
+# otherwise). Check the escape appears (and NOT without the flag).
+if "$vire" run --log-color "$work/span.vr" 2>/dev/null | grep -q "$(printf '\033')\[32m\[INFO\]"; then
+    echo "ok   --log-color emits ANSI level colour"; pass=$((pass+1))
+else
+    echo "FAIL --log-color ANSI"; fail=$((fail+1))
+fi
+if "$vire" run "$work/span.vr" 2>/dev/null | grep -q "$(printf '\033')"; then
+    echo "FAIL plain output contains ANSI"; fail=$((fail+1))
+else
+    echo "ok   default output stays plain"; pass=$((pass+1))
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

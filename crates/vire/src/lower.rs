@@ -1004,6 +1004,10 @@ struct FnLower<'a> {
     last_dbg_line: u32,
     /// Mangled name of the function being lowered (the innermost DebugLine frame).
     fn_name: String,
+    /// Active `with log.span(…)` context: a compile-time stack of field-lists.
+    /// Every `log.*` inside prepends the flattened fields; push/pop are markers
+    /// consumed at lowering, so a span costs nothing at runtime.
+    log_span: Vec<Vec<Expr>>,
 }
 
 impl<'a> FnLower<'a> {
@@ -1156,6 +1160,34 @@ impl<'a> FnLower<'a> {
     /// disabled-call = zero-cost property is preserved). A placeholder/arg count mismatch
     /// is a compile error. A non-literal message is printed as-is (no tag). Returns `None`
     /// on error (a diagnostic was pushed).
+    /// Compile-time prefix for the active `with log.span(…)` context, e.g.
+    /// `[req=<id> user=<name>] `. `None` when no span is active. Field keys that
+    /// are string literals print bare; values go through `str(…)`.
+    fn span_prefix(&self, sp: crate::diag::Span) -> Option<Expr> {
+        use crate::ast::BinOp;
+        let fields: Vec<&Expr> = self.log_span.iter().flatten().collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let add = |lhs: Expr, rhs: Expr| Expr::Binary { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs), span: sp };
+        let str_of = |e: &Expr| Expr::Call { callee: Box::new(Expr::Ident("str".into(), sp)), args: vec![e.clone()], span: sp };
+        let mut e = Expr::Str("[".into(), sp);
+        let mut i = 0;
+        while i < fields.len() {
+            if i > 0 {
+                e = add(e, Expr::Str(" ".into(), sp));
+            }
+            let key = if let Expr::Str(k, _) = fields[i] { Expr::Str(k.clone(), sp) } else { str_of(fields[i]) };
+            e = add(e, key);
+            if i + 1 < fields.len() {
+                e = add(e, Expr::Str("=".into(), sp));
+                e = add(e, str_of(fields[i + 1]));
+            }
+            i += 2;
+        }
+        Some(add(e, Expr::Str("] ".into(), sp)))
+    }
+
     fn build_log_message(&mut self, level: &str, tag: &str, msg: &Expr, extra: &[Expr], span: crate::diag::Span) -> Option<Expr> {
         use crate::ast::BinOp;
         let Expr::Str(s, sp) = msg else {
@@ -1166,12 +1198,27 @@ impl<'a> FnLower<'a> {
             }
             return Some(msg.clone());
         };
+        let add = |lhs: Expr, rhs: Expr| Expr::Binary { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs), span: *sp };
+        let prefix = self.span_prefix(*sp);
+        // Console sink: color the level tag when the build opted in (`--log-color`).
+        let ctag = colorize_tag(level, tag);
+        // `[LEVEL] ` + the span context (if any) + `rest`.
+        let head = |rest: Expr| -> Expr {
+            match &prefix {
+                Some(pfx) => add(add(Expr::Str(ctag.clone(), *sp), pfx.clone()), rest),
+                None => add(Expr::Str(ctag.clone(), *sp), rest),
+            }
+        };
         if !s.contains("{}") {
             if !extra.is_empty() {
                 self.errs.push(format!("log.{level}: {} extra argument(s) but no `{{}}` in the message", extra.len()));
                 return None;
             }
-            return Some(Expr::Str(format!("{tag}{s}"), *sp));
+            // No span → keep the compile-time-concatenated literal (zero runtime cost).
+            if prefix.is_none() {
+                return Some(Expr::Str(format!("{ctag}{s}"), *sp));
+            }
+            return Some(head(Expr::Str(s.clone(), *sp)));
         }
         let segs: Vec<&str> = s.split("{}").collect();
         let nph = segs.len() - 1;
@@ -1179,9 +1226,8 @@ impl<'a> FnLower<'a> {
             self.errs.push(format!("log.{level}: {nph} `{{}}` placeholder(s) but {} argument(s)", extra.len()));
             return None;
         }
-        // tag+seg0 + str(a0) + seg1 + str(a1) + … (drop empty trailing segments).
-        let mut e = Expr::Str(format!("{tag}{}", segs[0]), *sp);
-        let add = |lhs: Expr, rhs: Expr| Expr::Binary { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs), span: *sp };
+        // tag [+ span prefix] + seg0 + str(a0) + seg1 + str(a1) + …
+        let mut e = head(Expr::Str(segs[0].to_string(), *sp));
         for (i, a) in extra.iter().enumerate() {
             let stra = Expr::Call { callee: Box::new(Expr::Ident("str".into(), *sp)), args: vec![a.clone()], span: *sp };
             e = add(e, stra);
@@ -2702,6 +2748,19 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_call(&mut self, callee: &Expr, args: &[Expr]) -> (Operand, Ty) {
+        // `with log.span(…)` markers (compile-time only): push/pop the active
+        // context field-list. They emit no code — the fields are read when a
+        // `log.*` inside the span builds its message.
+        if let Expr::Ident(n, _) = callee {
+            if n == "__log_span_push" {
+                self.log_span.push(args.to_vec());
+                return (Operand::ConstI64(0), Ty::Void);
+            }
+            if n == "__log_span_pop" {
+                self.log_span.pop();
+                return (Operand::ConstI64(0), Ty::Void);
+            }
+        }
         // Method call `obj.method(args)` → direct call `Class.method(obj, args)`
         // (monomorphic, no virtual dispatch — Vire types are (still) flat).
         if let Expr::Field { base, name, span } = callee {
@@ -4442,6 +4501,7 @@ fn lower_fn(
         line_starts,
         last_dbg_line: 0,
         fn_name: name.clone(),
+        log_span: Vec::new(),
     };
     // Block 0
     fl.new_block();
@@ -4761,6 +4821,23 @@ fn log_threshold() -> i32 {
         Some("off") | Some("none") => 4,
         _ => 1,
     }
+}
+
+/// Console sink: colour the `[LEVEL] ` tag by severity when `--log-color`
+/// (`FASTLLVM_LOG_COLOR`) is set — otherwise the tag is returned unchanged, so
+/// the default output stays plain. ANSI: error=red, warn=yellow, info=green,
+/// debug=dim. The trailing space stays outside the reset so alignment holds.
+fn colorize_tag(level: &str, tag: &str) -> String {
+    if std::env::var_os("FASTLLVM_LOG_COLOR").is_none() {
+        return tag.to_string();
+    }
+    let code = match level {
+        "error" => "31",
+        "warn" => "33",
+        "info" => "32",
+        _ => "90",
+    };
+    format!("\x1b[{code}m{}\x1b[0m ", tag.trim_end())
 }
 
 /// Element-type name in an array parameter (`Array[Int]`) → array element kind.

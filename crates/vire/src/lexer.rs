@@ -35,7 +35,7 @@ pub enum Tok {
 pub enum Kw {
     Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Unsafe, Macro, Comptime,
     Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn, Capsule,
-    And, Or, Not, As, True, False, SelfLower, SelfType, Native,
+    And, Or, Not, As, True, False, SelfLower, SelfType, Native, With,
 }
 
 /// Canonical default spelling of each keyword. Single source of truth —
@@ -50,7 +50,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
         ("else", Else), ("while", While), ("for", For), ("in", In),
         ("break", Break), ("continue", Continue), ("return", Return),
         ("spawn", Spawn), ("capsule", Capsule), ("native", Native),
-        ("and", And), ("or", Or), ("not", Not), ("as", As),
+        ("and", And), ("or", Or), ("not", Not), ("as", As), ("with", With),
         ("true", True), ("false", False), ("self", SelfLower), ("Self", SelfType),
     ]
 };

@@ -887,6 +887,9 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
+            // Build-time console sink: color the level tag by severity (ANSI).
+            // Opt-in; without it the output is plain (a JSON/file sink is future work).
+            "--log-color" => std::env::set_var("FASTLLVM_LOG_COLOR", "1"),
             "-O0" => opt0 = true,
             // MEASUREMENT: cycle collector forced OFF (even for cyclic types).
             // Unsound (leaks cycles), but isolates the collector cost against the
