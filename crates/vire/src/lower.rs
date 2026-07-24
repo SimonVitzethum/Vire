@@ -353,6 +353,16 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         variant_owner_g.entry("Some".into()).or_insert("Option".into());
         variant_owner_g.entry("None".into()).or_insert("Option".into());
     }
+    // NOTE (§7 two-parameter typed Result): registering Result[T, E] in
+    // generic_stypes (like Option[T]) monomorphizes it — but the ERASED `Result`
+    // (i64 Ok_value/Err_error, used by the ?/.wrap/.error machinery) and the
+    // monomorphized `Result$T$E` then coexist and get mixed at construction vs.
+    // match sites. They only agree when every payload is i64 (Result[Int,Int]
+    // works); with a Ref payload the layouts diverge and a Ref field can be read
+    // as i64 (or vice versa) → memory-unsafe under RC. Making this sound needs a
+    // coordinated pass (unify the erased/mono representation, teach ?/.wrap/.error
+    // the mono class, then gate on the 0-live heap oracle). Deliberately NOT a
+    // one-line registration — left erased for now (use `.error()` for the message).
     // TRAIT OBJECTS (dynamic dispatch): traits are registered as interfaces,
     // `impl Trait for Typ` adds the methods into the type vtable at
     // consistent global slots (the backend's existing interface/CallVirtual

@@ -365,6 +365,13 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   (`generic_stypes`, `class_of_ann`) to two type args (`Result$T$E`) + infer the unconstrained arg.
   Soundness-sensitive (payload layout) — do NOT rush; gate on the heap oracle. Then `Err(e)` binds
   a typed `e`, typed sum-type errors + attached debug path follow.
+  - **Attempted 2026-07-24, reverted (finding).** Registering Result in `generic_stypes` [T,E]
+    monomorphizes it and `match Err(e)` binds typed — BUT the erased `Result` (i64 payloads, used
+    by `?`/`.wrap`/`.error`) and `Result$T$E` then coexist and are mixed at construct-vs-match
+    sites. They agree ONLY when every payload is i64 (`Result[Int,Int]` works); with a Ref payload
+    (`Result[Str,_]`) the layouts diverge → a Ref field read as i64 (or vice versa) → memory-unsafe
+    under RC, and it regressed `vire_errors.sh`. The real fix must unify the erased/mono
+    representation and teach `?`/`.wrap`/`.error` the mono class before gating on the heap oracle.
 
 ### [8] Debug symbols + crash paths — remaining
 - [ ] freestanding: compact symbol table instead of libc `backtrace`; map the entry
