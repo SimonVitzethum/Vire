@@ -1354,7 +1354,7 @@ impl<'a> FnLower<'a> {
             || self.variants.contains_key(n)
             || self.generic_ptypes.contains_key(n)
             || self.variant_owner_g.contains_key(n)
-            || matches!(n, "list" | "map" | "set" | "array" | "farray" | "barray" | "str_from" | "find_byte" | "peek_u8")
+            || matches!(n, "list" | "map" | "set" | "array" | "farray" | "barray" | "str_from" | "find_byte" | "peek_u8" | "find_byte_ptr" | "str_from_ptr")
     }
 
     /// AUTOMATIC LOOP ARENA (escape→arena). A `while` iteration whose
@@ -3709,6 +3709,30 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "jrt_peek_u8".into(), args: vec![p, i] });
             return (Operand::Copy(d), Ty::I64);
+        }
+        // `find_byte_ptr(ptr, from, len, byte)` — SIMD memchr over a RAW region (an mmap Ptr from
+        // C), zero-copy, no barray. Same as find_byte but the caller owns the pointer's validity
+        // (UNSAFE FFI, like peek_u8). Closes the last I/O gap to ripgrep: scan the mapped file
+        // bytes in place instead of copying the file into a byte array first.
+        if name == "find_byte_ptr" && args.len() == 4 {
+            let p = self.lower_expr(&args[0]).0;
+            let f0 = self.lower_expr(&args[1]).0; let from = self.to_i32(f0);
+            let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
+            let b0 = self.lower_expr(&args[3]).0; let byte = self.to_i32(b0);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_find_byte_ptr".into(), args: vec![p, from, len, byte] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // `str_from_ptr(ptr, start, len)` — a Str from `len` raw bytes at `ptr + start` (emit a
+        // matched line straight out of the mmap, no copy). UNSAFE FFI, like peek_u8.
+        if name == "str_from_ptr" && args.len() == 3 {
+            let p = self.lower_expr(&args[0]).0;
+            let s0 = self.lower_expr(&args[1]).0; let start = self.to_i32(s0);
+            let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "Str".into());
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_str_from_ptr".into(), args: vec![p, start, len] });
+            return (Operand::Copy(d), Ty::Ref);
         }
         // Collection builtins: `list()` (growing list), `map()` (Int→Int),
         // `set()` (Int hash set).

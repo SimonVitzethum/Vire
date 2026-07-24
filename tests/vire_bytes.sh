@@ -117,6 +117,29 @@ EOF
 check "peek_u8 raw Ptr load" "65
 67" "$work/peek.vr"
 
+# --- find_byte_ptr / str_from_ptr: SIMD scan + slice over a RAW Ptr (mmap model,
+# zero-copy) instead of a barray. UNSAFE FFI like peek_u8; the range args clamp so
+# from>=len → -1 and negative start/len can't OOB-read. ---------------------------
+cat > "$work/ptrscan.vr" <<'EOF'
+fn main() {
+    mut p = cstr("hello world")
+    print(find_byte_ptr(p, 0, 11, 119))   // 6   'w'
+    print(find_byte_ptr(p, 5, 11, 111))   // 7   from-offset skips first 'o'
+    print(find_byte_ptr(p, 0, 11, 122))   // -1  absent
+    print(find_byte_ptr(p, 20, 11, 104))  // -1  from past len (sound)
+    print(str_from_ptr(p, 6, 5))          // world
+    print(str_from_ptr(p, 0, 0).len())    // 0   empty slice
+    print(str_from_ptr(p, 0 - 3, 5))      // hello  (negative start clamped to 0)
+}
+EOF
+check "find_byte_ptr + str_from_ptr (raw Ptr, clamped)" "6
+7
+-1
+-1
+world
+0
+hello" "$work/ptrscan.vr"
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

@@ -922,6 +922,29 @@ int64_t jrt_peek_u8(int64_t ptr, int64_t i) {
     return (int64_t)((const uint8_t *)(intptr_t)ptr)[i];
 }
 
+/* `find_byte_ptr(ptr, from, len, byte)` — like find_byte, but SIMD-memchr over a RAW memory
+ * region of `len` bytes (an mmap pointer from C) instead of a bounds-checked barray. Zero-copy:
+ * Vire scans the mapped file bytes directly, same I/O model as ripgrep. Returns the index of the
+ * first `byte` at/after `from`, or -1. `from`/`len` are clamped so the memchr span stays inside
+ * [from, len); the caller owns the pointer's validity (UNSAFE FFI, like peek_u8). */
+int64_t jrt_find_byte_ptr(int64_t ptr, int32_t from, int32_t len, int32_t byte) {
+    if (len < 0) len = 0;
+    if (from < 0) from = 0;
+    if (from >= len) return -1;
+    const uint8_t *base = (const uint8_t *)(intptr_t)ptr;
+    const uint8_t *p = (const uint8_t *)memchr(base + from, byte & 0xFF, (size_t)(len - from));
+    return p ? (int64_t)(p - base) : -1;
+}
+
+/* `str_from_ptr(ptr, start, len)` — a Str from `len` raw bytes at `ptr + start` (e.g. a matched
+ * line straight out of the mmap, no barray copy). start/len clamped to non-negative; there is no
+ * upper bound to clamp against (raw region), so the caller owns validity (UNSAFE FFI). */
+JStr *jrt_str_from_ptr(int64_t ptr, int32_t start, int32_t len) {
+    if (start < 0) start = 0;
+    if (len < 0) len = 0;
+    return str_from_buf((const char *)(intptr_t)ptr + start, len);
+}
+
 /* Reinterpret an i64-erased Result payload slot as a Str (`result.error()`): the slot holds a
  * JStr* for string-message errors. 0 (a zeroed/absent payload) → the empty string, so calling
  * .error() on an Ok is safe. Scoped to string errors — typed sum-type errors use match. */
