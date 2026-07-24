@@ -651,6 +651,39 @@ Staged (each stage runnable):
 - [ ] **V5 — Vire optimizations.** Compile-time pipeline/descriptor baking, shader
   monomorphization per material, whole-program resource-lifetime + dead-resource
   elimination, zero-cost validation gating.
+- [~] **V6 — temporal upscaling (FSR2 / DLSS) — INPUTS + CONTEXT DONE, SDK + present loop
+  OPEN (2026-07-24).** The compiler/runtime now auto-provide every temporal-upscaler input,
+  each CPU-verified + validation-clean (`tests/vire_vulkan.sh`, 53/0):
+  - *GPU query/select DONE:* `vk_gpu_count/list/select` — `ctx_init` honours a chosen device
+    (scans for a graphics queue). `vk_gpu_select(1)` renders on the **RTX 5070** with no crash
+    (the old GLSL.std.450 crash was invalid SPIR-V; our shaders are validation-clean now). This
+    is the P0 prerequisite for DLSS/Streamline (NVIDIA-only).
+  - *Auto motion vectors DONE (the crown jewel):* `compile_vertex_mv` evaluates the @vertex
+    transform TWICE (current vs previous-frame uniform, `uniform_member` selects push-constant
+    member 0/1) and writes `ndc_cur − ndc_prev` to an **R16G16F** motion target — the exact
+    velocity FSR2/DLSS consume, derivable only because a single-source compiler sees the
+    transform. `vk_motion` (verified: 0.1 x-translation → mx=1000 exact).
+  - *Jitter DONE:* `vk_jitter(i)` = runtime Halton(2,3) service; the MV vertex adds it to
+    gl_Position (colour only, push member 2). Motion is computed from UN-jittered clip →
+    verified invariant under jitter.
+  - *Sampleable depth / full bundle DONE:* one render (`render_bundle`) emits colour + R16G16F
+    motion + **D32 depth** (SAMPLED+TRANSFER_SRC); `vk_depth` reads it (z=0.5→500000 exact).
+  - *Upscaler context DONE:* `vk_render_res(n)`/`vk_display_res(m)` split + `vk_upscale`
+    (render low-res, bilinear upscale to high-res, persistent temporal-history EMA). Reference
+    bilinear+EMA on host (simple/verifiable); GPU render real.
+  - **OPEN (the actual upscaler + real-time path):**
+    - [ ] **Vendor the FFX FSR2 SDK** (`ffx_fsr2` + its shaders) and feed the existing bundle
+      (colour+motion+depth+jitter, render→display res) into `ffxFsr2ContextDispatch` — replaces
+      the reference bilinear+EMA with real motion-guided reconstruction. Vendor-agnostic, runs
+      on either GPU; do this FIRST (no P0 needed).
+    - [ ] **General present loop (P2)** — `vk_window` presents only the built-in triangle and
+      has a swapchain-semaphore reuse hazard (found by the validation sweep). Generalise to
+      present arbitrary Vire geometry at render-res → upscale → display-res, per-frame; fix the
+      per-frame-semaphore ring (analogous to the fcache ring). Needed for a real-time budget
+      (the only regime where upscaling pays).
+    - [ ] **DLSS / NVIDIA Streamline backend** — same inputs, swap the backend; needs graphics
+      on the 5070 (P0, done) + the NGX/Streamline Vulkan plumbing (proprietary blob; Linux
+      native-Vulkan maturity to be VERIFIED, not assumed). After FSR2, since inputs are identical.
 
 ---
 
