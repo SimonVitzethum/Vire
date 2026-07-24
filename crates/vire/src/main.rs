@@ -1107,20 +1107,24 @@ fn build_or_run(args: &[String]) {
     }
 
     // Solver + optimization passes — identical to the Java driver.
-    let mut s = fastllvm_solver::run(&mut program);
-    let _ = fastllvm_solver::elide_redundant_ref_copies(&mut program);
-    let _ = fastllvm_solver::fuse_long_compares(&mut program);
+    let _tdbg = std::env::var_os("FASTLLVM_TIME_PASSES").is_some();
+    macro_rules! timed { ($name:expr, $e:expr) => {{
+        if _tdbg { let __t = std::time::Instant::now(); let __r = $e; eprintln!("[time] {:<28} {:>7.1} ms", $name, __t.elapsed().as_secs_f64()*1000.0); __r }
+        else { $e } }} }
+    let mut s = timed!("solver::run", fastllvm_solver::run(&mut program));
+    let _ = timed!("elide_redundant_ref_copies", fastllvm_solver::elide_redundant_ref_copies(&mut program));
+    let _ = timed!("fuse_long_compares", fastllvm_solver::fuse_long_compares(&mut program));
     // Constant-propagate entry-block scalar constants first: a divisor that was a
     // `mut n = <const>` local becomes a literal → native srem/magic-multiply
     // instead of a jrt_lrem call, and constant sizes/bounds help the passes below.
-    let _ = fastllvm_solver::propagate_const_scalars(&mut program);
-    let _ = fastllvm_solver::elide_bounds(&mut program);
-    let _ = fastllvm_solver::elide_pending_checks(&mut program);
-    s.inlined_calls = fastllvm_solver::inline_program(&mut program);
-    s.stack_allocated = fastllvm_solver::stack_allocate(&mut program);
+    let _ = timed!("propagate_const_scalars", fastllvm_solver::propagate_const_scalars(&mut program));
+    let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
+    let _ = timed!("elide_pending_checks", fastllvm_solver::elide_pending_checks(&mut program));
+    s.inlined_calls = timed!("inline_program", fastllvm_solver::inline_program(&mut program));
+    s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
     // provably fit in i32 to 4 bytes (RAM). Sound (widening).
-    let _narrowed = fastllvm_solver::narrow_fields(&mut program);
+    let _narrowed = timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program));
     let acyclic = s.acyclic;
 
     if emit_ir {
@@ -1136,9 +1140,9 @@ fn build_or_run(args: &[String]) {
         let p = std::path::Path::new(&path);
         let fname = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
         let dir = p.parent().and_then(|d| d.canonicalize().ok()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-        fastllvm_backend::emit_debug(&program, Some((&fname, &dir)))
+        timed!("backend::emit_debug", fastllvm_backend::emit_debug(&program, Some((&fname, &dir))))
     } else {
-        fastllvm_backend::emit(&program)
+        timed!("backend::emit", fastllvm_backend::emit(&program))
     };
     // Debug builds compile at -O0 (no LTO/inlining) so the line info stays precise
     // and partial !dbg is accepted.
