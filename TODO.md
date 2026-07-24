@@ -57,6 +57,33 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Tier 1 — the structural ~2× lever (highest ceiling)
 
+- [ ] **Elide RC on provably-arena refs → win sharedgraph (planned, measurement-grounded
+  2026-07-24).** After region inference the sharedgraph arena fires but Vire is still
+  ~2.4× Rust (352 vs ~128 ms). Diagnosed to the mechanism, not guessed:
+  - All sharedgraph objects are arena-immortal (rc=-1); `HEAPSTATS` shows 0 heap objects.
+  - Yet the emitted LLVM still calls `jrt_retain`/`jrt_release` at **89 sites** in the hot
+    loops (chain build + mutation walk). On immortal objects each call early-returns
+    (`if (refcount < 0) return`) — a pure no-op — but the call+check traffic runs millions
+    of times. The codegen is byte-identical between the normal and `--no-rc` builds; only
+    the runtime `.o` differs, so the cost IS those call bodies.
+  - Bisection (arena fires in all): normal 352 ms, `--no-cycles` 154 ms, `--no-rc` **70 ms**
+    (RC calls ≈84 ms, collector ≈198 ms). `--no-rc` = **0.55× Rust** (70 vs 128) — a clear
+    win. So eliding the RC ops on arena refs at compile time is the whole lever.
+  - **The fix:** the solver/lowering already proves which allocations are arena-local (the
+    `while_arena_safe` freshness analysis + the `jrt_arena_push` it inserts). Propagate an
+    "immortal/arena" bit to the backend so the RC-emission sites in `crates/backend/src/lib.rs`
+    (PutField retain-new/release-old ~2506-2537, local drops ~897/1063/2164) skip refs
+    proven arena-fresh. Reuse `expr_is_fresh`/`region_fresh_locals` (or mark `StackNew`-style
+    arena allocs in the IR). Sound: arena objects are immortal, RC is a definitional no-op,
+    so not emitting the call is behaviour-preserving.
+  - **Target:** 352 → ~70 ms (0.55× Rust), 0 heap, 0 collector. Gate: Java 0-live oracle +
+    GUARD_FREE + fuzzer + the sharedgraph value/heap check. Soundness-critical only in that
+    a wrong "arena" verdict would drop a real RC (leak/UAF) — but the arena verdict is
+    already trusted (it drives `arena_push`), so this rides on the same proof.
+  - Residual after: Vire's bare alloc+compute (`--no-rc`, 70 ms) is already 2× *faster* than
+    Rust's `Rc<RefCell>` (128 ms) — no bare-alloc gap remains (an earlier "1.9× ceiling"
+    reading was pre-lazy-region noise). This lever alone wins the class.
+
 - [x] **Automatic region/arena inference for short-lived heap graphs — ref-mutation
   case DONE (2026-07).** The loop-arena already captured recursive build/use/drop; the
   gap was ref-storing field mutation `obj.f = ref` (topology mutation, cycles). Now
