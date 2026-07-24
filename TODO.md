@@ -132,10 +132,22 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   in registers and the body uses `vfmadd` with no visible redundant reloads. The
   scoped-noalias work is not warranted — there is no reload pathology left to remove.
   (Note kept: inlining `advance` makes it *worse*, 7.5× — do not.)
-- [ ] **(M0.3-iv) Field-/interprocedural bounds elision** for `out[k]` (length of a
-  field array). Extends the mature `crates/solver/src/bounds.rs`. **Soundness risk
-  ~zero** — elision only removes a check when provably safe; a real OOB still throws.
-  Closes residual toward ~1.1×.
+- [ ] **(M0.3-iv) Field-array bounds elision** — exact gap located (2026-07-24), sound
+  fix scoped, NOT built (unexercised + disproportionate). `bounds.rs` GVN gives every
+  `GetField` a fresh per-site `Opaque` sym, so `x.arr.len()` in a loop guard and
+  `x.arr[i]` in the body get DIFFERENT syms → the length relation is lost → the field
+  access stays `checked: true`. (Param/local arrays with a HOISTED length already elide:
+  `n = d.len(); while i < n { d[i] }` → `checked: false`; only the field case is open.)
+  The sound fix: value-number `GetField(base, field)` as a shared `Field(base, field)`
+  sym, but ONLY for stable fields (never `PutField`'d, no calls) off an unreassigned
+  parameter — AND the base must be the canonical (post-collapse) sym, which forces a
+  shared field-name interner + `field_vn`/`unreassigned` to be threaded through all four
+  transfer points (`transfer_block`, `step_env`, `find_cmp`, the elision applier), since
+  the loop-header Phi collapse happens after the GVN fixpoint. **Attempted and reverted:**
+  the threading through a soundness-critical GVN (a wrong sym-merge = elided check = OOB)
+  is not warranted while NO benchmark indexes a field array in a hot loop (Vire code
+  passes arrays + length as separate params; the object-graph work uses scalar/ref
+  fields). Revisit when a field-array-heavy workload appears.
 - [x] **graph WON — was 1.61× Rust, now 1.12× (compute at parity) (2026-07).** The
   cause was neither RC, nor object layout, nor bounds checks (all ruled out causally:
   `FASTLLVM_NO_BOUNDS` closed <7%; Vire emits 2 throw sites vs Rust's 32). Isolating
@@ -155,11 +167,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Tier 3 — enablers with broad latent effect
 
-- [ ] **(M0.3-v) Overflow default + `+%` culture.** Checked-overflow currently blocks
-  vectorization of integer reductions; an explicit wrapping `+%` operator lets hot
-  loops vectorize — **opt-in, checked stays the default** (safe). Broad latent gain
-  for integer-array code. (Pairs with the overflow-in-release item under
-  Cross-cutting.)
+- [x] **`+%` / integer vectorization — ALREADY DONE (stale premise, verified 2026-07-24).**
+  The item assumed checked-overflow blocks vectorization. Vire has **no** checked
+  overflow: integer `add`/`sub`/`mul` already emit plain LLVM (no nsw/nuw) and wrap
+  (see the runtime.c note "addition etc. wrap"). The `+%`/`-%`/`*%` operators already
+  exist end-to-end (lexer `PlusPct`/`MinusPct`/`StarPct` → parser `AddWrap`/… → lower
+  `IB::Add`/… — identical to `+`); `x +% 1` on i64::MAX wraps to MIN. And integer
+  reductions **already auto-vectorize** (a contiguous i64 sum loop emits 35 `vpaddq`).
+  Nothing to build.
 - [ ] **Explicit SIMD intrinsic path** for reductions LLVM won't auto-vectorize
   (e.g. vectorized argmin — kmeans nearest-centroid is 0.55× Rust / **1.28× C++**;
   no compiler emits SIMD for the branchy argmin). Emit `@llvm.vector.reduce.*` /
