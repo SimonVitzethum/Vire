@@ -312,7 +312,12 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 ## Features 1–8 (open parts only)
 
 ### [1] Multithreading, safe by construction
-- [ ] `Mutex.lock(closure)` (scoped-guard form); `parallel_map`; typed `Channel[T]`
+- [x] **`parallel_map(n, shared, worker)` — DONE (2026-07-24).** Returns `Array[Int]` of
+  `out[i] = worker(i, shared)`; workers write disjoint indices (no data race), `shared` must be
+  a Sync type (same Send check as parallel_for). Runtime `jrt_parallel_map` (threads + sequential),
+  glue in spawn.rs desugars to `{ let r = array(n); shim(n, shared, r); r }`. Thread-safe against
+  the slab allocator (workers allocate too). Test: vire_threads.sh `parallel_map` (x30).
+- [ ] `Mutex.lock(closure)` (scoped-guard form); typed `Channel[T]`
   for ref payloads (currently Int values).
 - [ ] (M0.1c) measure real multithread atomic contention.
 

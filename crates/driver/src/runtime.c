@@ -1847,6 +1847,36 @@ void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
     free(args);
     free(tids);
 }
+/* parallel_map(n, shared, worker, out): like parallel_for, but store each
+ * worker's result — out[i] = worker(i, shared). Workers write DISJOINT indices,
+ * so there is no data race on `out` (and `shared` is a Sync object). `out` is the
+ * element pointer of a pre-allocated n-element i64 array (jrt_array_data). */
+typedef struct {
+    int64_t i;
+    void *shared;
+    int64_t (*fn)(int64_t, void *);
+    int64_t *out;
+} PMapArg;
+static void *pmap_tramp(void *p) {
+    PMapArg *a = (PMapArg *)p;
+    a->out[a->i] = a->fn(a->i, a->shared);
+    return NULL;
+}
+void jrt_parallel_map(int64_t n, void *shared, int64_t (*fn)(int64_t, void *), int64_t *out) {
+    if (n <= 0) return;
+    pthread_t *tids = (pthread_t *)malloc((size_t)n * sizeof(pthread_t));
+    PMapArg *args = (PMapArg *)malloc((size_t)n * sizeof(PMapArg));
+    for (int64_t i = 0; i < n; i++) {
+        args[i].i = i;
+        args[i].shared = shared;
+        args[i].fn = fn;
+        args[i].out = out;
+        pthread_create(&tids[i], NULL, pmap_tramp, &args[i]);
+    }
+    for (int64_t i = 0; i < n; i++) pthread_join(tids[i], NULL);
+    free(args);
+    free(tids);
+}
 /* Channel[Int]: a thread-safe FIFO queue of i64 values (mutex + condvar).
  * send enqueues + signals; recv blocks until an item is available. The safe
  * message-passing primitive between spawned workers. */
@@ -1933,6 +1963,10 @@ void jrt_mutex_set(void *p, int64_t v) { ((VMutex *)p)->val = v; }
 void jrt_parallel_for(int64_t n, void *shared, int64_t (*fn)(int64_t, void *)) {
     /* No threads: run the iterations sequentially (a valid schedule). */
     for (int64_t i = 0; i < n; i++) fn(i, shared);
+}
+void jrt_parallel_map(int64_t n, void *shared, int64_t (*fn)(int64_t, void *), int64_t *out) {
+    /* No threads: sequential is a valid schedule; store each result. */
+    for (int64_t i = 0; i < n; i++) out[i] = fn(i, shared);
 }
 /* No threads: a plain FIFO queue; recv on an empty channel returns 0 (a
  * single-threaded program sends before it receives). */

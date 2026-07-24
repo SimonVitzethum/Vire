@@ -146,6 +146,34 @@ fn main() {
 }
 EOF
 
+# parallel_map: out[i] = worker(i, shared), collected into an Array[Int]. Workers
+# write DISJOINT indices (no data race) and also allocate (str_from) → exercises the
+# thread-safe slab too. x30: a race would crash or return a wrong sum.
+ok_case parallel_map 9485 30 <<'EOF'
+fn work(i: Int, c: Atomic) -> Int {
+    mut b = barray(8)
+    b[0] = i
+    mut s = str_from(b, 0, 1)      // allocate in the worker
+    c.fetch_add(s.len())
+    (i + 1) * (i + 1)              // 1,4,9,… stored at out[i]
+}
+fn main() {
+    mut c = Atomic(0)
+    mut r = parallel_map(30, c, work)
+    mut sum = 0
+    mut i = 0
+    while i < 30 { sum = sum + r[i]  i = i + 1 }   // sum of squares 1..30 = 9455
+    print(sum + c.load())          // 9455 + 30 (one alloc per worker) = 9485
+}
+EOF
+
+# parallel_map shared must be a Sync type too
+err_case parallel_map_send "cannot send" <<'EOF'
+type Bag { n: Int }
+fn work(i: Int, b: Bag) -> Int { b.n }
+fn main() { mut b = Bag(0)  mut r = parallel_map(4, b, work)  print(r[0]) }
+EOF
+
 # parallel_for shared must be a Sync type
 err_case parallel_for_send "cannot send" <<'EOF'
 type Bag { n: Int }

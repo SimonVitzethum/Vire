@@ -120,6 +120,10 @@ impl Ctx {
                         if let Some(rep) = self.build_parallel_for(args, *span) {
                             *e = rep;
                         }
+                    } else if n == "parallel_map" {
+                        if let Some(rep) = self.build_parallel_map(args, *span) {
+                            *e = rep;
+                        }
                     }
                 }
             }
@@ -348,6 +352,91 @@ impl Ctx {
             self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
         }
         Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![args[0].clone(), args[1].clone()], span })
+    }
+
+    /// `parallel_map(n, shared, worker)` → an `Array[Int]` of the workers' results:
+    /// `out[i] = worker(i, shared)` for i in 0..n, run over `jrt_parallel_map`.
+    /// Workers write DISJOINT indices, so there is no data race on the array (and
+    /// `shared` must be a Sync type, like parallel_for). Desugars to a block that
+    /// binds n/shared once, allocates the result array, runs the shim, yields it.
+    fn build_parallel_map(&mut self, args: &[Expr], span: Span) -> Option<Expr> {
+        if args.len() != 3 {
+            self.errs.push("parallel_map: expected `parallel_map(count, shared, worker)`".into());
+            return None;
+        }
+        let worker = match &args[2] {
+            Expr::Ident(n, _) => n.clone(),
+            _ => {
+                self.errs.push("parallel_map: the third argument must be a worker function name".into());
+                return None;
+            }
+        };
+        let ptys = match self.params.get(&worker) {
+            Some(t) => t.clone(),
+            None => {
+                self.errs.push(format!("parallel_map: `{worker}` is not a top-level function"));
+                return None;
+            }
+        };
+        if ptys.len() != 2 {
+            self.errs.push(format!("parallel_map: `{worker}` must take (index: Int, shared) — found {} parameter(s)", ptys.len()));
+            return None;
+        }
+        if let Err(e) = boundary_cty(ptys[0].as_ref()) {
+            self.errs.push(e);
+            return None;
+        }
+        let shared_cty = match boundary_cty(ptys[1].as_ref()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.errs.push(e);
+                return None;
+            }
+        };
+        let ty = |name: &str| Type { name: name.to_string(), args: vec![], borrowed: false, span };
+        let shim = format!("__pmap_{worker}");
+        self.roots.insert(worker.clone());
+        if self.gen.insert(shim.clone()) {
+            // The shim hands the array's element pointer (jrt_array_data) to the
+            // runtime, which stores worker(i, shared) at out[i].
+            let code = format!(
+                "// generated glue for `parallel_map(.., {worker})` — trusted runtime handoff\n\
+                 #include <stdint.h>\n\
+                 extern void jrt_parallel_map(int64_t n, void *shared, int64_t (*fn)(int64_t, void *), int64_t *out);\n\
+                 extern void *jrt_array_data(void *);\n\
+                 extern int64_t {worker}(int64_t, {shared_cty});\n\
+                 int64_t {shim}(int64_t n, void *shared, void *arr) {{\n\
+                 \x20   jrt_parallel_map(n, shared, (int64_t (*)(int64_t, void *)){worker}, (int64_t *)jrt_array_data(arr));\n\
+                 \x20   return 0;\n\
+                 }}\n"
+            );
+            self.generated.push(Item::Native { abi: "c-glue".into(), code, links: vec![], span });
+            let params = vec![
+                Param { name: "n".into(), ty: Some(ty("Int")), default: None },
+                Param { name: "shared".into(), ty: Some(ptys[1].clone().unwrap_or_else(|| ty("Int"))), default: None },
+                Param { name: "arr".into(), ty: Some(Type { name: "Array".into(), args: vec![ty("Int")], borrowed: false, span }), default: None },
+            ];
+            let sig = FnSig { name: shim.clone(), generics: vec![], params, ret: Some(ty("Int")), span };
+            self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+        }
+        // { mut __n = <count>  mut __s = <shared>  mut __r = array(__n)
+        //   __pmap_shim(__n, __s, __r)  __r }
+        let nv = format!("__pm_n_{worker}");
+        let sv = format!("__pm_s_{worker}");
+        let rv = format!("__pm_r_{worker}");
+        let id = |n: &str| Expr::Ident(n.to_string(), span);
+        let lets = |name: &str, val: Expr| Stmt::Let { mutable: true, name: name.to_string(), ty: None, value: Some(val), span };
+        let stmts = vec![
+            lets(&nv, args[0].clone()),
+            lets(&sv, args[1].clone()),
+            lets(&rv, Expr::Call { callee: Box::new(id("array")), args: vec![id(&nv)], span }),
+            Stmt::Expr(Expr::Call {
+                callee: Box::new(id(&shim)),
+                args: vec![id(&nv), id(&sv), id(&rv)],
+                span,
+            }),
+        ];
+        Some(Expr::Block(Block { stmts, tail: Some(Box::new(id(&rv))), span }))
     }
 }
 
