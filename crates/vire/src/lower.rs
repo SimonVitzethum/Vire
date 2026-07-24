@@ -1354,7 +1354,7 @@ impl<'a> FnLower<'a> {
             || self.variants.contains_key(n)
             || self.generic_ptypes.contains_key(n)
             || self.variant_owner_g.contains_key(n)
-            || matches!(n, "list" | "map" | "set" | "array" | "farray")
+            || matches!(n, "list" | "map" | "set" | "array" | "farray" | "barray" | "str_from" | "find_byte" | "peek_u8")
     }
 
     /// AUTOMATIC LOOP ARENA (escape→arena). A `while` iteration whose
@@ -3653,16 +3653,58 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![af] });
             return (Operand::Copy(d), Ty::F64);
         }
-        // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float) —
-        // real bounds-checked/-elidable arrays (as opposed to the i64 list).
-        if name == "array" || name == "farray" {
-            let kind = if name == "farray" { ArrKind::Double } else { ArrKind::Long };
+        // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float), `barray(n)` (unsigned
+        // byte, 0..255) — real bounds-checked/-elidable arrays (as opposed to the i64 list).
+        // `barray` is the byte buffer for scanning file bytes in Vire (grep, binary I/O): one
+        // byte per element (not 8), `a[i]` is a zero-extended `load i8`.
+        if name == "array" || name == "farray" || name == "barray" {
+            let kind = match name.as_str() { "farray" => ArrKind::Double, "barray" => ArrKind::U8, _ => ArrKind::Long };
             let n = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstI64(0));
             let len32 = self.to_i32(n);
             let arr = self.new_local(Ty::Ref);
             self.local_arr.insert(arr.0, kind);
             self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
             return (Operand::Copy(arr), Ty::Ref);
+        }
+        // `str_from(a, start, len)` — build a Str from a byte array's [start, start+len) range
+        // (bounds-checked in the runtime). The inverse of scanning: emit a matched line.
+        if name == "str_from" && args.len() == 3 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let alen = self.array_len_i64(arr);
+            let s0 = self.lower_expr(&args[1]).0; let start = self.to_i32(s0);
+            let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
+            let alen32 = self.to_i32(alen);
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "Str".into());
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_str_from_bytes".into(), args: vec![Operand::Copy(ptr), alen32, start, len] });
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        // `find_byte(a, from, byte)` — index of the first `byte` in the byte array at/after
+        // `from`, or -1 (SIMD memchr over the array's own length; sound, fast). The rare-byte
+        // prefilter / scan primitive that keeps a Vire byte scan at ripgrep speed.
+        if name == "find_byte" && args.len() == 3 {
+            let arr = self.lower_expr(&args[0]).0;
+            let ptr = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+            let alen = self.array_len_i64(arr);
+            let f0 = self.lower_expr(&args[1]).0; let from = self.to_i32(f0);
+            let b0 = self.lower_expr(&args[2]).0; let byte = self.to_i32(b0);
+            let alen32 = self.to_i32(alen);
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_find_byte".into(), args: vec![Operand::Copy(ptr), alen32, from, byte] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // `peek_u8(ptr, i)` — a raw unsigned byte load `((uint8_t*)ptr)[i]` from an opaque Ptr
+        // (e.g. an mmap pointer from C), for zero-copy scanning. UNSAFE FFI, like `cstr`/Python
+        // handles: no bounds/lifetime tracking — the caller owns the pointer's validity.
+        if name == "peek_u8" && args.len() == 2 {
+            let p = self.lower_expr(&args[0]).0;
+            let i = self.lower_expr(&args[1]).0;
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_peek_u8".into(), args: vec![p, i] });
+            return (Operand::Copy(d), Ty::I64);
         }
         // Collection builtins: `list()` (growing list), `map()` (Int→Int),
         // `set()` (Int hash set).
@@ -4689,6 +4731,10 @@ fn arrkind_of_name(n: &str) -> ArrKind {
         "Float" | "F64" | "Double" => ArrKind::Double,
         "F32" => ArrKind::Float,
         "I32" | "U32" => ArrKind::Int,
+        // 1-byte elements. `Byte`/`U8` are UNSIGNED (0..255, zero-extend on load) — the right
+        // semantics for byte scanning (grep, binary I/O); `I8` is the signed variant.
+        "Byte" | "U8" => ArrKind::U8,
+        "I8" => ArrKind::Byte,
         "Ref" | "Str" => ArrKind::Ref,
         _ => ArrKind::Long, // Int / I64 / Long / default
     }

@@ -39,7 +39,7 @@ fn scal(ty: Ty) -> &'static str {
 /// Device storage element type for an array kind.
 fn elem(k: ArrKind) -> &'static str {
     match k {
-        ArrKind::Bool | ArrKind::Byte => "i8",
+        ArrKind::Bool | ArrKind::Byte | ArrKind::U8 => "i8",
         ArrKind::Char | ArrKind::Short => "i16",
         ArrKind::Int => "i32",
         ArrKind::Long => "i64",

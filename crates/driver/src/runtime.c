@@ -894,6 +894,34 @@ static JStr *str_from_buf(const char *buf, int n) {
  * case; typed sum-type errors go through `match` — see REFERENCE §11). The result is immortal
  * (refcount -1), like a string literal, so the i64-erased Result error slot needs no RC and the
  * 0-live heap oracle stays balanced. */
+/* `str_from(a, start, len)` — a Str from a byte array's [start, start+len) range. Bounds are
+ * clamped to [0, alen] so an out-of-range request yields a shorter/empty string, never an OOB
+ * read (sound). `data` is the array's element pointer (jrt_array_data), `alen` its length. */
+JStr *jrt_str_from_bytes(const uint8_t *data, int32_t alen, int32_t start, int32_t len) {
+    if (start < 0) start = 0;
+    if (start > alen) start = alen;
+    if (len < 0) len = 0;
+    if (len > alen - start) len = alen - start;
+    return str_from_buf((const char *)(data + start), len);
+}
+
+/* `find_byte(a, from, byte)` — index of the first `byte` (0..255) in the byte array at/after
+ * `from`, or -1. `memchr` is SIMD-accelerated in libc, so a Vire byte scan stays fast. Bounds
+ * clamped (sound): from<0 → 0, from>=alen → -1. */
+int64_t jrt_find_byte(const uint8_t *data, int32_t alen, int32_t from, int32_t byte) {
+    if (from < 0) from = 0;
+    if (from >= alen) return -1;
+    const uint8_t *p = (const uint8_t *)memchr(data + from, byte & 0xFF, (size_t)(alen - from));
+    return p ? (int64_t)(p - data) : -1;
+}
+
+/* `peek_u8(ptr, i)` — a raw unsigned byte load `((uint8_t*)ptr)[i]`. UNSAFE (opaque Ptr, no
+ * bounds/lifetime): the caller owns the pointer's validity, same boundary as cstr/Python
+ * handles. For zero-copy scanning over an mmap pointer supplied by C. */
+int64_t jrt_peek_u8(int64_t ptr, int64_t i) {
+    return (int64_t)((const uint8_t *)(intptr_t)ptr)[i];
+}
+
 /* Reinterpret an i64-erased Result payload slot as a Str (`result.error()`): the slot holds a
  * JStr* for string-message errors. 0 (a zeroed/absent payload) → the empty string, so calling
  * .error() on an Ok is safe. Scoped to string errors — typed sum-type errors use match. */

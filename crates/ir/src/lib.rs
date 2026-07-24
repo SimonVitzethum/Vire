@@ -162,6 +162,10 @@ pub enum Statement {
 pub enum ArrKind {
     Bool,
     Byte,
+    /// Unsigned 8-bit byte (value 0..255). Like `Byte` in storage (1 byte) but ZERO-extends
+    /// on load, so `a[i]` is the unsigned value — the right semantics for byte scanning
+    /// (grep, binary I/O). Vire's `Byte`/`U8` map here; Java's signed `byte` stays `Byte`.
+    U8,
     Char,
     Short,
     Int,
@@ -185,7 +189,7 @@ impl ArrKind {
     /// Storage width in bytes.
     pub fn size(self) -> usize {
         match self {
-            ArrKind::Bool | ArrKind::Byte => 1,
+            ArrKind::Bool | ArrKind::Byte | ArrKind::U8 => 1,
             ArrKind::Char | ArrKind::Short => 2,
             ArrKind::Int | ArrKind::Float => 4,
             ArrKind::Long | ArrKind::Double | ArrKind::Ref => 8,

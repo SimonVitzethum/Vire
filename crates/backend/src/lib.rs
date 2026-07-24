@@ -2897,7 +2897,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
 
 fn arr_store_fn(k: ArrKind) -> &'static str {
     match k {
-        ArrKind::Bool | ArrKind::Byte => "jrt_bastore",
+        ArrKind::Bool | ArrKind::Byte | ArrKind::U8 => "jrt_bastore",
         ArrKind::Char => "jrt_castore",
         ArrKind::Short => "jrt_sastore",
         ArrKind::Int => "jrt_iastore",
@@ -2910,7 +2910,7 @@ fn arr_store_fn(k: ArrKind) -> &'static str {
 /// LLVM storage type of an array element.
 fn arr_store_ty(k: ArrKind) -> &'static str {
     match k {
-        ArrKind::Bool | ArrKind::Byte => "i8",
+        ArrKind::Bool | ArrKind::Byte | ArrKind::U8 => "i8",
         ArrKind::Char | ArrKind::Short => "i16",
         ArrKind::Int => "i32",
         ArrKind::Long => "i64",
@@ -2937,7 +2937,7 @@ fn emit_array_elem_load(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, k: 
             writeln!(w, "  {x} = sext {} {raw} to i32", arr_store_ty(k)).unwrap();
             x
         }
-        ArrKind::Bool | ArrKind::Char => {
+        ArrKind::Bool | ArrKind::Char | ArrKind::U8 => {
             let x = e.fresh();
             writeln!(w, "  {x} = zext {} {raw} to i32", arr_store_ty(k)).unwrap();
             x
@@ -2956,7 +2956,7 @@ fn emit_array_elem_store(w: &mut String, e: &mut FnEmitter, a: &str, i: &str, v:
     writeln!(w, "  {ep} = getelementptr i8, ptr {base}, i64 {off}").unwrap();
     // Truncate the value to the storage width (byte/char/short).
     let sv = match k {
-        ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
+        ArrKind::Bool | ArrKind::Byte | ArrKind::U8 | ArrKind::Char | ArrKind::Short => {
             let x = e.fresh();
             writeln!(w, "  {x} = trunc i32 {v} to {}", arr_store_ty(k)).unwrap();
             x
@@ -2989,7 +2989,7 @@ fn emit_array_elem_load_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: &
                 writeln!(w, "  {x} = sext {sty} {raw} to i32").unwrap();
                 x
             }
-            ArrKind::Bool | ArrKind::Char => {
+            ArrKind::Bool | ArrKind::Char | ArrKind::U8 => {
                 let x = e.fresh();
                 writeln!(w, "  {x} = zext {sty} {raw} to i32").unwrap();
                 x
@@ -3088,7 +3088,7 @@ fn emit_array_elem_store_checked(w: &mut String, e: &mut FnEmitter, a: &str, i: 
     let sty = arr_store_ty(k);
     let trunc_val = |w: &mut String, e: &mut FnEmitter| -> String {
         match k {
-            ArrKind::Bool | ArrKind::Byte | ArrKind::Char | ArrKind::Short => {
+            ArrKind::Bool | ArrKind::Byte | ArrKind::U8 | ArrKind::Char | ArrKind::Short => {
                 let x = e.fresh();
                 writeln!(w, "  {x} = trunc i32 {v} to {sty}").unwrap();
                 x
