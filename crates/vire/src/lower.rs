@@ -1354,7 +1354,7 @@ impl<'a> FnLower<'a> {
             || self.variants.contains_key(n)
             || self.generic_ptypes.contains_key(n)
             || self.variant_owner_g.contains_key(n)
-            || matches!(n, "list" | "map" | "set" | "array" | "farray" | "barray" | "str_from" | "find_byte" | "peek_u8" | "find_byte_ptr" | "str_from_ptr")
+            || matches!(n, "list" | "map" | "set" | "array" | "farray" | "barray" | "str_from" | "find_byte" | "bview" | "bview_len")
     }
 
     /// AUTOMATIC LOOP ARENA (escape→arena). A `while` iteration whose
@@ -2457,6 +2457,14 @@ impl<'a> FnLower<'a> {
                     let (idx, _) = self.lower_expr(index);
                     let d = self.new_local(Ty::I64);
                     self.emit(Statement::Call { dest: Some(d), func: "vire_list_get".into(), args: vec![arr, to_i64(idx)] });
+                    return (Operand::Copy(d), Ty::I64);
+                }
+                // `view[i]` — a bounds-checked unsigned byte load over the mmap bytes (the runtime
+                // reads the view's (ptr, len) and checks i against len). Zero-copy; unsigned 0..255.
+                if self.class_of_operand(&arr).as_deref() == Some("ByteView") {
+                    let (idx, _) = self.lower_expr(index);
+                    let d = self.new_local(Ty::I64);
+                    self.emit(Statement::Call { dest: Some(d), func: "jrt_bview_get".into(), args: vec![arr, to_i64(idx)] });
                     return (Operand::Copy(d), Ty::I64);
                 }
                 let kind = match self.arr_of_operand(&arr) {
@@ -3670,69 +3678,72 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
             return (Operand::Copy(arr), Ty::Ref);
         }
-        // `str_from(a, start, len)` — build a Str from a byte array's [start, start+len) range
-        // (bounds-checked in the runtime). The inverse of scanning: emit a matched line.
+        // `str_from(a, start, len)` — build a Str from a byte array's [start, start+len) range,
+        // OR from a ByteView's [start, start+len) mmap bytes (zero-copy). Bounds-clamped in the
+        // runtime (sound). The inverse of scanning: emit a matched line.
         if name == "str_from" && args.len() == 3 {
             let arr = self.lower_expr(&args[0]).0;
-            let ptr = self.new_local(Ty::Ref);
-            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
-            let alen = self.array_len_i64(arr);
             let s0 = self.lower_expr(&args[1]).0; let start = self.to_i32(s0);
             let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
-            let alen32 = self.to_i32(alen);
             let d = self.new_local(Ty::Ref);
             self.local_class.insert(d.0, "Str".into());
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_str_from_bytes".into(), args: vec![Operand::Copy(ptr), alen32, start, len] });
+            if self.class_of_operand(&arr).as_deref() == Some("ByteView") {
+                // The view carries (ptr, len); the runtime reads both and clamps to len.
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_bview_str".into(), args: vec![arr, start, len] });
+            } else {
+                let ptr = self.new_local(Ty::Ref);
+                self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+                let alen = self.array_len_i64(arr);
+                let alen32 = self.to_i32(alen);
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_str_from_bytes".into(), args: vec![Operand::Copy(ptr), alen32, start, len] });
+            }
             return (Operand::Copy(d), Ty::Ref);
         }
-        // `find_byte(a, from, byte)` — index of the first `byte` in the byte array at/after
-        // `from`, or -1 (SIMD memchr over the array's own length; sound, fast). The rare-byte
-        // prefilter / scan primitive that keeps a Vire byte scan at ripgrep speed.
+        // `find_byte(a, from, byte)` — index of the first `byte` at/after `from`, or -1 (SIMD
+        // memchr; sound, fast). Works over a byte array OR a ByteView (mmap bytes, zero-copy) —
+        // the rare-byte prefilter that keeps a Vire byte scan at ripgrep speed.
         if name == "find_byte" && args.len() == 3 {
             let arr = self.lower_expr(&args[0]).0;
-            let ptr = self.new_local(Ty::Ref);
-            self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
-            let alen = self.array_len_i64(arr);
             let f0 = self.lower_expr(&args[1]).0; let from = self.to_i32(f0);
             let b0 = self.lower_expr(&args[2]).0; let byte = self.to_i32(b0);
-            let alen32 = self.to_i32(alen);
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_find_byte".into(), args: vec![Operand::Copy(ptr), alen32, from, byte] });
+            if self.class_of_operand(&arr).as_deref() == Some("ByteView") {
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_bview_find".into(), args: vec![arr, from, byte] });
+            } else {
+                let ptr = self.new_local(Ty::Ref);
+                self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
+                let alen = self.array_len_i64(arr);
+                let alen32 = self.to_i32(alen);
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_find_byte".into(), args: vec![Operand::Copy(ptr), alen32, from, byte] });
+            }
             return (Operand::Copy(d), Ty::I64);
         }
-        // `peek_u8(ptr, i)` — a raw unsigned byte load `((uint8_t*)ptr)[i]` from an opaque Ptr
-        // (e.g. an mmap pointer from C), for zero-copy scanning. UNSAFE FFI, like `cstr`/Python
-        // handles: no bounds/lifetime tracking — the caller owns the pointer's validity.
-        if name == "peek_u8" && args.len() == 2 {
-            let p = self.lower_expr(&args[0]).0;
-            let i = self.lower_expr(&args[1]).0;
-            let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_peek_u8".into(), args: vec![p, i] });
-            return (Operand::Copy(d), Ty::I64);
+        // `bview(ptr, len)` — a bounds-checked, ZERO-COPY window over an external byte region (an
+        // mmap pointer from C). SAFE replacement for peek_u8/find_byte_ptr/str_from_ptr: `len` is
+        // carried once here (the single FFI trust point, like `cstr`), and every later access —
+        // `v[i]`, `find_byte(v,…)`, `str_from(v,…)` — is checked against it. Represented as a
+        // 2-element i64 array `[ptr, len]` (a real GC-managed array; the mmap bytes are never
+        // copied), tagged class "ByteView" so those ops dispatch to the checked runtime path.
+        if name == "bview" && args.len() == 2 {
+            let p0 = self.lower_expr(&args[0]).0; let p = to_i64(p0);
+            let l0 = self.lower_expr(&args[1]).0; let l = to_i64(l0);
+            let arr = self.new_local(Ty::Ref);
+            self.local_arr.insert(arr.0, ArrKind::Long);
+            self.emit(Statement::NewArray { dest: arr, kind: ArrKind::Long, len: Operand::ConstI32(2) });
+            self.emit(Statement::ArrayStore { arr: Operand::Copy(arr), index: Operand::ConstI32(0), value: p, kind: ArrKind::Long, checked: false });
+            self.emit(Statement::ArrayStore { arr: Operand::Copy(arr), index: Operand::ConstI32(1), value: l, kind: ArrKind::Long, checked: false });
+            // Overwrite the array-kind tag with the view class: indexing dispatches to the
+            // checked byte load, not a raw i64 load of the [ptr, len] metadata.
+            self.local_arr.remove(&arr.0);
+            self.local_class.insert(arr.0, "ByteView".into());
+            return (Operand::Copy(arr), Ty::Ref);
         }
-        // `find_byte_ptr(ptr, from, len, byte)` — SIMD memchr over a RAW region (an mmap Ptr from
-        // C), zero-copy, no barray. Same as find_byte but the caller owns the pointer's validity
-        // (UNSAFE FFI, like peek_u8). Closes the last I/O gap to ripgrep: scan the mapped file
-        // bytes in place instead of copying the file into a byte array first.
-        if name == "find_byte_ptr" && args.len() == 4 {
-            let p = self.lower_expr(&args[0]).0;
-            let f0 = self.lower_expr(&args[1]).0; let from = self.to_i32(f0);
-            let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
-            let b0 = self.lower_expr(&args[3]).0; let byte = self.to_i32(b0);
+        // `bview_len(v)` — the view's byte length (its loop bound).
+        if name == "bview_len" && args.len() == 1 {
+            let v = self.lower_expr(&args[0]).0;
             let d = self.new_local(Ty::I64);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_find_byte_ptr".into(), args: vec![p, from, len, byte] });
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_bview_len".into(), args: vec![v] });
             return (Operand::Copy(d), Ty::I64);
-        }
-        // `str_from_ptr(ptr, start, len)` — a Str from `len` raw bytes at `ptr + start` (emit a
-        // matched line straight out of the mmap, no copy). UNSAFE FFI, like peek_u8.
-        if name == "str_from_ptr" && args.len() == 3 {
-            let p = self.lower_expr(&args[0]).0;
-            let s0 = self.lower_expr(&args[1]).0; let start = self.to_i32(s0);
-            let l0 = self.lower_expr(&args[2]).0; let len = self.to_i32(l0);
-            let d = self.new_local(Ty::Ref);
-            self.local_class.insert(d.0, "Str".into());
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_str_from_ptr".into(), args: vec![p, start, len] });
-            return (Operand::Copy(d), Ty::Ref);
         }
         // Collection builtins: `list()` (growing list), `map()` (Int→Int),
         // `set()` (Int hash set).

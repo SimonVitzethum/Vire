@@ -1,8 +1,10 @@
 #!/bin/sh
 # Byte arrays for byte-scanning (grep/binary I/O in pure Vire): barray(n) (1 byte/element,
 # UNSIGNED 0..255), Array[Byte] params, str_from(a,start,len) (bytes -> Str), find_byte(a,
-# from,byte) (SIMD memchr), peek_u8(ptr,i) (raw unsafe Ptr load). All array access is
-# bounds-checked; the runtime range primitives clamp (sound). Byte load ZERO-extends, so a
+# from,byte) (SIMD memchr). ByteView — bview(ptr,len) — is a bounds-checked, ZERO-COPY window
+# over an external region (mmap), the SAFE replacement for the removed unsafe peek_u8/
+# find_byte_ptr/str_from_ptr: v[i]/find_byte(v)/str_from(v) are all checked against the carried
+# len. All access is bounds-checked; range primitives clamp (sound). Byte load ZERO-extends, so a
 # high byte reads as its unsigned value (255), not -1.
 set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,6 +16,10 @@ check() { # name expected file
     got="$("$vire" run "$3" 2>/dev/null)"
     if [ "$got" = "$2" ]; then echo "ok   $1"; pass=$((pass+1));
     else echo "FAIL $1 (want [$2] got [$got])"; fail=$((fail+1)); fi
+}
+errck() { # name pattern file — passes if running the program emits `pattern` (a rejected/aborted case)
+    if "$vire" run "$3" 2>&1 | grep -q "$2"; then echo "ok   $1"; pass=$((pass+1));
+    else echo "FAIL $1 (no '$2')"; fail=$((fail+1)); fi
 }
 
 # --- barray: unsigned bytes, str_from, find_byte ------------------------
@@ -106,39 +112,52 @@ check "byte<->Int interop (store/compare/arg/arith/nested index)" "65
 10
 3" "$work/interop.vr"
 
-# --- peek_u8: raw byte load over a Ptr (from cstr) ----------------------
-cat > "$work/peek.vr" <<'EOF'
-fn main() {
-    mut p = cstr("ABC")
-    print(peek_u8(p, 0))    // 65
-    print(peek_u8(p, 2))    // 67
+# --- ByteView: a bounds-checked, ZERO-COPY window over an external byte region (mmap model).
+# The SAFE replacement for the removed unsafe peek_u8/find_byte_ptr/str_from_ptr: len is carried
+# at bview(ptr,len) (the single FFI trust point, like cstr), and v[i]/find_byte(v)/str_from(v)
+# are all checked against it. Also crosses a function boundary (`v: ByteView` param). ----------
+cat > "$work/view.vr" <<'EOF'
+fn scan(v: ByteView, needle: Int) -> Int {          // ByteView as a parameter type
+    mut c = 0
+    mut i = find_byte(v, 0, needle)
+    while i >= 0 { c = c + 1  i = find_byte(v, i + 1, needle) }
+    c
 }
-EOF
-check "peek_u8 raw Ptr load" "65
-67" "$work/peek.vr"
-
-# --- find_byte_ptr / str_from_ptr: SIMD scan + slice over a RAW Ptr (mmap model,
-# zero-copy) instead of a barray. UNSAFE FFI like peek_u8; the range args clamp so
-# from>=len → -1 and negative start/len can't OOB-read. ---------------------------
-cat > "$work/ptrscan.vr" <<'EOF'
 fn main() {
     mut p = cstr("hello world")
-    print(find_byte_ptr(p, 0, 11, 119))   // 6   'w'
-    print(find_byte_ptr(p, 5, 11, 111))   // 7   from-offset skips first 'o'
-    print(find_byte_ptr(p, 0, 11, 122))   // -1  absent
-    print(find_byte_ptr(p, 20, 11, 104))  // -1  from past len (sound)
-    print(str_from_ptr(p, 6, 5))          // world
-    print(str_from_ptr(p, 0, 0).len())    // 0   empty slice
-    print(str_from_ptr(p, 0 - 3, 5))      // hello  (negative start clamped to 0)
+    mut v = bview(p, 11)
+    print(v[0])                    // 104 'h'  (zero-copy, unsigned)
+    print(v[6])                    // 119 'w'
+    print(bview_len(v))            // 11
+    print(find_byte(v, 0, 111))    // 4   'o'
+    print(find_byte(v, 5, 111))    // 7   from-offset
+    print(find_byte(v, 0, 122))    // -1  absent
+    print(str_from(v, 6, 5))       // world  (slice straight from the region, no copy)
+    print(str_from(v, 20, 5).len())// 0   start past len clamped (sound)
+    print(scan(v, 108))            // 3   'l' at 2,3,9
 }
 EOF
-check "find_byte_ptr + str_from_ptr (raw Ptr, clamped)" "6
+check "ByteView zero-copy scan (v[i]/find_byte/str_from + param)" "104
+119
+11
+4
 7
--1
 -1
 world
 0
-hello" "$work/ptrscan.vr"
+3" "$work/view.vr"
+
+# SOUNDNESS: an out-of-range view index aborts (bounds), never reads outside [0, len).
+cat > "$work/view_oob.vr" <<'EOF'
+fn main() {
+    mut p = cstr("abc")
+    mut v = bview(p, 3)
+    print(v[0])     // 97
+    print(v[9])     // out of range -> bounds abort
+    print(999)      // unreachable
+}
+EOF
+errck "ByteView OOB index aborts (sound)" "ArrayIndexOutOfBounds" "$work/view_oob.vr"
 
 echo "---"
 echo "$pass passed, $fail failed"

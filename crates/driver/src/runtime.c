@@ -298,6 +298,7 @@ void *jrt_alloc(int64_t size);
 void jrt_retain(void *p);
 void jrt_throw_npe(void);
 void jrt_throw_bounds(void);
+_Noreturn void jrt_throw_bounds_fatal(void);
 void jrt_throw_sioobe(void);
 static void jrt_sb_drop(void *p);
 
@@ -915,34 +916,67 @@ int64_t jrt_find_byte(const uint8_t *data, int32_t alen, int32_t from, int32_t b
     return p ? (int64_t)(p - data) : -1;
 }
 
-/* `peek_u8(ptr, i)` — a raw unsigned byte load `((uint8_t*)ptr)[i]`. UNSAFE (opaque Ptr, no
- * bounds/lifetime): the caller owns the pointer's validity, same boundary as cstr/Python
- * handles. For zero-copy scanning over an mmap pointer supplied by C. */
-int64_t jrt_peek_u8(int64_t ptr, int64_t i) {
-    return (int64_t)((const uint8_t *)(intptr_t)ptr)[i];
+/* ByteView — a bounds-checked, zero-copy window over an external byte region (e.g. an mmap
+ * pointer from C). Represented in Vire as a 2-element i64 array `[ptr, len]`: a real GC-managed
+ * array (no new allocator, no heap-oracle impact), whose spanned bytes are NOT copied. The
+ * length is carried at construction, so `bview(ptr, len)` is the SINGLE trust point (the caller
+ * asserts `ptr` is valid for `len` bytes, exactly like cstr); EVERY subsequent access is checked
+ * against `len` — which is why this replaces the unsafe peek_u8 / find_byte_ptr / str_from_ptr.
+ *
+ * All view ops take the view ARRAY (a `ptr`) and read (ptr,len) from its data in C — so no raw
+ * i64 pointer ever crosses the ABI as an argument. The metadata lives at the array's element
+ * offset (jrt_array_data == view + 32), two int64 slots: [0]=external ptr, [1]=byte length. */
+static inline void bview_meta(void *view, const uint8_t **ptr, int64_t *len) {
+    const int64_t *m = (const int64_t *)((const char *)view + 32);
+    *ptr = (const uint8_t *)(intptr_t)m[0];
+    *len = m[1];
 }
 
-/* `find_byte_ptr(ptr, from, len, byte)` — like find_byte, but SIMD-memchr over a RAW memory
- * region of `len` bytes (an mmap pointer from C) instead of a bounds-checked barray. Zero-copy:
- * Vire scans the mapped file bytes directly, same I/O model as ripgrep. Returns the index of the
- * first `byte` at/after `from`, or -1. `from`/`len` are clamped so the memchr span stays inside
- * [from, len); the caller owns the pointer's validity (UNSAFE FFI, like peek_u8). */
-int64_t jrt_find_byte_ptr(int64_t ptr, int32_t from, int32_t len, int32_t byte) {
-    if (len < 0) len = 0;
+/* `view[i]` — a bounds-checked unsigned byte load. Out of range aborts with a bounds error (like
+ * an array access under the uncatchable model); it can NEVER read outside [0, len). */
+int64_t jrt_bview_get(void *view, int64_t i) {
+    const uint8_t *p;
+    int64_t len;
+    bview_meta(view, &p, &len);
+    if ((uint64_t)i >= (uint64_t)len) {
+        jrt_throw_bounds_fatal();
+    }
+    return (int64_t)p[i];
+}
+
+/* `find_byte(view, from, byte)` — SIMD memchr over the mapped bytes, zero-copy. Index of the
+ * first `byte` at/after `from`, or -1. Clamped to [from, len) → sound (the region length is the
+ * view's own, not a caller-supplied number). */
+int64_t jrt_bview_find(void *view, int32_t from, int32_t byte) {
+    const uint8_t *p;
+    int64_t len;
+    bview_meta(view, &p, &len);
     if (from < 0) from = 0;
-    if (from >= len) return -1;
-    const uint8_t *base = (const uint8_t *)(intptr_t)ptr;
-    const uint8_t *p = (const uint8_t *)memchr(base + from, byte & 0xFF, (size_t)(len - from));
-    return p ? (int64_t)(p - base) : -1;
+    if ((int64_t)from >= len) return -1;
+    const uint8_t *q = (const uint8_t *)memchr(p + from, byte & 0xFF, (size_t)(len - (int64_t)from));
+    return q ? (int64_t)(q - p) : -1;
 }
 
-/* `str_from_ptr(ptr, start, len)` — a Str from `len` raw bytes at `ptr + start` (e.g. a matched
- * line straight out of the mmap, no barray copy). start/len clamped to non-negative; there is no
- * upper bound to clamp against (raw region), so the caller owns validity (UNSAFE FFI). */
-JStr *jrt_str_from_ptr(int64_t ptr, int32_t start, int32_t len) {
+/* `str_from(view, start, len)` — a Str from the view's [start, start+len) bytes (emit a matched
+ * line straight from the mmap, no copy). Clamped to the view's length → sound. */
+JStr *jrt_bview_str(void *view, int32_t start, int32_t len) {
+    const uint8_t *p;
+    int64_t vlen;
+    bview_meta(view, &p, &vlen);
     if (start < 0) start = 0;
+    if ((int64_t)start > vlen) start = (int32_t)vlen;
     if (len < 0) len = 0;
-    return str_from_buf((const char *)(intptr_t)ptr + start, len);
+    if ((int64_t)len > vlen - (int64_t)start) len = (int32_t)(vlen - (int64_t)start);
+    return str_from_buf((const char *)(p + start), len);
+}
+
+/* `bview_len(view)` — the view's byte length (its loop bound). */
+int64_t jrt_bview_len(void *view) {
+    const uint8_t *p;
+    int64_t len;
+    bview_meta(view, &p, &len);
+    (void)p;
+    return len;
 }
 
 /* Reinterpret an i64-erased Result payload slot as a Str (`result.error()`): the slot holds a
