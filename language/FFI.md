@@ -84,8 +84,18 @@ print(pyval(625.0))          // 25.0 — no -I, no -lpython, no extra file
 
 ## Type mapping (scalar, clean)
 `Int`→`int64_t`, `I32`→`int`, `F64`→`double`, `F32`→`float`, `Bool`→`int`.
-Pointer/string interop (Vire `Str` is an object with a header, not a `char*`) needs a
-shim that passes the bytes — still open (extension: `cstr(s)` builtin).
+Vire `Str` is an object with a header, not a `char*`, so to pass a string to a C function
+that expects `const char*` use the **`cstr(s)` builtin** — it returns a NUL-terminated
+`char*` (as a `Ptr`) of the string's bytes:
+```vire
+native "c" """ #include <string.h>
+extern long clen(const char *s) { return (long)strlen(s); } """
+extern "C" { fn clen(p: Ptr) -> Int }
+fn main() { print(clen(cstr("Hello"))) }   // 5
+```
+It works on literals and runtime-built strings, and requires a `Str` — `cstr(123)` or
+`cstr(anArray)` is a compile error. The returned buffer is a fresh copy that is not freed
+(short-lived argument strings); copy it in C for lasting use. Tested in `tests/vire_ffi.sh`.
 
 ## Flags
 - `-l NAME` — link library (e.g., `-l stdc++`, `-l python3.14`).

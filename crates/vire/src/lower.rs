@@ -3641,9 +3641,23 @@ impl<'a> FnLower<'a> {
             let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
             return (self.to_str(op, ty), Ty::Ref);
         }
-        // FFI builtin `cstr(s)` → NUL-terminated char* (as Ptr/i64).
+        // FFI builtin `cstr(s)` → a NUL-terminated `char*` (as `Ptr`/i64) for extern-C
+        // functions expecting `const char*`. Requires a Str: a bare `Ty::Ref` that is not an
+        // array and carries no non-`Str` class (a literal, a concat/`str()` result, or a
+        // `Str`-typed param — same test the `jrt_str_*` method dispatch uses). Passing anything
+        // else (an Int, an array, a classed object) to `vire_cstr(JStr*)` would be a wrong-type
+        // pointer → garbage/crash, so reject it at compile time.
         if name == "cstr" {
-            let arg = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstNull);
+            if lowered.len() != 1 {
+                self.errs.push(format!("cstr(s) takes exactly one argument, got {}", lowered.len()));
+            }
+            let (arg, aty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let is_str = aty == Ty::Ref
+                && self.arr_of_operand(&arg).is_none()
+                && self.class_of_operand(&arg).as_deref().map_or(true, |c| c == "Str");
+            if !is_str {
+                self.errs.push("cstr(s) expects a Str argument".into());
+            }
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "vire_cstr".into(), args: vec![arg] });
             return (Operand::Copy(d), Ty::I64);
