@@ -168,13 +168,13 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 
 ## Perf — residual / parked (low ROI, keep for context)
 
-- [ ] **Codegen scheduling / register allocation** on the FP losers (raytracer 1.9×,
-  regex/pquicksort/pipeline 1.1–1.25×). Verified *not* IR quality (same program
-  through `opt -O2` matches clang) — it's the LLVM **backend** reacting to subtle IR
-  structure (~2× the stack spills of clang on the raytracer inner loop). Deep-codegen
-  tuning, not a single fixable pass. **Parked — low ROI vs the wins already banked.**
-- [ ] **sort 1.05× / pquicksort 1.23×** residual — the explicit-stack structure (a
-  recursive `Array`-param version measured *slower*). Marginal.
+- [ ] **Codegen scheduling / register allocation** on the branchy/irregular residuals.
+  Re-measured best-of-N vs Rust 2026-07-24: regex **1.27×**, pquicksort **1.22×**,
+  pipeline **1.12×**, compression **1.12×**. (STALE values corrected: raytracer is
+  **0.99× = parity**, not 1.9×; sort is **0.99×**, not 1.05×; fft 0.99×.) Verified *not*
+  IR quality (same program through `opt -O2` matches clang) — it's the LLVM **backend**
+  reacting to subtle IR structure. Deep-codegen tuning, not a single fixable pass.
+  **Parked — low ROI vs the wins already banked.**
 - [ ] **Expand the differential fuzzer** (`tests/fuzz_gen.py`) — floats
   (fp-contract-matched), nested control-flow, break/continue, strings. (Correctness
   insurance, not perf, but belongs with the perf work.)
