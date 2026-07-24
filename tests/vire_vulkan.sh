@@ -1226,6 +1226,29 @@ fn main() {
 }
 EOF
 
+# Sampleable depth (vk_depth): the third FSR/DLSS input. The auto-render now produces the full
+# bundle — colour + R16G16F motion + D32 depth — in ONE pass, with the depth image created
+# SAMPLED + TRANSFER_SRC (a real readable/sampleable buffer). vk_depth reads the centroid depth
+# (D32 in [0,1], returned *1e6). The @vertex's gl_Position.z (here uniform().z) drives it: z=0.5
+# → depth 0.5 → 500000, exact.
+case_ vire_depth_target <<'EOF'
+@vertex
+fn vs(pos: Vec2) -> Vec4 {
+    mut u = uniform()
+    vec4(pos.x, pos.y, u.z, 1.0)
+}
+@fragment
+fn fs() -> Vec4 { vec4(0.2, 0.8, 0.3, 1.0) }
+fn main() {
+    mut tri = farray(6)
+    tri[0]=0.0  tri[1]=0.5  tri[2]=0.5  tri[3]=0.0-0.5  tri[4]=0.0-0.5  tri[5]=0.0-0.5
+    mut d = vk_depth(tri, 0.0, 0.0, 0.5, 1.0)   // z=0.5 → depth 0.5 → 500000
+    mut ok = 0
+    if d > 498000 { if d < 502000 { ok = 1 } }
+    print(ok)
+}
+EOF
+
 # Camera jitter (vk_jitter): the runtime PROVIDES the Halton(2,3) sub-pixel offset FSR/DLSS
 # need for temporal accumulation, and the auto motion-vector render adds it to gl_Position
 # (colour only). Two properties: (1) the sequence is the exact Halton values — vk_jitter(0) →

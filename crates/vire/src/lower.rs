@@ -3231,9 +3231,9 @@ impl<'a> FnLower<'a> {
         // vk_draw(verts, ux, uy, uz, uw): the generic draw surface — program-supplied
         // geometry ([Float] of interleaved x,y) + a vec4 uniform, rendered through the
         // compiled @vertex/@fragment shaders (the uniform reaches the shader's uniform()).
-        // vk_motion(verts, ux,uy,uz,uw): render `verts` through the compiler's auto
-        // motion-vector shader; returns the centroid's packed encoded motion vector.
-        if name == "vk_motion" && args.len() == 5 {
+        // vk_motion / vk_depth (verts, ux,uy,uz,uw): render the FSR input bundle and read back
+        // the centroid of the motion (R16G16F) or the sampleable depth (D32) target.
+        if (name == "vk_motion" || name == "vk_depth") && args.len() == 5 {
             let arr = self.lower_expr(&args[0]).0;
             let ptr = self.new_local(Ty::Ref);
             self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![arr.clone()] });
@@ -3242,7 +3242,8 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(Ty::I64);
             let mut call_args = vec![Operand::Copy(ptr), len];
             call_args.extend(uni);
-            self.emit(Statement::Call { dest: Some(d), func: "jrt_vk_motion".into(), args: call_args });
+            let func = if name == "vk_depth" { "jrt_vk_depth" } else { "jrt_vk_motion" };
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
         if name == "vk_draw" && args.len() == 5 {
