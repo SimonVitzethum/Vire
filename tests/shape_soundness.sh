@@ -22,11 +22,15 @@ case_() {
         echo "FAIL $name (javac): $(head -1 "$work/jerr")"; fail=$((fail+1)); return
     fi
     classes=$(ls "$work/$name.class" "$work/$name"'$'*.class 2>/dev/null)
-    if ! "$fj" -o "$work/$name.bin" $classes >/dev/null 2>"$work/ferr"; then
+    if ! "$fj" --stats -o "$work/$name.bin" $classes >/dev/null 2>"$work/ferr"; then
         echo "FAIL $name (fastjavac): $(head -1 "$work/ferr")"; fail=$((fail+1)); return
     fi
-    # Collector present?  (jrt_collect_cycles is only linked when NOT proven acyclic.)
-    if objdump -d "$work/$name.bin" 2>/dev/null | grep -q collect_cycles; then have=keep; else have=drop; fi
+    # Collector kept iff the solver reports it required. This reads the solver's own
+    # decision (`--stats`, stderr) rather than grepping `collect_cycles` in the binary:
+    # under `-flto` the collector is inlined into its caller, so the standalone symbol
+    # is gone even though the collector functionally runs — the symbol grep gave a
+    # false "drop" for every real cycle.
+    if grep -q 'Zyklen-Collector: required' "$work/ferr"; then have=keep; else have=drop; fi
     out="$(FASTLLVM_HEAPSTATS=1 "$work/$name.bin" 2>&1)"
     val="$(printf '%s\n' "$out" | grep -v '^\[heap\]' | head -1)"
     live_ok=1; echo "$out" | grep -q '\[heap\]' && ! echo "$out" | grep -q '0 still live' && live_ok=0
