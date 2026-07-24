@@ -1381,9 +1381,107 @@ impl FnEmitter<'_> {
 /// class literals, null) — there retain/release are provably no-ops. Monotone
 /// invalidation: starts optimistically (all ref non-parameters), removes
 /// every local with a possibly heap-creating def until the fixpoint.
+/// Locals defined by a `New`/`NewArray` that provably executes INSIDE an auto-arena
+/// (an `jrt_arena_push`…`jrt_arena_pop` dynamic extent). Such an object is allocated
+/// into the arena at runtime — immortal (refcount -1), freed en bloc by the pop — so
+/// every retain/release on it is a runtime no-op that can be elided at compile time.
+/// Arena depth is a forward CFG dataflow (push +1, pop -1); a block's entry depth is
+/// the MIN over its predecessors (sound: immortal only if depth>0 on EVERY path), so a
+/// `New` reached at depth>0 is always arena. `arena_push`/`pop` are balanced and
+/// structured (the lowering emits them around loop/capsule bodies), so this converges.
+fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    let nb = f.blocks.len();
+    if nb == 0 {
+        return (BTreeSet::new(), BTreeSet::new());
+    }
+    let net: Vec<i32> = f
+        .blocks
+        .iter()
+        .map(|bb| {
+            bb.statements
+                .iter()
+                .map(|st| match st {
+                    Statement::Call { func, .. } if func == "jrt_arena_push" => 1,
+                    Statement::Call { func, .. } if func == "jrt_arena_pop" => -1,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .collect();
+    let succs = |bi: usize| -> Vec<usize> {
+        match &f.blocks[bi].terminator {
+            Terminator::Goto(b) => vec![b.0 as usize],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+            Terminator::Switch { default, cases, .. } => {
+                let mut v = vec![default.0 as usize];
+                v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                v
+            }
+            Terminator::Return(_) => vec![],
+        }
+    };
+    // Entry arena-depth per reachable block: min over predecessors' exit depth.
+    let mut entry: Vec<Option<i32>> = vec![None; nb];
+    entry[0] = Some(0);
+    let mut wl = vec![0usize];
+    let mut guard = 0usize;
+    while let Some(b) = wl.pop() {
+        guard += 1;
+        if guard > nb * nb + nb + 16 {
+            break; // malformed/unbalanced arena → bail conservatively (no seeds lost below)
+        }
+        let ex = entry[b].unwrap() + net[b];
+        for s in succs(b) {
+            let newv = Some(entry[s].map_or(ex, |c| c.min(ex)));
+            if newv != entry[s] {
+                entry[s] = newv;
+                wl.push(s);
+            }
+        }
+    }
+    // `new_dests`: New/NewArray at depth>0 — always immortal (arena allocation).
+    // `call_dests`: Call dests at depth>0 — immortal IFF their arguments are all
+    // immortal/scalar (decided in the fixpoint below): a callee running inside the
+    // arena returns arena memory as long as it does not return a non-arena argument.
+    let mut new_dests = BTreeSet::new();
+    let mut call_dests = BTreeSet::new();
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        let Some(mut depth) = entry[bi] else { continue };
+        for st in &bb.statements {
+            match st {
+                Statement::Call { func, .. } if func == "jrt_arena_push" => depth += 1,
+                Statement::Call { func, .. } if func == "jrt_arena_pop" => depth -= 1,
+                Statement::New { dest, .. } | Statement::NewArray { dest, .. } if depth > 0 => {
+                    new_dests.insert(dest.0);
+                }
+                // A call to a USER function (not a `jrt_*` runtime helper — those may
+                // return explicit heap, e.g. a capsule's `jrt_deep_copy_heap`) at arena
+                // depth. Sound because the arena_push only exists where the Vire region
+                // check vetted the whole scope INCLUDING transitive callees (no capsule /
+                // heap escape), so every allocation the callee makes lands in the arena.
+                Statement::Call { dest: Some(d), func, .. } if depth > 0 && !func.starts_with("jrt_") => {
+                    call_dests.insert(d.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    (new_dests, call_dests)
+}
+
 fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
     let n = f.locals.len();
     let n_params = f.params.len();
+    // Objects allocated inside an auto-arena are immortal seeds (like StackNew); a user
+    // call inside the arena yields immortal memory when its arguments are immortal/scalar.
+    let (arena_new, arena_call) = arena_immortal_dests(f);
+    // Is a call argument safe (cannot introduce a non-arena ref into the result)?
+    // A ref must be immortal; a scalar / immortal literal always is.
+    let op_imm = |op: &Operand, imm: &[bool]| match op {
+        Operand::Copy(l) => imm[l.0 as usize] || f.locals[l.0 as usize] != Ty::Ref,
+        Operand::ConstNull | Operand::ConstStr(_) | Operand::ConstClass(_) => true,
+        _ => true, // scalar constant — carries no reference
+    };
     let mut imm = vec![false; n];
     for l in n_params..n {
         if f.locals[l] == Ty::Ref {
@@ -1408,19 +1506,34 @@ fn immortal_only_locals(f: &Function) -> BTreeSet<u32> {
                         (Some(d.0), ip)
                     }
                     Statement::Assign(d, _) => (Some(d.0), false),
-                    Statement::New { dest, .. } => (Some(dest.0), false),
+                    // A `New`/`NewArray` inside an auto-arena is immortal (allocated into
+                    // the arena, freed en bloc); elsewhere it is a heap allocation.
+                    Statement::New { dest, .. } => (Some(dest.0), arena_new.contains(&dest.0)),
+                    Statement::NewArray { dest, .. } => (Some(dest.0), arena_new.contains(&dest.0)),
                     // `jrt_array_data` returns an INTERIOR pointer into the array (its
                     // data region), a borrow — it owns nothing, so its result must not be
                     // retained/released (releasing an interior pointer reads a bogus
                     // header). Treat it as immortal, like a stack/literal value.
                     Statement::Call { dest, func, .. } if func == "jrt_array_data" => (dest.map(|d| d.0), true),
+                    // A user call inside the arena whose arguments are all immortal/scalar
+                    // returns arena memory (the callee, vetted by the region check, only
+                    // allocates into the active arena and never returns a non-arena arg).
+                    Statement::Call { dest: Some(d), args, .. } if arena_call.contains(&d.0) && args.iter().all(|a| op_imm(a, &imm)) => (Some(d.0), true),
                     Statement::Call { dest, .. }
                     | Statement::CallGuarded { dest, .. }
                     | Statement::CallVirtual { dest, .. }
                     | Statement::CallPoly { dest, .. } => (dest.map(|d| d.0), false),
-                    Statement::GetField { dest, .. }
-                    | Statement::GetStatic { dest, .. }
-                    | Statement::NewArray { dest, .. }
+                    // A field read from an immortal object yields an immortal reference:
+                    // an immortal object's ref fields hold only immortal refs (the escape
+                    // analysis's both-or-neither promotion for StackNew, and the arena
+                    // freshness rule for arena objects — both already relied upon when
+                    // skipping the immortal object's own field releases). So `x = imm.f`
+                    // is RC-free, exactly like a copy of an immortal local.
+                    Statement::GetField { dest, obj, .. } => {
+                        let ip = matches!(obj, Operand::Copy(s) if imm[s.0 as usize]);
+                        (Some(dest.0), ip)
+                    }
+                    Statement::GetStatic { dest, .. }
                     | Statement::ArrayLoad { dest, .. } => (Some(dest.0), false),
                     _ => (None, false),
                 };
@@ -2501,14 +2614,24 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 // A move-on-last-use local (`moved`) hands the field its own +1 —
                 // omit the retain here (the local's cleanup release is likewise
                 // skipped in emit_cleanup), removing the ownership-transfer churn.
+                // An IMMORTAL value (arena/stack, `imm`) needs no retain: retain is a
+                // runtime no-op on it. And when the OBJECT is immortal, its ref field
+                // held an immortal ref (both-or-neither / arena invariant), so the
+                // release of the old value is a no-op too — omit it. Together these
+                // strip the entire retain/release churn from an arena-local mutation
+                // (e.g. a per-iteration graph's topology rewrite), leaving a bare store.
                 let moved_in = matches!(value, Operand::Copy(l) if e.moved.contains(&l.0));
-                if !matches!(value, Operand::ConstNull) && !moved_in {
+                let v_imm = matches!(value, Operand::Copy(l) if e.imm.contains(&l.0));
+                let obj_imm = matches!(obj, Operand::Copy(l) if e.imm.contains(&l.0));
+                if !matches!(value, Operand::ConstNull) && !moved_in && !v_imm {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
                 let old = e.fresh();
                 writeln!(w, "  {old} = load ptr, ptr {p}{tb}").unwrap();
                 writeln!(w, "  store ptr {v}, ptr {p}{tb}").unwrap();
-                writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
+                if !obj_imm {
+                    writeln!(w, "  call void @jrt_release(ptr {old})").unwrap();
+                }
             } else {
                 writeln!(w, "  store {} {v}, ptr {p}{tb}", llty(ty)).unwrap();
             }
