@@ -254,6 +254,72 @@ fn main() {
 }
 EOF
 
+# ── PROMOTE 4: ref-field mutation performed INSIDE A CALLEE whose arguments are proven
+#    fresh at the call site. `link(last, h)` closes the cycle via a helper; both args are
+#    iteration-fresh, so the callee's `a.next = b` keeps an arena ref in an arena object.
+#    Exercises the interprocedural freshness domain (callee params seeded fresh). 4000
+#    trials × h.id=20.
+check callee_fresh_mutation promote 80000 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn chain(len: Int) -> Node { if len == 0 { null } else { Node(len, chain(len - 1), null) } }
+fn link(a: Node, b: Node) { a.next = b }
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 4000 {
+        mut h = chain(20)
+        mut last = h
+        while last.next != null { last = last.next }
+        link(last, h)
+        sum = (sum + h.id) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
+EOF
+
+# ── DECLINE 8: callee mutation whose BASE arg is an OUTER object. The args are not all
+#    fresh, so the callee descent uses the empty freshness domain and its `a.next = b`
+#    stays forbidden → no arena (else the outer object would hold a dangling arena ref).
+check callee_outer_base decline 999949972 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn mk(v: Int) -> Node { Node(v, null, null) }
+fn link(a: Node, b: Node) { a.next = b }
+fn main() {
+    mut keep = mk(0)
+    mut sum = 0
+    mut t = 0
+    while t < 100000 {
+        mut h = mk(t)
+        link(keep, h)
+        sum = (sum + keep.next.id) % 1000000007
+        t = t + 1
+    }
+    keep.next = null
+    print(sum)
+}
+EOF
+
+# ── DECLINE 9: callee stores an OUTER ref (non-fresh value arg) into a fresh object →
+#    the fresh object would capture a non-arena ref (leak at pop) → must decline.
+check callee_outer_value decline 700000 <<'EOF'
+type Node { id: Int  next: Node  side: Node }
+fn mk(v: Int) -> Node { Node(v, null, null) }
+fn link(a: Node, b: Node) { a.next = b }
+fn main() {
+    mut ext = mk(7)
+    mut sum = 0
+    mut t = 0
+    while t < 100000 {
+        mut h = mk(t)
+        link(h, ext)
+        sum = (sum + h.next.id) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
+EOF
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

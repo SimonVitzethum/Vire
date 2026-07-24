@@ -1405,8 +1405,9 @@ impl<'a> FnLower<'a> {
             }
         }
         // Iteration-fresh locals — the domain in which a ref-storing field mutation
-        // can be admitted soundly (loop's own function only).
-        let fresh = self.loop_fresh_locals(body);
+        // can be admitted soundly. Seed empty (no fresh params in the loop's own
+        // function); callee descents re-seed with the callee's fresh parameters.
+        let fresh = self.region_fresh_locals(body, &std::collections::HashSet::new(), None);
         let mut seen = std::collections::HashSet::new();
         if self.region_bad_block(body, false, false, None, &outer, &mut seen, &fresh) {
             return false;
@@ -1415,23 +1416,27 @@ impl<'a> FnLower<'a> {
         self.region_allocates_block(body, &mut seen)
     }
 
-    /// Locals that are provably iteration-fresh in the loop body: every assignment to
-    /// them comes from an arena-local source (a constructor / a call whose arguments
-    /// are all fresh / a field-read of a fresh object / `null` / a scalar / a string
-    /// concat, which allocates into the active arena). A greatest fixpoint: assume all
-    /// assigned locals fresh, then drop any with a non-fresh right-hand side until
-    /// stable. Non-fresh ground sources (a read of an outer ref variable, an opaque
-    /// call, an uninitialised `mut`) propagate and remove names transitively. Sound
-    /// direction: a name stays fresh only if EVERY reaching definition is fresh.
-    fn loop_fresh_locals(&self, body: &Block2) -> std::collections::HashSet<String> {
+    /// Names that are provably iteration-fresh in a body: every assignment to them
+    /// comes from an arena-local source (a constructor / a call whose arguments are all
+    /// fresh / a field-read of a fresh object / `null` / a scalar / a string concat,
+    /// which allocates into the active arena). `seed` are names fresh on entry — empty
+    /// for the loop's own function, the callee's fresh ref parameters for a callee body
+    /// (their arguments were proven fresh at the call site). `cur_fn` is the scope for
+    /// scalarness. A greatest fixpoint: assume all seeded+assigned names fresh, then
+    /// drop any whose right-hand side is not fresh until stable. Non-fresh ground
+    /// sources (an opaque call, an uninitialised `mut`) propagate and remove names
+    /// transitively. Sound direction: a name stays fresh only if EVERY reaching
+    /// definition is fresh (a not-reassigned seed param stays fresh).
+    fn region_fresh_locals(&self, body: &Block2, seed: &std::collections::HashSet<String>, cur_fn: Option<&FnDef>) -> std::collections::HashSet<String> {
         let mut assigns: Vec<(String, Option<&Expr>)> = Vec::new();
         self.collect_fresh_assigns_block(body, &mut assigns);
-        let mut fresh: std::collections::HashSet<String> = assigns.iter().map(|(n, _)| n.clone()).collect();
+        let mut fresh: std::collections::HashSet<String> = seed.iter().cloned().collect();
+        fresh.extend(assigns.iter().map(|(n, _)| n.clone()));
         loop {
             let mut changed = false;
             for (name, rhs) in &assigns {
                 if fresh.contains(name) {
-                    let ok = rhs.map(|e| self.expr_is_fresh(e, &fresh)).unwrap_or(false);
+                    let ok = rhs.map(|e| self.expr_is_fresh(e, &fresh, cur_fn)).unwrap_or(false);
                     if !ok {
                         fresh.remove(name);
                         changed = true;
@@ -1498,7 +1503,7 @@ impl<'a> FnLower<'a> {
     /// hold fresh refs, `null`, or immortal literals — so a field-read of a fresh base
     /// is itself fresh, and a constructor/call yields fresh memory when its arguments
     /// are all fresh (a callee that returns an argument returns a fresh one).
-    fn expr_is_fresh(&self, e: &Expr, fresh: &std::collections::HashSet<String>) -> bool {
+    fn expr_is_fresh(&self, e: &Expr, fresh: &std::collections::HashSet<String>, cur_fn: Option<&FnDef>) -> bool {
         match e {
             // Scalars cannot be a dangling ref; a string literal is immortal (never
             // freed, so no dangle); `a + b` allocates into the active arena (or is
@@ -1506,9 +1511,11 @@ impl<'a> FnLower<'a> {
             Expr::Int(..) | Expr::Float(..) | Expr::Bool(..) | Expr::Char(..) | Expr::Str(..)
             | Expr::Unary { .. } | Expr::Binary { .. } => true,
             Expr::Ident(n, _) if n == "null" && self.lookup(n).is_none() => true,
-            // A fresh local, or any scalar-typed local (a scalar reference cannot dangle).
-            Expr::Ident(n, _) => fresh.contains(n) || !self.region_name_is_ref(n, None),
-            Expr::Field { base, .. } => self.expr_is_fresh(base, fresh),
+            // A fresh local/param, or any scalar-typed name (a scalar cannot dangle).
+            // `cur_fn` selects the scope for scalarness: the loop's own function (None →
+            // live scope) or a callee (Some(fd) → its parameter annotations).
+            Expr::Ident(n, _) => fresh.contains(n) || !self.region_name_is_ref(n, cur_fn),
+            Expr::Field { base, .. } => self.expr_is_fresh(base, fresh, cur_fn),
             // Constructor / known function: the result is arena-local as long as every
             // argument is fresh (a callee that returns an argument returns a fresh one).
             // Relies on Vire having NO global/static ref state (0 GetStatic/PutStatic
@@ -1518,7 +1525,7 @@ impl<'a> FnLower<'a> {
             // branch must also require the callee to be proven not to return one.
             Expr::Call { callee, args, .. } => match callee.as_ref() {
                 Expr::Ident(n, _) if self.is_alloc_name(n) || self.fn_defs.contains_key(n) => {
-                    args.iter().all(|a| self.expr_is_fresh(a, fresh))
+                    args.iter().all(|a| self.expr_is_fresh(a, fresh, cur_fn))
                 }
                 _ => false,
             },
@@ -1574,16 +1581,19 @@ impl<'a> FnLower<'a> {
                     // container). `region_index_scalar`/`expr_may_be_ref` are conservative.
                     Expr::Index { base, .. } => !self.region_index_scalar(base, cur_fn) && self.expr_may_be_ref(value, cur_fn),
                     // Field mutation `obj.f = v`. A scalar `v` cannot leak a ref. A ref `v`
-                    // is admitted ONLY in the loop's own function when the mutated object
-                    // `base` AND the stored value are both provably iteration-fresh: then
-                    // both live in this iteration's arena and are freed together at the pop,
-                    // so nothing outlives it (no dangle) and no non-arena ref is captured
-                    // (no missing release → no leak). Otherwise it stays forbidden.
+                    // is admitted when the mutated object `base` AND the stored value are
+                    // both provably iteration-fresh: then both live in this iteration's
+                    // arena and are freed together at the pop, so nothing outlives it (no
+                    // dangle) and no non-arena ref is captured (no missing release → no
+                    // leak). This holds in the loop's own function (`fresh` = the loop's
+                    // fresh locals) and inside a callee whose arguments were proven fresh
+                    // at the call site (`fresh` = the callee's fresh params + locals);
+                    // in a non-fresh-args callee descent `fresh` is empty, so nothing is
+                    // admitted. `in_callee` no longer gates it — the `fresh` set does.
                     Expr::Field { base, .. } => {
                         self.expr_may_be_ref(value, cur_fn)
-                            && !(!in_callee
-                                && self.expr_is_fresh(base, fresh)
-                                && self.expr_is_fresh(value, fresh))
+                            && !(self.expr_is_fresh(base, fresh, cur_fn)
+                                && self.expr_is_fresh(value, fresh, cur_fn))
                     }
                     // Ref to an outer variable (compound `x op= e`) → escapes. Safe if the
                     // outer variable is scalar-typed (a ref cannot be stored into an I64/F64
@@ -1612,16 +1622,38 @@ impl<'a> FnLower<'a> {
                 let callee_bad = match callee.as_ref() {
                     Expr::Ident(n, _) => {
                         if let Some(fd) = self.fn_defs.get(n) {
-                            if seen.insert(n.clone()) {
+                            // Are ALL arguments fresh at THIS call site? Then the callee's
+                            // ref parameters are arena-local, and it may mutate their graphs
+                            // (a fresh ref stored into a fresh param stays in the arena).
+                            // Only when the arg/param arity matches (no defaults in play).
+                            let args_fresh = args.len() == fd.sig.params.len()
+                                && args.iter().all(|a| self.expr_is_fresh(a, fresh, cur_fn));
+                            // Key `seen` by (callee, args_fresh): the fresh and conservative
+                            // descents are distinct checks, and each terminates recursion.
+                            let key = format!("{n}#{}", args_fresh as u8);
+                            if seen.insert(key) {
                                 match &fd.body {
                                     // Descend into the callee: `in_callee = true` (its
-                                    // return/break/continue no longer disqualify the
-                                    // arena), `in_loop = false` (a fresh loop nesting),
-                                    // `cur_fn = Some(fd)` (resolve names via ITS params).
-                                    // Empty `fresh`: the loop's iteration-freshness domain
-                                    // does not extend into a callee, so ref-field mutation
-                                    // stays conservatively forbidden there.
-                                    Some(b) => self.region_bad_block(b, true, false, Some(fd), outer, seen, &std::collections::HashSet::new()),
+                                    // return/break/continue no longer disqualify the arena),
+                                    // `in_loop = false`, `cur_fn = Some(fd)` (names via ITS
+                                    // params). `fresh` = the callee's fresh params + locals
+                                    // when the args were proven fresh, else empty (ref-field
+                                    // mutation then stays conservatively forbidden there).
+                                    Some(b) => {
+                                        let callee_fresh = if args_fresh {
+                                            let seed: std::collections::HashSet<String> = fd
+                                                .sig
+                                                .params
+                                                .iter()
+                                                .filter(|p| ty_of(p.ty.as_ref()) == Ty::Ref)
+                                                .map(|p| p.name.clone())
+                                                .collect();
+                                            self.region_fresh_locals(b, &seed, Some(fd))
+                                        } else {
+                                            std::collections::HashSet::new()
+                                        };
+                                        self.region_bad_block(b, true, false, Some(fd), outer, seen, &callee_fresh)
+                                    }
                                     None => true, // only signature → opaque
                                 }
                             } else {
