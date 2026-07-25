@@ -503,9 +503,17 @@ impl DebugGen {
         self.next += 1;
         self.subs.insert(name.to_string(), sub);
         let l = if line == 0 { 1 } else { line };
+        // The program entry is lowered under the symbol `java_main` (the `@main`
+        // wrapper installs the runtime and calls it). Show it as `main` in the debug
+        // name so a backtrace reads `main`, keeping `linkageName` = the real symbol.
+        let (disp, linkage) = if name == "java_main" {
+            ("main".to_string(), format!(", linkageName: \"{}\"", escape_md(name)))
+        } else {
+            (escape_md(name), String::new())
+        };
         self.defs.push(format!(
-            "!{sub} = distinct !DISubprogram(name: \"{}\", scope: !{f}, file: !{f}, line: {l}, type: !{st}, scopeLine: {l}, spFlags: DISPFlagDefinition, unit: !{cu})",
-            escape_md(name), f = self.file_id(), st = self.subtype_id(), cu = self.cu_id(),
+            "!{sub} = distinct !DISubprogram(name: \"{disp}\"{linkage}, scope: !{f}, file: !{f}, line: {l}, type: !{st}, scopeLine: {l}, spFlags: DISPFlagDefinition, unit: !{cu})",
+            f = self.file_id(), st = self.subtype_id(), cu = self.cu_id(),
         ));
         sub
     }
