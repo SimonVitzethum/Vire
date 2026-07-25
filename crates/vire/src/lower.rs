@@ -246,6 +246,21 @@ fn arr_ret(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
     (None, None)
 }
 
+/// Array-return kind/class for a call into a GENERIC instantiation. A generic body
+/// `fn f[T](…) -> Array[T] { array(n) }` allocates an UNTYPED (scalar-vtable) array —
+/// `array(n)` inside the body has no visibility of `T` — so a REF element `T` (e.g.
+/// `Array[Node]`) would leak (the array's drop never releases the ref slots). Only
+/// SCALAR element returns are sound here; a ref element is left unattributed, so the
+/// caller's `f()[i]` is a loud "unknown array" error rather than a silent leak. (A
+/// non-generic factory that writes `mut a: Array[Node] = array(n)` builds a real ref
+/// array and is handled by `arr_ret`.)
+fn arr_ret_generic(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
+    match arr_ret(t) {
+        (Some(ArrKind::Ref), _) => (None, None),
+        other => other,
+    }
+}
+
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     lower_module_src(m, "")
 }
@@ -2847,8 +2862,10 @@ impl<'a> FnLower<'a> {
         let targ_strs: Vec<String> = g.tparams.iter().map(|tp| bind.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
         let sym = mono_sym(callee, &targ_strs);
         self.mono.push((callee.to_string(), targ_strs));
-        let ret = g.ret.as_ref().map(|t| ty_of(Some(&subst_type(t, &bind)))).unwrap_or(Ty::Void);
-        let ret_class = g.ret.as_ref().and_then(|t| class_of(Some(&subst_type(t, &bind))));
+        let ret_sub = g.ret.as_ref().map(|t| subst_type(t, &bind));
+        let ret = ret_sub.as_ref().map(|t| ty_of(Some(t))).unwrap_or(Ty::Void);
+        let ret_class = ret_sub.as_ref().and_then(|t| class_of(Some(t)));
+        let (ret_arr, ret_arr_class) = arr_ret_generic(ret_sub.as_ref());
         let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
         if ret == Ty::Void {
             self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
@@ -2857,6 +2874,12 @@ impl<'a> FnLower<'a> {
         let d = self.new_local(ret);
         if let Some(c) = ret_class {
             self.local_class.insert(d.0, c);
+        }
+        if let Some(k) = ret_arr {
+            self.local_arr.insert(d.0, k);
+        }
+        if let Some(c) = ret_arr_class {
+            self.local_arr_class.insert(d.0, c);
         }
         self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
         (Operand::Copy(d), ret)
@@ -4054,8 +4077,10 @@ impl<'a> FnLower<'a> {
             let targs: Vec<String> = g.tparams.iter().map(|tp| bind.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
             let sym = mono_sym(&name, &targs);
             self.mono.push((name.clone(), targs.clone()));
-            let ret = g.ret.as_ref().map(|t| ty_of(Some(&subst_type(t, &bind)))).unwrap_or(Ty::Void);
-            let ret_class = g.ret.as_ref().and_then(|t| class_of(Some(&subst_type(t, &bind))));
+            let ret_sub = g.ret.as_ref().map(|t| subst_type(t, &bind));
+            let ret = ret_sub.as_ref().map(|t| ty_of(Some(t))).unwrap_or(Ty::Void);
+            let ret_class = ret_sub.as_ref().and_then(|t| class_of(Some(t)));
+            let (ret_arr, ret_arr_class) = arr_ret_generic(ret_sub.as_ref());
             let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
             if ret == Ty::Void {
                 self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
@@ -4064,6 +4089,12 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(ret);
             if let Some(c) = ret_class {
                 self.local_class.insert(d.0, c);
+            }
+            if let Some(k) = ret_arr {
+                self.local_arr.insert(d.0, k);
+            }
+            if let Some(c) = ret_arr_class {
+                self.local_arr_class.insert(d.0, c);
             }
             self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
             return (Operand::Copy(d), ret);

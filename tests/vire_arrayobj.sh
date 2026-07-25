@@ -160,6 +160,31 @@ fn put(a: Array[A]) { a[0] = B(1) }
 fn main() { mut a: Array[A] = array(2)  put(a)  print(0) }
 EOF
 
+# ── RETURN (generic, scalar): `fn f[T](n) -> Array[T]` with a scalar T is sound
+#    (the body's untyped array matches a scalar element). a[2] = 99.
+run generic_scalar_return decline 99 <<'EOF'
+fn firstn[T](n: Int) -> Array[T] { array(n) }
+fn main() {
+    mut a: Array[Int] = firstn[Int](4)
+    a[2] = 99
+    print(a[2])
+}
+EOF
+
+# ── REJECT (generic, ref): `fn f[T](n) -> Array[T]` with a REF T is NOT sound — the
+#    generic body allocates an untyped (scalar-vtable) array that would leak its ref
+#    slots — so the element class is deliberately NOT attributed; `a[i] = …` is a loud
+#    error, never a silent leak.
+reject reject_generic_ref_return "not an array" <<'EOF'
+type Node { id: Int }
+fn firstn[T](n: Int) -> Array[T] { array(n) }
+fn main() {
+    mut a: Array[Node] = firstn[Node](3)
+    a[0] = Node(42)
+    print(0)
+}
+EOF
+
 # ── FOR-EACH: `for x in refArray` binds the element object class → `x.field`
 #    resolves in the loop body. ids 5+6+7 = 18.
 run foreach_refarray decline 18 <<'EOF'
