@@ -431,9 +431,21 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
     under RC, and it regressed `vire_errors.sh`. The real fix must unify the erased/mono
     representation and teach `?`/`.wrap`/`.error` the mono class before gating on the heap oracle.
 
-### [8] Debug symbols + crash paths — remaining
-- [ ] freestanding: compact symbol table instead of libc `backtrace`; map the entry
-  symbol `java_main` back to `main` in the DISubprogram name (cosmetic).
+### [8] Debug symbols + crash paths — DONE (2026-07-25)
+- [x] **Map `java_main` → `main` in the DISubprogram name.** The entry's DISubprogram now
+  uses `name: "main"` + `linkageName: "java_main"`, so a DWARF backtrace (gdb/addr2line)
+  reads `main`. Verified with `llvm-dwarfdump` (both Vire and Java paths).
+- [x] **Freestanding: compact symbol table instead of libc `backtrace`.** A `--freestanding`
+  build has no execinfo/DWARF, so the backend (`emit_freestanding` → `emit_symtab`) emits
+  `jrt_symtab` (generated function address → name) + forces a frame pointer on every
+  generated function (`#0 = "frame-pointer"="all"`, plus `-fno-omit-frame-pointer` for the
+  C). On a fatal exception the runtime walks the rbp chain and names each frame by its
+  nearest preceding symbol (the faulting Vire/Java frames symbolize exactly; interspersed
+  `jrt_*` frames resolve to the nearest generated name — honest "nearest symbol" header).
+  Hosted builds are unchanged (no symtab, no frame-pointer cost — they use libc
+  `backtrace`). End-to-end test `tests/freestanding_backtrace.sh` (OOB → linked with
+  `sel4/bringup.c`, run via raw syscalls → backtrace names `boom` + `main`). Gated: Java
+  oracle 67/67 (incl. the freestanding case), shape_soundness 3/3.
 
 ---
 

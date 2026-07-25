@@ -2299,6 +2299,51 @@ __attribute__((constructor)) static void bt_install(void) {
     signal(SIGSEGV, bt_signal);
     signal(SIGBUS, bt_signal);
 }
+#elif defined(FASTLLVM_FREESTANDING)
+/* Libc-free backtrace (bare-metal / seL4): no execinfo, no DWARF. The backend emits
+ * a compact symbol table `jrt_symtab` (generated function address → name) + forces a
+ * frame pointer on every generated function (`-fno-omit-frame-pointer` covers the C).
+ * capture walks the rbp chain (fp[0]=saved fp, fp[1]=return address); print names each
+ * return address by the NEAREST PRECEDING symbol. The generated (Vire/Java) frames —
+ * the ones that matter — symbolize exactly (a return address lands inside its own
+ * function); interspersed runtime `jrt_*` frames (not in the table) resolve to the
+ * nearest generated name, hence the honest "nearest symbol" header. Always on in a
+ * freestanding build (the only crash-debugging aid there); zero cost until a crash. */
+struct jrt_sym { long addr; const char *name; };
+extern const struct jrt_sym jrt_symtab[];
+extern const long jrt_symtab_len;
+static const char *jrt_symbolize(long pc) {
+    const char *best = 0;
+    long best_addr = 0;
+    for (long i = 0; i < jrt_symtab_len; i++) {
+        long a = jrt_symtab[i].addr;
+        if (a <= pc && a >= best_addr) { best_addr = a; best = jrt_symtab[i].name; }
+    }
+    return best ? best : "?";
+}
+static void *fbt_buf[64];
+static int fbt_n = 0;
+static void capture_backtrace(void) {
+    fbt_n = 0;
+    void **fp = (void **)__builtin_frame_address(0);
+    for (int i = 0; i < 64 && fp; i++) {
+        void *ret = fp[1];
+        if (!ret) break;
+        fbt_buf[fbt_n++] = ret;
+        void **next = (void **)fp[0];
+        if (next <= fp) break; /* the frame chain grows upward; stop on a bad/looping fp */
+        fp = next;
+    }
+}
+static void print_backtrace(void) {
+    if (fbt_n <= 0) return;
+    plat_puts("backtrace (most recent call first, nearest symbol per frame):\n");
+    for (int i = 0; i < fbt_n; i++) {
+        plat_puts("  at ");
+        plat_puts(jrt_symbolize((long)fbt_buf[i]));
+        plat_puts("\n");
+    }
+}
 #else
 static void capture_backtrace(void) {}
 static void print_backtrace(void) {}

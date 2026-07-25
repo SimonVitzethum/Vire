@@ -157,7 +157,13 @@ fn main() {
         return;
     }
 
-    let ll = fastllvm_backend::emit(&program);
+    // Freestanding codegen additionally emits frame-pointer attributes + a compact
+    // symbol table for the libc-free crash backtrace (crates/driver/src/runtime.c).
+    let ll = if freestanding {
+        fastllvm_backend::emit_freestanding(&program, None)
+    } else {
+        fastllvm_backend::emit(&program)
+    };
     if emit_llvm {
         print!("{ll}");
         return;
@@ -212,6 +218,9 @@ fn main() {
             "-nostdlib",
             "-ffreestanding",
             "-fno-stack-protector",
+            // Keep frame pointers so the libc-free backtrace can walk the rbp chain
+            // (runtime.c + bringup; the generated .ll carries the attribute per-function).
+            "-fno-omit-frame-pointer",
             "-DFASTLLVM_FREESTANDING",
         ]);
     }

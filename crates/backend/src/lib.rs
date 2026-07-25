@@ -571,10 +571,21 @@ fn escape_md(s: &str) -> String {
 }
 
 pub fn emit(program: &Program) -> String {
-    emit_debug(program, None)
+    emit_full(program, None, false)
 }
 
 pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
+    emit_full(program, debug, false)
+}
+
+/// Freestanding (libc-free) codegen: additionally emits frame-pointer attributes
+/// on the generated functions and a compact symbol table (`jrt_symtab`), so the
+/// runtime can print a function-name backtrace on a crash without libc `backtrace`.
+pub fn emit_freestanding(program: &Program, debug: Option<(&str, &str)>) -> String {
+    emit_full(program, debug, true)
+}
+
+fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool) -> String {
     let mut out = String::new();
     let w = &mut out;
 
@@ -1032,7 +1043,16 @@ pub fn emit_debug(program: &Program, debug: Option<(&str, &str)>) -> String {
     let heap_esc = heap_escaping_fns(program);
     let arena_ctx = arena_ctx_fns(program, &heap_esc);
     for (fi, f) in program.functions.iter().enumerate() {
-        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name), arena_ctx.contains(&f.name), &heap_esc);
+        emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name), arena_ctx.contains(&f.name), &heap_esc, freestanding);
+    }
+
+    // Freestanding: a compact symbol table (function address → name) so the runtime's
+    // frame-pointer backtrace can name each frame without libc `backtrace`/DWARF. Sorted
+    // at first use in the runtime; here just an unordered {addr, name} array. The
+    // frame-pointer attribute group `#0` (referenced by every function) is defined here.
+    if freestanding {
+        emit_symtab(w, program);
+        writeln!(w, "attributes #0 = {{ \"frame-pointer\"=\"all\" }}").unwrap();
     }
 
     // Thread trampoline: called by the runtime (pthread or synchronous),
@@ -2227,20 +2247,55 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
         .collect()
 }
 
-fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool, local_names: Option<&Vec<Option<String>>>, arena_ctx: bool, heap_esc: &BTreeSet<String>) {
+/// Compact symbol table for the freestanding backtrace: an unordered array of
+/// `{ i64 function-address, ptr name }` plus its length, consumed by the runtime's
+/// `jrt_symbolize` (greatest start ≤ return-address). Names come from the LLVM symbol,
+/// with the entry `java_main` shown as `main` (matching the DISubprogram). Tiny and
+/// freestanding-only, so hosted binaries are not bloated (they use libc `backtrace`).
+fn emit_symtab(w: &mut String, program: &Program) {
+    for (i, f) in program.functions.iter().enumerate() {
+        let disp: &str = if f.name == "java_main" { "main" } else { &f.name };
+        let mut bytes: Vec<u8> = disp.bytes().collect();
+        bytes.push(0);
+        let len = bytes.len();
+        let lit: String = bytes.iter().map(|b| format!("\\{b:02X}")).collect();
+        writeln!(w, "@.symname.{i} = private constant [{len} x i8] c\"{lit}\"").unwrap();
+    }
+    let m = program.functions.len();
+    writeln!(w, "@jrt_symtab_len = constant i64 {m}").unwrap();
+    if m == 0 {
+        writeln!(w, "@jrt_symtab = constant [0 x {{ i64, ptr }}] zeroinitializer").unwrap();
+        return;
+    }
+    write!(w, "@jrt_symtab = constant [{m} x {{ i64, ptr }}] [").unwrap();
+    for (i, f) in program.functions.iter().enumerate() {
+        if i > 0 {
+            write!(w, ", ").unwrap();
+        }
+        write!(w, "{{ i64, ptr }} {{ i64 ptrtoint (ptr @{} to i64), ptr @.symname.{i} }}", f.name).unwrap();
+    }
+    writeln!(w, "]").unwrap();
+}
+
+fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mut DebugGen, fn_lines: &std::collections::HashMap<String, u32>, uncatchable: bool, local_names: Option<&Vec<Option<String>>>, arena_ctx: bool, heap_esc: &BTreeSet<String>, freestanding: bool) {
     let ps: Vec<String> = f
         .params
         .iter()
         .enumerate()
         .map(|(i, t)| format!("{} %p{i}", llty(*t)))
         .collect();
+    // Freestanding backtrace walks the frame-pointer chain (libc `backtrace` absent) —
+    // force a frame pointer on every generated function so each frame is walkable and
+    // its return address symbolizes via `jrt_symtab`. `#0` = { "frame-pointer"="all" },
+    // emitted once at module end. Hosted builds keep the optimizer's default (no cost).
+    let fp = if freestanding { "#0 " } else { "" };
     // Debug: a DISubprogram for the function + one DILocation (chain, for inlined
     // code) per distinct DebugLine inline-stack, so instructions map to the exact
     // `.vr` line with the caller chain. `marker_locs` maps a marker's frames → its
     // innermost DILocation id.
     let (marker_locs, default_loc) = if dg.on {
         let sub = dg.subprogram(&f.name, f.line);
-        writeln!(w, "define {} @{}({}) !dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}) {fp}!dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         let mut map: std::collections::HashMap<Vec<(String, u32)>, usize> = std::collections::HashMap::new();
         for bb in &f.blocks {
             for st in &bb.statements {
@@ -2255,7 +2310,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
         let def = dg.location(f.line, sub, 0);
         (map, Some(def))
     } else {
-        writeln!(w, "define {} @{}({}) {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}) {fp}{{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         (std::collections::HashMap::new(), None)
     };
 
