@@ -1686,8 +1686,20 @@ fn immortal_only_locals(f: &Function, arena_ctx: bool, heap_esc: &BTreeSet<Strin
                         let ip = matches!(obj, Operand::Copy(s) if imm[s.0 as usize]);
                         (Some(dest.0), ip)
                     }
-                    Statement::GetStatic { dest, .. }
-                    | Statement::ArrayLoad { dest, .. } => (Some(dest.0), false),
+                    Statement::GetStatic { dest, .. } => (Some(dest.0), false),
+                    // Symmetric with GetField: an element read from an immortal array is
+                    // itself immortal. A REF-element array is immortal only as an arena
+                    // array — the escape pass never stack/region-promotes ref arrays
+                    // (escape.rs `NewArray … if !kind.is_ref()`) — and the arena freshness
+                    // invariant guarantees its ref slots hold only immortal refs (every
+                    // in-arena `a[i] = ref` had a fresh/immortal value, else the region
+                    // check declines the arena). So the load's retain is a proven no-op.
+                    // (Scalar loads: the flag is irrelevant — a scalar dest is never
+                    // retained — so this is harmless for primitive arrays.)
+                    Statement::ArrayLoad { dest, arr, .. } => {
+                        let ip = matches!(arr, Operand::Copy(s) if imm[s.0 as usize]);
+                        (Some(dest.0), ip)
+                    }
                     _ => (None, false),
                 };
                 if let Some(d) = def {
@@ -2884,7 +2896,22 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             // covariance/ArrayStoreException check that the inline path would
             // not have). Primitive stores are checked inline.
             let bck = *checked && std::env::var_os("FASTLLVM_NO_BOUNDS").is_none();
-            if bck && kind.is_ref() {
+            // Immortal (arena) ref array + immortal/null value: jrt_aastore's retain(new)
+            // and release(old) are both provable no-ops (the value is immortal; the slot
+            // held an immortal ref by the arena freshness invariant). Emit an RC-free
+            // inline store instead — mirrors PutField's immortal elision — bounds-checked
+            // when asked. Covariance is a non-issue: Vire ref arrays are monomorphic and
+            // the element class is checked at lowering.
+            let arr_imm = matches!(arr, Operand::Copy(l) if e.imm.contains(&l.0));
+            let val_imm = matches!(value, Operand::ConstNull)
+                || matches!(value, Operand::Copy(l) if e.imm.contains(&l.0));
+            if kind.is_ref() && arr_imm && val_imm {
+                if bck {
+                    emit_array_elem_store_checked(w, e, &a, &i, &v, *kind, e.nonnull(arr));
+                } else {
+                    emit_array_elem_store(w, e, &a, &i, &v, *kind);
+                }
+            } else if bck && kind.is_ref() {
                 writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
             } else if bck {
                 emit_array_elem_store_checked(w, e, &a, &i, &v, *kind, e.nonnull(arr));

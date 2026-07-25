@@ -11,7 +11,7 @@ Performance sits at **geomean ~1.00× Rust** across 12 Vire benchmarks — compu
 at parity or faster, virtual dispatch 2.4× faster than clang. What shipped is in
 [DONE.md](DONE.md); the remaining headroom is captured in the Performance Push below.
 
-Soundness floor (never waived): Java heap-balance oracle **65/65** +
+Soundness floor (never waived): Java heap-balance oracle **67/67** +
 `tests/vire_heap.sh` 0-live + all `tests/vire_*.sh` green after every change.
 
 ---
@@ -19,7 +19,7 @@ Soundness floor (never waived): Java heap-balance oracle **65/65** +
 # ⚡ PERFORMANCE PUSH — TOP PRIORITY (2-month plan)
 
 **Goal: maximum performance without losing memory safety.** Every item is gated by
-the 65/65 heap oracle + 0-live. **Execution order: Tier 4 → Tier 1 → Tier 2 →
+the 67/67 heap oracle + 0-live. **Execution order: Tier 4 → Tier 1 → Tier 2 →
 Tier 3.** (Tier 4 first per decision 2026-07-22.)
 
 Baseline is already Rust-parity, so the achievable delta is: (1) capture the one
@@ -87,10 +87,24 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   `expr_is_fresh`, greatest-fixpoint over the loop body). On sharedgraph the arena fires:
   729 → 352 ms (2.08×; 5.0× → 2.4× Rust), 0 heap allocs, 0 collector — 0-live +
   GUARD_FREE-clean, pinned both directions in `vire_interproc_arena.sh` (+3 cases).
-  **Still open (smaller):** (a) the same relaxation inside CALLEES (currently only the
-  loop's own function; needs the freshness domain extended interprocedurally), (b)
-  ref-*array* element stores `a[i] = ref` on a fresh array, (c) the residual ~2.4× to
-  Rust's `Rc` is a separate bare-allocation codegen gap the arena does not touch.
+  **(a) callee relaxation — DONE (2026-07-24, `fbab9ae`).** The fresh-mutation
+  relaxation extends into callees: a user call with all-fresh args descends with the
+  callee's fresh params seeded (`region_fresh_locals`), so `in_callee` no longer gates
+  the field-store admission — the `fresh` set does. Pinned by `vire_interproc_arena.sh`
+  `callee_fresh_mutation` (promote) + `callee_outer_base`/`callee_outer_value` (decline).
+  **(b) ref-*array* element stores `a[i] = ref` — DONE (2026-07-25).** Symmetric with
+  the field case: `a[i] = ref` on a fresh array is admitted when the array AND the value
+  are iteration-fresh (both arena-local, freed en bloc). This required the *array-of-
+  objects* front-end capability to be exercisable at all (a ref array had no element
+  class → `a[i].field` was a compile error) — see [Front-end completeness]. Two backend
+  RC elisions realise the win (symmetric with the field case): an ArrayLoad from an
+  immortal arena ref array is immortal, and an in-arena `a[i] = immortal` is an RC-free
+  inline store. Measured on [benchmarks/complex/arraygraph.vr](benchmarks/complex/arraygraph.vr):
+  arena 42.4 ms vs 68.0 ms RC+collector = **1.60×**, below the leak ceiling (bump < malloc),
+  0 heap / 0 live / GUARD_FREE-clean. Gated: Java 67/67, fuzzer (220 seeds), `vire_arrayobj.sh`
+  (promote + decline + 2 must-reject), `vire_interproc_arena` 13/13.
+  **Still open:** (c) the residual ~2.4× to Rust's `Rc` is a separate bare-allocation
+  codegen gap the arena does not touch.
   Original framing (kept for context): capture the build→consume→drop pattern soundly
   without the user writing `capsule`, freeing the subgraph en bloc.
   - Extends a proven mechanism: thread-local `arena_top`, `while_arena_safe`
@@ -260,12 +274,28 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   a fixpoint; generic type args work. `tests/vire_itemmacro.sh`. **Open:** token
   **pasting** (identifier interpolation), multi-argument generics (`Map[K, V]`),
   `block`/`pat` parameter kinds.
-- [ ] **`comptime for`** (loop unrolling to runtime statements) / **`emit`** surface
-  syntax. Also open: comptime over reference/aggregate values (scalars only today),
+- [~] **`comptime for`** (loop unrolling to runtime statements) — **DONE (2026-07-24,
+  `20133fc`).** `comptime for i in a..b { … }` unrolls at compile time to runtime
+  statements ([comptime.rs](crates/vire/src/comptime.rs) `fold_comptime_for` + trip-count
+  guard [0,4096]); `tests/vire_comptime.sh` (17). **Still open:** the `emit` surface
+  syntax, comptime over reference/aggregate values (scalars only today), and
   `return`/`break` in a comptime body.
 
 ## Front-end completeness
 
+- [x] **Array of objects (ref-element arrays) — DONE (2026-07-25).** `mut x: Array[Node]
+  = array(n)` builds a ref array whose slots hold `Node` references. The annotation's
+  element type declares the element object class (via `arr_hint`, consumed once by the
+  `array(n)` builtin → a `NewArray{kind:Ref}`); `x[i]` then resolves to `Node` and
+  `x[i] = e` is **class-checked** (a mismatch — or a `.field` on an unannotated ref array
+  — is a loud compile error, never a wrong-offset load/store, exactly like the merge-point
+  class propagation). Unblocks node pools / adjacency lists, and is the prerequisite that
+  made the loop-arena index-store relaxation exercisable (Tier 1 (b) above).
+  [lower.rs](crates/vire/src/lower.rs) `local_arr_class` / `arr_class_of_operand`;
+  [array_objects.vr](examples/vire/array_objects.vr); `tests/vire_arrayobj.sh`.
+  **Open (smaller):** ref arrays as **callee parameters** (`fn f(a: Array[Node])`) don't
+  yet carry the element class across the call (local arrays only); ref-array `Str`/generic
+  element classes; `for x in refArray` element-class binding.
 - [x] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance — **DONE (2026-07-24).**
   `vire fmt FILE.vr` prints canonical source (`-i` rewrites in place). Two invariants, both
   tested: idempotency (`fmt(fmt(x))==fmt(x)`) and round-trip run equality (running the formatted
@@ -335,7 +365,7 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 ### [3] Compile-time reflection
 - [ ] `@typeinfo(T)` (fields/variants/methods/attributes, comptime-iterable).
 - [ ] `@derive` via reflection (generic + nested-user-type — see (b) above).
-- [ ] `comptime for`, `emit`. **No** runtime reflection (AOT).
+- [~] `comptime for` DONE (`20133fc`); `emit` surface still open. **No** runtime reflection (AOT).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic

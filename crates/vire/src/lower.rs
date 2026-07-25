@@ -987,6 +987,12 @@ struct FnLower<'a> {
     local_class: HashMap<u32, String>,
     /// Element kind of an array/list local (for index/len/for-over-list).
     local_arr: HashMap<u32, ArrKind>,
+    /// For a REF-element array local (`mut x: Array[Node] = array(n)`): the object
+    /// class of its elements, so `x[i].field` resolves and `x[i] = e` is class-checked.
+    local_arr_class: HashMap<u32, String>,
+    /// Set while lowering a `mut x: Array[Cls] = …` RHS: the expected element object
+    /// class, consumed once by the `array(n)` builtin to build a ref array of `Cls`.
+    arr_hint: Option<String>,
     /// Lambda locals: `mut f = x -> …` → (parameter, body). The call `f(a)` is
     /// inline-expanded at that spot (capturing closures in the same scope for free).
     local_lambda: HashMap<u32, (Vec<String>, Expr)>,
@@ -1099,6 +1105,13 @@ impl<'a> FnLower<'a> {
     fn arr_of_operand(&self, op: &Operand) -> Option<ArrKind> {
         match op {
             Operand::Copy(l) => self.local_arr.get(&l.0).copied(),
+            _ => None,
+        }
+    }
+    /// Element object class of a ref-element array operand (`x` where `x[i]` is an object).
+    fn arr_class_of_operand(&self, op: &Operand) -> Option<String> {
+        match op {
+            Operand::Copy(l) => self.local_arr_class.get(&l.0).cloned(),
             _ => None,
         }
     }
@@ -1576,6 +1589,11 @@ impl<'a> FnLower<'a> {
             // live scope) or a callee (Some(fd) → its parameter annotations).
             Expr::Ident(n, _) => fresh.contains(n) || !self.region_name_is_ref(n, cur_fn),
             Expr::Field { base, .. } => self.expr_is_fresh(base, fresh, cur_fn),
+            // A slot read `a[i]` of a fresh array is fresh: inside a promoted arena every
+            // ref store into `a` had a fresh value (the index-store admission above), so
+            // the array's ref slots only hold fresh refs — reading one yields a fresh ref.
+            // (Scalar reads are trivially non-dangling.) Symmetric with the field-read case.
+            Expr::Index { base, .. } => self.expr_is_fresh(base, fresh, cur_fn),
             // Constructor / known function: the result is arena-local as long as every
             // argument is fresh (a callee that returns an argument returns a fresh one).
             // Relies on Vire having NO global/static ref state (0 GetStatic/PutStatic
@@ -1639,7 +1657,17 @@ impl<'a> FnLower<'a> {
                     // Both are base-insensitive → also fire inside callees (the one
                     // relaxation-proof leak route: a heap ref stored into a long-lived
                     // container). `region_index_scalar`/`expr_may_be_ref` are conservative.
-                    Expr::Index { base, .. } => !self.region_index_scalar(base, cur_fn) && self.expr_may_be_ref(value, cur_fn),
+                    // THIRD proof (the freshness relaxation, symmetric with the field case
+                    // below): `a[i] = ref` is admitted when the array `a` AND the stored
+                    // `ref` are both provably iteration-fresh — then both live in this
+                    // iteration's arena and are freed en bloc at the pop, so the slot never
+                    // holds a ref that outlives the arena and no non-arena ref is captured.
+                    Expr::Index { base, .. } => {
+                        !self.region_index_scalar(base, cur_fn)
+                            && self.expr_may_be_ref(value, cur_fn)
+                            && !(self.expr_is_fresh(base, fresh, cur_fn)
+                                && self.expr_is_fresh(value, fresh, cur_fn))
+                    }
                     // Field mutation `obj.f = v`. A scalar `v` cannot leak a ref. A ref `v`
                     // is admitted when the mutated object `base` AND the stored value are
                     // both provably iteration-fresh: then both live in this iteration's
@@ -1865,7 +1893,18 @@ impl<'a> FnLower<'a> {
                 .find(|p| &p.name == n)
                 .and_then(|p| p.ty.as_ref())
                 .filter(|t| t.name == "Array" || t.name == "array")
-                .map(|t| arrkind_of_name(t.args.first().map(|a| a.name.as_str()).unwrap_or("Int")) != ArrKind::Ref)
+                .map(|t| {
+                    // Scalar element ONLY for a recognised primitive kind. A user object
+                    // class maps to `arrkind_of_name` = Long (its default) but is a REF
+                    // element — treating it as scalar here would wrongly admit a ref store
+                    // in a callee (unsound). So require both: not Ref-kind AND not a user
+                    // product/sum type.
+                    let elem = t.args.first().map(|a| a.name.as_str()).unwrap_or("Int");
+                    arrkind_of_name(elem) != ArrKind::Ref
+                        && !self.types.contains_key(elem)
+                        && !self.variants.contains_key(elem)
+                        && !self.generic_ptypes.contains_key(elem)
+                })
                 .unwrap_or(false),
         }
     }
@@ -1909,7 +1948,21 @@ impl<'a> FnLower<'a> {
             Stmt::Let { mutable, name, ty: ann, value, .. } => {
                 // An explicit `: Type` annotation names the object class the RHS may
                 // not carry (the inference escape hatch); used as a fallback below.
-                let ann_class = ann.as_ref().and_then(|t| class_of(Some(t)));
+                // An `Array[Cls]` annotation is NOT an object class for the local itself
+                // (the local is the array) — it declares the element class, handled via
+                // `arr_hint` below, so exclude it here.
+                let ann_class = ann
+                    .as_ref()
+                    .filter(|t| t.name != "Array" && t.name != "array")
+                    .and_then(|t| class_of(Some(t)));
+                // `mut x: Array[Node] = array(n)` — the annotation's element type is a
+                // user object class → build a REF array of that class. Passed to the
+                // `array(n)` builtin through `arr_hint` (consumed once).
+                let arr_hint = ann
+                    .as_ref()
+                    .filter(|t| t.name == "Array" || t.name == "array")
+                    .and_then(|t| t.args.first())
+                    .and_then(|a| class_of(Some(a)));
                 // `mut f = x -> …`: remember lambda (the call is inline-expanded).
                 if let Some(Expr::Lambda { params, body, .. }) = value {
                     let l = self.new_local(Ty::I64);
@@ -1935,10 +1988,12 @@ impl<'a> FnLower<'a> {
                         return;
                     }
                 }
+                self.arr_hint = arr_hint;
                 let (op, ty) = match value {
                     Some(v) => self.lower_expr(v),
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
+                self.arr_hint = None;
                 let l = self.new_local(ty);
                 // Pass the object class resp. array element kind on to the new local.
                 // The explicit `: Type` annotation is the fallback when the RHS operand
@@ -1948,6 +2003,10 @@ impl<'a> FnLower<'a> {
                 }
                 if let Some(k) = self.arr_of_operand(&op) {
                     self.local_arr.insert(l.0, k);
+                }
+                // Propagate the ref-array element class (`x[i]` is then a known object).
+                if let Some(c) = self.arr_class_of_operand(&op) {
+                    self.local_arr_class.insert(l.0, c);
                 }
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
@@ -2009,7 +2068,21 @@ impl<'a> FnLower<'a> {
                     if self.class_of_operand(&arr).as_deref() == Some("$List") {
                         self.emit(Statement::Call { dest: None, func: "vire_list_set".into(), args: vec![arr, to_i64(idx), to_i64(v)] });
                     } else if let Some(kind) = self.arr_of_operand(&arr) {
-                        if (kind == ArrKind::Double || kind == ArrKind::Float) && (vt == Ty::I32 || vt == Ty::I64) {
+                        if kind == ArrKind::Ref {
+                            // `x[i] = e` into a ref array of `Cls`: the stored value must be
+                            // a `Cls` reference (or `null`). A class mismatch is a loud error
+                            // — never a wrong-offset store — so a later `x[i].field` read
+                            // (which trusts the declared element class) is always sound.
+                            match (self.arr_class_of_operand(&arr), self.class_of_operand(&v)) {
+                                (Some(ec), Some(vc)) if ec != vc => {
+                                    self.errs.push(format!("index assignment: array element is `{ec}`, stored value is `{vc}`"));
+                                }
+                                // A ref value with no known class (e.g. a bare `null`,
+                                // class Ref/Str) is admitted — null stores no object; a
+                                // classless ref cannot claim a conflicting layout.
+                                _ => {}
+                            }
+                        } else if (kind == ArrKind::Double || kind == ArrKind::Float) && (vt == Ty::I32 || vt == Ty::I64) {
                             // `xs[i] = <int>` into a float array → widen int to the
                             // element's float value type (i2d/i2f), else the store's
                             // value/element types would mismatch.
@@ -2530,11 +2603,19 @@ impl<'a> FnLower<'a> {
                         return (Operand::ConstI64(0), Ty::I64);
                     }
                 };
+                let elem_class = self.arr_class_of_operand(&arr);
                 let (idx, _) = self.lower_expr(index);
                 let idx32 = self.to_i32(idx);
                 let vty = kind.value_ty();
                 let d = self.new_local(vty);
                 self.emit(Statement::ArrayLoad { dest: d, arr, index: idx32, kind, checked: true });
+                // A ref array of objects: the loaded element is a `Cls` — attach the
+                // class so `x[i].field` / `mut n = x[i]; n.field` resolve.
+                if kind == ArrKind::Ref {
+                    if let Some(c) = elem_class {
+                        self.local_class.insert(d.0, c);
+                    }
+                }
                 (Operand::Copy(d), vty)
             }
             Expr::Block(b) => self.lower_block_val(b),
@@ -3739,10 +3820,22 @@ impl<'a> FnLower<'a> {
         // `barray` is the byte buffer for scanning file bytes in Vire (grep, binary I/O): one
         // byte per element (not 8), `a[i]` is a zero-extended `load i8`.
         if name == "array" || name == "farray" || name == "barray" {
-            let kind = match name.as_str() { "farray" => ArrKind::Double, "barray" => ArrKind::U8, _ => ArrKind::Long };
             let n = lowered.into_iter().next().map(|(o, _)| o).unwrap_or(Operand::ConstI64(0));
             let len32 = self.to_i32(n);
             let arr = self.new_local(Ty::Ref);
+            // `mut x: Array[Cls] = array(n)` — a REF array of objects: every slot holds a
+            // `Cls` reference (default null). The element class is recorded so `x[i]`
+            // resolves to `Cls` and `x[i] = e` is class-checked. `farray`/`barray` are
+            // always scalar (float / byte) and ignore the hint.
+            if name == "array" {
+                if let Some(cls) = self.arr_hint.take() {
+                    self.local_arr.insert(arr.0, ArrKind::Ref);
+                    self.local_arr_class.insert(arr.0, cls);
+                    self.emit(Statement::NewArray { dest: arr, kind: ArrKind::Ref, len: len32 });
+                    return (Operand::Copy(arr), Ty::Ref);
+                }
+            }
+            let kind = match name.as_str() { "farray" => ArrKind::Double, "barray" => ArrKind::U8, _ => ArrKind::Long };
             self.local_arr.insert(arr.0, kind);
             self.emit(Statement::NewArray { dest: arr, kind, len: len32 });
             return (Operand::Copy(arr), Ty::Ref);
@@ -4493,6 +4586,8 @@ fn lower_fn(
         mono: Vec::new(),
         local_class: HashMap::new(),
         local_arr: HashMap::new(),
+        local_arr_class: HashMap::new(),
+        arr_hint: None,
         local_lambda: HashMap::new(),
         strings,
         str_idx,

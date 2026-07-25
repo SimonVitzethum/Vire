@@ -1,0 +1,45 @@
+// Array-backed object graph — the (b) case for the loop-arena: a node POOL held in
+// a fresh `Array[Node]` and cross-linked by REF stores into array slots
+// (`pool[i] = Node(...)` and `pool[i].next = pool[j]`), then consumed and dropped
+// per iteration. Semantically the same short-lived build→use→drop as sharedgraph,
+// but the topology lives in an array of refs rather than in ref fields.
+//
+// The loop-arena was suppressed by the ref-storing INDEX mutation `pool[i] = ref`
+// (a fresh array, but the analysis had no freshness admission for array element
+// stores — only field stores). With the index-store freshness relaxation the whole
+// pool becomes arena-local and is freed en bloc: no per-node RC, no collector.
+//
+// Measured 2026-07-25 (400k trials, best-of-7): arena 42.4 ms vs --no-arena (RC +
+// collector) 68.0 ms = 1.60x, and BELOW the --no-rc leak ceiling (61.4 ms) because
+// bump-allocation is cheaper than malloc. 0 heap allocations (all nodes immortal in
+// the arena), 0 live, GUARD_FREE-clean. Realising the win took two backend RC
+// elisions symmetric with the field case: an ArrayLoad from an immortal (arena) ref
+// array is immortal, and an in-arena `a[i] = immortal` is an RC-free inline store.
+type Node { id: Int  next: Node }
+
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 400000 {
+        mut pool: Array[Node] = array(20)
+        mut i = 0
+        while i < 20 {
+            pool[i] = Node(i, null)
+            i = i + 1
+        }
+        // cross-link: each node points at the next slot (a ref stored into a field
+        // of an arena node, the value read from a fresh array slot)
+        mut j = 0
+        while j < 19 {
+            pool[j].next = pool[j + 1]
+            j = j + 1
+        }
+        // consume: walk the chain from slot 0
+        mut c = pool[0]
+        mut acc = 0
+        while c != null { acc = acc + c.id  c = c.next }
+        sum = (sum + acc) % 1000000007
+        t = t + 1
+    }
+    print(sum)
+}
