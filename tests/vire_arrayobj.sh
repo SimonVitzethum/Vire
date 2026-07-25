@@ -134,6 +134,23 @@ fn main() {
 }
 EOF
 
+# ── RETURN: a factory returns a ref array; the caller reads an element's field
+#    through the returned handle (the element class threads across the return).
+#    No loop → no arena (pushes=0); pool[3].id = 3*7 = 21.
+run refarray_return decline 21 <<'EOF'
+type Node { id: Int  next: Node }
+fn build(n: Int) -> Array[Node] {
+    mut a: Array[Node] = array(n)
+    mut i = 0
+    while i < n { a[i] = Node(i * 7, null)  i = i + 1 }
+    a
+}
+fn main() {
+    mut pool = build(5)
+    print(pool[3].id)
+}
+EOF
+
 # ── REJECT: a class-mismatched element store inside a callee (the param carries
 #    the declared element class across the call).
 reject reject_param_mismatch "array element is \`A\`, stored value is \`B\`" <<'EOF'

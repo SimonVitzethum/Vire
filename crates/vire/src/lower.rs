@@ -222,6 +222,28 @@ struct Sig {
     params: Vec<Ty>,
     ret: Ty,
     ret_class: Option<String>,
+    /// For an array return (`-> Array[T]` / `farray`): the element kind, so `f()[i]`
+    /// lowers to a real array access (not "unknown array").
+    ret_arr: Option<ArrKind>,
+    /// For a ref-array return (`-> Array[Node]`): the element object class, so
+    /// `f()[i].field` resolves and the result threads on like a local ref array.
+    ret_arr_class: Option<String>,
+}
+
+/// Element kind (and, for a user object element, class) of an array return type
+/// (`Array[Elem]` / `array` / `farray`) — else `(None, None)`.
+fn arr_ret(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
+    let Some(t) = t else { return (None, None) };
+    if t.name == "farray" {
+        return (Some(ArrKind::Double), None);
+    }
+    if t.name == "Array" || t.name == "array" {
+        return match t.args.first().and_then(|a| class_of(Some(a))) {
+            Some(ec) => (Some(ArrKind::Ref), Some(ec)),
+            None => (Some(t.args.first().map(|a| arrkind_of_name(&a.name)).unwrap_or(ArrKind::Long)), None),
+        };
+    }
+    (None, None)
 }
 
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
@@ -464,7 +486,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             // `parallel_for` worker `(i, …)` whose `i` is supplied by the launcher.
             let skip = if is_gpu_fn(f) { 1 } else { 0 };
             let ps = f.sig.params.iter().skip(skip).map(|p| ty_of(p.ty.as_ref())).collect();
-            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
+            let (ra, rac) = arr_ret(f.sig.ret.as_ref());
+            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
         }
         // extern "C" { fn name(...) -> T }: C-ABI function, directly under its
         // name (no mangling). Calls resolve through this; the backend
@@ -473,7 +496,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         if let Item::Extern { items, .. } = it {
             for sig in items {
                 let ps = sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
-                sigs.insert(sig.name.clone(), Sig { params: ps, ret: ret_ty(sig), ret_class: class_of(sig.ret.as_ref()) });
+                let (ra, rac) = arr_ret(sig.ret.as_ref());
+                sigs.insert(sig.name.clone(), Sig { params: ps, ret: ret_ty(sig), ret_class: class_of(sig.ret.as_ref()), ret_arr: ra, ret_arr_class: rac });
             }
         }
     }
@@ -481,7 +505,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     // & co. are callable from pure Vire WITHOUT an `extern` block (the lowering
     // emits calls, the backend declares, the driver links the bridge).
     for (name, params, ret) in builtin_ffi_sigs() {
-        sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None });
+        sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None, ret_arr: None, ret_arr_class: None });
     }
     // Methods (type-inline + impl blocks) → symbol `Class.method`, self = Ref.
     let methods = collect_methods(m);
@@ -511,7 +535,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             .map(|p| if p.name == "self" { Ty::Ref } else { ty_of(p.ty.as_ref()) })
             .collect();
         let sym = format!("{class}.{}", meth.sig.name);
-        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
+        let (ra, rac) = arr_ret(meth.sig.ret.as_ref());
+        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
     }
     // Collect generic functions (do NOT lower directly — one monomorph.
     // instance per call type argument). Trait bounds are parsed, but not yet
@@ -724,7 +749,8 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         let inst = subst_fndef(gdef, &bind);
         // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
-        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes) });
+        let (ra, rac) = arr_ret(inst.sig.ret.as_ref());
+        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
         match lower_fn(&inst, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
@@ -3198,10 +3224,14 @@ impl<'a> FnLower<'a> {
             for a in args {
                 arg_ops.push(self.lower_expr(a).0);
             }
-            let (ret, ret_class) = self.sigs.get(&sym).map(|s| (s.ret, s.ret_class.clone())).unwrap_or_else(|| {
-                self.errs.push(format!("`{class}` has no method `{name}`"));
-                (Ty::I64, None)
-            });
+            let (ret, ret_class, ret_arr, ret_arr_class) = self
+                .sigs
+                .get(&sym)
+                .map(|s| (s.ret, s.ret_class.clone(), s.ret_arr, s.ret_arr_class.clone()))
+                .unwrap_or_else(|| {
+                    self.errs.push(format!("`{class}` has no method `{name}`"));
+                    (Ty::I64, None, None, None)
+                });
             if ret == Ty::Void {
                 self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
                 return (Operand::ConstI64(0), Ty::Void);
@@ -3209,6 +3239,12 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(ret);
             if let Some(c) = ret_class {
                 self.local_class.insert(d.0, c);
+            }
+            if let Some(k) = ret_arr {
+                self.local_arr.insert(d.0, k);
+            }
+            if let Some(c) = ret_arr_class {
+                self.local_arr_class.insert(d.0, c);
             }
             self.emit(Statement::Call { dest: Some(d), func: sym, args: arg_ops });
             return (Operand::Copy(d), ret);
@@ -4025,7 +4061,11 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(d), ret);
         }
         // Call of an own function
-        let (ret, ret_class) = self.sigs.get(&name).map(|s| (s.ret, s.ret_class.clone())).unwrap_or((Ty::I64, None));
+        let (ret, ret_class, ret_arr, ret_arr_class) = self
+            .sigs
+            .get(&name)
+            .map(|s| (s.ret, s.ret_class.clone(), s.ret_arr, s.ret_arr_class.clone()))
+            .unwrap_or((Ty::I64, None, None, None));
         // Convenience: for `py_*` bridge functions, string arguments are
         // automatically turned into C strings (`cstr`), so that one can write
         // `py_import("math")` instead of `py_import(cstr("math"))`.
@@ -4049,6 +4089,14 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(ret);
             if let Some(c) = ret_class {
                 self.local_class.insert(d.0, c); // object return: remember the class
+            }
+            // Array return: remember the element kind (+ class for a ref array) so
+            // `f()[i]` / `f()[i].field` resolve like a local/param array.
+            if let Some(k) = ret_arr {
+                self.local_arr.insert(d.0, k);
+            }
+            if let Some(c) = ret_arr_class {
+                self.local_arr_class.insert(d.0, c);
             }
             self.emit(Statement::Call { dest: Some(d), func: name, args: arg_ops });
             (Operand::Copy(d), ret)

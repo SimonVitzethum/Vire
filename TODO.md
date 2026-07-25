@@ -298,9 +298,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   array + `local_arr_class`, instead of the old `arrkind_of_name`→Long that misread the
   ref slots), so `a[i].field` / `a[i] = e` work + are class-checked inside callees, and a
   fresh pool threaded through callees still arena-promotes (`vire_arrayobj.sh`
-  `refarray_param_calls` + `reject_param_mismatch`). **Open (smaller):** ref-array element
-  class across a **return** value (`fn f() -> Array[Node]`); ref-array `Str`/generic
-  element classes; `for x in refArray` element-class binding.
+  `refarray_param_calls` + `reject_param_mismatch`). **Return values — DONE (2026-07-25).**
+  `Sig` gained `ret_arr`/`ret_arr_class` (via `arr_ret`), applied at the free-fn and
+  method call dests, so `f()[i]` / `f()[i].field` resolve for a factory `fn f() ->
+  Array[Node]` — this also fixed the general case (a *scalar* array return `-> Array[Int]`
+  was likewise "unknown array" before). `vire_arrayobj.sh` `refarray_return`. **Open
+  (smaller):** array returns from **generic** instantiations (the two `g.ret` call dests
+  still set only `ret_class`); ref-array `Str`/generic element classes; `for x in
+  refArray` element-class binding.
 - [x] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance — **DONE (2026-07-24).**
   `vire fmt FILE.vr` prints canonical source (`-i` rewrites in place). Two invariants, both
   tested: idempotency (`fmt(fmt(x))==fmt(x)`) and round-trip run equality (running the formatted
