@@ -4,8 +4,8 @@ Matched programs, each optimized (`vire build` = -O2 -flto -march=native;
 `rustc -O`; `clang++ -O2 -march=native`), best-of-3, outputs checked
 **bit-identical**. `./run.sh` reproduces.
 
-`./run.sh` runs all six (arith, fib, struct, mandelbrot, btree, **nsieve**) and
-checks outputs bit-identical.
+`./run.sh` runs all seven (arith, fib, struct, mandelbrot, btree, **nsieve**,
+**leibniz**) and checks outputs bit-identical.
 
 ## Results (one machine, best-of-3 time + peak RSS, measured 2026-07)
 | Bench | Kind | Vire | Rust | C++ | V/Rust | V/C++ | RAM V/R/C |
@@ -16,6 +16,7 @@ checks outputs bit-identical.
 | **mandelbrot** | CLBG, float compute | 0.218 s | 0.213 s | 0.218 s | 1.02× | **1.00×** | 1.9 / 1.9 / 3.8 MB |
 | **binary-trees** | CLBG, alloc/GC | 0.325 s | 0.357 s | 0.251 s | **0.91×** | 1.29× | **5.7 / 5.8 / 7.8 MB** |
 | **nsieve** (i64-matched) | CLBG, array | 0.626 s | 0.572 s | 0.601 s | 1.09× | 1.04× | ~9 / ~9 / ~11 MB |
+| **leibniz** | pi series, f64 (100M) | 0.140 s | 0.136 s | 0.161 s | 1.03× | **0.87×** | **1.8 / 1.9 / 3.8 MB** |
 
 **Memory (peak RSS):** at or below both on every row — ~2 MB under C++ (no
 `libstdc++`/iostream), level with Rust. Even **binary-trees** (pure alloc/GC) peaks at

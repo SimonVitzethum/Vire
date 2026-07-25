@@ -1,0 +1,18 @@
+// Leibniz series for pi: pi/4 = 1 - 1/3 + 1/5 - 1/7 + …  (100M terms).
+// A sequential f64 reduction — sign/denominator carried, no branches — the same
+// operation order in all three languages, so the truncated result matches exactly.
+// Prints floor(pi * 1e6) = 3141592 (the series is ~7 digits accurate at 1e8 terms).
+fn main() {
+    mut sum = 0.0
+    mut denom = 1.0
+    mut sign = 1.0
+    mut k = 0
+    while k < 100000000 {
+        sum = sum + sign / denom
+        denom = denom + 2.0
+        sign = 0.0 - sign
+        k = k + 1
+    }
+    mut pi = sum * 4.0
+    print((pi * 1000000.0) as Int)
+}
