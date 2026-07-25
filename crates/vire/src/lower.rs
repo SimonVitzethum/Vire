@@ -2275,9 +2275,17 @@ impl<'a> FnLower<'a> {
                     self.term(header.0 as usize, Terminator::Branch { cond: Operand::Copy(cond), then_blk: bodyb, else_blk: exit });
                     self.cur = bodyb.0 as usize;
                     let elem = self.new_local(vty);
+                    let elem_class = self.arr_class_of_operand(&arr);
                     let idx32 = self.to_i32(Operand::Copy(ivar));
                     self.emit(Statement::ArrayLoad { dest: elem, arr, index: idx32, kind, checked: true });
                     self.scopes.push(HashMap::new());
+                    // `for x in refArray` — bind the element's object class so `x.field`
+                    // resolves in the loop body (like `mut x = refArray[i]`).
+                    if kind == ArrKind::Ref {
+                        if let Some(c) = elem_class {
+                            self.local_class.insert(elem.0, c);
+                        }
+                    }
                     self.bind(&name, elem, vty);
                     self.loops.push((latch, exit));
                     self.lower_block(body);

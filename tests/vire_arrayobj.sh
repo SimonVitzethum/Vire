@@ -160,6 +160,20 @@ fn put(a: Array[A]) { a[0] = B(1) }
 fn main() { mut a: Array[A] = array(2)  put(a)  print(0) }
 EOF
 
+# ── FOR-EACH: `for x in refArray` binds the element object class → `x.field`
+#    resolves in the loop body. ids 5+6+7 = 18.
+run foreach_refarray decline 18 <<'EOF'
+type Node { id: Int }
+fn main() {
+    mut a: Array[Node] = array(3)
+    mut i = 0
+    while i < 3 { a[i] = Node(i + 5)  i = i + 1 }
+    mut s = 0
+    for x in a { s = s + x.id }
+    print(s)
+}
+EOF
+
 # ── REJECT: a class-mismatched element store.
 reject reject_class_mismatch "array element is \`A\`, stored value is \`B\`" <<'EOF'
 type A { x: Int }

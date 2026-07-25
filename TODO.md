@@ -304,8 +304,10 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   Array[Node]` — this also fixed the general case (a *scalar* array return `-> Array[Int]`
   was likewise "unknown array" before). `vire_arrayobj.sh` `refarray_return`. **Open
   (smaller):** array returns from **generic** instantiations (the two `g.ret` call dests
-  still set only `ret_class`); ref-array `Str`/generic element classes; `for x in
-  refArray` element-class binding.
+  still set only `ret_class`); ref-array `Str`/generic element classes.
+  **`for x in refArray` — DONE (2026-07-25).** The for-each element binding attaches the
+  array's element object class, so `for x in pool { x.field }` resolves like `mut x =
+  pool[i]` (`vire_arrayobj.sh` `foreach_refarray`).
 - [x] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance — **DONE (2026-07-24).**
   `vire fmt FILE.vr` prints canonical source (`-i` rewrites in place). Two invariants, both
   tested: idempotency (`fmt(fmt(x))==fmt(x)`) and round-trip run equality (running the formatted
