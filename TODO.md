@@ -293,8 +293,13 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   made the loop-arena index-store relaxation exercisable (Tier 1 (b) above).
   [lower.rs](crates/vire/src/lower.rs) `local_arr_class` / `arr_class_of_operand`;
   [array_objects.vr](examples/vire/array_objects.vr); `tests/vire_arrayobj.sh`.
-  **Open (smaller):** ref arrays as **callee parameters** (`fn f(a: Array[Node])`) don't
-  yet carry the element class across the call (local arrays only); ref-array `Str`/generic
+  **Callee parameters — DONE (2026-07-25).** `fn f(a: Array[Node])` now carries the
+  element class across the call (`lower_fn` param binding: a user-class element → a REF
+  array + `local_arr_class`, instead of the old `arrkind_of_name`→Long that misread the
+  ref slots), so `a[i].field` / `a[i] = e` work + are class-checked inside callees, and a
+  fresh pool threaded through callees still arena-promotes (`vire_arrayobj.sh`
+  `refarray_param_calls` + `reject_param_mismatch`). **Open (smaller):** ref-array element
+  class across a **return** value (`fn f() -> Array[Node]`); ref-array `Str`/generic
   element classes; `for x in refArray` element-class binding.
 - [x] **`vire fmt`** (roundtrip AST→source) as parser-fuzz insurance — **DONE (2026-07-24).**
   `vire fmt FILE.vr` prints canonical source (`-i` rewrites in place). Two invariants, both

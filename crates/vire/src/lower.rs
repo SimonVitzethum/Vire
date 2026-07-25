@@ -4609,11 +4609,22 @@ fn lower_fn(
         // carried no ArrKind → "unknown array"). Lets array-taking helpers (e.g. a
         // recursive `qsort(a, lo, hi)`) be written directly instead of an explicit stack.
         let mut arr_kind: Option<ArrKind> = None;
+        let mut arr_cls: Option<String> = None;
         // `self` receiver: Ref to the method class.
         let (t, cls) = if p.name == "self" {
             (Ty::Ref, recv_class.map(|c| c.to_string()))
         } else if let Some(pt) = p.ty.as_ref().filter(|pt| pt.name == "Array" || pt.name == "array") {
-            arr_kind = Some(pt.args.first().map(|a| arrkind_of_name(&a.name)).unwrap_or(ArrKind::Long));
+            // `a: Array[Node]` — an element type that is a user object class is a REF
+            // array (arrkind_of_name defaults unknown names to Long, which would misread
+            // the ref slots as i64). Record the element class so `a[i].field` resolves
+            // and `a[i] = e` is class-checked in the body, exactly like a local ref array.
+            match pt.args.first().and_then(|a| class_of(Some(a))) {
+                Some(ec) => {
+                    arr_kind = Some(ArrKind::Ref);
+                    arr_cls = Some(ec);
+                }
+                None => arr_kind = Some(pt.args.first().map(|a| arrkind_of_name(&a.name)).unwrap_or(ArrKind::Long)),
+            }
             (Ty::Ref, None)
         } else if p.ty.as_ref().is_some_and(|pt| pt.name == "farray") {
             // `a: farray` — the builtin float(f64) array (element = Double), so
@@ -4637,6 +4648,9 @@ fn lower_fn(
         }
         if let Some(k) = arr_kind {
             fl.local_arr.insert(l.0, k);
+        }
+        if let Some(c) = arr_cls {
+            fl.local_arr_class.insert(l.0, c);
         }
         fl.bind(&p.name, l, t);
     }

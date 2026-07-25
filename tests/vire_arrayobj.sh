@@ -104,6 +104,45 @@ fn main() {
 }
 EOF
 
+# ── PROMOTE across a call: a ref array passed to callees that index it (read the
+#    element's field, mutate its ref field). The pool is fresh + consumed per
+#    iteration through the callees → still arena. ids 0,10,20,30 sum = 60, ×1000.
+run refarray_param_calls promote 60000 <<'EOF'
+type Node { id: Int  next: Node }
+fn link(a: Array[Node], n: Int) {
+    mut j = 0
+    while j < n - 1 { a[j].next = a[j + 1]  j = j + 1 }
+}
+fn total(a: Array[Node]) -> Int {
+    mut s = 0
+    mut c = a[0]
+    while c != null { s = s + c.id  c = c.next }
+    s
+}
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 1000 {
+        mut pool: Array[Node] = array(4)
+        mut i = 0
+        while i < 4 { pool[i] = Node(i * 10, null)  i = i + 1 }
+        link(pool, 4)
+        sum = sum + total(pool)
+        t = t + 1
+    }
+    print(sum)
+}
+EOF
+
+# ── REJECT: a class-mismatched element store inside a callee (the param carries
+#    the declared element class across the call).
+reject reject_param_mismatch "array element is \`A\`, stored value is \`B\`" <<'EOF'
+type A { x: Int }
+type B { y: Int }
+fn put(a: Array[A]) { a[0] = B(1) }
+fn main() { mut a: Array[A] = array(2)  put(a)  print(0) }
+EOF
+
 # ── REJECT: a class-mismatched element store.
 reject reject_class_mismatch "array element is \`A\`, stored value is \`B\`" <<'EOF'
 type A { x: Int }
