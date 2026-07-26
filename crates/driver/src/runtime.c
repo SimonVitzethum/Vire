@@ -3395,3 +3395,86 @@ int64_t jrt_dyn_install(int64_t slot, int64_t id, const char *sym) {
     return 1;
 }
 #endif
+
+/* --- Runtime code patcher (B1) — DYNAMIC-VIRE-PATCH.md ------------------------
+ * Redirect a @patchable function's entry, in place, by overwriting its reserved 5-byte NOP
+ * sled with a `jmp` — hot-update / live patch. Writes ONLY into a sled listed in the
+ * compiler-emitted `@jrt_patchtab` (never over a real instruction) — that is the soundness
+ * fence. W^X: pages are writable only for the microscopic patch window. The original sled
+ * bytes are saved so `jrt_unpatch` restores the entry BYTE-IDENTICALLY. Single-threaded
+ * (no cross-thread safepoint yet). Anti-leak: a live patch REFERENCES the module it points
+ * into, so it retains it (and releases the displaced one) exactly like a dyn-slot — a
+ * module a patch still uses is never dlclose'd (no UAF), and a replaced/unpatched module is
+ * reclaimed (no leak). Hosted only. */
+#ifndef FASTLLVM_FREESTANDING
+extern const struct jrt_patchrec { int64_t addr; int64_t sled_len; const char *name; } jrt_patchtab[];
+extern const int64_t jrt_patchtab_len;
+#define JRT_MAX_PATCH 256
+struct jrt_patch { int64_t addr; int owner; int saved; unsigned char orig[14]; };
+static struct jrt_patch jrt_patches[JRT_MAX_PATCH];
+static int jrt_patches_n = 0;
+
+static int64_t jrt_patch_lookup(const char *name, int64_t *sled_len) {
+    for (int64_t i = 0; i < jrt_patchtab_len; i++)
+        if (strcmp(jrt_patchtab[i].name, name) == 0) {
+            if (sled_len) *sled_len = jrt_patchtab[i].sled_len;
+            return jrt_patchtab[i].addr;
+        }
+    return 0;
+}
+static int jrt_write_code(void *addr, const unsigned char *bytes, size_t n) {
+    long pg = sysconf(_SC_PAGESIZE);
+    uintptr_t s = (uintptr_t)addr & ~(uintptr_t)(pg - 1);
+    uintptr_t e = ((uintptr_t)addr + n + pg - 1) & ~(uintptr_t)(pg - 1);
+    if (mprotect((void *)s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC)) return 0;
+    memcpy(addr, bytes, n);
+    __builtin___clear_cache((char *)addr, (char *)addr + n); /* i-cache flush */
+    mprotect((void *)s, e - s, PROT_READ | PROT_EXEC);       /* W^X: never W and X together */
+    return 1;
+}
+/* Find/create the patch record for `addr`; on first touch save its original bytes so the
+ * entry is restorable byte-identically. */
+static struct jrt_patch *jrt_patch_rec(int64_t addr) {
+    for (int i = 0; i < jrt_patches_n; i++)
+        if (jrt_patches[i].addr == addr) return &jrt_patches[i];
+    if (jrt_patches_n >= JRT_MAX_PATCH) return 0;
+    struct jrt_patch *r = &jrt_patches[jrt_patches_n++];
+    r->addr = addr; r->owner = 0; r->saved = 1;
+    memcpy(r->orig, (void *)(intptr_t)addr, 14); /* the pristine NOP sled */
+    return r;
+}
+static void jrt_patch_own(int64_t addr, int new_owner) { /* anti-leak RC of the pointed-into module */
+    struct jrt_patch *r = jrt_patch_rec(addr);
+    if (!r) return;
+    int prev = r->owner;
+    if (new_owner) jrt_mods[new_owner - 1].rc++;
+    r->owner = new_owner;
+    jrt_mod_release(prev);
+}
+int64_t jrt_patch(const char *target, int64_t module_id, const char *repl_sym) {
+    if (module_id <= 0 || module_id > JRT_MAX_MODS || !jrt_mods[module_id - 1].h || !target || !repl_sym) return 0;
+    void *repl = dlsym(jrt_mods[module_id - 1].h, repl_sym);
+    if (!repl) return 0;
+    int64_t sled = 0, addr = jrt_patch_lookup(target, &sled);
+    if (!addr || sled < 14) return 0;                /* not a registered patch point → reject */
+    if (!jrt_patch_rec(addr)) return 0;              /* save original bytes (once) */
+    /* Absolute indirect jump `jmp qword ptr [rip+0]` (FF 25 00000000) + the 8-byte target
+     * inline — 14 bytes, no register clobber, works to ANY address (no rel32 range limit,
+     * so a module mmap'd far from the host is fine). */
+    unsigned char jmp[14] = { 0xFF, 0x25, 0, 0, 0, 0 };
+    uint64_t t = (uint64_t)(uintptr_t)repl;
+    for (int i = 0; i < 8; i++) jmp[6 + i] = (unsigned char)(t >> (8 * i));
+    if (!jrt_write_code((void *)(intptr_t)addr, jmp, 14)) return 0;
+    jrt_patch_own(addr, (int)module_id);
+    return 1;
+}
+int64_t jrt_unpatch(const char *target) {
+    int64_t sled = 0, addr = jrt_patch_lookup(target, &sled);
+    if (!addr || sled < 14) return 0;
+    struct jrt_patch *r = jrt_patch_rec(addr);
+    if (!r || !r->saved) return 0;
+    if (!jrt_write_code((void *)(intptr_t)addr, r->orig, 14)) return 0; /* byte-identical restore */
+    jrt_patch_own(addr, 0);                          /* release the module (no patch references it now) */
+    return 1;
+}
+#endif

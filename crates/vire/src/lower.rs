@@ -599,6 +599,16 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             .collect();
         dl.sort();
         prog.dyn_fns = dl;
+        // `@patchable fn` — a direct-call function with a NOP entry sled the runtime patcher
+        // can redirect (hot-update, DYNAMIC-VIRE-PATCH.md B1). Distinct from `dynamic fn`:
+        // not slot-dispatched. Sorted for a deterministic `@jrt_patchtab` order.
+        let mut pl: Vec<String> = fn_defs
+            .values()
+            .filter(|fd| fd.attrs.iter().any(|a| a.name == "patchable"))
+            .map(|fd| fd.sig.name.clone())
+            .collect();
+        pl.sort();
+        prog.patch_fns = pl;
     }
     // Pre-pass: instantiate annotation-driven generic instances (`-> Option[Float]`,
     // `b: Box[Int]`) module-wide, so that call sites/matches see the
@@ -4151,6 +4161,45 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(cs), func: "vire_cstr".into(), args: vec![Operand::ConstStr(sym)] });
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "jrt_dyn_install".into(), args: vec![Operand::ConstI64(slot), handle, Operand::Copy(cs)] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // `patch("target", handle, "repl") -> Int` (1 = ok) — hot-update: redirect the
+        // `@patchable fn` `target`'s entry to the loaded module's `repl` by rewriting its
+        // reserved NOP sled with a `jmp` (DYNAMIC-VIRE-PATCH.md B1). `unpatch("target")`
+        // restores the original entry byte-identically. Both names are string literals.
+        if name == "patch" || name == "unpatch" {
+            let target = match args.first() {
+                Some(Expr::Str(s, _)) => s.clone(),
+                _ => {
+                    self.errs.push(format!("{name}(\"target\", …): the target must be a string literal naming a `@patchable fn`"));
+                    String::new()
+                }
+            };
+            if !target.is_empty()
+                && !self.fn_defs.get(&target).is_some_and(|fd| fd.attrs.iter().any(|a| a.name == "patchable"))
+            {
+                self.errs.push(format!("{name}: `{target}` is not a `@patchable fn`"));
+            }
+            let t_id = self.intern(&target);
+            let ct = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(ct), func: "vire_cstr".into(), args: vec![Operand::ConstStr(t_id)] });
+            let d = self.new_local(Ty::I64);
+            if name == "unpatch" {
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_unpatch".into(), args: vec![Operand::Copy(ct)] });
+            } else {
+                let handle = lowered.into_iter().nth(1).map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+                let repl = match args.get(2) {
+                    Some(Expr::Str(s, _)) => s.clone(),
+                    _ => {
+                        self.errs.push("patch(\"target\", handle, \"repl\"): the 3rd argument must be a string literal".into());
+                        String::new()
+                    }
+                };
+                let r_id = self.intern(&format!("vire_override_{repl}"));
+                let cr = self.new_local(Ty::I64);
+                self.emit(Statement::Call { dest: Some(cr), func: "vire_cstr".into(), args: vec![Operand::ConstStr(r_id)] });
+                self.emit(Statement::Call { dest: Some(d), func: "jrt_patch".into(), args: vec![Operand::Copy(ct), handle, Operand::Copy(cr)] });
+            }
             return (Operand::Copy(d), Ty::I64);
         }
         // `field_name(x, i)` / `field_type(x, i)` → the i-th declared field's name resp.

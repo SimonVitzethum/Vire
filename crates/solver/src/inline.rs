@@ -31,12 +31,15 @@ pub fn inline_program(program: &mut Program) -> usize {
     // A `dynamic fn` / `open fn` seam must NOT be inlined — its calls dispatch through the
     // mutable slot so a loaded module can override it; inlining would bake in the default
     // and bypass the override (DYNAMIC-VIRE-PLAN.md P1). Empty for sealed/Java programs.
-    let dyn_names = program.dyn_fns.clone();
+    let mut pinned = program.dyn_fns.clone();
+    // `@patchable` fns must keep a single entry to redirect (DYNAMIC-VIRE-PATCH.md B1), so
+    // they are pinned against inlining too.
+    pinned.extend(program.patch_fns.iter().cloned());
     // Copy candidates so callers stay mutable.
     let candidates: BTreeMap<String, Function> = program
         .functions
         .iter()
-        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f) && !dyn_names.contains(&f.name))
+        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f) && !pinned.contains(&f.name))
         .map(|f| (f.name.clone(), f.clone()))
         .collect();
 

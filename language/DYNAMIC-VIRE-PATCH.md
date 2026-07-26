@@ -1,8 +1,9 @@
 # Design Plan: Binary patch-point subsystem (Option B) — general native self-modification
 
 **Date:** 2026-07-26
-**Status:** PLAN, **B0 landed** (entry patch points + `@jrt_patchtab` + the anti-leak
-RC'd module lifetime, §8); B1+ (the runtime patcher) unstarted. Companion to [DYNAMIC-VIRE-PLAN.md](DYNAMIC-VIRE-PLAN.md);
+**Status:** PLAN, **B0 + B1 landed** (entry patch points + `@jrt_patchtab` + the RC'd
+module lifetime; the runtime patcher `patch`/`unpatch` = hot-update, §8); B2+ (mixin
+around-advice, probes, JIT clients, cross-thread) unstarted. Companion to [DYNAMIC-VIRE-PLAN.md](DYNAMIC-VIRE-PLAN.md);
 this is the heavier **Option B** (literal self-modifying machine code) referenced there in
 §4.3, planned here as a **general facility**, not a mixin one-off. Mixin/around-advice on a
 direct call is only its first client.
@@ -213,10 +214,22 @@ existing symtab/dynslot globals.
   vire_modlife.sh` (3/3): 1000× load/unload and 500× install→replace→unload both keep the
   256-entry table from exhausting (a leak would), RSS flat ~2 MB, and a slot-kept module
   stays callable after its load ref is released.
-- **B1 — redirect + restore (single-threaded).** `jrt_patch_redirect` / `jrt_patch_restore`
-  with W^X + i-cache. *Test:* redirect a fn to a replacement, call → new behaviour; restore
-  → original; byte-identical after restore; 0-live. **First client: hot-update / feature
-  swap — already useful beyond mixins.**
+- **B1 — redirect + restore (single-threaded) — DONE (2026-07-26).** `@patchable fn` (a
+  direct-call function with a NOP entry sled, `noinline optnone` so no inlining/CSE bypasses
+  a patch) + host builtins `patch("target", handle, "repl")` / `unpatch("target")`. The
+  runtime patcher (`jrt_patch`/`jrt_unpatch`) rewrites the reserved **14-byte** sled with an
+  absolute `jmp qword [rip]` + inline 8-byte target — no rel32 range limit, so a module
+  mmap'd far from the host works — under W^X (`mprotect` RW→write→RX) + i-cache flush, and
+  restores the entry **byte-identically** (original sled bytes saved on first patch). Only
+  sleds listed in `@jrt_patchtab` are ever written (the soundness fence); a non-`@patchable`
+  target is a compile error. **Anti-leak carried through:** a live patch reference-counts the
+  module it points into (retain on patch, release on unpatch/replace), so a module a patch
+  still uses is never `dlclose`d (no UAF) and a released one is reclaimed (no leak). *Test:*
+  `tests/vire_patch.sh` (3/3) — redirect 6→5000, restore→6; a 500× patch/unload/call/unpatch
+  loop keeps the module alive under the patch (no UAF) and reclaims it each cycle (no leak);
+  a non-`@patchable` patch is rejected. **Java 67/67 + shape_soundness 3/3 unaffected** (no
+  sled/table on the Java path). **First client: hot-update / live patch — useful now, beyond
+  mixins.**
 - **B2 — around-advice + `prev` on direct calls (the mixin client).** wrapper install +
   `jrt_patch_original`; chaining. *Test:* a wrapper logs before/after and `prev` runs the
   original; a 2-wrapper chain composes; 0-live.

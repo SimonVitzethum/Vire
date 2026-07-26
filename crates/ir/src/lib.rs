@@ -450,6 +450,11 @@ pub struct Program {
     /// (default = the function's own body) instead of a direct call, so a loaded module can
     /// override it at runtime. Empty for the Java path and any sealed program (zero effect).
     pub dyn_fns: Vec<String>,
+    /// `@patchable` function names (DYNAMIC-VIRE-PATCH.md B1). Like `dyn_fns` they get a NOP
+    /// entry sled + a `@jrt_patchtab` record, but they are NOT slot-dispatched — they stay
+    /// ordinary direct calls whose entry the runtime patcher redirects in place (hot-update).
+    /// Not inlined (a single entry must remain to patch). Empty for Java/sealed programs.
+    pub patch_fns: Vec<String>,
 }
 
 impl Program {

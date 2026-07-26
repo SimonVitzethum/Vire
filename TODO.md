@@ -407,8 +407,16 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   **reference-counted**: `unload_module` + override-replace dlclose a module the instant no
   load ref / no dyn-slot references it → **no retained-stale-function leak, no UAF**.
   `tests/vire_modlife.sh` (3/3: 1000× load/unload, 500× install-replace, slot-kept-alive;
-  RSS flat). The runtime patcher (B1: redirect/restore/around/probe) and the shared-type
-  object boundary + load-time verifier + the JIT are the open rest — see
+  RSS flat).
+  **Runtime code patcher B1 (hot-update) — DONE (2026-07-26):** `@patchable fn` + host
+  `patch("t", handle, "repl")` / `unpatch("t")`. The runtime rewrites the reserved 14-byte
+  entry sled with an absolute `jmp [rip]` (any-range) under W^X + i-cache flush, restores it
+  byte-identically; only `@jrt_patchtab` sleds are ever written (soundness fence), non-
+  patchable target = compile error. A live patch RC-references its module (retain/release) →
+  no UAF, no leak. `tests/vire_patch.sh` (3/3: 6→5000→6; 500× patch/unload/unpatch keeps
+  alive + reclaims). Java 67/67 + shape 3/3 unaffected. Open rest: mixin `prev`/around (B2),
+  probes/JIT clients/cross-thread; the shared-type object boundary + load-time verifier; the
+  JIT — see
   [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md) and
   [language/DYNAMIC-VIRE-PATCH.md](language/DYNAMIC-VIRE-PATCH.md).
 

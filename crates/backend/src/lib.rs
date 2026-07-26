@@ -1054,24 +1054,27 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     if !program.dyn_fns.is_empty() {
         let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
         writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
-        // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
-        // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
-        // locates a function's reserved NOP sled by name. Static, read-only data (it cannot
-        // leak); the sleds it points at stay inert until a patch is applied.
-        for (i, n) in program.dyn_fns.iter().enumerate() {
+    }
+    // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
+    // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
+    // locates a function's reserved NOP sled by name. Static, read-only data (it cannot
+    // leak); the sleds it points at stay inert until a patch is applied. Covers both the
+    // slot seams (`dyn_fns`) and the direct-call `@patchable` fns (`patch_fns`).
+    let patch_set: Vec<&String> = program.dyn_fns.iter().chain(program.patch_fns.iter()).collect();
+    if !patch_set.is_empty() {
+        for (i, n) in patch_set.iter().enumerate() {
             let mut b: Vec<u8> = n.bytes().collect();
             b.push(0);
             let lit: String = b.iter().map(|x| format!("\\{x:02X}")).collect();
             writeln!(w, "@.patchname.{i} = private constant [{} x i8] c\"{lit}\"", b.len()).unwrap();
         }
-        writeln!(w, "@jrt_patchtab_len = constant i64 {}", program.dyn_fns.len()).unwrap();
-        let recs: Vec<String> = program
-            .dyn_fns
+        writeln!(w, "@jrt_patchtab_len = constant i64 {}", patch_set.len()).unwrap();
+        let recs: Vec<String> = patch_set
             .iter()
             .enumerate()
-            .map(|(i, n)| format!("{{ i64, i64, ptr }} {{ i64 ptrtoint (ptr @{n} to i64), i64 5, ptr @.patchname.{i} }}"))
+            .map(|(i, n)| format!("{{ i64, i64, ptr }} {{ i64 ptrtoint (ptr @{n} to i64), i64 14, ptr @.patchname.{i} }}"))
             .collect();
-        writeln!(w, "@jrt_patchtab = constant [{} x {{ i64, i64, ptr }}] [{}]", program.dyn_fns.len(), recs.join(", ")).unwrap();
+        writeln!(w, "@jrt_patchtab = constant [{} x {{ i64, i64, ptr }}] [{}]", patch_set.len(), recs.join(", ")).unwrap();
     }
 
     // Freestanding: a compact symbol table (function address → name) so the runtime's
@@ -2322,8 +2325,17 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     // patcher can later rewrite it into a `jmp`/`call` (hot-update, JIT collapse, mixin,
     // probe) — never over a real instruction. Inert (plain NOPs) until patched; only opted-
     // in functions get it, so sealed/Java code is untouched. Listed in `@jrt_patchtab`.
-    let patch = if ctx.program.dyn_fns.iter().any(|n| n == &f.name) {
-        "\"patchable-function-entry\"=\"5\" "
+    let patch = if ctx.program.patch_fns.iter().any(|n| n == &f.name) {
+        // `@patchable` (direct-call, hot-updatable): `noinline` keeps a single out-of-line
+        // entry to patch, and `optnone` stops the optimizer from inferring the function is
+        // pure and CSE-ing / memoizing calls to it — a patched result can change between
+        // two identical calls, so each call must actually run the (possibly patched) entry.
+        "noinline optnone \"patchable-function-entry\"=\"14\" "
+    } else if ctx.program.dyn_fns.iter().any(|n| n == &f.name) {
+        // A seam's default body: it is reached only through the indirect slot (which LLVM
+        // cannot CSE), so `noinline` + the sled suffice (the sled is for the future JIT
+        // dispatch-collapse). No `optnone` → its body stays optimized.
+        "noinline \"patchable-function-entry\"=\"14\" "
     } else {
         ""
     };
