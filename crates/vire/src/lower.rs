@@ -9,6 +9,11 @@ use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Oper
 
 use crate::ast::*;
 
+/// Frozen dynamic-ABI version (DYNAMIC-VIRE-PLAN.md §3). Bumped on any change to the
+/// object header / descriptor / dispatch-slot layout a loaded module depends on. `1` = the
+/// initial reflection substrate (P0). Exposed to programs via `abi_version()`.
+const VIRE_ABI_VERSION: i64 = 1;
+
 /// Field layout of a user type: (field name, IR type, ref target class).
 type Layout = Vec<(String, Ty, Option<String>)>;
 
@@ -4021,6 +4026,45 @@ impl<'a> FnLower<'a> {
         if name == "str" {
             let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
             return (self.to_str(op, ty), Ty::Ref);
+        }
+        // ── Reflection API (P0 of the dynamic-runtime plan, DYNAMIC-VIRE-PLAN.md §3).
+        // Static, typed introspection resolved at compile time from the type graph — no
+        // runtime metadata table yet (that lands with dynamic loading, P1, when a loaded
+        // type's descriptor must be read at runtime). In a sealed build a value's runtime
+        // type equals its static class, so these are exact today.
+        // `type_name(x)` → the class name of `x` as a Str (scalars → their type name).
+        if name == "type_name" {
+            let (arg, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let nm = match self.class_of_operand(&arg) {
+                Some(c) => c,
+                None => match ty {
+                    Ty::F64 | Ty::F32 => "Float",
+                    Ty::Ref => "Ref",
+                    _ => "Int",
+                }
+                .to_string(),
+            };
+            let id = self.intern(&nm);
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "Str".into());
+            self.emit(Statement::Assign(d, Rvalue::Use(Operand::ConstStr(id))));
+            return (Operand::Copy(d), Ty::Ref);
+        }
+        // `field_count(x)` → number of declared fields of `x`'s type (0 for a scalar /
+        // classless ref). Excludes the synthetic sum-type `__tag` slot.
+        if name == "field_count" {
+            let (arg, _) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let n = self
+                .class_of_operand(&arg)
+                .and_then(|c| self.layout_of(&c))
+                .map(|l| l.iter().filter(|(nm, ..)| nm != "__tag").count() as i64)
+                .unwrap_or(0);
+            return (Operand::ConstI64(n), Ty::I64);
+        }
+        // `abi_version()` → the frozen dynamic-ABI version the binary was built with; the
+        // anchor a loaded module's manifest will be pinned against (DYNAMIC-VIRE-PLAN.md §3).
+        if name == "abi_version" {
+            return (Operand::ConstI64(VIRE_ABI_VERSION), Ty::I64);
         }
         // FFI builtin `cstr(s)` → a NUL-terminated `char*` (as `Ptr`/i64) for extern-C
         // functions expecting `const char*`. Requires a Str: a bare `Ty::Ref` that is not an

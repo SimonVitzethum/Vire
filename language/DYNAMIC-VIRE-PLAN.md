@@ -1,7 +1,8 @@
 # Design Plan: Dynamic Loading, Reflection & Self-Modification for Vire — with a JIT, no VM
 
 **Date:** 2026-07-26
-**Status:** PLAN (not started). FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
+**Status:** PLAN. First slice landed — **P0 step 1** (the static reflection API
+`type_name`/`field_count`/`abi_version`, §9); the rest is unstarted. FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
 DYNAMIC-RUNTIME-PLAN.md`) is the **existence proof** that native, no-VM/no-JIT dynamism
 works: native module ABI, `dlopen` loader, redefinition by code-pointer swap,
 compile-on-load cache, binary trampoline patching — all implemented and 0-live-heap tested
@@ -437,9 +438,18 @@ extends existing machinery (or is a direct port of FastJavaC's proven code).
 
 ## 9. Phased roadmap (each phase independently shippable & 0-live-heap gated)
 
-- **P0 — ABI freeze & runtime metadata.** Serialize type descriptors + registries; version
-  the ABI; `@typeinfo` reads them. *Test:* the sealed core introspects its own types;
-  oracle unchanged. *(Direct port of FastJavaC Phase 0.)*
+- **P0 — reflection API + ABI freeze & runtime metadata.**
+  - *Step 1 — static reflection API — DONE (2026-07-26).* `type_name(x)` / `field_count(x)`
+    / `abi_version()` (`VIRE_ABI_VERSION = 1`), resolved at compile time from the type graph
+    (`crates/vire/src/lower.rs`). In a sealed build a value's runtime type equals its static
+    class, so these are exact today; no runtime metadata table is emitted yet (deferred to
+    step 2 / P1, when a *loaded* type's descriptor must be read at runtime — avoids shipping
+    a dead table). 0-live, Vire-only (Java oracle 67/67 unaffected). `tests/vire_reflect.sh`,
+    `examples/vire/reflect.vr`.
+  - *Step 2 — runtime descriptor table + registries* (folds into P1, where the loader
+    consumes it): serialize per-type descriptors (§3), version the ABI in the binary, and
+    upgrade `type_name`/`describe` to read a loaded value's descriptor. *Test:* the sealed
+    core introspects its own types via the table; oracle unchanged.
 - **P1 — the sealing model + native module ABI (M1) + the no-GC verifier.** `open`/`dynamic`
   parse + seam-aware optimizer scoping; `vire --emit-module` → `.so`; `dlopen` loader;
   **load-time verifier** incl. the **acyclicity-or-weak gate** (§6) so the open world stays

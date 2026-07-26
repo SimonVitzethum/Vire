@@ -380,6 +380,10 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [~] `comptime for` DONE (`20133fc`); `emit` surface still open. **No** runtime reflection
   by default (AOT); opt-in typed reflection metadata at `open`/`dynamic` seams is *planned,
   not yet implemented* — see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
+  **Static reflection API — DONE (2026-07-26, P0 step 1):** `type_name(x)` / `field_count(x)`
+  / `abi_version()`, compile-time-resolved from the type graph (0-live, Vire-only);
+  `tests/vire_reflect.sh`, `examples/vire/reflect.vr`. The runtime descriptor table is
+  deferred to the dynamic-loading phase (P1) so no dead metadata is emitted meanwhile.
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic
