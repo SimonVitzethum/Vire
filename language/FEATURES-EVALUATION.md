@@ -120,9 +120,11 @@ compare types, generate code at compile time (`emit`), static assertions (`compt
 assert`). This simultaneously replaces **derivation macros** (`@derive`),
 **serialization**, **ORM mapping**, **schema generation** — all without runtime.
 
-**Deliberate limit:** **No** runtime reflection (`getClass().getFields()` at
-runtime). That would go against "AOT/no runtime ballast". Anyone who needs genuine
-dynamic behavior generates it at compile time or uses a sum type.
+**Deliberate limit (default build):** **No** runtime reflection (`getClass().getFields()`
+at runtime) in a sealed build — that would go against "AOT/no runtime ballast". Anyone who
+needs genuine dynamic behavior generates it at compile time or uses a sum type. *(A
+`--dynamic` build's opt-in typed reflection metadata + runtime overrides — no VM, no GC —
+are planned, not yet implemented; see DYNAMIC-VIRE-PLAN.md.)*
 
 ---
 

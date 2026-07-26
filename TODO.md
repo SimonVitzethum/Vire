@@ -377,7 +377,9 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 ### [3] Compile-time reflection
 - [ ] `@typeinfo(T)` (fields/variants/methods/attributes, comptime-iterable).
 - [ ] `@derive` via reflection (generic + nested-user-type — see (b) above).
-- [~] `comptime for` DONE (`20133fc`); `emit` surface still open. **No** runtime reflection (AOT).
+- [~] `comptime for` DONE (`20133fc`); `emit` surface still open. **No** runtime reflection
+  by default (AOT); opt-in typed reflection metadata at `open`/`dynamic` seams is *planned,
+  not yet implemented* — see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic
@@ -815,5 +817,11 @@ Windows works (`--target x86_64-pc-windows-gnu` → running `.exe`). Follow-ups:
 ---
 
 ## Non-goals (deliberate)
-Runtime `eval`/reflection · dynamic loading of unknown code · C-text preprocessor ·
+An in-process **VM/interpreter** or bytecode/source execution (M3) · runtime **dynamic
+typing** / whole-heap runtime reflection · a **tracing GC** · C-text preprocessor ·
 deadlock-freedom guarantee · "all" C++/Rust libraries beyond the C-ABI boundary.
+
+*(Note: native, opt-in **dynamic loading + runtime overrides + typed reflection metadata**
+— with no VM, no GC, a deterministic memory-safe JIT, sealed-by-default — are a **planned,
+not-yet-implemented** track, see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
+Closed-world/sealed stays the default; the above non-goals are what that track also excludes.)*

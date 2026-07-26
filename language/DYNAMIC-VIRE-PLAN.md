@@ -145,6 +145,46 @@ had been part of the original closed-world compile. The runtime JIT then adds on
 *last* increment of specialization that was unknowable even at plugin-compile time — which
 of several loaded impls actually wins a seam, and runtime constants (§5).
 
+### 2.2 Seam granularity — the decision (resolves risk #1)
+How coarse is a seam? The spectrum, coarsest → finest:
+
+| Granularity | Unit that becomes open | Cost |
+|---|---|---|
+| Whole-program (`--dynamic` global) | everything | the entire perf story — **rejected** (§2) |
+| Module (`open module M`) | every trait + exported fn in M | pessimizes all of M, even parts no mod touches |
+| **Trait / method (`open trait`, `dynamic fn`)** | one trait's dispatch, or one fn | **minimal — only the exact extension points** |
+| — with `open module` as opt-in **sugar** | marks all of a module's traits/exports open at once | coarse *when you want it*, at the host's choice |
+
+**Decision: the finest practical unit — per-`open trait` and per-`dynamic fn`, sealed by
+default, explicit, with `open module` as coarsening sugar.** Rationale:
+
+1. **Perf & safety are the same argument here.** Vire's optimizations are memory-safety-
+   critical, so the seam surface is not just where speed is lost — it is where the load
+   verifier must do its work. Minimizing it minimizes *both* the perf tax and the trust
+   surface. Finest-grained ⇒ smallest surface.
+2. **It synergizes with asymmetric knowledge (§2.1).** The more of the host stays *sealed*,
+   the more a plugin can inline into it. Fine granularity keeps the sealed surface large,
+   so plugins are faster, not just the host.
+3. **Under-annotation fails *safe*.** Forget to mark something `open` that a mod needs, and
+   the mod is **rejected at load** with a clear "host did not declare X extensible" — never
+   a silent miscompile. So the closed default is safe to iterate against: the failure mode
+   of "too sealed" is a loud rejection, whereas "too open" would be a silent perf/safety
+   tax. Always fail toward the safe side.
+4. **Traits are sealed unless `open trait`.** Vire leans on traits heavily; an implicitly-
+   open trait would route *every* trait call through a mutable slot — a broad, invisible
+   regression. Explicit `open` (like Kotlin/Swift `open`/`final`, closed by default) keeps
+   the host author in deliberate control of their **stable extension API** — which is also
+   what makes the ABI versionable.
+5. **`open type` means "may receive new trait impls," not "layout is extensible."** A
+   struct's fields are always the frozen ABI (you cannot add a field at runtime without
+   breaking every compiled offset). So `open type T` only enables *new `impl`s* for T at a
+   runtime seam; field layout is never open. (Runtime *state* extension, if ever wanted, is
+   a separate opt-in side-table, not a layout change — deferred, not in this plan.)
+
+Net: the default is "closed and fast"; opening is a deliberate, local, greppable act on
+exactly the trait or function meant to be an extension point; and a host that wants a
+broadly moddable surface writes `open module` once rather than annotating each item.
+
 ---
 
 ## 3. Reflection = compile-time metadata, not runtime type synthesis
@@ -437,10 +477,11 @@ over a sound base, never a correctness dependency.
 
 ## 10. Principal risks & open decisions
 
-1. **Seam granularity vs. ergonomics.** Too coarse (`open module`) pessimizes too much;
-   too fine (`dynamic fn` everywhere) is noisy. *Decision needed:* the default unit and
-   whether traits are implicitly open. Lean: sealed default, `open`/`dynamic` explicit,
-   traits sealed unless `open trait`.
+1. **Seam granularity — DECIDED (§2.2).** Finest practical unit: per-`open trait` /
+   per-`dynamic fn`, sealed by default, explicit, with `open module` as opt-in coarsening
+   sugar. Under-annotation fails safe (a needed-but-unopened seam ⇒ the mod is rejected at
+   load, never a silent miscompile). Remaining sub-question: whether `open module` should
+   also be inferrable from a manifest for a pure plugin-host boundary crate.
 2. **W^X + safepoints under threads.** In-place patching a method another thread is
    executing needs a safepoint protocol (park at RC-safe points). Single-threaded first
    (P3), cross-thread deferred (P5) — same staging FastJavaC used.

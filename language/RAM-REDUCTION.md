@@ -131,7 +131,7 @@ worse than calloc; switched to 8-B classes (40 B → exactly 40 B).
 | esc (100k acyclic nodes) | 7.20 MB | **5.85 MB** | **−19%** |
 | pagerank (262k cyclic nodes) | 20.4 MB | **18.1 MB** | −11% (collector dominates) |
 
-Sound: Java 65/65 (heap balance), Vire suite green, correctness across objects/arrays/
+Sound: Java 67/67 (heap balance), Vire suite green, correctness across objects/arrays/
 collections/arena/generics/C++ bridge verified. **Total RAM reduction this session:
 pagerank 24.4 → 18.1 MB = −26%** (header pack + slab). The cyclic residual gap to
 Rust is the Bacon-Rajan collector (mark/scan buffer over the large cycle) +

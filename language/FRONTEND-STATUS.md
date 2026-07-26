@@ -1,5 +1,11 @@
 # Vire front-end — status of the 7 lowering points
 
+> **Historical snapshot** (early front-end session). Several rows below are now stale:
+> generics/traits/monomorphization, closures/lambdas, Option/Result + `?`, and
+> `comptime`/`comptime for` have since been implemented. For current front-end status see
+> [TODO.md](../TODO.md) and [DONE.md](../DONE.md); this file is kept as a record of the
+> original plan, not the present state.
+
 Session goal: close the 7 "parsed but not lowered" gaps (after FFI +
 syntactic sugar). Status:
 
@@ -41,7 +47,7 @@ over the AST) + reflection API. Hygienic macros: AST→AST transformation with
 hygiene context. Both are self-contained subparts.
 
 ## Why stopped here (instead of rushing)
-The 4 completed points are sound, tested (41 Vire tests), Java 65/65. The 3
+The 4 completed points are sound, tested (41 Vire tests), Java 67/67. The 3
 open ones each need an architectural extension that — rushed — risks
 unsoundness (the discipline of this entire thread: better to honestly measure/mark than
 momentum). Each path above is concrete; generics is the lever that also unlocks #7 (Option/

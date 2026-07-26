@@ -58,7 +58,7 @@ explicit capsule.
 - **Callee escape** (`head = attach(head, i)`, attach returns a fresh Node):
   correctly NOT promoted (1249975000).
 - **Array store**: index assign → not promoted, correct.
-- **Java regression 65/65** (heap balance 0-live = soundness oracle), **Vire suite
+- **Java regression 67/67** (heap balance 0-live = soundness oracle), **Vire suite
   green** (35 lower tests incl. `auto_arena_promotes_*` / `auto_arena_avoids_*`).
 
 ## Limits (honest)

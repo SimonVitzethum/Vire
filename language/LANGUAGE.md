@@ -329,7 +329,9 @@ binary.
 - No inheritance tree (traits/composition instead of a class hierarchy).
 - No headers/declarations (whole-program, single pass).
 - No macros/`unsafe` in everyday use (only at the FFI boundary).
-- No runtime reflection/`eval` (AOT, closed world).
+- No runtime reflection/`eval` by default (sealed/closed-world default). *Opt-in dynamic
+  seams (native loading, overrides, typed reflection metadata; no VM, no GC) are planned,
+  not yet implemented — see DYNAMIC-VIRE-PLAN.md.*
 - No null, no exceptions, no implicit conversions.
 
 ## Mapping onto FastLLVM (why it lowers "simply")

@@ -307,7 +307,7 @@ information that the ownership proofs need.
 
 **Implemented (all 6 phases):** 1 acyclicity→collector elimination ✅, 2 function-sections/dead-stripping ✅, 3 loop stack allocation via liveness (region-light, both-or-neither-safe) ✅, 4 RC elision for immortal-only locals (ownership-like) ✅, 5 interprocedural escape analysis ✅, 6 Rust benchmark + irreducible core ✅.
 
-**Implementation conclusion:** both pure arithmetic and **loop-allocated, non-escaping objects** now reach Rust parity (GC-free AND RC-free). Remaining gaps: (a) ~~safety-check elision~~ **done** (bounds-check elision via GVN, §9 below), (b) the division check with a constant divisor, (c) escaping/shared object graphs fall back to RC — which Rust likewise does with `Rc`/`Arc` (parity, not a deficit). The GC (cycle collector) is removed *entirely* for acyclic programs; for mixed-cyclic ones it remains the provable rest. Suite 65/65, heap 0 live — hosted, freestanding, threaded.
+**Implementation conclusion:** both pure arithmetic and **loop-allocated, non-escaping objects** now reach Rust parity (GC-free AND RC-free). Remaining gaps: (a) ~~safety-check elision~~ **done** (bounds-check elision via GVN, §9 below), (b) the division check with a constant divisor, (c) escaping/shared object graphs fall back to RC — which Rust likewise does with `Rc`/`Arc` (parity, not a deficit). The GC (cycle collector) is removed *entirely* for acyclic programs; for mixed-cyclic ones it remains the provable rest. Suite 67/67, heap 0 live — hosted, freestanding, threaded.
 
 ### Benchmark FastLLVM vs Rust vs C++ (g++ -O3 -march=native), bit-identical results
 
@@ -384,7 +384,7 @@ overhead that Rust/C++ do not have:
 - **Ref-array bounds elision** (see above, point 1): `sh[i & 1]` becomes *unchecked* (a pure
   GEP), ref stores stay checked (covariance/ArrayStoreException).
 
-All passes are sound (suite 65/65, heap 0 live; out-of-bounds/NPE with an
+All passes are sound (suite 67/67, heap 0 live; out-of-bounds/NPE with an
 unprovable index/receiver still throw). **C++ wins** on Fib (GCC
 recursion codegen) and polymorphism (constant-folds the two fixed `area()`
 values — a benchmark artifact; FastLLVM and Rust dispatch honestly dynamically).

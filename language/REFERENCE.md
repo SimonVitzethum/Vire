@@ -208,7 +208,9 @@ fn to_json[T](v: T) -> Str {
 @derive(Json, Eq, Hash, Ord)              // derivation = comptime-generated impls
 type User { id: Int, name: Str }
 ```
-Reflection is purely static — **no** runtime metadata, no RTTI overhead.
+Reflection is purely static in sealed/default builds — **no** runtime metadata, no RTTI
+overhead. *(A `--dynamic` build's opt-in typed runtime reflection metadata is planned, not
+yet implemented — see DYNAMIC-VIRE-PLAN.md.)*
 
 ## 8. Macros (hygienic **and type-safe**) — *Point 4*
 

@@ -159,7 +159,7 @@ the claim now carries an asterisk ([EVALUATION.md](EVALUATION.md) §2,
 
 ## M0.1c — Collector fixed (the safe half implemented)
 
-Two **safe** runtime fixes implemented (suite 65/65, 0 live, graph correct — no
+Two **safe** runtime fixes implemented (suite 67/67, 0 live, graph correct — no
 borrow logic touched):
 1. **Adaptive threshold:** collector trigger = 2× live objects instead of a fixed
    10000 → frequency bounded → amortizes **linearly** instead of O(n²). 0-live

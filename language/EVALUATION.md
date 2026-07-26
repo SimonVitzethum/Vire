@@ -91,8 +91,9 @@ but the **absence of type annotations** through inference. That is exactly the
 lever:
 
 → **The "simplicity of Python" is attainable if you replace dynamism with
-inference.** The price: no real runtime `eval`/monkey-patching (nobody needs that
-for performance code anyway), and the closed-world assumption (see below).
+inference.** The price (in the default, sealed build): no runtime `eval`, and the
+closed-world assumption (see below). *(Runtime overrides / mixin-style injection are a
+planned opt-in seam — no VM, no GC — not yet implemented; see DYNAMIC-VIRE-PLAN.md.)*
 
 ### Tension C — "all C/C++/Rust libraries" + "memory-safe/dedicated language"
 
@@ -207,9 +208,11 @@ A dedicated front end that produces **SSA directly** would:
 - C-header→binding generator (for the interop claim).
 
 **Real limits that remain:**
-- **Closed world.** Whole-program ownership inference and devirtualization need
-  *all* source texts at compile time. No loading of unknown code at runtime
-  (plugins only over stable ABI boundaries). That is the price for "RC elimination
+- **Closed world by default.** Whole-program ownership inference and devirtualization need
+  *all* source texts at compile time. No loading of unknown code at runtime in a sealed
+  build (plugins only over stable ABI boundaries). *(Native, opt-in dynamic loading at
+  declared `open`/`dynamic` seams — no VM, no GC, verified at load — is planned, not yet
+  implemented; see DYNAMIC-VIRE-PLAN.md.)* That is the price for "RC elimination
   without annotations" — and for FastLLVM's target audience (native binaries, seL4) given
   anyway.
 - **Never 100% runtime-free.** The cyclic, non-provable rest needs RC +
@@ -236,7 +239,8 @@ smaller, only correct:
 2. "All libraries" → **C natively; C++/Rust via C ABI/bindings** (the same boundary
    as for any non-C++/Rust language).
 3. "As simple as Python" → **syntax yes; semantics statically inferred** (no
-   runtime `eval`, closed world).
+   runtime `eval`; closed-world by default — dynamism opt-in, planned, see
+   DYNAMIC-VIRE-PLAN.md).
 
 Within this tailoring the language is **realistic, differentiated from everything
 existing and technically already half finished**. Recommendation: build it as a
