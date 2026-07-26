@@ -114,6 +114,33 @@ they run and disables them precisely where they'd be unsound.
 and runs **exactly** as it does today — same speed, same 0-live oracle. Dynamism is
 opt-in, visible in the source, and locally reasoned about.
 
+### 2.1 Knowledge is asymmetric — and that is the main performance lever
+The host and its plugins do **not** know each other symmetrically, and the design exploits
+the asymmetry rather than treating the boundary as an opaque wall:
+
+- **Only the host, at *its* compile time, is blind to the plugins** — they don't exist yet.
+  So the host must treat its declared seams as open (mutable slot, no cross-seam
+  optimization). This is the unavoidable direction.
+- **A plugin/mod, at *its* compile time, sees the host in full** — its type descriptors,
+  layouts, and the **IR of the host's sealed surface** (shipped in the host's module SDK /
+  passed to the M2 subprocess as `--link-against <host-manifest>`, incl. already-loaded
+  deps). Therefore the plugin is compiled **closed-world relative to (host-sealed-surface +
+  this plugin + resolved deps)** and may fully optimize *into* the host:
+
+  > **A plugin may inline, devirtualize, monomorphize and const-fold against the host's
+  > SEALED surface** — sealed host code is immutable (that is what `sealed` *means*), so an
+  > inlined copy can never go stale; the plugin's cache key includes the host version, so a
+  > changed host just recompiles the plugin. **Only the host's OPEN seams** must still be
+  > reached through the frozen ABI (they can change under it).
+
+This is strictly stronger than FastJavaC's "never inline across the module boundary": the
+boundary is porous **in the plugin→host-sealed direction**, sealed only in the
+host→plugin and the across-an-open-seam directions. A mod calling hundreds of host
+utility functions pays no ABI tax on the sealed ones — it inlined them, exactly as if it
+had been part of the original closed-world compile. The runtime JIT then adds only the
+*last* increment of specialization that was unknowable even at plugin-compile time — which
+of several loaded impls actually wins a seam, and runtime constants (§5).
+
 ---
 
 ## 3. Reflection = compile-time metadata, not runtime type synthesis
@@ -292,11 +319,15 @@ the graph RC-collectable so no tracing collector is ever needed.**
   `jrt_retain`/`jrt_release`** at the boundary — the callee is a black box that may retain
   it, so the +1 must be real. Determinism is preserved: RC frees at the same point every
   run, whether or not the JIT has specialized the surrounding code (G1).
-- **Arena promotion is forbidden across a seam.** `while_arena_safe` already declines when
-  it cannot prove non-escape through a callee; a `dynamic`/`open`-typed callee is
-  **unconditionally opaque** to it (an override could store the arena object somewhere
-  that outlives the pop). This is a *conservative extension of an existing check* — the
-  arena simply never fires on a loop whose body touches a seam. Sealed loops are untouched.
+- **Arena promotion is forbidden across a *plain* seam.** `while_arena_safe` already
+  declines when it cannot prove non-escape through a callee; a plain `dynamic`/`open`-typed
+  callee is **opaque** to it (an override could store the arena object somewhere that
+  outlives the pop). This is a *conservative extension of an existing check* — the arena
+  simply never fires on a loop whose body touches a plain seam. Sealed loops are untouched.
+  **Exception (the recovery lever):** a seam declared `noescape` carries a contract the load
+  verifier enforces on **every** impl (§11.1), so no override *can* escape — and then the
+  arena **is allowed to fire across it**. This is how the open world gets its arena back
+  where it matters.
 - **Loaded instances carry a field-ref map** (from their descriptor, §3) so the RC
   **drop/release** path walks them and decrements their referents without static layout
   knowledge — the map records **element classes of ref arrays** (Vire has typed object
@@ -425,12 +456,68 @@ over a sound base, never a correctness dependency.
    the same "measure before shipping soundness-critical complexity" discipline the rest of
    the project follows.
 
-## 11. Non-goals (deliberate)
+## 11. Additional concepts worth adopting (beyond the core), ranked
+
+Ordered by value-to-risk. The first two are the headline additions — the rest are natural
+extensions once the spine (P0–P3) exists.
+
+1. **Effect-contract seams — the biggest performance recovery (do this).** The sealing model
+   gives up the arena and RC-elision at *every* seam because an unknown override *might*
+   escape/retain. Let a seam carry a **contract the load verifier enforces on every impl**:
+   `dynamic noescape fn` (args/`self`/result provably don't escape the call),
+   `dynamic pure fn` (no observable effect, no retain), `noalloc`, `nopanic`. If a seam is
+   `noescape`, the host **keeps the arena firing across it** — no impl can break the escape
+   assumption because the verifier *rejects* any that would. This turns "seams are slow"
+   into "seams you constrain are fast," recovering exactly the optimization the open world
+   costs, with the guarantee moved to load time. **Highest value; directly attacks §7's
+   only real tax.** (Extends the existing RC/arena effect summary in §3.)
+2. **Composition warm-image (ahead-of-load whole-program re-optimization).** When a *stable*
+   set of modules is loaded (a game + its known mod list, a server + its plugins), optionally
+   produce a cached, **re-sealed, fused native image of the whole composition** — M2 applied
+   to host+plugins *together*, so cross-module calls that were ABI edges get inlined/devirt'd
+   as if closed-world. Keyed by the set's content hashes (deterministic, item 6). Gives
+   *near-closed-world speed for a known plugin set* while keeping full dynamism for the
+   unknown case. The JIT handles the transient/unknown; the warm-image handles the settled.
+3. **Polymorphic inline caches at seams.** Beyond the monomorphic guard (§4.2): a small N-way
+   PIC for seams that see a handful of impls — still counter-driven and deterministic (§5.3),
+   still deopts to the slow path on the (N+1)th type. Cheap, and covers the common "2–3 mods
+   implement this hook" case without falling to the indirect slot.
+4. **Capability/effect-scoped modules (sound, not process isolation).** A module *declares*
+   which host capabilities it may use — FFI, threads, specific host APIs, `unsafe`/`native`
+   — and the verifier **enforces** it at load (a module that reaches beyond its declared set
+   is rejected). Type-/effect-level containment reusing the descriptor metadata; not a
+   sandbox for actively-malicious native code (that's process isolation, still out of scope),
+   but real, checked least-privilege for the trusted-input model.
+5. **Deterministic hot-swap & unload (RC makes this clean).** Because reclamation is RC, not
+   GC, a module can be **atomically hot-swapped or unloaded at a safepoint**: drain its live
+   instances under their versioned drop, revert its patches, free — at a *defined,
+   reproducible* point, not whenever a collector runs. Live code update with a deterministic
+   reclamation semantics a GC'd runtime cannot offer.
+6. **Content-addressed modules + reproducible composition.** Identify each module by a
+   content hash; load resolves deterministically (fixed order, hash-pinned deps). The entire
+   running composition — which modules, which versions, which seams resolved to which impl —
+   is then **reproducible from the input set**, extending the JIT's determinism (G3) to the
+   whole system: same module set + same inputs ⇒ same run, enabling record/replay debugging.
+7. **Comptime-generated ABI glue & manifests.** Use Vire's existing comptime layer to
+   generate the module manifest, descriptor, and boundary glue from the seam declarations —
+   comptime-checked, so an ABI mismatch is a *compile* error on the module side, before it
+   ever reaches the load verifier.
+8. **Speculative whole-program sealing (research, not default).** Treat even unannotated code
+   as sealed *speculatively*, guard it, deopt on a load that violates — recovering speed
+   without explicit `open`. **Risk:** the arena is memory-safety-critical, so a mis-speculation
+   is a UAF, not a slowdown; would need deopt *before* any arena free commits. Parked as a
+   research direction, explicitly behind the safe sealed-by-default model.
+
+---
+
+## 12. Non-goals (deliberate)
 An **interpreter** or a *bytecode/source-executing* engine (M3) — the JIT is allowed but
 only as a **semantics-preserving, memory-safe, deterministic** specializer of already-
 verified native code (§5), never a runtime compiler of new source · a **garbage collector**
 as dynamism's safety net — the open world stays **RC-only + deterministic**, cycles handled
 by the load verifier (§6) · runtime *type* synthesis / dynamic typing · unsealing the whole
 program by default · a JIT whose output depends on wall-clock/scheduling (non-determinism) ·
-sandboxing untrusted modules within the process · cross-module inlining at the ABI boundary
-(always real calls + real RC).
+sandboxing untrusted modules within the process · inlining **across an open seam** or in
+the **host→plugin** direction (the host never sees plugins; those edges stay real calls +
+real RC). *(Note: plugin→host-**sealed** inlining is explicitly allowed and encouraged,
+§2.1 — it is not cross-seam and cannot go stale.)*
