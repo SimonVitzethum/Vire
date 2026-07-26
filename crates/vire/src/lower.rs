@@ -1755,7 +1755,15 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => {
                 let callee_bad = match callee.as_ref() {
                     Expr::Ident(n, _) => {
-                        if let Some(fd) = self.fn_defs.get(n) {
+                        // A `dynamic fn` / `open fn` is an extension SEAM (DYNAMIC-VIRE-PLAN.md
+                        // §2/§6): a runtime override could store its args or escape, so it is a
+                        // hard black box to region inference — treat it as opaque, exactly like
+                        // an extern. This is what makes the arena decline at a seam (the sealed-
+                        // by-default performance/soundness boundary). Sealed callees are still
+                        // descended into transparently below.
+                        if self.fn_defs.get(n).is_some_and(|fd| fd.attrs.iter().any(|a| a.name == "__dynamic")) {
+                            true
+                        } else if let Some(fd) = self.fn_defs.get(n) {
                             // Are ALL arguments fresh at THIS call site? Then the callee's
                             // ref parameters are arena-local, and it may mutate their graphs
                             // (a fresh ref stored into a fresh param stays in the arena).

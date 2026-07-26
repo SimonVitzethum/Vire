@@ -389,8 +389,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   --emit-module` → a PIC `.so` exporting `vire_module_main(i64)->i64` + `vire_module_abi`;
   host `load_module(path)` (dlopen + ABI-version gate) + `module_call(handle, arg)`.
   Scalar-in/-out only (no cross-boundary RC/arena). `tests/vire_module.sh` (4/4), Java oracle
-  67/67 unaffected. Full sealing model + object-boundary verifier + JIT are the open rest —
-  see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
+  67/67 unaffected.
+  **Sealing model foundation — DONE (2026-07-26, P1 step 2a):** `dynamic fn`/`open fn`/`open
+  trait`/`open type` parse (sealed = keyword-free default); a call to a `dynamic`/`open` fn is
+  opaque to region inference → the **loop-arena declines at the seam** (a future override
+  could escape), while a sealed builder still gets the arena — both 0-live, same value.
+  `tests/vire_sealing.sh` (4/4), Vire-only. Open rest of P1+: the shared-type object boundary
+  + load-time verifier + the runtime override (mutable-slot dispatch) + the JIT — see
+  [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic

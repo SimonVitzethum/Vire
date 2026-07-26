@@ -150,6 +150,8 @@ impl Parser {
             Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
+                // Dynamic-surface seam declarations: `dynamic fn` / `open trait|type|fn`.
+                | Tok::Kw(Kw::Dynamic) | Tok::Kw(Kw::Open)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
             // `@derive(...)`/`@when(...)`/`@gpu` and the `@vulkan` shader stages
             // (`@vertex`/`@fragment`/`@compute`/`@task`/`@mesh`) introduce a
@@ -170,6 +172,41 @@ impl Parser {
         }
         match self.peek() {
             Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn_attrs(is_pub, attrs))),
+            // `dynamic fn` — a runtime-overridable seam (DYNAMIC-VIRE-PLAN.md §2/§4). Marked
+            // with a synthetic `__dynamic` attribute; the optimizer treats a call to it as an
+            // opaque black box (no arena/RC-elision across it — a future override could
+            // escape/retain). `open fn` is an accepted alias.
+            Tok::Kw(Kw::Dynamic) => {
+                self.bump();
+                let mut f = self.parse_fn_attrs(is_pub, attrs);
+                let sp = f.sig.span;
+                f.attrs.push(Attr { name: "__dynamic".into(), args: vec![], span: sp });
+                Some(Item::Fn(f))
+            }
+            // `open trait` / `open type` / `open fn` — extensible-at-runtime seams. For now
+            // `open` on a trait/type establishes the syntax (recorded, no dispatch change
+            // yet — that lands with the runtime override step); `open fn` == `dynamic fn`.
+            Tok::Kw(Kw::Open) => {
+                self.bump();
+                match self.peek() {
+                    Tok::Kw(Kw::Fn) => {
+                        let mut f = self.parse_fn_attrs(is_pub, attrs);
+                        let sp = f.sig.span;
+                        f.attrs.push(Attr { name: "__dynamic".into(), args: vec![], span: sp });
+                        Some(Item::Fn(f))
+                    }
+                    Tok::Kw(Kw::Type) => {
+                        let mut t = self.parse_type_def();
+                        t.attrs = attrs;
+                        Some(Item::Type(t))
+                    }
+                    Tok::Kw(Kw::Trait) => Some(Item::Trait(self.parse_trait())),
+                    _ => {
+                        self.err("`open` must be followed by `trait`, `type`, or `fn`");
+                        None
+                    }
+                }
+            }
             Tok::Kw(Kw::Native) => Some(self.parse_native()),
             Tok::Kw(Kw::Type) => {
                 let mut t = self.parse_type_def();

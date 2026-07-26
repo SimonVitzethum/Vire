@@ -3,9 +3,9 @@
 **Date:** 2026-07-26
 **Status:** PLAN, first slices landed — **P0 step 1** (static reflection API:
 `type_name`/`field_count`/`field_name`/`field_type`/`abi_version`) and **P1 step 1** (the
-scalar-only M1 module round-trip: `--emit-module` + `load_module`/`module_call` with the
-ABI-version gate), §9. The sealing model, the object-boundary verifier, and the JIT are
-unstarted. FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
+scalar-only M1 module round-trip) and the **P1 step 2a** sealing-model foundation
+(`dynamic fn`/`open` parse + the arena declining at a seam), §9. The shared-type object
+boundary + load-time verifier + the runtime override + the JIT are unstarted. FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
 DYNAMIC-RUNTIME-PLAN.md`) is the **existence proof** that native, no-VM/no-JIT dynamism
 works: native module ABI, `dlopen` loader, redefinition by code-pointer swap,
 compile-on-load cache, binary trampoline patching — all implemented and 0-live-heap tested
@@ -463,13 +463,20 @@ extends existing machinery (or is a direct port of FastJavaC's proven code).
     capsule discipline). A missing / non-module / wrong-ABI `.so` → handle 0, never a crash
     or a wrong call. `tests/vire_module.sh` (4/4, 0-live); Java oracle 67/67 unaffected
     (the loader is section-stripped when unused; freestanding excludes it).
-  - *Step 2 — full sealing + shared-type ABI + object-boundary verifier.* `open`/`dynamic`
-  parse + seam-aware optimizer scoping; `vire --emit-module` → `.so`; `dlopen` loader;
-  **load-time verifier** incl. the **acyclicity-or-weak gate** (§6) so the open world stays
-  RC-only; cross-module trait/dispatch calls + real boundary RC. *Test:* a two-module 0-live
-  program; a layout-incompatible module and a cycle-closing module are both **rejected**,
-  not linked; the deterministic-RC drop is verified. **The soundness contract is proven
-  here; do not compress it.**
+  - *Step 2a — sealing model: parsing + optimizer scoping — DONE (2026-07-26).* `dynamic fn`
+    / `open fn` / `open trait` / `open type` parse (keywords `dynamic`/`open`, sealed stays
+    the keyword-free default). The memory-safety-critical part: a call to a `dynamic`/`open`
+    **fn** is a hard black box to region inference (`crates/vire/src/lower.rs`) — a future
+    override could escape/retain its args — so the **loop-arena declines at the seam** while
+    an identical *sealed* builder still gets the arena, both 0-live, same value.
+    `tests/vire_sealing.sh` (4/4). Vire-frontend-only (Java oracle unaffected). *(Trait-
+    method seam dispatch is 2b; `open trait`/`open type` currently parse but don't yet route
+    trait calls through a mutable slot — that's the override step.)*
+  - *Step 2b — shared-type ABI + object-boundary verifier.* objects (not just scalars) cross
+    the module boundary with frozen layouts + real boundary RC; the **load-time verifier**
+    incl. the **acyclicity-or-weak gate** (§6) so the open world stays RC-only. *Test:* a
+    two-module 0-live program; a layout-incompatible and a cycle-closing module are both
+    **rejected**, not linked. **The soundness contract is proven here; do not compress it.**
 - **P2 — redefinition by pointer swap + guarded devirt (override + mixin capability).**
   Mutable slot; a module overrides a `dynamic fn`, and an injection override calls through
   to the previous pointer (native "around"). *Test:* new behavior on next call; the mixin
