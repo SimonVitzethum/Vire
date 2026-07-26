@@ -49,6 +49,17 @@ check scalar "Int,0,Float" <<'EOF'
 fn main() { print(type_name(42))  print(field_count(42))  print(type_name(3.5)) }
 EOF
 
+# field_name / field_type by constant index (exact from the layout)
+check fields "x,Int,y,Float,next,Point" <<'EOF'
+type Point { x: Int  y: Float  next: Point }
+fn main() {
+    mut p = Point(1, 2.0, null)
+    print(field_name(p, 0))  print(field_type(p, 0))
+    print(field_name(p, 1))  print(field_type(p, 1))
+    print(field_name(p, 2))  print(field_type(p, 2))
+}
+EOF
+
 # the class threads through a reassignment (traversal keeps the type)
 check traverse "Node" <<'EOF'
 type Node { id: Int  next: Node }

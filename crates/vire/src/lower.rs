@@ -4066,6 +4066,53 @@ impl<'a> FnLower<'a> {
         if name == "abi_version" {
             return (Operand::ConstI64(VIRE_ABI_VERSION), Ty::I64);
         }
+        // `field_name(x, i)` / `field_type(x, i)` → the i-th declared field's name resp.
+        // type name (as a Str). `i` must be a COMPILE-TIME CONSTANT (the layout is static;
+        // a runtime index would need the descriptor table, P1). Exact from the type graph;
+        // out-of-range or non-constant `i` is a loud compile error. (`size_of` is
+        // deliberately NOT here: an exact instance size needs the backend's post-narrowing
+        // struct layout, so it lands with the descriptor table in P1, not a guess now.)
+        if name == "field_name" || name == "field_type" {
+            let mut it = lowered.into_iter();
+            let (arg, _) = it.next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let i = match it.next().map(|(o, _)| o) {
+                Some(Operand::ConstI64(i)) => i,
+                Some(Operand::ConstI32(i)) => i as i64,
+                _ => {
+                    self.errs.push(format!("{name}(x, i): the index i must be a constant integer"));
+                    0
+                }
+            };
+            let fields: Vec<(String, Ty, Option<String>)> = self
+                .class_of_operand(&arg)
+                .and_then(|c| self.layout_of(&c))
+                .map(|l| l.into_iter().filter(|(nm, ..)| nm != "__tag").collect())
+                .unwrap_or_default();
+            let s = if i >= 0 && (i as usize) < fields.len() {
+                let (fname, fty, fclass) = &fields[i as usize];
+                if name == "field_name" {
+                    fname.clone()
+                } else {
+                    match fclass {
+                        Some(c) => c.clone(),
+                        None => match fty {
+                            Ty::F64 | Ty::F32 => "Float",
+                            Ty::Ref => "Ref",
+                            _ => "Int",
+                        }
+                        .to_string(),
+                    }
+                }
+            } else {
+                self.errs.push(format!("{name}(x, {i}): field index out of range (type has {} fields)", fields.len()));
+                String::new()
+            };
+            let id = self.intern(&s);
+            let d = self.new_local(Ty::Ref);
+            self.local_class.insert(d.0, "Str".into());
+            self.emit(Statement::Assign(d, Rvalue::Use(Operand::ConstStr(id))));
+            return (Operand::Copy(d), Ty::Ref);
+        }
         // FFI builtin `cstr(s)` → a NUL-terminated `char*` (as `Ptr`/i64) for extern-C
         // functions expecting `const char*`. Requires a Str: a bare `Ty::Ref` that is not an
         // array and carries no non-`Str` class (a literal, a concat/`str()` result, or a
