@@ -17,6 +17,10 @@ footprint** (per-seam counters + one reused scratch buffer, no background thread
 growing code cache). And the whole open world stays **RC-only — no garbage collector** —
 running as native code directly on the CPU, never a VM.
 
+**Concrete surface syntax** for every construct below (open seams, effect contracts,
+plugin impls/overrides, module headers, loading, reflection) is proposed in the companion
+[DYNAMIC-VIRE-SYNTAX.md](DYNAMIC-VIRE-SYNTAX.md).
+
 **What is borrowed and what is not.** FastJavaC contributes only the **systems
 mechanisms** — code-pointer indirection, trampoline patching, native module linking, the
 load-then-link discipline — which are language-agnostic. **No Java compatibility is a
