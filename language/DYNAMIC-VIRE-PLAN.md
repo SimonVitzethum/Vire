@@ -243,7 +243,9 @@ FastJavaC proved out, reused here under Vire's own dispatch.
    (reserved NOP bytes) the runtime can rewrite into a `jmp` to another native
    implementation. Literal self-modifying code, but it only **switches between
    pre-existing native code**. Needs W^X (`mprotect` RW↔RX), i-cache flush, and
-   cross-thread safepoints.
+   cross-thread safepoints. **Designed as a general facility** (not mixin-specific) — hot-
+   update, JIT dispatch-collapse, constant specialization, and instrumentation are all
+   clients — in [DYNAMIC-VIRE-PATCH.md](DYNAMIC-VIRE-PATCH.md) (Option B).
 
 Mechanisms 1 and 3 are proven native primitives (FastJavaC); for Vire they are the
 *carrier*. The new work is the **soundness contract they must respect** (§6) and the
