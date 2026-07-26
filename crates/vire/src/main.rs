@@ -795,6 +795,7 @@ fn build_or_run(args: &[String]) {
     let mut emit_obj = false;
     let mut emit_asm = false;
     let mut emit_staticlib = false;
+    let mut emit_module = false;
     let mut deps_file: Option<String> = None;
     let mut include_dirs: Vec<String> = Vec::new();
     let mut pkgs: Vec<String> = Vec::new();
@@ -832,6 +833,10 @@ fn build_or_run(args: &[String]) {
             }
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
+            // Dynamic module (M1, DYNAMIC-VIRE-PLAN.md P1): a PIC `.so` exporting a scalar
+            // C-ABI entry `vire_module_main(i64)->i64` (from `fn module_main(x: Int) -> Int`)
+            // + a `vire_module_abi` version constant, loadable at runtime via `load_module`.
+            "--emit-module" => emit_module = true,
             // Unified emit selector (Meson-style): --emit=obj|asm|llvm|ir|staticlib|exe.
             a if a.starts_with("--emit=") => match &a[7..] {
                 "ir" => emit_ir = true,
@@ -1138,7 +1143,14 @@ fn build_or_run(args: &[String]) {
             exit(1);
         }
     };
-    if !program.functions.iter().any(|f| f.name == "java_main") {
+    // A dynamic module has no `main` — its entry is `fn module_main(x: Int) -> Int`
+    // (exported by the shim as `vire_module_main`). Everything else needs `fn main`.
+    if emit_module {
+        if !program.functions.iter().any(|f| f.name == "module_main") {
+            eprintln!("--emit-module: expected `fn module_main(x: Int) -> Int`");
+            exit(1);
+        }
+    } else if !program.functions.iter().any(|f| f.name == "java_main") {
         eprintln!("no entry point: expected `fn main()`");
         exit(1);
     }
@@ -1216,6 +1228,18 @@ fn build_or_run(args: &[String]) {
     }
     let ll_path = build_dir.join("program.ll");
     let rt_path = build_dir.join("runtime.c");
+    // `--emit-module`: append the C-ABI export shim (a scalar module entry + the frozen
+    // ABI version) so the runtime loader can dlsym + version-check + call it. Requires the
+    // module to define `fn module_main(x: Int) -> Int` (symbol `@module_main`).
+    let ll = if emit_module {
+        format!(
+            "{ll}\n@vire_module_abi = constant i64 1\n\
+             define i64 @vire_module_main(i64 %x) {{\n  \
+             %r = call i64 @module_main(i64 %x)\n  ret i64 %r\n}}\n"
+        )
+    } else {
+        ll
+    };
     if let Err(e) = std::fs::write(&ll_path, &ll).and_then(|_| std::fs::write(&rt_path, RUNTIME_C)) {
         eprintln!("writing to {}: {e}", build_dir.display());
         exit(1);
@@ -1654,7 +1678,9 @@ fn build_or_run(args: &[String]) {
         // cached `-flto` bitcode instead of recompiling it (~80% of a small build's
         // time). Lossless — the LTO link optimizes it exactly as if from source.
         // Skipped under PGO (the runtime must share the program's instrumentation).
-        let rt_cached = if pgo_gen || pgo_use.is_some() {
+        let rt_cached = if pgo_gen || pgo_use.is_some() || emit_module {
+            // A module links `-shared`, so the runtime must be PIC — the cached object is
+            // not; compile runtime.c from source (with the `-fPIC` added below) instead.
             None
         } else {
             cached_runtime_object(want_threads || threads_flag, backtrace_flag, acyclic || force_no_cycles, force_no_rc, thin_lto, target.as_deref())
@@ -1688,6 +1714,17 @@ fn build_or_run(args: &[String]) {
             // if a site is missing from the profile, that is not an error (just uninstrumented codegen).
             cmd.arg("-Wno-profile-instr-unprofiled").arg("-Wno-profile-instr-out-of-date");
         }
+    }
+    // Dynamic loading: link libdl so the runtime's `jrt_load_module` (dlopen) resolves.
+    // Hosted only; harmless when `load_module` is unused (the loader is section-stripped,
+    // so libdl stays unreferenced). Cross targets get their own loader story later.
+    if target.is_none() {
+        cmd.arg("-ldl");
+    }
+    // A dynamic module (`--emit-module`) is a position-independent shared object exporting
+    // the scalar C-ABI entry, not an executable.
+    if emit_module {
+        cmd.arg("-shared").arg("-fPIC");
     }
     // Threads: enabled automatically when the program uses `spawn` (or explicitly
     // via `--threads`). Switches on atomic reference counting + pthreads. Note the

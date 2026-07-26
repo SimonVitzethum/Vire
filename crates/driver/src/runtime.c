@@ -173,6 +173,7 @@ static int fmt_spec_f(char *buf, const char *spec, double v) {
 #include <string.h>
 #include <sys/mman.h> /* FASTLLVM_GUARD_FREE: mmap/mprotect guard-page allocation */
 #include <unistd.h>
+#include <dlfcn.h> /* dynamic module loading (jrt_load_module) — hosted only */
 static void *plat_alloc(size_t n) { return calloc(1, n); }
 static void *plat_realloc(void *p, size_t n) { return realloc(p, n); }
 static void plat_free(void *p) { free(p); }
@@ -3322,3 +3323,26 @@ void jrt_println_long(int64_t v) { jrt_print_long(v); plat_write("\n", 1); }
 /* %g approximation; not Java's shortest round-trip-safe format (DESIGN.md §6). */
 void jrt_print_double(double d) { char b[40]; plat_write(b, (size_t)fmt_g(b, d)); }
 void jrt_println_double(double d) { jrt_print_double(d); plat_write("\n", 1); }
+
+/* --- Dynamic module loading (M1, scalar-only) — DYNAMIC-VIRE-PLAN.md P1 -------
+ * Load a PREBUILT native Vire module (.so, `vire --emit-module`), verify its frozen
+ * ABI version, and call its scalar entry. Scalar-in/-out only: no object graph crosses
+ * the boundary, so there is no cross-module RC/arena question here (the same discipline
+ * as a scalar capsule). Hosted only (needs dlopen); freestanding gets a custom loader
+ * later. The ABI constant (1) mirrors VIRE_ABI_VERSION in crates/vire/src/lower.rs. */
+#ifndef FASTLLVM_FREESTANDING
+int64_t jrt_load_module(const char *path) {
+    if (!path) return 0;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 0;
+    int64_t *abi = (int64_t *)dlsym(h, "vire_module_abi");
+    if (!abi || *abi != 1 /* VIRE_ABI_VERSION */) { dlclose(h); return 0; }
+    return (int64_t)(intptr_t)h; /* opaque handle; 0 = load failed / ABI mismatch */
+}
+int64_t jrt_module_call(int64_t handle, int64_t arg) {
+    if (!handle) return 0;
+    int64_t (*fn)(int64_t) = (int64_t(*)(int64_t))dlsym((void *)(intptr_t)handle, "vire_module_main");
+    if (!fn) return 0;
+    return fn(arg);
+}
+#endif

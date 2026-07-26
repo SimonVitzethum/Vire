@@ -4066,6 +4066,28 @@ impl<'a> FnLower<'a> {
         if name == "abi_version" {
             return (Operand::ConstI64(VIRE_ABI_VERSION), Ty::I64);
         }
+        // ── Dynamic module loading (M1, scalar-only) — DYNAMIC-VIRE-PLAN.md P1.
+        // `load_module(path: Str) -> Int` loads a prebuilt native module (`vire
+        // --emit-module`), checks its ABI version, and returns an opaque handle (0 =
+        // failed / ABI mismatch). `module_call(handle, arg: Int) -> Int` calls its scalar
+        // entry. Scalar-in/-out only — no object crosses the boundary, so no cross-module
+        // RC/arena concern (the scalar-capsule discipline).
+        if name == "load_module" {
+            let (arg, _) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let cs = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(cs), func: "vire_cstr".into(), args: vec![arg] });
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_load_module".into(), args: vec![Operand::Copy(cs)] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        if name == "module_call" {
+            let mut it = lowered.into_iter();
+            let h = it.next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let a = it.next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call".into(), args: vec![h, a] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // `field_name(x, i)` / `field_type(x, i)` → the i-th declared field's name resp.
         // type name (as a Str). `i` must be a COMPILE-TIME CONSTANT (the layout is static;
         // a runtime index would need the descriptor table, P1). Exact from the type graph;

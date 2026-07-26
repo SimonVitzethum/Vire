@@ -1,8 +1,11 @@
 # Design Plan: Dynamic Loading, Reflection & Self-Modification for Vire — with a JIT, no VM
 
 **Date:** 2026-07-26
-**Status:** PLAN. First slice landed — **P0 step 1** (the static reflection API
-`type_name`/`field_count`/`abi_version`, §9); the rest is unstarted. FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
+**Status:** PLAN, first slices landed — **P0 step 1** (static reflection API:
+`type_name`/`field_count`/`field_name`/`field_type`/`abi_version`) and **P1 step 1** (the
+scalar-only M1 module round-trip: `--emit-module` + `load_module`/`module_call` with the
+ABI-version gate), §9. The sealing model, the object-boundary verifier, and the JIT are
+unstarted. FastJavaC's dynamic runtime (Phases 0–5, `../FastJavaC/
 DYNAMIC-RUNTIME-PLAN.md`) is the **existence proof** that native, no-VM/no-JIT dynamism
 works: native module ABI, `dlopen` loader, redefinition by code-pointer swap,
 compile-on-load cache, binary trampoline patching — all implemented and 0-live-heap tested
@@ -450,7 +453,17 @@ extends existing machinery (or is a direct port of FastJavaC's proven code).
     consumes it): serialize per-type descriptors (§3), version the ABI in the binary, and
     upgrade `type_name`/`describe` to read a loaded value's descriptor. *Test:* the sealed
     core introspects its own types via the table; oracle unchanged.
-- **P1 — the sealing model + native module ABI (M1) + the no-GC verifier.** `open`/`dynamic`
+- **P1 — the sealing model + native module ABI (M1) + the no-GC verifier.**
+  - *Step 1 — scalar-only M1 round-trip — DONE (2026-07-26).* `vire --emit-module` builds a
+    PIC `.so` exporting a scalar C-ABI entry `vire_module_main(i64)->i64` (from `fn
+    module_main(x: Int) -> Int`) + a `vire_module_abi` version constant; the host loads it
+    with `load_module(path) -> handle` (`dlopen` + **ABI-version check** — the first
+    verifier gate) and calls it with `module_call(handle, arg)`. Scalar-in/-out only, so no
+    object crosses the boundary and there is no cross-module RC/arena question (the scalar-
+    capsule discipline). A missing / non-module / wrong-ABI `.so` → handle 0, never a crash
+    or a wrong call. `tests/vire_module.sh` (4/4, 0-live); Java oracle 67/67 unaffected
+    (the loader is section-stripped when unused; freestanding excludes it).
+  - *Step 2 — full sealing + shared-type ABI + object-boundary verifier.* `open`/`dynamic`
   parse + seam-aware optimizer scoping; `vire --emit-module` → `.so`; `dlopen` loader;
   **load-time verifier** incl. the **acyclicity-or-weak gate** (§6) so the open world stays
   RC-only; cross-module trait/dispatch calls + real boundary RC. *Test:* a two-module 0-live

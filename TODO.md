@@ -380,10 +380,17 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
 - [~] `comptime for` DONE (`20133fc`); `emit` surface still open. **No** runtime reflection
   by default (AOT); opt-in typed reflection metadata at `open`/`dynamic` seams is *planned,
   not yet implemented* — see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
-  **Static reflection API — DONE (2026-07-26, P0 step 1):** `type_name(x)` / `field_count(x)`
-  / `abi_version()`, compile-time-resolved from the type graph (0-live, Vire-only);
-  `tests/vire_reflect.sh`, `examples/vire/reflect.vr`. The runtime descriptor table is
-  deferred to the dynamic-loading phase (P1) so no dead metadata is emitted meanwhile.
+  **Static reflection API — DONE (2026-07-26, P0 step 1):** `type_name` / `field_count` /
+  `field_name(x,i)` / `field_type(x,i)` / `abi_version()`, compile-time-resolved from the
+  type graph (0-live, Vire-only); `tests/vire_reflect.sh`, `examples/vire/reflect.vr`. The
+  runtime descriptor table is deferred to the dynamic-loading phase (P1) so no dead metadata
+  is emitted meanwhile.
+  **Dynamic module loading — DONE (2026-07-26, P1 step 1, scalar-only):** `vire
+  --emit-module` → a PIC `.so` exporting `vire_module_main(i64)->i64` + `vire_module_abi`;
+  host `load_module(path)` (dlopen + ABI-version gate) + `module_call(handle, arg)`.
+  Scalar-in/-out only (no cross-boundary RC/arena). `tests/vire_module.sh` (4/4), Java oracle
+  67/67 unaffected. Full sealing model + object-boundary verifier + JIT are the open rest —
+  see [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic
