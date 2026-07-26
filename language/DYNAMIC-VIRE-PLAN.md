@@ -477,10 +477,19 @@ extends existing machinery (or is a direct port of FastJavaC's proven code).
     incl. the **acyclicity-or-weak gate** (§6) so the open world stays RC-only. *Test:* a
     two-module 0-live program; a layout-incompatible and a cycle-closing module are both
     **rejected**, not linked. **The soundness contract is proven here; do not compress it.**
-- **P2 — redefinition by pointer swap + guarded devirt (override + mixin capability).**
-  Mutable slot; a module overrides a `dynamic fn`, and an injection override calls through
-  to the previous pointer (native "around"). *Test:* new behavior on next call; the mixin
-  override still invokes the original; heap balances; arena still declines on seam loops.
+- **P2 — redefinition by pointer swap (override capability).**
+  - *Step 1 — scalar `dynamic fn` override — DONE (2026-07-26).* A `dynamic fn`/`open fn`
+    dispatches through the mutable slot `@jrt_dynslot[slot]` (backend, default = its own
+    body; never inlined so the slot is honoured); a scalar module `fn NAME(x: Int) -> Int`
+    is exported as `vire_override_NAME` (`--emit-module`); the host installs it with
+    `install_override(handle, "NAME")` (`jrt_dyn_install` → `dlsym` + slot write). After
+    install, host calls to `NAME` run the module's native body — no VM, native pointer swap.
+    Scalar-only (no cross-boundary RC/arena). `install_override` on a sealed fn is a compile
+    error. `tests/vire_override.sh` (3/3, 0-live); **Java oracle 67/67 + shape_soundness 3/3
+    unaffected** (the shared backend/ir/solver paths are inert when `dyn_fns` is empty).
+  - *Step 2 — mixin-style around-advice (`prev`) + guarded devirt.* an override calls
+    through to the pointer it replaced (native "around"); guarded fast path with native
+    fallback. *Test:* the mixin override still invokes the original; heap balances.
 - **P3 — JIT Tier A: dispatch collapse & re-sealing (§5.1) + the determinism gate.** Emit
   guarded-direct patches for seams proven hot by the **deterministic counter**; repatch to
   slow path on a new override. *Test:* a hot redefined method returns to near-direct-call

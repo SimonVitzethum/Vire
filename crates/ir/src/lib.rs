@@ -445,6 +445,11 @@ pub struct Program {
     /// generated/native glue invisible to RTA (e.g. a Vire `spawn` worker, called
     /// from its C shim via `jrt_spawn`). Analogous to the Runnable.run() roots.
     pub exported: Vec<String>,
+    /// `dynamic fn` / `open fn` names, in slot order (DYNAMIC-VIRE-PLAN.md P1). A call to
+    /// one of these is dispatched through the mutable runtime slot `@jrt_dynslot[slot]`
+    /// (default = the function's own body) instead of a direct call, so a loaded module can
+    /// override it at runtime. Empty for the Java path and any sealed program (zero effect).
+    pub dyn_fns: Vec<String>,
 }
 
 impl Program {

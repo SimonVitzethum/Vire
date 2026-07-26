@@ -1146,8 +1146,14 @@ fn build_or_run(args: &[String]) {
     // A dynamic module has no `main` — its entry is `fn module_main(x: Int) -> Int`
     // (exported by the shim as `vire_module_main`). Everything else needs `fn main`.
     if emit_module {
-        if !program.functions.iter().any(|f| f.name == "module_main") {
-            eprintln!("--emit-module: expected `fn module_main(x: Int) -> Int`");
+        // A module exports `fn module_main(x: Int) -> Int` (a scalar entry) and/or any
+        // scalar `fn NAME(x: Int) -> Int` as an override — it needs at least one.
+        let has_scalar = program
+            .functions
+            .iter()
+            .any(|f| f.params == [fastllvm_ir::Ty::I64] && f.ret == fastllvm_ir::Ty::I64);
+        if !has_scalar {
+            eprintln!("--emit-module: expected at least one scalar `fn NAME(x: Int) -> Int` (entry `module_main` and/or an override)");
             exit(1);
         }
     } else if !program.functions.iter().any(|f| f.name == "java_main") {
@@ -1232,11 +1238,23 @@ fn build_or_run(args: &[String]) {
     // ABI version) so the runtime loader can dlsym + version-check + call it. Requires the
     // module to define `fn module_main(x: Int) -> Int` (symbol `@module_main`).
     let ll = if emit_module {
-        format!(
-            "{ll}\n@vire_module_abi = constant i64 1\n\
-             define i64 @vire_module_main(i64 %x) {{\n  \
-             %r = call i64 @module_main(i64 %x)\n  ret i64 %r\n}}\n"
-        )
+        use fastllvm_ir::Ty;
+        let mut shim = String::from("\n@vire_module_abi = constant i64 1\n");
+        // Optional scalar entry `fn module_main(x: Int) -> Int` → `vire_module_main`.
+        if program.functions.iter().any(|f| f.name == "module_main") {
+            shim.push_str("define i64 @vire_module_main(i64 %x) {\n  %r = call i64 @module_main(i64 %x)\n  ret i64 %r\n}\n");
+        }
+        // Every scalar `fn NAME(x: Int) -> Int` is also exported as `vire_override_NAME`,
+        // so a host with a matching `dynamic fn NAME` can install it via `install_override`.
+        for f in &program.functions {
+            if f.name != "module_main" && f.params == [Ty::I64] && f.ret == Ty::I64 {
+                shim.push_str(&format!(
+                    "define i64 @vire_override_{0}(i64 %x) {{\n  %r = call i64 @{0}(i64 %x)\n  ret i64 %r\n}}\n",
+                    f.name
+                ));
+            }
+        }
+        format!("{ll}{shim}")
     } else {
         ll
     };
@@ -1686,7 +1704,14 @@ fn build_or_run(args: &[String]) {
             cached_runtime_object(want_threads || threads_flag, backtrace_flag, acyclic || force_no_cycles, force_no_rc, thin_lto, target.as_deref())
         };
         let rt_input = rt_cached.as_deref().unwrap_or_else(|| rt_path.as_path());
-        cmd.arg("-O2").arg(&ll_path).arg(rt_input);
+        cmd.arg("-O2").arg(&ll_path);
+        // A scalar module (`--emit-module`) is self-contained (pure scalar arithmetic, no
+        // jrt_ calls) and must NOT pull in runtime.c — doing so would drag in the runtime's
+        // `jrt_dynslot` reference, which a module (with no `dynamic fn`s) does not define,
+        // making the `.so` fail to `dlopen` (undefined symbol). Host binaries link it.
+        if !emit_module {
+            cmd.arg(rt_input);
+        }
         cmd.args(["-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]);
         // ThinLTO (parallel, low memory) for huge programs; otherwise full LTO.
         cmd.arg(if thin_lto { "-flto=thin" } else { "-flto" });

@@ -394,8 +394,14 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   trait`/`open type` parse (sealed = keyword-free default); a call to a `dynamic`/`open` fn is
   opaque to region inference → the **loop-arena declines at the seam** (a future override
   could escape), while a sealed builder still gets the arena — both 0-live, same value.
-  `tests/vire_sealing.sh` (4/4), Vire-only. Open rest of P1+: the shared-type object boundary
-  + load-time verifier + the runtime override (mutable-slot dispatch) + the JIT — see
+  `tests/vire_sealing.sh` (4/4), Vire-only.
+  **Runtime override (pointer swap) — DONE (2026-07-26, P2 step 1, scalar):** a `dynamic fn`
+  dispatches through a mutable slot `@jrt_dynslot` (backend; never inlined); a module's
+  scalar `fn NAME` is exported as `vire_override_NAME`; `install_override(handle, "NAME")`
+  swaps the slot → host calls run the module's native body (no VM). `tests/vire_override.sh`
+  (3/3, 0-live), **Java 67/67 + shape_soundness 3/3** (shared backend/ir/solver inert when
+  `dyn_fns` empty). Open rest: mixin `prev`/around-advice, guarded devirt, the shared-type
+  object boundary + load-time verifier, and the JIT — see
   [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE

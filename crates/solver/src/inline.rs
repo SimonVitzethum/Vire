@@ -28,11 +28,15 @@ pub fn inline_program(program: &mut Program) -> usize {
     // of the inlined body is detected in the continuation block; an
     // internal try/catch handler is self-contained anyway.
 
+    // A `dynamic fn` / `open fn` seam must NOT be inlined — its calls dispatch through the
+    // mutable slot so a loaded module can override it; inlining would bake in the default
+    // and bypass the override (DYNAMIC-VIRE-PLAN.md P1). Empty for sealed/Java programs.
+    let dyn_names = program.dyn_fns.clone();
     // Copy candidates so callers stay mutable.
     let candidates: BTreeMap<String, Function> = program
         .functions
         .iter()
-        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f))
+        .filter(|f| size(f) <= SIZE_LIMIT && !calls_self(f) && !dyn_names.contains(&f.name))
         .map(|f| (f.name.clone(), f.clone()))
         .collect();
 

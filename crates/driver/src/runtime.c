@@ -3346,3 +3346,20 @@ int64_t jrt_module_call(int64_t handle, int64_t arg) {
     return fn(arg);
 }
 #endif
+
+/* Runtime override install (M1) — write a loaded module's `vire_override_<name>` into the
+ * host's dynamic-fn slot table `@jrt_dynslot` (emitted by the backend). After this, host
+ * calls to that `dynamic fn` dispatch to the module's native body. Scalar signature only.
+ * `jrt_dynslot` is defined by the generated program (only when it has `dynamic fn`s); this
+ * function is section-stripped when `install_override` is unused, so the reference is inert
+ * for programs without seams. */
+#ifndef FASTLLVM_FREESTANDING
+extern void *jrt_dynslot[];
+int64_t jrt_dyn_install(int64_t slot, int64_t handle, const char *sym) {
+    if (!handle || !sym) return 0;
+    void *f = dlsym((void *)(intptr_t)handle, sym);
+    if (!f) return 0;
+    jrt_dynslot[slot] = f;
+    return 1;
+}
+#endif

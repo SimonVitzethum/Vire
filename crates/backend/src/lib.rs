@@ -1046,6 +1046,16 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name), arena_ctx.contains(&f.name), &heap_esc, freestanding);
     }
 
+    // Dynamic-fn dispatch table (DYNAMIC-VIRE-PLAN.md P1): one mutable code pointer per
+    // `dynamic fn` / `open fn`, initialized to the function's own body (the default). A call
+    // to such a fn loads its slot and calls through it (see Statement::Call); the runtime's
+    // `jrt_dyn_install` overwrites a slot with a loaded module's override. `extern void
+    // *jrt_dynslot[]` in runtime.c binds here. Emitted only when the program has seams.
+    if !program.dyn_fns.is_empty() {
+        let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
+        writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
+    }
+
     // Freestanding: a compact symbol table (function address → name) so the runtime's
     // frame-pointer backtrace can name each frame without libc `backtrace`/DWARF. Sorted
     // at first use in the runtime; here just an unordered {addr, name} array. The
@@ -2583,6 +2593,27 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         }
         Statement::Call { dest, func, args } => {
             let avs = call_args(w, e, args);
+            // A `dynamic fn` / `open fn` seam (DYNAMIC-VIRE-PLAN.md P1): dispatch through the
+            // mutable slot `@jrt_dynslot[slot]` (default = its own body) so a loaded module
+            // can override it. `dyn_fns` is empty for Java and sealed programs → this branch
+            // is never taken there (a plain direct call, unchanged).
+            if let Some(slot) = ctx.program.dyn_fns.iter().position(|n| n == func) {
+                let n = ctx.program.dyn_fns.len();
+                let p = e.fresh();
+                writeln!(w, "  {p} = getelementptr [{n} x ptr], ptr @jrt_dynslot, i64 0, i64 {slot}").unwrap();
+                let fp = e.fresh();
+                writeln!(w, "  {fp} = load ptr, ptr {p}").unwrap();
+                match dest {
+                    None => writeln!(w, "  call void {fp}({avs}){}", e.dbg()).unwrap(),
+                    Some(d) => {
+                        let rty = llty(e.f.locals[d.0 as usize]);
+                        let t = e.fresh();
+                        writeln!(w, "  {t} = call {rty} {fp}({avs}){}", e.dbg()).unwrap();
+                        store_dest(w, e, *d, &t, false);
+                    }
+                }
+                return;
+            }
             match dest {
                 None => writeln!(w, "  call void @{func}({avs}){}", e.dbg()).unwrap(),
                 Some(d) => {

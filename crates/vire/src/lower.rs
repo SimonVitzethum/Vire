@@ -588,6 +588,18 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             }
         }
     }
+    // Dynamic-fn / open-fn seams (DYNAMIC-VIRE-PLAN.md P1): the slot index is the position
+    // in this SORTED list — deterministic, and the single source of truth that both the
+    // backend (`@jrt_dynslot`) and `install_override` compute from `fn_defs`, so they agree.
+    {
+        let mut dl: Vec<String> = fn_defs
+            .values()
+            .filter(|fd| fd.attrs.iter().any(|a| a.name == "__dynamic"))
+            .map(|fd| fd.sig.name.clone())
+            .collect();
+        dl.sort();
+        prog.dyn_fns = dl;
+    }
     // Pre-pass: instantiate annotation-driven generic instances (`-> Option[Float]`,
     // `b: Box[Int]`) module-wide, so that call sites/matches see the
     // concrete instance (layout + variants) — even in functions that only
@@ -4094,6 +4106,42 @@ impl<'a> FnLower<'a> {
             let a = it.next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call".into(), args: vec![h, a] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // `install_override(handle: Int, "fn_name") -> Int` (1 = installed, 0 = symbol not
+        // found): write a loaded module's `vire_override_<name>` into the host's runtime slot
+        // for the `dynamic fn` named `fn_name`, so subsequent calls dispatch to it. The slot
+        // index is the fn's SORTED position among the dynamic fns (matches `@jrt_dynslot`).
+        if name == "install_override" {
+            let handle = lowered.into_iter().next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let fname = match args.get(1) {
+                Some(Expr::Str(s, _)) => s.clone(),
+                _ => {
+                    self.errs.push("install_override(handle, \"name\"): the 2nd argument must be a string literal naming a `dynamic fn`".into());
+                    String::new()
+                }
+            };
+            let mut dl: Vec<String> = self
+                .fn_defs
+                .values()
+                .filter(|fd| fd.attrs.iter().any(|a| a.name == "__dynamic"))
+                .map(|fd| fd.sig.name.clone())
+                .collect();
+            dl.sort();
+            let slot = match dl.iter().position(|n| n == &fname) {
+                Some(i) => i as i64,
+                None => {
+                    if !fname.is_empty() {
+                        self.errs.push(format!("install_override: `{fname}` is not a `dynamic fn`/`open fn`"));
+                    }
+                    0
+                }
+            };
+            let sym = self.intern(&format!("vire_override_{fname}"));
+            let cs = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(cs), func: "vire_cstr".into(), args: vec![Operand::ConstStr(sym)] });
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_dyn_install".into(), args: vec![Operand::ConstI64(slot), handle, Operand::Copy(cs)] });
             return (Operand::Copy(d), Ty::I64);
         }
         // `field_name(x, i)` / `field_type(x, i)` → the i-th declared field's name resp.
