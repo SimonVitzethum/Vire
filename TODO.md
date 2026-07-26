@@ -400,9 +400,17 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   scalar `fn NAME` is exported as `vire_override_NAME`; `install_override(handle, "NAME")`
   swaps the slot → host calls run the module's native body (no VM). `tests/vire_override.sh`
   (3/3, 0-live), **Java 67/67 + shape_soundness 3/3** (shared backend/ir/solver inert when
-  `dyn_fns` empty). Open rest: mixin `prev`/around-advice, guarded devirt, the shared-type
-  object boundary + load-time verifier, and the JIT — see
-  [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md).
+  `dyn_fns` empty).
+  **Binary patch substrate B0 + anti-leak module RC — DONE (2026-07-26):** backend emits a
+  5-byte NOP entry sled (`patchable-function-entry`) on seam fns + `@jrt_patchtab` (addr,
+  sled_len, name) — static, inert until patched, Java 67/67 unaffected. Loaded modules are
+  **reference-counted**: `unload_module` + override-replace dlclose a module the instant no
+  load ref / no dyn-slot references it → **no retained-stale-function leak, no UAF**.
+  `tests/vire_modlife.sh` (3/3: 1000× load/unload, 500× install-replace, slot-kept-alive;
+  RSS flat). The runtime patcher (B1: redirect/restore/around/probe) and the shared-type
+  object boundary + load-time verifier + the JIT are the open rest — see
+  [language/DYNAMIC-VIRE-PLAN.md](language/DYNAMIC-VIRE-PLAN.md) and
+  [language/DYNAMIC-VIRE-PATCH.md](language/DYNAMIC-VIRE-PATCH.md).
 
 ### [4] Own optional preprocessor *(= comptime/@if/macros)* — DONE
 - [x] **Hygienic macros: typed parameters `block`/`pat`, token pasting, diagnostic

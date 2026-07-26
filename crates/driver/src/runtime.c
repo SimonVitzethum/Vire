@@ -3324,42 +3324,74 @@ void jrt_println_long(int64_t v) { jrt_print_long(v); plat_write("\n", 1); }
 void jrt_print_double(double d) { char b[40]; plat_write(b, (size_t)fmt_g(b, d)); }
 void jrt_println_double(double d) { jrt_print_double(d); plat_write("\n", 1); }
 
-/* --- Dynamic module loading (M1, scalar-only) — DYNAMIC-VIRE-PLAN.md P1 -------
- * Load a PREBUILT native Vire module (.so, `vire --emit-module`), verify its frozen
- * ABI version, and call its scalar entry. Scalar-in/-out only: no object graph crosses
- * the boundary, so there is no cross-module RC/arena question here (the same discipline
- * as a scalar capsule). Hosted only (needs dlopen); freestanding gets a custom loader
- * later. The ABI constant (1) mirrors VIRE_ABI_VERSION in crates/vire/src/lower.rs. */
+/* --- Dynamic module lifecycle (M1, scalar-only) — DYNAMIC-VIRE-PLAN.md P1 ----
+ * Load a PREBUILT native Vire module (.so, `vire --emit-module`), verify its frozen ABI
+ * version, call its scalar entry, install its overrides. Scalar-in/-out only (no object
+ * graph crosses the boundary → no cross-module RC/arena question, the scalar-capsule
+ * discipline). Hosted only (needs dlopen). ABI constant (1) mirrors VIRE_ABI_VERSION.
+ *
+ * ANTI-LEAK (required): loaded modules are REFERENCE-COUNTED — a load holds one ref, and
+ * each dyn-slot that points into the module holds one. A module is `dlclose`d (its code
+ * unmapped) the instant its count reaches 0, so a STALE module — one whose override was
+ * replaced, or that was explicitly unloaded — never lingers (no retained-stale-function
+ * leak). And it is NEVER closed while a slot still points into it (that would be a
+ * use-after-free). Same RC discipline Vire uses for objects, applied to `.so`s. Handles
+ * are 1-based module ids (0 = failure), not raw pointers, so the runtime can track them. */
 #ifndef FASTLLVM_FREESTANDING
+#define JRT_MAX_MODS 256
+#define JRT_MAX_SLOTS 256
+static struct jrt_mod { void *h; int rc; } jrt_mods[JRT_MAX_MODS];
+static int jrt_slot_owner[JRT_MAX_SLOTS]; /* module id owning each dyn slot; 0 = host default */
+
+static void jrt_mod_release(int id) { /* rc--; dlclose + free when it hits 0 */
+    if (id <= 0 || id > JRT_MAX_MODS) return;
+    struct jrt_mod *m = &jrt_mods[id - 1];
+    if (m->h && --m->rc <= 0) { dlclose(m->h); m->h = 0; m->rc = 0; }
+}
 int64_t jrt_load_module(const char *path) {
     if (!path) return 0;
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) return 0;
     int64_t *abi = (int64_t *)dlsym(h, "vire_module_abi");
     if (!abi || *abi != 1 /* VIRE_ABI_VERSION */) { dlclose(h); return 0; }
-    return (int64_t)(intptr_t)h; /* opaque handle; 0 = load failed / ABI mismatch */
+    for (int i = 0; i < JRT_MAX_MODS; i++) {
+        if (!jrt_mods[i].h) { jrt_mods[i].h = h; jrt_mods[i].rc = 1; return i + 1; } /* 1-based id, 1 load ref */
+    }
+    dlclose(h); return 0; /* module table full */
 }
-int64_t jrt_module_call(int64_t handle, int64_t arg) {
-    if (!handle) return 0;
-    int64_t (*fn)(int64_t) = (int64_t(*)(int64_t))dlsym((void *)(intptr_t)handle, "vire_module_main");
+int64_t jrt_module_call(int64_t id, int64_t arg) {
+    if (id <= 0 || id > JRT_MAX_MODS || !jrt_mods[id - 1].h) return 0;
+    int64_t (*fn)(int64_t) = (int64_t(*)(int64_t))dlsym(jrt_mods[id - 1].h, "vire_module_main");
     if (!fn) return 0;
     return fn(arg);
+}
+/* Release the caller's LOAD reference. The module is only really unloaded once no slot
+ * references it either — so this cannot dangle a slot (no UAF), and a module whose
+ * overrides have all been replaced is reclaimed here (no leak). */
+int64_t jrt_unload_module(int64_t id) {
+    if (id <= 0 || id > JRT_MAX_MODS) return 0;
+    jrt_mod_release((int)id);
+    return 1;
 }
 #endif
 
 /* Runtime override install (M1) — write a loaded module's `vire_override_<name>` into the
- * host's dynamic-fn slot table `@jrt_dynslot` (emitted by the backend). After this, host
- * calls to that `dynamic fn` dispatch to the module's native body. Scalar signature only.
- * `jrt_dynslot` is defined by the generated program (only when it has `dynamic fn`s); this
- * function is section-stripped when `install_override` is unused, so the reference is inert
- * for programs without seams. */
+ * host's dynamic-fn slot table `@jrt_dynslot` (backend-emitted). After this, host calls to
+ * that `dynamic fn` dispatch to the module's native body. The slot now REFERENCES the
+ * module, so we retain it and release the module the slot used to reference (the anti-leak
+ * hand-off: a displaced module whose last slot is gone is dlclose'd). Scalar signature. */
 #ifndef FASTLLVM_FREESTANDING
 extern void *jrt_dynslot[];
-int64_t jrt_dyn_install(int64_t slot, int64_t handle, const char *sym) {
-    if (!handle || !sym) return 0;
-    void *f = dlsym((void *)(intptr_t)handle, sym);
+int64_t jrt_dyn_install(int64_t slot, int64_t id, const char *sym) {
+    if (id <= 0 || id > JRT_MAX_MODS || !jrt_mods[id - 1].h || !sym) return 0;
+    if (slot < 0 || slot >= JRT_MAX_SLOTS) return 0;
+    void *f = dlsym(jrt_mods[id - 1].h, sym);
     if (!f) return 0;
     jrt_dynslot[slot] = f;
+    int prev = jrt_slot_owner[slot];   /* module the slot referenced before (0 = host default) */
+    jrt_mods[id - 1].rc++;             /* the slot now holds a reference to `id` */
+    jrt_slot_owner[slot] = (int)id;
+    jrt_mod_release(prev);             /* drop the displaced owner; dlclose if it hit 0 (no leak) */
     return 1;
 }
 #endif

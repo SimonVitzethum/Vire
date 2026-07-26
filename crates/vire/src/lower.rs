@@ -4108,6 +4108,15 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call".into(), args: vec![h, a] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // `unload_module(handle) -> Int` — release the load reference. The module's `.so` is
+        // dlclose'd (code unmapped) once no dyn-slot references it either, so a stale module
+        // is reclaimed (no leak) but never closed while a slot still points into it (no UAF).
+        if name == "unload_module" {
+            let h = lowered.into_iter().next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_unload_module".into(), args: vec![h] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // `install_override(handle: Int, "fn_name") -> Int` (1 = installed, 0 = symbol not
         // found): write a loaded module's `vire_override_<name>` into the host's runtime slot
         // for the `dynamic fn` named `fn_name`, so subsequent calls dispatch to it. The slot

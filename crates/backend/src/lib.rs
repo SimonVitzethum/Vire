@@ -1054,6 +1054,24 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     if !program.dyn_fns.is_empty() {
         let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
         writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
+        // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
+        // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
+        // locates a function's reserved NOP sled by name. Static, read-only data (it cannot
+        // leak); the sleds it points at stay inert until a patch is applied.
+        for (i, n) in program.dyn_fns.iter().enumerate() {
+            let mut b: Vec<u8> = n.bytes().collect();
+            b.push(0);
+            let lit: String = b.iter().map(|x| format!("\\{x:02X}")).collect();
+            writeln!(w, "@.patchname.{i} = private constant [{} x i8] c\"{lit}\"", b.len()).unwrap();
+        }
+        writeln!(w, "@jrt_patchtab_len = constant i64 {}", program.dyn_fns.len()).unwrap();
+        let recs: Vec<String> = program
+            .dyn_fns
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{{ i64, i64, ptr }} {{ i64 ptrtoint (ptr @{n} to i64), i64 5, ptr @.patchname.{i} }}"))
+            .collect();
+        writeln!(w, "@jrt_patchtab = constant [{} x {{ i64, i64, ptr }}] [{}]", program.dyn_fns.len(), recs.join(", ")).unwrap();
     }
 
     // Freestanding: a compact symbol table (function address → name) so the runtime's
@@ -2299,13 +2317,23 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     // its return address symbolizes via `jrt_symtab`. `#0` = { "frame-pointer"="all" },
     // emitted once at module end. Hosted builds keep the optimizer's default (no cost).
     let fp = if freestanding { "#0 " } else { "" };
+    // Binary patch point (DYNAMIC-VIRE-PATCH.md B0): a 5-byte NOP sled at the entry of a
+    // patchable function (currently the `dynamic fn`/`open fn` seams), so the runtime
+    // patcher can later rewrite it into a `jmp`/`call` (hot-update, JIT collapse, mixin,
+    // probe) — never over a real instruction. Inert (plain NOPs) until patched; only opted-
+    // in functions get it, so sealed/Java code is untouched. Listed in `@jrt_patchtab`.
+    let patch = if ctx.program.dyn_fns.iter().any(|n| n == &f.name) {
+        "\"patchable-function-entry\"=\"5\" "
+    } else {
+        ""
+    };
     // Debug: a DISubprogram for the function + one DILocation (chain, for inlined
     // code) per distinct DebugLine inline-stack, so instructions map to the exact
     // `.vr` line with the caller chain. `marker_locs` maps a marker's frames → its
     // innermost DILocation id.
     let (marker_locs, default_loc) = if dg.on {
         let sub = dg.subprogram(&f.name, f.line);
-        writeln!(w, "define {} @{}({}) {fp}!dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}) {fp}{patch}!dbg !{sub} {{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         let mut map: std::collections::HashMap<Vec<(String, u32)>, usize> = std::collections::HashMap::new();
         for bb in &f.blocks {
             for st in &bb.statements {
@@ -2320,7 +2348,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
         let def = dg.location(f.line, sub, 0);
         (map, Some(def))
     } else {
-        writeln!(w, "define {} @{}({}) {fp}{{", llty(f.ret), f.name, ps.join(", ")).unwrap();
+        writeln!(w, "define {} @{}({}) {fp}{patch}{{", llty(f.ret), f.name, ps.join(", ")).unwrap();
         (std::collections::HashMap::new(), None)
     };
 

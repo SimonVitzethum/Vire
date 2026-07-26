@@ -1,7 +1,8 @@
 # Design Plan: Binary patch-point subsystem (Option B) — general native self-modification
 
 **Date:** 2026-07-26
-**Status:** PLAN (not started). Companion to [DYNAMIC-VIRE-PLAN.md](DYNAMIC-VIRE-PLAN.md);
+**Status:** PLAN, **B0 landed** (entry patch points + `@jrt_patchtab` + the anti-leak
+RC'd module lifetime, §8); B1+ (the runtime patcher) unstarted. Companion to [DYNAMIC-VIRE-PLAN.md](DYNAMIC-VIRE-PLAN.md);
 this is the heavier **Option B** (literal self-modifying machine code) referenced there in
 §4.3, planned here as a **general facility**, not a mixin one-off. Mixin/around-advice on a
 direct call is only its first client.
@@ -196,9 +197,22 @@ existing symtab/dynslot globals.
 
 ## 8. Phased roadmap (each independently shippable & gated)
 
-- **B0 — entry patch points + `@jrt_patchtab`.** Backend emits sleds on opted-in fns +
-  the table. *Test:* the table resolves a fn's (addr, sled_len); running is unchanged; Java
-  67/67; the sled is inert NOPs until patched.
+- **B0 — entry patch points + `@jrt_patchtab` — DONE (2026-07-26).** The backend sets
+  `"patchable-function-entry"="5"` on the patchable functions (currently the `dynamic fn`/
+  `open fn` seams) → a 5-byte NOP sled at entry (verified in the binary: `0f 1f 44 00 08`
+  before the real prologue), and emits `@jrt_patchtab` = `{ i64 addr, i64 sled_len, ptr
+  name }` per patchable fn. Static, read-only (cannot leak); the sled is inert NOPs until a
+  patch is applied. Running unchanged (seam still 210000, override still works); **Java 67/67
+  + shape_soundness 3/3 unaffected** (no sled/table on the Java path — `dyn_fns` empty).
+  *Also delivered here (the anti-leak requirement): reference-counted module lifetime.* A
+  loaded module is a 1-based id into an RC'd table; a load holds 1 ref, each dyn-slot that
+  points into it holds 1; `unload_module(handle)` drops the load ref; installing/replacing an
+  override retains the new module and **releases the displaced one**; a module is `dlclose`d
+  the instant its count hits 0 — so a stale module never lingers (**no retained-stale-
+  function leak**) and is never closed while a slot still uses it (**no UAF**). `tests/
+  vire_modlife.sh` (3/3): 1000× load/unload and 500× install→replace→unload both keep the
+  256-entry table from exhausting (a leak would), RSS flat ~2 MB, and a slot-kept module
+  stays callable after its load ref is released.
 - **B1 — redirect + restore (single-threaded).** `jrt_patch_redirect` / `jrt_patch_restore`
   with W^X + i-cache. *Test:* redirect a fn to a replacement, call → new behaviour; restore
   → original; byte-identical after restore; 0-live. **First client: hot-update / feature
