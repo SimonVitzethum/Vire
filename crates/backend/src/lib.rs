@@ -631,9 +631,13 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     }
     let static_writes = static_write_effects(program);
     let field_writes = instance_field_writes(program);
-    // AOT hot path: metadata IDs for the two shared branch_weights nodes,
-    // above the TBAA IDs (max TBAA ID = 2*len for len fields, otherwise 0).
-    let bw_base = if tbaa.is_empty() { 0 } else { 2 * tbaa.len() + 1 };
+    // AOT hot path: metadata IDs for the two shared branch_weights nodes, above the TBAA
+    // IDs. Field TBAA nodes use ids 2..=2*len; the TBAA ROOT (`!0`) is emitted even with no
+    // fields, so start at 1 (not 0) when empty — else branch_weights would collide with the
+    // root `!0` for a class-free (scalar-only) program. (Latent: every Vire/Java program
+    // registers at least Option/Result, so `tbaa` is never empty here; the extracted Basalt
+    // backend hit this with a truly class-free front end.)
+    let bw_base = if tbaa.is_empty() { 1 } else { 2 * tbaa.len() + 1 };
     let bw_then = bw_base;
     let bw_else = bw_base + 1;
     let md_inv = bw_base + 2;
