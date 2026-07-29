@@ -89,7 +89,7 @@ pub fn register_class(cf: &ClassFile, program: &mut Program) -> Result<()> {
             };
             static_fields.push(StaticFieldInfo { name: f.name.clone(), ty, init });
         } else {
-            fields.push(FieldInfo { name: f.name.clone(), ty, ref_target: ref_target_of(&f.descriptor) });
+            fields.push(FieldInfo { name: f.name.clone(), ty, ref_target: ref_target_of(&f.descriptor), weak: false });
         }
     }
     let methods = cf
@@ -207,8 +207,8 @@ fn register_concurrency(program: &mut Program) {
         is_interface: false,
         interfaces: Vec::new(),
         fields: vec![
-            FieldInfo { name: "$runnable".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/Runnable".to_string()) },
-            FieldInfo { name: "$handle".to_string(), ty: Ty::I64, ref_target: None },
+            FieldInfo { name: "$runnable".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/Runnable".to_string()), weak: false },
+            FieldInfo { name: "$handle".to_string(), ty: Ty::I64, ref_target: None, weak: false },
         ],
         static_fields: Vec::new(),
         methods: vec![MethodInfo {
@@ -257,7 +257,7 @@ fn register_throwables(program: &mut Program) {
         let init0 = mangle(cls, "<init>", "()V");
         let init1 = mangle(cls, "<init>", "(Ljava/lang/String;)V");
         let fields = if cls == "java/lang/Throwable" {
-            vec![FieldInfo { name: "$message".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()) }]
+            vec![FieldInfo { name: "$message".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()), weak: false }]
         } else {
             Vec::new()
         };
@@ -366,8 +366,8 @@ fn register_enum(program: &mut Program) {
         is_interface: false,
         interfaces: Vec::new(),
         fields: vec![
-            FieldInfo { name: "$name".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()) },
-            FieldInfo { name: "$ordinal".to_string(), ty: Ty::I32, ref_target: None },
+            FieldInfo { name: "$name".to_string(), ty: Ty::Ref, ref_target: Some("java/lang/String".to_string()), weak: false },
+            FieldInfo { name: "$ordinal".to_string(), ty: Ty::I32, ref_target: None, weak: false },
         ],
         static_fields: Vec::new(),
         methods: vec![
@@ -505,6 +505,7 @@ fn register_lambda(program: &mut Program, info: &LambdaInfo) -> Result<String> {
             name: format!("cap{i}"),
             ty,
             ref_target: (ty == Ty::Ref).then(|| "java/lang/Object".to_string()),
+            weak: false,
         })
         .collect();
 

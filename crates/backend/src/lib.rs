@@ -353,14 +353,16 @@ impl<'a> Ctx<'a> {
     }
 
     /// Instance fields in layout order: superclasses first.
-    fn flatten_fields(&self, class: &str) -> Vec<(String, String, Ty)> {
+    /// `(owner class, field name, type, weak)` — `weak` marks a non-owning ref field
+    /// (Vire `weak f: T`), which is stored without retain and dropped without release.
+    fn flatten_fields(&self, class: &str) -> Vec<(String, String, Ty, bool)> {
         let Some(ci) = self.class(class) else { return Vec::new() };
         let mut out = match &ci.super_name {
             Some(s) => self.flatten_fields(s),
             None => Vec::new(),
         };
         for f in &ci.fields {
-            out.push((ci.name.clone(), f.name.clone(), f.ty));
+            out.push((ci.name.clone(), f.name.clone(), f.ty, f.weak));
         }
         out
     }
@@ -371,8 +373,21 @@ impl<'a> Ctx<'a> {
         let (owner, ty) = self.program.resolve_field(class, field)?;
         let owner = owner.to_string();
         let flat = self.flatten_fields(&owner);
-        let idx = flat.iter().position(|(o, n, _)| *o == owner && n == field)?;
+        let idx = flat.iter().position(|(o, n, ..)| *o == owner && n == field)?;
         Some((owner, idx + HEADER_SLOTS, ty))
+    }
+
+    /// Is `class.field` a `weak` (non-owning) reference field? Resolved up the super
+    /// chain, like `resolve_field`.
+    fn field_is_weak(&self, class: &str, field: &str) -> bool {
+        let mut cur = self.class(class);
+        while let Some(ci) = cur {
+            if let Some(f) = ci.fields.iter().find(|f| f.name == field) {
+                return f.weak;
+            }
+            cur = ci.super_name.as_deref().and_then(|s| self.class(s));
+        }
+        false
     }
 
     /// Global symbol and type of a static field (up the super chain).
@@ -381,13 +396,14 @@ impl<'a> Ctx<'a> {
         Some((format!("@sf.{}.{}", sanitize(owner), sanitize(field)), ty))
     }
 
-    /// Ref fields of `class` (including inherited) as a GEP index list — for
-    /// the generated drop function.
+    /// **Owning** ref fields of `class` (including inherited) as a GEP index list — for
+    /// the generated drop and trace functions. `weak` fields are excluded on purpose:
+    /// they hold no count to give back (drop) and keep nothing alive (trace).
     fn ref_field_slots(&self, class: &str) -> Vec<usize> {
         self.flatten_fields(class)
             .iter()
             .enumerate()
-            .filter(|(_, (_, _, t))| *t == Ty::Ref)
+            .filter(|(_, (_, _, t, weak))| *t == Ty::Ref && !*weak)
             .map(|(i, _)| i + HEADER_SLOTS)
             .collect()
     }
@@ -726,7 +742,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     // Struct types: { i64 refcount, i64 rcflags, ptr vtable, fields… }.
     for c in &program.classes {
         let mut parts = vec!["i64".to_string(), "ptr".to_string()];
-        parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
+        parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t, _)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
     // Array types (header + i64 length + flexible element field) and their
@@ -952,11 +968,18 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         writeln!(w, "  %vtp = getelementptr ptr, ptr %new, i64 {VTABLE_WORD}").unwrap();
         writeln!(w, "  store ptr @vt.{}, ptr %vtp", sanitize(class)).unwrap();
         writeln!(w, "  call void @jrt_copymap_put(ptr %map, ptr %src, ptr %new)").unwrap();
-        for (k, (_owner, _name, ty)) in ctx.flatten_fields(class).iter().enumerate() {
+        for (k, (_owner, _name, ty, weak)) in ctx.flatten_fields(class).iter().enumerate() {
             let slot = k + HEADER_SLOTS;
             writeln!(w, "  %sp{k} = getelementptr {sn}, ptr %src, i32 0, i32 {slot}").unwrap();
             writeln!(w, "  %np{k} = getelementptr {sn}, ptr %new, i32 0, i32 {slot}").unwrap();
-            if *ty == Ty::Ref {
+            if *ty == Ty::Ref && *weak {
+                // A weak field is a non-owning back-edge: deep-copying through it would
+                // clone the ancestor it points back at (and, on a cyclic shape, recurse).
+                // The copy aliases the SAME referent and stays non-owning — the pointer is
+                // moved verbatim, no retain, no descent.
+                writeln!(w, "  %fv{k} = load ptr, ptr %sp{k}").unwrap();
+                writeln!(w, "  store ptr %fv{k}, ptr %np{k}").unwrap();
+            } else if *ty == Ty::Ref {
                 writeln!(w, "  %fv{k} = load ptr, ptr %sp{k}").unwrap();
                 writeln!(w, "  %fc{k} = call ptr @jrt_deep_copy_ref(ptr %fv{k}, ptr %map)").unwrap();
                 writeln!(w, "  store ptr %fc{k}, ptr %np{k}").unwrap();
@@ -2194,7 +2217,7 @@ impl<'a> FnEmitter<'a> {
 /// **exhaustive** match (no `_` arm) over every `Statement`/`Terminator` operand, so
 /// a use can never be silently missed (an under-count would be unsound); an
 /// over-count only forgoes the optimization.
-fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, imm: &BTreeSet<u32>) -> BTreeSet<u32> {
+fn moved_locals(f: &Function, ctx: &Ctx, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, imm: &BTreeSet<u32>) -> BTreeSet<u32> {
     let n = f.locals.len();
     let mut uses = vec![0u32; n];
     let mut consumed = vec![false; n]; // the local's use is a PutField-value / return
@@ -2231,11 +2254,17 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
                     owned[dest.0 as usize] = true;
                 }
                 Statement::GetField { obj, .. } => touch(&mut uses, obj),
-                Statement::PutField { obj, value, .. } => {
+                Statement::PutField { obj, class, field, value } => {
                     touch(&mut uses, obj);
                     touch(&mut uses, value);
+                    // A store into a `weak` field consumes NOTHING: the field takes no
+                    // ownership, so the local keeps its +1 and must still be released at
+                    // cleanup. Treating it as a move would drop that count on the floor
+                    // (a leak) — the one place `weak` has to reach into the move analysis.
                     if let Operand::Copy(l) = value {
-                        consumed[l.0 as usize] = true;
+                        if !ctx.field_is_weak(class, field) {
+                            consumed[l.0 as usize] = true;
+                        }
                     }
                 }
                 Statement::GetStatic { .. } | Statement::InstanceOfPending { .. } => {}
@@ -2452,7 +2481,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let moved = moved_locals(f, &borrowed, &borrow, &imm);
+    let moved = moved_locals(f, ctx, &borrowed, &borrow, &imm);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, vt_tbaa: ctx.vt_tbaa, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
@@ -2911,7 +2940,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let tb = ctx.tbaa_suffix(&owner, field);
-            if ty == Ty::Ref {
+            if ty == Ty::Ref && ctx.field_is_weak(class, field) {
+                // `weak f: T` — a NON-OWNING back-edge (DYNAMIC-VIRE-PLAN.md §6). No
+                // retain (the field takes no count) and no release of the old value (it
+                // never held one), so the store is a bare pointer write. This is what
+                // makes a cycle closed through this field reference-countable: the edge
+                // contributes nothing to the referent's count, so the cycle cannot
+                // sustain itself. The referent must outlive the holder — Vire does not
+                // clear weak fields (the parent-pointer discipline, see LANGUAGE.md).
+                writeln!(w, "  store ptr {v}, ptr {p}{tb}").unwrap();
+            } else if ty == Ty::Ref {
                 // The field takes over an owning reference: retain new, release old.
                 // `retain(null)` is a provable no-op (constant null) → omit it.
                 // A move-on-last-use local (`moved`) hands the field its own +1 —

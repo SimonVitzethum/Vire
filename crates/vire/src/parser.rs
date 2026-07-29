@@ -355,26 +355,45 @@ impl Parser {
             if self.at_kw(Kw::Fn) {
                 methods.push(self.parse_fn(false));
             } else {
+                // `weak` is a CONTEXTUAL modifier, not a keyword: it only binds when the
+                // next two tokens are `<ident> :`, so a field actually *named* `weak`
+                // (`weak: Int`) still parses as a field. Nothing existing breaks.
+                let weak = matches!(self.peek(), Tok::Ident(n) if n == "weak")
+                    && matches!(self.peek_at(1), Tok::Ident(_))
+                    && matches!(self.peek_at(2), Tok::Colon);
+                if weak {
+                    self.bump();
+                }
                 let mname = self.ident();
                 if self.eat(&Tok::Colon) {
                     // field: name: Type
                     let ty = self.parse_type();
-                    fields.push(Field { name: mname, ty });
+                    fields.push(Field { name: mname, ty, weak });
                 } else if self.eat(&Tok::LParen) {
                     // variant with fields: Name(a: T, b: T) or Name(T)
                     let mut vf = Vec::new();
                     let mut positional = true;
                     self.skip_nl();
                     while !self.at(&Tok::RParen) && !matches!(self.peek(), Tok::Eof) {
+                        // The same contextual `weak` modifier as on a product field. A
+                        // sum-type payload cannot BE weak (lowering rejects it, §6), but it
+                        // must PARSE — otherwise `A(weak p: N)` dies in three cryptic syntax
+                        // errors and the intended diagnostic is never reached.
+                        let vweak = matches!(self.peek(), Tok::Ident(n) if n == "weak")
+                            && matches!(self.peek_at(1), Tok::Ident(_))
+                            && matches!(self.peek_at(2), Tok::Colon);
+                        if vweak {
+                            self.bump();
+                        }
                         // `name: Type` (named) or just `Type` (positional)
                         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Colon) {
                             positional = false;
                             let fname = self.ident();
                             self.expect(&Tok::Colon, "':'");
-                            vf.push(Field { name: fname, ty: self.parse_type() });
+                            vf.push(Field { name: fname, ty: self.parse_type(), weak: vweak });
                         } else {
                             let ty = self.parse_type();
-                            vf.push(Field { name: format!("_{}", vf.len()), ty });
+                            vf.push(Field { name: format!("_{}", vf.len()), ty, weak: false });
                         }
                         if !self.eat(&Tok::Comma) {
                             break;

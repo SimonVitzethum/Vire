@@ -3,7 +3,7 @@
 //! for-over-Range), `print`, calls to own functions. Generics/traits/
 //! closures/capsule follow (FRONTEND-PLAN F5–F8).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
 
@@ -307,8 +307,31 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     // [(field name, type name)])]). Single-parameter; Result stays i64-erased.
     let mut generic_stypes: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)> = HashMap::new();
     let mut variant_owner_g: HashMap<String, String> = HashMap::new();
+    // `weak f: T` fields, keyed `Type.field` (DYNAMIC-VIRE-PLAN.md §6). A side table
+    // instead of a 4th element in `Layout`, which threads through two dozen signatures
+    // and means nothing to any of them: only `FieldInfo` construction reads this.
+    let mut weak_fields: BTreeSet<String> = BTreeSet::new();
     for it in &m.items {
         if let Item::Type(t) = it {
+            // `weak` is meaningful only on a product type's ref field. On a sum-type
+            // payload or a generic type parameter it would need per-variant / per-
+            // instantiation ownership tracking that step 2b does not build — reject it
+            // instead of silently ignoring the modifier (a silently-owning "weak" field
+            // would make the acyclicity gate lie).
+            for f in t.fields.iter().filter(|f| f.weak) {
+                if !t.generics.is_empty() {
+                    errs.push(format!("`weak` is not supported on a generic type ({}.{})", t.name, f.name));
+                } else if ty_of(Some(&f.ty)) != Ty::Ref {
+                    errs.push(format!("`weak {}: {}` — only a reference field can be weak", f.name, f.ty.name));
+                } else {
+                    weak_fields.insert(format!("{}.{}", t.name, f.name));
+                }
+            }
+            for v in &t.variants {
+                for f in v.fields.iter().filter(|f| f.weak) {
+                    errs.push(format!("`weak` is not supported on a sum-type payload ({}.{})", v.name, f.name));
+                }
+            }
             if !t.generics.is_empty() && t.variants.is_empty() {
                 generic_ptypes.insert(
                     t.name.clone(),
@@ -449,7 +472,12 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     for tname in &all_type_names {
         let fields = types[tname]
             .iter()
-            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo {
+                name: n.clone(),
+                ty: *ty,
+                ref_target: rt.clone(),
+                weak: weak_fields.contains(&format!("{tname}.{n}")),
+            })
             .collect();
         // Implemented traits → interfaces + the impl methods into the vtable
         // (mangled = `Typ.methode`, as collect_methods lowers them).
@@ -811,7 +839,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     for (mangled, layout) in &all_insts {
         let fields = layout
             .iter()
-            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone(), weak: false })
             .collect();
         prog.classes.push(fastllvm_ir::ClassInfo {
             name: mangled.clone(),

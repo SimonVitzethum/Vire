@@ -344,6 +344,12 @@ fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
             }
             let Some(info) = class_of(&cn) else { break };
             for f in &info.fields {
+                // A `weak` field is non-owning (no retain/release) — it can never keep
+                // an object alive, so it is not an edge of the OWNERSHIP graph and a
+                // cycle closed through it is not a leak (DYNAMIC-VIRE-PLAN.md §6).
+                if f.weak {
+                    continue;
+                }
                 if let Some(t) = &f.ref_target {
                     targets.push(t.clone());
                 }
@@ -403,6 +409,12 @@ fn cyclic_classes(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> BTr
             }
             let Some(info) = class_of(&cn) else { break };
             for f in &info.fields {
+                // A `weak` field is non-owning (no retain/release) — it can never keep
+                // an object alive, so it is not an edge of the OWNERSHIP graph and a
+                // cycle closed through it is not a leak (DYNAMIC-VIRE-PLAN.md §6).
+                if f.weak {
+                    continue;
+                }
                 if let Some(t) = &f.ref_target {
                     targets.push(t.clone());
                 }

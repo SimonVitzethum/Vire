@@ -257,6 +257,13 @@ pub struct FieldInfo {
     /// AND for primitive arrays (`int[]` references nothing → no cycle
     /// edge). Basis of the acyclicity analysis (cycle collector elimination).
     pub ref_target: Option<String>,
+    /// Vire `weak f: T` — a **non-owning** reference field (DYNAMIC-VIRE-PLAN.md §6).
+    /// No retain on store, no release on drop, not traced: it carries no ownership, so
+    /// it forms **no edge** in the acyclicity analysis and none in the load verifier's
+    /// ownership graph. This is the declared back-edge of "acyclicity-or-weak" — how a
+    /// cyclic shape stays reference-counted with no collector. Always `false` on the
+    /// Java path (`weak` is Vire-only).
+    pub weak: bool,
 }
 
 /// Compile-time initial value of a static field (ConstantValue).

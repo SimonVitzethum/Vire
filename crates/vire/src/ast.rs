@@ -131,6 +131,12 @@ pub struct MacroParam {
 pub struct Field {
     pub name: String,
     pub ty: Type,
+    /// `weak f: T` — a **non-owning** reference field (DYNAMIC-VIRE-PLAN.md §6). It does
+    /// not retain on store and is not released on drop, so it carries no ownership and
+    /// forms no ownership edge: it is the declared back-edge that lets an otherwise
+    /// cyclic graph stay reference-counted without a collector. The referent must outlive
+    /// the holder (Vire does not clear weak fields) — the parent-pointer discipline.
+    pub weak: bool,
 }
 
 #[derive(Debug, Clone)]
