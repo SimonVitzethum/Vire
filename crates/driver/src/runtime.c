@@ -3381,7 +3381,12 @@ int64_t jrt_unload_module(int64_t id) {
  * module, so we retain it and release the module the slot used to reference (the anti-leak
  * hand-off: a displaced module whose last slot is gone is dlclose'd). Scalar signature. */
 #ifndef FASTLLVM_FREESTANDING
-extern void *jrt_dynslot[];
+/* The backend emits `@jrt_dynslot` ONLY for a program that has `dynamic fn` seams. In a
+ * program without any, this reference normally dies with the (unreachable) function during
+ * -flto + --gc-sections — but `--backtrace` links `-rdynamic`, which keeps every symbol
+ * alive and turns the dangling reference into a link error. A weak, zero-filled fallback
+ * makes the contract total; a program WITH seams emits a strong table that overrides it. */
+__attribute__((weak)) void *jrt_dynslot[JRT_MAX_SLOTS];
 int64_t jrt_dyn_install(int64_t slot, int64_t id, const char *sym) {
     if (id <= 0 || id > JRT_MAX_MODS || !jrt_mods[id - 1].h || !sym) return 0;
     if (slot < 0 || slot >= JRT_MAX_SLOTS) return 0;
@@ -3407,8 +3412,12 @@ int64_t jrt_dyn_install(int64_t slot, int64_t id, const char *sym) {
  * module a patch still uses is never dlclose'd (no UAF), and a replaced/unpatched module is
  * reclaimed (no leak). Hosted only. */
 #ifndef FASTLLVM_FREESTANDING
-extern const struct jrt_patchrec { int64_t addr; int64_t sled_len; const char *name; } jrt_patchtab[];
-extern const int64_t jrt_patchtab_len;
+/* Same totality problem as `jrt_dynslot` above: emitted only for a program that has
+ * `@patchable` fns, so a `--backtrace` (-rdynamic) build of any other program would fail
+ * to link. The weak fallback has length 0, so `jrt_patch_lookup` never reads the array. */
+struct jrt_patchrec { int64_t addr; int64_t sled_len; const char *name; };
+__attribute__((weak)) const struct jrt_patchrec jrt_patchtab[1] = {{0, 0, 0}};
+__attribute__((weak)) const int64_t jrt_patchtab_len = 0;
 #define JRT_MAX_PATCH 256
 struct jrt_patch { int64_t addr; int owner; int saved; unsigned char orig[14]; };
 static struct jrt_patch jrt_patches[JRT_MAX_PATCH];
