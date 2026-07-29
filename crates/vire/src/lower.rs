@@ -4932,7 +4932,12 @@ fn lower_fn(
             // array (arrkind_of_name defaults unknown names to Long, which would misread
             // the ref slots as i64). Record the element class so `a[i].field` resolves
             // and `a[i] = e` is class-checked in the body, exactly like a local ref array.
-            match pt.args.first().and_then(|a| class_of(Some(a))) {
+            // `class_of` only filters the INFERENCE type names, so it still answers "class"
+            // for the element-kind spellings `Byte`/`U8`/`I8`/`Long`/`Double` — taking
+            // those down the ref path made `a[i]` in an `Array[Byte]` callee load a Ref
+            // where an integer was expected. Ask `arrkind_of_name` first: anything it
+            // knows is a scalar element, never a class.
+            match pt.args.first().filter(|a| !is_scalar_elem_name(&a.name)).and_then(|a| class_of(Some(a))) {
                 Some(ec) => {
                     arr_kind = Some(ArrKind::Ref);
                     arr_cls = Some(ec);
@@ -5273,6 +5278,19 @@ fn field_arrkind(t: &Type) -> Option<ArrKind> {
         "farray" => Some(ArrKind::Double),
         _ => None,
     }
+}
+
+/// Is `n` an element-KIND spelling (a scalar/ref array element), as opposed to a user
+/// object class? Every name `arrkind_of_name` recognises explicitly, plus the `Int`/`I64`/
+/// `Long` family that it folds into its default arm. Guards the param path in `lower_fn`:
+/// `class_of` alone answers "class" for `Byte`/`U8`/`I8`/`Long`/`Double`, which would make
+/// `fn f(a: Array[Byte])` a ref array and mistype every `a[i]` in the body.
+fn is_scalar_elem_name(n: &str) -> bool {
+    matches!(
+        n,
+        "Float" | "F64" | "Double" | "F32" | "I32" | "U32" | "Byte" | "U8" | "I8"
+            | "Int" | "I64" | "U64" | "Long" | "Bool" | "Ref" | "Str"
+    )
 }
 
 fn arrkind_of_name(n: &str) -> ArrKind {
