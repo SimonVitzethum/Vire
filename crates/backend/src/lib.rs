@@ -586,6 +586,154 @@ fn escape_md(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Encoding of `Ty` in the shared-type ABI table. Fixed by the ABI, so it may not
+/// follow the enum's declaration order — a reordering of `Ty` must not silently
+/// change what a previously built module means.
+fn abi_kind(t: Ty) -> i32 {
+    match t {
+        Ty::I32 => 0,
+        Ty::I64 => 1,
+        Ty::F32 => 2,
+        Ty::F64 => 3,
+        Ty::Ref => 4,
+        Ty::Void => 5,
+    }
+}
+
+/// Instance fields of `class` in **memory layout order** (superclass fields first),
+/// mirroring `Ctx::flatten_fields` — but from `Program` alone, so the ABI table can be
+/// emitted without a full `Ctx`.
+fn abi_flat_fields(program: &Program, class: &str) -> Vec<FieldInfo> {
+    let Some(ci) = program.class(class) else { return Vec::new() };
+    let mut out = match &ci.super_name {
+        Some(s) => abi_flat_fields(program, s),
+        None => Vec::new(),
+    };
+    out.extend(ci.fields.iter().cloned());
+    out
+}
+
+/// FNV-1a over the flattened layout: field order, kind, weakness and ref target.
+/// This is the **layout fingerprint** the load verifier compares. It deliberately
+/// excludes the class name (that is the lookup key) and the methods (a module may
+/// carry its own code for a shared type — only the *shape* must agree).
+fn abi_layout_hash(program: &Program, class: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8], h: &mut u64| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for f in abi_flat_fields(program, class) {
+        eat(f.name.as_bytes(), &mut h);
+        eat(b":", &mut h);
+        eat(abi_kind(f.ty).to_string().as_bytes(), &mut h);
+        eat(if f.weak { b"w" } else { b"o" }, &mut h);
+        eat(f.ref_target.as_deref().unwrap_or("-").as_bytes(), &mut h);
+        eat(b";", &mut h);
+    }
+    h as i64
+}
+
+/// The **shared-type ABI** table (DYNAMIC-VIRE-PLAN.md P1 step 2b) — a C-readable
+/// description of every class's layout and of its *ownership* edges, emitted into the
+/// host executable and into every `--emit-module` `.so`. It exists so that
+/// `jrt_load_module`'s verifier can decide, at load time and without trusting the
+/// module, the two questions §6 makes the price of an open world:
+///
+/// 1. **Layout compatibility** — a type both sides declare must have the identical
+///    layout, or the module would read the host's objects at the wrong offsets.
+///    Decided by `hash`; a mismatch rejects the module (no partial linking).
+/// 2. **Acyclicity-or-weak** — linking the module's types into the host's type graph
+///    must not close a *new* ownership cycle, or pure RC would leak and the open world
+///    would need the collector back. Decided by walking `fields`/`super`/`ifaces`;
+///    `weak` fields carry no ownership and are therefore not edges.
+///
+/// The C mirror lives in `runtime.c` (`struct vire_type`); the two must be changed
+/// together, which is what `vire_module_abi` versions.
+///
+/// `symbol` is `vire_host_types` in an executable and `vire_module_types` in a module —
+/// **deliberately different names**: a host that loads modules links `-rdynamic`, and
+/// ELF symbol interposition would otherwise let the module's `dlsym` resolve to the
+/// *host's* table, so the verifier would compare the host against itself and pass
+/// everything.
+pub fn emit_typetab(program: &Program, symbol: &str) -> String {
+    let mut defs = String::new();
+    let mut body = String::new();
+    // Interned C strings: one definition per distinct name, referenced by pointer.
+    let mut pool: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cstr = |s: &str, pool: &mut BTreeMap<String, usize>, defs: &mut String| -> String {
+        if let Some(i) = pool.get(s) {
+            return format!("@vts.{i}");
+        }
+        let i = pool.len();
+        pool.insert(s.to_string(), i);
+        let b = s.as_bytes();
+        writeln!(
+            defs,
+            "@vts.{i} = private unnamed_addr constant [{n} x i8] c\"{esc}\\00\"",
+            n = b.len() + 1,
+            esc = escape_ll(b),
+        )
+        .unwrap();
+        format!("@vts.{i}")
+    };
+
+    let mut entries: Vec<String> = Vec::new();
+    for (ci_idx, c) in program.classes.iter().enumerate() {
+        let name_p = cstr(&c.name, &mut pool, &mut defs);
+        let super_p = match &c.super_name {
+            Some(s) if program.class(s).is_some() => cstr(s, &mut pool, &mut defs),
+            _ => "null".to_string(),
+        };
+        // Directly implemented interfaces, null-terminated. The verifier closes the
+        // relation transitively itself (it must anyway, across the two tables).
+        let ifaces: Vec<String> = c
+            .interfaces
+            .iter()
+            .filter(|i| program.class(i).is_some())
+            .map(|i| format!("ptr {}", cstr(i, &mut pool, &mut defs)))
+            .collect();
+        let ifaces_p = if ifaces.is_empty() {
+            "null".to_string()
+        } else {
+            writeln!(defs, "@vti.{ci_idx} = private constant [{n} x ptr] [{l}, ptr null]", n = ifaces.len() + 1, l = ifaces.join(", ")).unwrap();
+            format!("@vti.{ci_idx}")
+        };
+        // Flattened (real) layout: what the module would actually read and write.
+        let flat = abi_flat_fields(program, &c.name);
+        let fields_p = if flat.is_empty() {
+            "null".to_string()
+        } else {
+            let items: Vec<String> = flat
+                .iter()
+                .map(|f| {
+                    let fname = cstr(&f.name, &mut pool, &mut defs);
+                    let target = match &f.ref_target {
+                        Some(t) => format!("ptr {}", cstr(t, &mut pool, &mut defs)),
+                        None => "ptr null".to_string(),
+                    };
+                    format!("{{ ptr, i32, i32, ptr }} {{ ptr {fname}, i32 {k}, i32 {w}, {target} }}", k = abi_kind(f.ty), w = i32::from(f.weak))
+                })
+                .collect();
+            writeln!(defs, "@vtf.{ci_idx} = private constant [{n} x {{ ptr, i32, i32, ptr }}] [{l}]", n = flat.len(), l = items.join(", ")).unwrap();
+            format!("@vtf.{ci_idx}")
+        };
+        entries.push(format!(
+            "{{ ptr, ptr, ptr, i64, ptr, i64 }} {{ ptr {name_p}, ptr {super_p}, ptr {ifaces_p}, i64 {n}, ptr {fields_p}, i64 {h} }}",
+            n = flat.len(),
+            h = abi_layout_hash(program, &c.name),
+        ));
+    }
+    // A class-free program still needs the symbol (the runtime references it
+    // unconditionally); `[0 x T] []` is not valid IR, `zeroinitializer` is.
+    let init = if entries.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", entries.join(", ")) };
+    writeln!(body, "@{symbol} = constant [{n} x {{ ptr, ptr, ptr, i64, ptr, i64 }}] {init}", n = entries.len()).unwrap();
+    writeln!(body, "@{symbol}_len = constant i64 {}", entries.len()).unwrap();
+    format!("\n{defs}{body}")
+}
+
 pub fn emit(program: &Program) -> String {
     emit_full(program, None, false)
 }

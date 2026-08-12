@@ -4146,6 +4146,34 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call".into(), args: vec![h, a] });
             return (Operand::Copy(d), Ty::I64);
         }
+        // ── Step 2b: the OBJECT boundary. `module_call_obj(handle, o: T) -> T` hands a
+        // live object to the loaded module's `fn module_obj(o: T) -> T` and takes its
+        // result back. Two things make this sound, and neither is checked here:
+        //   * The LAYOUT of `T` is proven identical on both sides by the load-time
+        //     verifier (`jrt_verify_module`) — a module whose `T` differs was already
+        //     rejected at `load_module`, so `handle` cannot name one.
+        //   * The COUNTS are real: the module links no runtime of its own, so its
+        //     retain/release/alloc are the host's. Argument is borrowed (+0), result is
+        //     owned (+1) — the ordinary Vire calling convention, which is why the result
+        //     needs no special cleanup here.
+        // The result's class is the ARGUMENT's class: `module_obj` is `T -> T` by
+        // signature, so there is nothing else it could be, and this keeps `r.field`
+        // resolving in the host without a second type channel across the boundary.
+        if name == "module_call_obj" {
+            let mut it = lowered.into_iter();
+            let h = it.next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let (obj, _) = it.next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let arg_cls = match &obj {
+                Operand::Copy(l) => self.local_class.get(&l.0).cloned(),
+                _ => None,
+            };
+            let d = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call_obj".into(), args: vec![h, obj] });
+            if let Some(c) = arg_cls {
+                self.local_class.insert(d.0, c);
+            }
+            return (Operand::Copy(d), Ty::Ref);
+        }
         // `unload_module(handle) -> Int` — release the load reference. The module's `.so` is
         // dlclose'd (code unmapped) once no dyn-slot references it either, so a stale module
         // is reclaimed (no leak) but never closed while a slot still points into it (no UAF).

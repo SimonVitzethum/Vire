@@ -3348,16 +3348,186 @@ static void jrt_mod_release(int id) { /* rc--; dlclose + free when it hits 0 */
     struct jrt_mod *m = &jrt_mods[id - 1];
     if (m->h && --m->rc <= 0) { dlclose(m->h); m->h = 0; m->rc = 0; }
 }
+
+/* --- Shared-type ABI + load-time object-boundary verifier (P1 step 2b, §6) ------------
+ *
+ * The mirror of `fastllvm_backend::emit_typetab`. Host and module each carry a table
+ * describing every class's LAYOUT and its OWNERSHIP edges; the loader uses it to answer,
+ * without trusting the module, the two questions an open world has to pay for:
+ *
+ *   1. LAYOUT — a type both sides declare must be laid out identically, or the module
+ *      would read the host's objects at the wrong offsets. Decided by the layout hash.
+ *   2. ACYCLICITY-OR-WEAK — linking the module's types into the host's type graph must
+ *      not close a NEW ownership cycle, or reference counting alone would leak and the
+ *      open world would need the collector back. Decided by walking the edges; a `weak`
+ *      field is non-owning and therefore not an edge (that is the declared back-edge).
+ *
+ * "New" is the operative word in (2): a host that already has a cyclic type graph made
+ * that decision at build time (it links the collector, or the shape analysis proved the
+ * instances tree-shaped). The gate compares the host-only graph against the combined one
+ * and rejects only cycles the module ADDS.
+ *
+ * Failure is always all-or-nothing: a rejected module is dlclose'd and `load_module`
+ * returns 0. There is no partial link, so a module can never be half-present. */
+struct vire_field { const char *name; int32_t kind; int32_t weak; const char *target; };
+struct vire_type {
+    const char *name;
+    const char *super;
+    const char *const *ifaces; /* NULL-terminated, or NULL */
+    int64_t nfields;
+    const struct vire_field *fields; /* flattened layout order (super fields first) */
+    int64_t hash;
+};
+/* Emitted by the backend into the executable. Weak fallback for the same reason as
+ * `jrt_patchtab`: the runtime object is compiled once and shared by every build, and a
+ * build path that emits no table (freestanding, `--emit-c`) must still link. */
+__attribute__((weak)) const struct vire_type vire_host_types[1] = {{0, 0, 0, 0, 0, 0}};
+__attribute__((weak)) const int64_t vire_host_types_len = 0;
+
+/* Bounded because the gate must fail CLOSED: a program with more types than this cannot
+ * load modules at all, rather than loading them unverified. 512 words of 64 bits. */
+#define JRT_MAX_TYPES 512
+#define JRT_TYPE_WORDS (JRT_MAX_TYPES / 64)
+static void jrt_bs_set(uint64_t *bs, int i) { bs[i >> 6] |= (uint64_t)1 << (i & 63); }
+static int jrt_bs_get(const uint64_t *bs, int i) { return (bs[i >> 6] >> (i & 63)) & 1; }
+static void jrt_bs_or(uint64_t *a, const uint64_t *b) {
+    for (int w = 0; w < JRT_TYPE_WORDS; w++) a[w] |= b[w];
+}
+/* Transitive closure of `rel` (n×n as bitset rows), Floyd-Warshall over words. */
+static void jrt_bs_close(uint64_t (*rel)[JRT_TYPE_WORDS], int n) {
+    for (int k = 0; k < n; k++)
+        for (int i = 0; i < n; i++)
+            if (jrt_bs_get(rel[i], k)) jrt_bs_or(rel[i], rel[k]);
+}
+
+/* Scratch for one verification. `jrt_load_module` is not re-entrant anyway (it mutates
+ * the module table), and these are 100 KB that no non-loading program ever touches. */
+static const struct vire_type *jrt_v_ty[JRT_MAX_TYPES];
+static uint64_t jrt_v_sup[JRT_MAX_TYPES][JRT_TYPE_WORDS]; /* i → its supertypes */
+static uint64_t jrt_v_adj[JRT_MAX_TYPES][JRT_TYPE_WORDS]; /* i → what i can own */
+
+/* Ownership edges of the first `n` entries of `jrt_v_ty` into `jrt_v_adj`, closed; sets
+ * `oncyc[i]` iff type i lies on a cycle. Returns 0 if the graph does not fit. */
+static int jrt_type_cycles(int n, uint64_t *oncyc) {
+    if (n > JRT_MAX_TYPES) return 0;
+    memset(jrt_v_sup, 0, sizeof jrt_v_sup);
+    memset(jrt_v_adj, 0, sizeof jrt_v_adj);
+    /* Direct supertypes (super + declared interfaces), plus self — then close, so
+     * `jrt_v_sup[i]` answers "is i a subtype of j?" for every j. */
+    for (int i = 0; i < n; i++) {
+        jrt_bs_set(jrt_v_sup[i], i);
+        for (int j = 0; j < n; j++) {
+            if (jrt_v_ty[i]->super && !strcmp(jrt_v_ty[i]->super, jrt_v_ty[j]->name)) jrt_bs_set(jrt_v_sup[i], j);
+            for (const char *const *it = jrt_v_ty[i]->ifaces; it && *it; it++)
+                if (!strcmp(*it, jrt_v_ty[j]->name)) jrt_bs_set(jrt_v_sup[i], j);
+        }
+    }
+    jrt_bs_close(jrt_v_sup, n);
+    /* A field of declared target T is an edge to EVERY type that is-a T — the same
+     * conservative widening the compile-time analysis does (`is_subtype` in the solver),
+     * because the field can hold any subtype. `java/lang/Object` means "anything". */
+    for (int i = 0; i < n; i++) {
+        for (int64_t f = 0; f < jrt_v_ty[i]->nfields; f++) {
+            const struct vire_field *fi = &jrt_v_ty[i]->fields[f];
+            if (fi->weak || !fi->target) continue; /* weak = non-owning = not an edge */
+            int wide = !strcmp(fi->target, "java/lang/Object");
+            for (int j = 0; j < n; j++) {
+                int isa = 0;
+                for (int t = 0; t < n && !isa; t++)
+                    if (!strcmp(jrt_v_ty[t]->name, fi->target) && jrt_bs_get(jrt_v_sup[j], t)) isa = 1;
+                if (wide || isa) jrt_bs_set(jrt_v_adj[i], j);
+            }
+        }
+    }
+    jrt_bs_close(jrt_v_adj, n);
+    memset(oncyc, 0, JRT_TYPE_WORDS * sizeof(uint64_t));
+    for (int i = 0; i < n; i++)
+        if (jrt_bs_get(jrt_v_adj[i], i)) jrt_bs_set(oncyc, i);
+    return 1;
+}
+
+/* A rejection is deliberately silent (`load_module` just returns 0, which the program is
+ * expected to handle) — but a silent "no" is miserable to debug, so VIRE_VERIFY_DEBUG=1
+ * makes the verifier say which gate said no. Diagnostic only; it changes no decision. */
+static void jrt_verify_note(const char *why, const char *what) {
+    const char *e = getenv("VIRE_VERIFY_DEBUG");
+    if (e && *e && *e != '0') fprintf(stderr, "[verify] reject: %s%s%s\n", why, what ? " " : "", what ? what : "");
+}
+
+/* 1 = the module may be linked, 0 = reject. */
+static int jrt_verify_module(void *h) {
+    const struct vire_type *mt = (const struct vire_type *)dlsym(h, "vire_module_types");
+    const int64_t *mlen_p = (const int64_t *)dlsym(h, "vire_module_types_len");
+    int64_t mlen = (mt && mlen_p) ? *mlen_p : 0;
+    int64_t hlen = vire_host_types_len;
+    if (mlen <= 0) return 1; /* scalar-only module: no type crosses, nothing to verify */
+
+    /* (1) Layout: a shared name must mean a shared shape. */
+    for (int64_t m = 0; m < mlen; m++)
+        for (int64_t i = 0; i < hlen; i++)
+            if (!strcmp(mt[m].name, vire_host_types[i].name) && mt[m].hash != vire_host_types[i].hash) {
+                jrt_verify_note("layout differs for type", mt[m].name);
+                if (getenv("VIRE_VERIFY_DEBUG")) {
+                    fprintf(stderr, "[verify]   host %lld fields, module %lld fields\n", (long long)vire_host_types[i].nfields, (long long)mt[m].nfields);
+                    for (int64_t f = 0; f < vire_host_types[i].nfields; f++)
+                        fprintf(stderr, "[verify]   host   %s kind=%d weak=%d target=%s\n", vire_host_types[i].fields[f].name, vire_host_types[i].fields[f].kind, vire_host_types[i].fields[f].weak, vire_host_types[i].fields[f].target ? vire_host_types[i].fields[f].target : "-");
+                    for (int64_t f = 0; f < mt[m].nfields; f++)
+                        fprintf(stderr, "[verify]   module %s kind=%d weak=%d target=%s\n", mt[m].fields[f].name, mt[m].fields[f].kind, mt[m].fields[f].weak, mt[m].fields[f].target ? mt[m].fields[f].target : "-");
+                }
+                return 0;
+            }
+
+    /* (2) Acyclicity-or-weak. Host-only graph first, so pre-existing host cycles (which
+     * the host already accounted for at build time) do not block every module. */
+    if (hlen > JRT_MAX_TYPES) { jrt_verify_note("host has more types than the verifier can graph", 0); return 0; }
+    static uint64_t host_cyc[JRT_TYPE_WORDS], all_cyc[JRT_TYPE_WORDS];
+    for (int64_t i = 0; i < hlen; i++) jrt_v_ty[i] = &vire_host_types[i];
+    if (!jrt_type_cycles((int)hlen, host_cyc)) return 0;
+    /* Combined: host types, then the module's own types. A name the host already knows is
+     * the SAME type (its layout was just proven identical), so it is not added twice. */
+    int n = (int)hlen;
+    for (int64_t m = 0; m < mlen; m++) {
+        int dup = 0;
+        for (int i = 0; i < (int)hlen; i++)
+            if (!strcmp(mt[m].name, vire_host_types[i].name)) dup = 1;
+        if (dup) continue;
+        if (n >= JRT_MAX_TYPES) return 0; /* fail closed */
+        jrt_v_ty[n++] = &mt[m];
+    }
+    if (!jrt_type_cycles(n, all_cyc)) return 0;
+    /* Reject exactly the cycles the module ADDS: a type on a cycle now that was not on
+     * one before (host types), or any module-contributed type on a cycle at all. */
+    for (int i = 0; i < n; i++) {
+        if (!jrt_bs_get(all_cyc, i)) continue;
+        if (i >= (int)hlen || !jrt_bs_get(host_cyc, i)) {
+            jrt_verify_note("the module closes a new ownership cycle through type", jrt_v_ty[i]->name);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int64_t jrt_load_module(const char *path) {
     if (!path) return 0;
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) return 0;
     int64_t *abi = (int64_t *)dlsym(h, "vire_module_abi");
     if (!abi || *abi != 1 /* VIRE_ABI_VERSION */) { dlclose(h); return 0; }
+    if (!jrt_verify_module(h)) { dlclose(h); return 0; }
     for (int i = 0; i < JRT_MAX_MODS; i++) {
         if (!jrt_mods[i].h) { jrt_mods[i].h = h; jrt_mods[i].rc = 1; return i + 1; } /* 1-based id, 1 load ref */
     }
     dlclose(h); return 0; /* module table full */
+}
+/* Step 2b: the object entry. The module's `vire_module_obj` takes a BORROWED object and
+ * returns an OWNED one (+1) — the ordinary Vire convention, and the module's retains and
+ * releases are the host's, since it resolves `jrt_*` against this executable. A module
+ * without the entry returns null rather than calling something wrong. */
+void *jrt_module_call_obj(int64_t id, void *obj) {
+    if (id <= 0 || id > JRT_MAX_MODS || !jrt_mods[id - 1].h) return 0;
+    void *(*fn)(void *) = (void *(*)(void *))dlsym(jrt_mods[id - 1].h, "vire_module_obj");
+    if (!fn) return 0;
+    return fn(obj);
 }
 int64_t jrt_module_call(int64_t id, int64_t arg) {
     if (id <= 0 || id > JRT_MAX_MODS || !jrt_mods[id - 1].h) return 0;

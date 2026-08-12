@@ -5,7 +5,24 @@
 output equality. C++ = **clang++** (LLVM, like Vire) for a fair codegen
 comparison (g++/GCC diverges separately, see RECURSION-INLINING.md).
 
-## Results (best-of-5 time + peak RSS, the same machine, freshly measured 2026-07)
+## Results (best-of-5 time + peak RSS, the same machine, freshly measured 2026-07-20)
+
+> **One run per document.** These are the numbers from the 2026-07-20 refresh; every ratio
+> quoted below is from this table. An earlier run (2026-07-19) measured the same benchmarks
+> on the same machine at noticeably lower absolute times (e.g. nbody 0.072 s, binsearch
+> 0.480 s) and therefore at different ratios. Those numbers survive only in the
+> [bounds-check addendum](#bounds-checks-analysis--honest-ceiling-addendum) at the end,
+> which is explicitly labelled as that older run — do **not** mix the two.
+>
+> **Caveat, and why a re-measurement is owed.** This run is uniformly 3–5× slower in
+> absolute terms than the 2026-07-19 one (nbody 0.360 vs 0.072 s), across *all three*
+> languages — the signature of a loaded or thermally throttled machine, not of a codegen
+> change. The ratios are therefore the least trustworthy part of this file: a third,
+> independent run (8-vCPU EPYC-Rome, 2026-07-29) landed at geomean **1.02× Rust**, which
+> confirms the headline parity claim, but per-benchmark reproduced the *older* matmul
+> figure (0.85× Rust, not 0.98×) and neither run's binsearch (1.12× Rust). Treat every
+> per-benchmark ratio here as provisional until the suite is re-run on an idle machine.
+
 | Benchmark | Vire | Rust | clang++ | Vire/Rust | Vire/clang | RAM V/R/C |
 |---|---|---|---|---|---|---|
 | bitmanip (popcount) | 0.229 | 0.231 | 0.230 | **0.99×** | **1.00×** | 1.8 / 1.9 / 3.8 MB |
@@ -32,10 +49,10 @@ last few % — a recursive `Array[Int]` param version measured *slower*, so it s
 ## Interpretation
 - **Compute (bitmanip/nbody/montecarlo): Vire = clang parity** (0.99–1.00×).
   Both go through LLVM → the same codegen optimum.
-- **binsearch: Vire = 1.00× Rust / 1.06× clang** — the constant upper/lower-bound
+- **binsearch: Vire = 1.03× Rust / 0.78× clang** — the constant upper/lower-bound
   fixpoint elides the data-dependent midpoint check (`0 ≤ (lo+hi)/2 ≤ n-1 < len`),
-  safely. This is the LLVM-safe-language ceiling (its no-checks floor is 1.07× clang).
-- **matmul (256³ ikj): Vire 0.83× Rust / 0.77× clang — beats both.** The kernel now
+  safely. At Rust parity, i.e. the LLVM-safe-language ceiling.
+- **matmul (256³ ikj): Vire 0.98× Rust / 0.91× clang — beats clang, at Rust parity.** The kernel now
   uses the cache-friendly **ikj** loop order (the same order the Java-AOT `Matmul` uses
   to beat Rust): the inner loop `c[ci+j] += aik*b[bk+j]` is unit-stride in `j` — a
   SAXPY — so LLVM **vectorizes** it (8 packed-FP ops). The earlier ijk dot-product
@@ -43,18 +60,18 @@ last few % — a recursive `Array[Int]` param version measured *slower*, so it s
   why it sat at 1.27× Rust (a scalar-scheduling residual). Same algorithm across all
   three languages (fair), bit-identical output (100659197). The affine index
   (`bounds.rs` Path 4, `N·a+b < N² ≤ len`) is still elided; a real OOB still throws.
-- **vcall = trait objects (dyn dispatch): Vire 0.41× — 2.4× FASTER than clang
-  `virtual`, and essentially at Rust.** Vire's solver devirtualizes + inlines the
+- **vcall = trait objects (dyn dispatch): Vire 0.44× clang — 2.3× FASTER than clang
+  `virtual`, and exactly at Rust.** Vire's solver devirtualizes + inlines the
   vtable dispatch; clang keeps the indirect call. (Vire's vcall time roughly halved
   vs the previous snapshot as the devirt/vtable path matured.)
-- **sort (quicksort): Vire 1.14× clang / 1.05× Rust.** Measured finding: Rust's sort
+- **sort (quicksort): Vire 1.33× clang / 1.06× Rust.** Measured finding: Rust's sort
   has the SAME bounds checks (47× more `jae` than Vire, actually) — the gap was never
   missing elision, it was Vire's **check model**. Vire's pending-exception throw
   (set-pending + continue + a `phi` folding the load result with a default) was
   costlier than Rust's noreturn panic. Now, when the whole program provably can't
   catch a runtime exception (no try/catch — always true for pure Vire), the check
   aborts via a `_fatal` noreturn helper and its failure block ends in `unreachable`,
-  so the load result is direct (Rust's structure). **1.35× → 1.05× Rust**, matching
+  so the load result is direct (Rust's structure). **1.35× → 1.06× Rust**, matching
   the no-checks ceiling. Memory safety unchanged (a real OOB still throws, verified).
   The last ~5% is the explicit-stack structure Vire needs *because it can't yet pass
   arrays as parameters* — Rust writes `qsort(a: &mut [i64], …)` recursively (TODO).
@@ -105,7 +122,13 @@ measured shows the generated code is already at the LLVM optimum.
 
 ## Bounds checks: analysis + honest ceiling (addendum)
 Measured ceiling with `FASTLLVM_NO_BOUNDS=1` (a **measurement-only** flag that emits
-checks off — never shipped; the shipped path stays memory-safe):
+checks off — never shipped; the shipped path stays memory-safe).
+
+> **Older run (2026-07-19), kept because the no-checks column was only ever measured
+> then.** Same machine, same benchmarks, but faster absolute times than the 2026-07-20
+> table at the top — so the ratios here differ from it and the two are not comparable.
+> Read this table only for the *safe vs. no-checks* comparison within it, which is what
+> it exists for; for Vire-vs-Rust-vs-clang take the table at the top.
 
 | Benchmark | Vire (safe) | Vire (no checks) | Rust | clang++ | status |
 |---|---|---|---|---|---|
