@@ -929,6 +929,7 @@ impl Parser {
             Tok::Amp => (BinOp::BitAnd, 5),
             Tok::Shl => (BinOp::Shl, 5),
             Tok::Shr => (BinOp::Shr, 5),
+            Tok::UShr => (BinOp::UShr, 5),
             Tok::Plus => (BinOp::Add, 6),
             Tok::Minus => (BinOp::Sub, 6),
             Tok::PlusPct => (BinOp::AddWrap, 6),

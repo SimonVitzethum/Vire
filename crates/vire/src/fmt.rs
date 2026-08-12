@@ -505,7 +505,7 @@ fn binop_str(op: BinOp) -> &'static str {
         BinOp::AddWrap => "+%", BinOp::SubWrap => "-%", BinOp::MulWrap => "*%",
         BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<", BinOp::Le => "<=", BinOp::Gt => ">", BinOp::Ge => ">=",
         BinOp::And => "and", BinOp::Or => "or",
-        BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^", BinOp::Shl => "<<", BinOp::Shr => ">>",
+        BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^", BinOp::Shl => "<<", BinOp::Shr => ">>", BinOp::UShr => ">>>",
     }
 }
 

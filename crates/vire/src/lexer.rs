@@ -25,7 +25,7 @@ pub enum Tok {
     // operators
     Plus, Minus, Star, Slash, Percent, PlusPct, MinusPct, StarPct,
     EqEq, Ne, Lt, Le, Gt, Ge,
-    Amp, Pipe, Caret, Shl, Shr,
+    Amp, Pipe, Caret, Shl, Shr, UShr,
     Eq, PlusEq, MinusEq, StarEq, SlashEq,
     // control
     Newline, Eof,
@@ -480,6 +480,11 @@ impl<'a> Lexer<'a> {
             }
             b'>' => {
                 two!(b'=', Tok::Ge);
+                // `>>>` must be matched before `>>`, else it lexes as `>>` + `>`.
+                if b == b'>' && self.peek2() == b'>' {
+                    self.pos += 2;
+                    return Tok::UShr;
+                }
                 two!(b'>', Tok::Shr);
                 Tok::Gt
             }

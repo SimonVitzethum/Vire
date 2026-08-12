@@ -271,5 +271,5 @@ pub enum BinOp {
     AddWrap, SubWrap, MulWrap,
     Eq, Ne, Lt, Le, Gt, Ge,
     And, Or,
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd, BitOr, BitXor, Shl, Shr, UShr,
 }

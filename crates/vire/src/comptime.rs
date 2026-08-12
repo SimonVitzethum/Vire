@@ -348,6 +348,7 @@ fn int_binop(op: BinOp, x: i64, y: i64) -> Option<CVal> {
         BitXor => CVal::Int(x ^ y),
         Shl => CVal::Int(x.wrapping_shl(y as u32)),
         Shr => CVal::Int(x.wrapping_shr(y as u32)),
+        UShr => CVal::Int((x as u64).wrapping_shr(y as u32) as i64),
         Eq => CVal::Bool(x == y),
         Ne => CVal::Bool(x != y),
         Lt => CVal::Bool(x < y),

@@ -5223,6 +5223,7 @@ fn const_eval(e: &Expr) -> Option<CVal> {
                     BinOp::BitXor => CVal::Int(a ^ b),
                     BinOp::Shl => CVal::Int(a << b),
                     BinOp::Shr => CVal::Int(a >> b),
+                    BinOp::UShr => CVal::Int(((a as u64) >> b) as i64),
                     _ => return None,
                 },
                 (CVal::Float(a), CVal::Float(b)) => match op {
@@ -5364,6 +5365,7 @@ fn map_op(o: BinOp) -> IB {
         BinOp::BitXor => IB::Xor,
         BinOp::Shl => IB::Shl,
         BinOp::Shr => IB::Shr,
+        BinOp::UShr => IB::UShr,
     }
 }
 
