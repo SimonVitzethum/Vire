@@ -3945,6 +3945,18 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![af] });
             return (Operand::Copy(d), Ty::F64);
         }
+        // `ctz(x)` / `popcount(x)` — bit intrinsics on Int (i64). The backend emits
+        // @llvm.cttz.i64(x, i1 false) (so ctz(0) = 64, defined — no UB) and
+        // @llvm.ctpop.i64(x), each a single instruction (tzcnt / popcnt on x86).
+        // Guarded by `fn_defs`: a user's own `fn ctz` takes precedence over the builtin.
+        if (name == "ctz" || name == "popcount") && lowered.len() == 1 && !self.fn_defs.contains_key(&name) {
+            let (a, _at) = lowered.into_iter().next().unwrap();
+            let ai = to_i64(a);
+            let d = self.new_local(Ty::I64);
+            let func = if name == "ctz" { "jrt_ctz" } else { "jrt_popcount" };
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![ai] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float), `barray(n)` (unsigned
         // byte, 0..255) — real bounds-checked/-elidable arrays (as opposed to the i64 list).
         // `barray` is the byte buffer for scanning file bytes in Vire (grep, binary I/O): one

@@ -229,6 +229,8 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("llvm.sin.f64", "double (double)"),
     ("llvm.cos.f64", "double (double)"),
     ("llvm.floor.f64", "double (double)"),
+    ("llvm.cttz.i64", "i64 (i64, i1)"),
+    ("llvm.ctpop.i64", "i64 (i64)"),
     ("jrt_current_time_millis", "i64 ()"),
     ("jrt_nano_time", "i64 ()"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -2810,6 +2812,21 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let t = e.fresh();
             let intr = match func.as_str() { "jrt_math_sin" => "llvm.sin.f64", "jrt_math_cos" => "llvm.cos.f64", _ => "llvm.floor.f64" };
             writeln!(w, "  {t} = call double @{intr}(double {a}){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
+        }
+        // ctz/popcount → the LLVM bit intrinsics. `cttz` with `i1 false` is DEFINED at
+        // zero (returns the bit width, 64) — no UB, the safety-first choice, and on x86
+        // `tzcnt` yields exactly that for free. `ctpop` → a single `popcnt`.
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_ctz" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i64 @llvm.cttz.i64(i64 {a}, i1 false){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
+        }
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_popcount" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i64 @llvm.ctpop.i64(i64 {a}){}", e.dbg()).unwrap();
             store_dest(w, e, *d, &t, false);
         }
         Statement::Call { dest, func, args } => {
