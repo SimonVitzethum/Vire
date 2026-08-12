@@ -24,20 +24,8 @@
 // Vire hat kein bitweises NOT: `x ^ -1` ist die Umschreibung.
 fn bnot(x: Int) -> Int { x ^ (0 - 1) }
 
-// count trailing zeros, Binaersuche. Vire hat (noch) kein ctz-Intrinsic;
-// mit `@llvm.cttz.i64` waere das eine einzige tzcnt-Instruktion.
-fn ctz(x: Int) -> Int {
-    if x == 0 { return 64 }
-    mut n = 0
-    mut v = x
-    if (v & 4294967295) == 0 { n = n + 32  v = v >>> 32 }
-    if (v & 65535) == 0 { n = n + 16  v = v >>> 16 }
-    if (v & 255) == 0 { n = n + 8  v = v >>> 8 }
-    if (v & 15) == 0 { n = n + 4  v = v >>> 4 }
-    if (v & 3) == 0 { n = n + 2  v = v >>> 2 }
-    if (v & 1) == 0 { n = n + 1 }
-    n
-}
+// ctz(x) ist jetzt ein Vire-Builtin -> @llvm.cttz.i64(x, i1 false), eine
+// tzcnt-Instruktion, ctz(0)=64 definiert. (Frueher Hand-Binaersuche.)
 
 fn bit(sq: Int) -> Int { 1 << sq }
 
