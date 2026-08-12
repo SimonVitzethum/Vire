@@ -1,0 +1,546 @@
+// Chess perft — Zuggenerator + Knotenzaehlung ueber den Spielbaum.
+// Parallel zu perft.cpp / perft.rs, bitidentische Ausgabe (nur Zahlen).
+//
+// Die Knotenzahlen sind mathematisch feststehend (chessprogramming.org/Perft_Results),
+// nicht "plausibel" — dieser Benchmark prueft als einziger der Suite seine eigene
+// Korrektheit exakt. Ein falsch elidierter Bounds-Check faellt als falsche Zahl auf.
+//
+// Was er stresst:
+//   - SoA-Aliasing: bb[8] werden in make/unmake wechselseitig geschrieben und gelesen
+//     (dieselbe Struktur wie NBody, aber in der innersten Schleife)
+//   - Bounds-Elision: mb[64], tab[272], mv[256*d], ud[4*d] in jeder Schleife
+//   - tiefe Rekursion mit kleinem Frame
+//   - Bitmanipulation: ctz, Shift/Mask ueberall
+//
+// Layout der Zustandsarrays (Vire hat keine structs — parallele Arrays wie hashmap.vr):
+//   bb[0]=weiss bb[1]=schwarz bb[2]=Bauer bb[3]=Springer bb[4]=Laeufer
+//   bb[5]=Turm  bb[6]=Dame    bb[7]=Koenig
+//   mb[sq] = Figurentyp 0..7 (0 = leer)
+//   st[0]=Zugrecht st[1]=Rochaderechte st[2]=ep-Feld(-1) st[3]=Halbzugzaehler
+//   tab[0..63]=Springer tab[64..127]=Koenig tab[128..191]=Bauer weiss
+//   tab[192..255]=Bauer schwarz tab[256..263]=Richtung Datei tab[264..271]=Richtung Reihe
+
+// ---- Bit-Helfer ---------------------------------------------------------
+// Vire hat kein bitweises NOT: `x ^ -1` ist die Umschreibung.
+fn bnot(x: Int) -> Int { x ^ (0 - 1) }
+
+// count trailing zeros, Binaersuche. Vire hat (noch) kein ctz-Intrinsic;
+// mit `@llvm.cttz.i64` waere das eine einzige tzcnt-Instruktion.
+fn ctz(x: Int) -> Int {
+    if x == 0 { return 64 }
+    mut n = 0
+    mut v = x
+    if (v & 4294967295) == 0 { n = n + 32  v = v >>> 32 }
+    if (v & 65535) == 0 { n = n + 16  v = v >>> 16 }
+    if (v & 255) == 0 { n = n + 8  v = v >>> 8 }
+    if (v & 15) == 0 { n = n + 4  v = v >>> 4 }
+    if (v & 3) == 0 { n = n + 2  v = v >>> 2 }
+    if (v & 1) == 0 { n = n + 1 }
+    n
+}
+
+fn bit(sq: Int) -> Int { 1 << sq }
+
+// ---- Tabellenaufbau -----------------------------------------------------
+fn init_tab(tab: Array[Int]) {
+    // Richtungen: 0..3 gerade (Turm), 4..7 diagonal (Laeufer)
+    tab[256] = 0   tab[264] = 1
+    tab[257] = 0   tab[265] = 0 - 1
+    tab[258] = 1   tab[266] = 0
+    tab[259] = 0 - 1  tab[267] = 0
+    tab[260] = 1   tab[268] = 1
+    tab[261] = 1   tab[269] = 0 - 1
+    tab[262] = 0 - 1  tab[270] = 1
+    tab[263] = 0 - 1  tab[271] = 0 - 1
+
+    mut sq = 0
+    while sq < 64 {
+        mut f = sq & 7
+        mut r = sq >>> 3
+        mut n = 0
+        mut k = 0
+        // Springer
+        mut i = 0
+        while i < 8 {
+            mut df = 0
+            mut dr = 0
+            if i == 0 { df = 1   dr = 2 }
+            if i == 1 { df = 2   dr = 1 }
+            if i == 2 { df = 2   dr = 0 - 1 }
+            if i == 3 { df = 1   dr = 0 - 2 }
+            if i == 4 { df = 0 - 1  dr = 0 - 2 }
+            if i == 5 { df = 0 - 2  dr = 0 - 1 }
+            if i == 6 { df = 0 - 2  dr = 1 }
+            if i == 7 { df = 0 - 1  dr = 2 }
+            mut nf = f + df
+            mut nr = r + dr
+            if nf >= 0 and nf < 8 and nr >= 0 and nr < 8 { n = n | bit(nr * 8 + nf) }
+            i = i + 1
+        }
+        // Koenig
+        i = 0
+        while i < 8 {
+            mut kf = tab[256 + i]
+            mut kr = tab[264 + i]
+            mut nf = f + kf
+            mut nr = r + kr
+            if nf >= 0 and nf < 8 and nr >= 0 and nr < 8 { k = k | bit(nr * 8 + nf) }
+            i = i + 1
+        }
+        tab[sq] = n
+        tab[64 + sq] = k
+        // Bauernangriffe
+        mut wp = 0
+        mut bp = 0
+        if f > 0 and r < 7 { wp = wp | bit(sq + 7) }
+        if f < 7 and r < 7 { wp = wp | bit(sq + 9) }
+        if f > 0 and r > 0 { bp = bp | bit(sq - 9) }
+        if f < 7 and r > 0 { bp = bp | bit(sq - 7) }
+        tab[128 + sq] = wp
+        tab[192 + sq] = bp
+        sq = sq + 1
+    }
+}
+
+// ---- Slider-Angriffe (Richtungsschleife; v2: Magic Bitboards) -----------
+fn slide(tab: Array[Int], sq: Int, occ: Int, d0: Int, d1: Int) -> Int {
+    mut atk = 0
+    mut d = d0
+    while d <= d1 {
+        mut f = sq & 7
+        mut r = sq >>> 3
+        mut go = 1
+        while go == 1 {
+            f = f + tab[256 + d]
+            r = r + tab[264 + d]
+            if f < 0 or f > 7 or r < 0 or r > 7 {
+                go = 0
+            } else {
+                mut t = r * 8 + f
+                atk = atk | bit(t)
+                if (occ & bit(t)) != 0 { go = 0 }
+            }
+        }
+        d = d + 1
+    }
+    atk
+}
+
+fn rook_atk(tab: Array[Int], sq: Int, occ: Int) -> Int { slide(tab, sq, occ, 0, 3) }
+fn bish_atk(tab: Array[Int], sq: Int, occ: Int) -> Int { slide(tab, sq, occ, 4, 7) }
+
+// ---- Angriffsabfrage ----------------------------------------------------
+fn attacked(bb: Array[Int], tab: Array[Int], sq: Int, by: Int) -> Int {
+    mut occ = bb[0] | bb[1]
+    mut them = bb[by]
+    mut opp = 1 - by
+    if (tab[128 + opp * 64 + sq] & bb[2] & them) != 0 { return 1 }
+    if (tab[sq] & bb[3] & them) != 0 { return 1 }
+    if (tab[64 + sq] & bb[7] & them) != 0 { return 1 }
+    mut bq = (bb[4] | bb[6]) & them
+    if bq != 0 {
+        if (bish_atk(tab, sq, occ) & bq) != 0 { return 1 }
+    }
+    mut rq = (bb[5] | bb[6]) & them
+    if rq != 0 {
+        if (rook_atk(tab, sq, occ) & rq) != 0 { return 1 }
+    }
+    0
+}
+
+// ---- Brettmutation ------------------------------------------------------
+fn put(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) {
+    bb[color] = bb[color] | bit(sq)
+    bb[piece] = bb[piece] | bit(sq)
+    mb[sq] = piece
+}
+
+fn clr(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) {
+    bb[color] = bb[color] & bnot(bit(sq))
+    bb[piece] = bb[piece] & bnot(bit(sq))
+    mb[sq] = 0
+}
+
+fn cmask(sq: Int) -> Int {
+    if sq == 4 { return 3 }
+    if sq == 0 { return 2 }
+    if sq == 7 { return 1 }
+    if sq == 60 { return 12 }
+    if sq == 56 { return 8 }
+    if sq == 63 { return 4 }
+    0
+}
+
+fn rook_from(to: Int) -> Int {
+    if to == 6 { return 7 }
+    if to == 2 { return 0 }
+    if to == 62 { return 63 }
+    56
+}
+fn rook_to(to: Int) -> Int {
+    if to == 6 { return 5 }
+    if to == 2 { return 3 }
+    if to == 62 { return 61 }
+    59
+}
+
+// Zugkodierung: from(6) | to(6)<<6 | promo(3)<<12 | flag(2)<<15
+// flag: 0 normal, 1 en passant, 2 Rochade, 3 Doppelschritt
+fn mk(f: Int, t: Int, p: Int, fl: Int) -> Int { f | (t << 6) | (p << 12) | (fl << 15) }
+
+fn make(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) {
+    mut from = m & 63
+    mut to = (m >>> 6) & 63
+    mut promo = (m >>> 12) & 7
+    mut flag = (m >>> 15) & 3
+    mut us = st[0]
+    mut them = 1 - us
+    mut piece = mb[from]
+
+    ud[uo + 1] = st[1]
+    ud[uo + 2] = st[2]
+    ud[uo + 3] = st[3]
+    ud[uo] = 0
+
+    if flag == 1 {
+        mut capsq = to + 8
+        if us == 0 { capsq = to - 8 }
+        ud[uo] = 2
+        clr(bb, mb, capsq, them, 2)
+    } else {
+        if mb[to] != 0 {
+            ud[uo] = mb[to]
+            clr(bb, mb, to, them, mb[to])
+        }
+    }
+
+    clr(bb, mb, from, us, piece)
+    mut np = piece
+    if promo != 0 { np = promo }
+    put(bb, mb, to, us, np)
+
+    if flag == 2 {
+        mut rf = rook_from(to)
+        mut rt = rook_to(to)
+        clr(bb, mb, rf, us, 5)
+        put(bb, mb, rt, us, 5)
+    }
+
+    st[1] = st[1] & bnot(cmask(from) | cmask(to))
+    if flag == 3 { st[2] = (from + to) / 2 } else { st[2] = 0 - 1 }
+    if piece == 2 or ud[uo] != 0 { st[3] = 0 } else { st[3] = st[3] + 1 }
+    st[0] = them
+}
+
+fn unmake(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) {
+    mut from = m & 63
+    mut to = (m >>> 6) & 63
+    mut promo = (m >>> 12) & 7
+    mut flag = (m >>> 15) & 3
+    mut us = 1 - st[0]
+    mut them = st[0]
+
+    st[0] = us
+    st[1] = ud[uo + 1]
+    st[2] = ud[uo + 2]
+    st[3] = ud[uo + 3]
+
+    mut moved = mb[to]
+    if promo != 0 { moved = 2 }
+    mut cleared = moved
+    if promo != 0 { cleared = promo }
+    clr(bb, mb, to, us, cleared)
+    put(bb, mb, from, us, moved)
+
+    if flag == 2 {
+        mut rf = rook_from(to)
+        mut rt = rook_to(to)
+        clr(bb, mb, rt, us, 5)
+        put(bb, mb, rf, us, 5)
+    }
+
+    if ud[uo] != 0 {
+        if flag == 1 {
+            mut capsq = to + 8
+            if us == 0 { capsq = to - 8 }
+            put(bb, mb, capsq, them, 2)
+        } else {
+            put(bb, mb, to, them, ud[uo])
+        }
+    }
+}
+
+// ---- Zuggenerierung (pseudo-legal) --------------------------------------
+fn gen(bb: Array[Int], mb: Array[Int], st: Array[Int], tab: Array[Int], mv: Array[Int], mo: Int) -> Int {
+    mut n = 0
+    mut us = st[0]
+    mut them = 1 - us
+    mut own = bb[us]
+    mut opp = bb[them]
+    mut occ = own | opp
+    mut empty = bnot(occ)
+    mut pawns = bb[2] & own
+
+    mut up = 8
+    mut rank3 = 16711680
+    mut rank8 = 0 - 72057594037927936
+    if us == 1 {
+        up = 0 - 8
+        rank3 = 280375465082880
+        rank8 = 255
+    }
+
+    mut single = 0
+    if us == 0 { single = (pawns << 8) & empty } else { single = (pawns >>> 8) & empty }
+    mut dbl = 0
+    if us == 0 { dbl = ((single & rank3) << 8) & empty } else { dbl = ((single & rank3) >>> 8) & empty }
+
+    mut x = single
+    while x != 0 {
+        mut to = ctz(x)
+        x = x & (x - 1)
+        mut from = to - up
+        if (bit(to) & rank8) != 0 {
+            mv[mo + n] = mk(from, to, 6, 0)  n = n + 1
+            mv[mo + n] = mk(from, to, 5, 0)  n = n + 1
+            mv[mo + n] = mk(from, to, 4, 0)  n = n + 1
+            mv[mo + n] = mk(from, to, 3, 0)  n = n + 1
+        } else {
+            mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+        }
+    }
+    x = dbl
+    while x != 0 {
+        mut to = ctz(x)
+        x = x & (x - 1)
+        mv[mo + n] = mk(to - up - up, to, 0, 3)  n = n + 1
+    }
+
+    mut p = pawns
+    while p != 0 {
+        mut from = ctz(p)
+        p = p & (p - 1)
+        mut atk = tab[128 + us * 64 + from] & opp
+        while atk != 0 {
+            mut to = ctz(atk)
+            atk = atk & (atk - 1)
+            if (bit(to) & rank8) != 0 {
+                mv[mo + n] = mk(from, to, 6, 0)  n = n + 1
+                mv[mo + n] = mk(from, to, 5, 0)  n = n + 1
+                mv[mo + n] = mk(from, to, 4, 0)  n = n + 1
+                mv[mo + n] = mk(from, to, 3, 0)  n = n + 1
+            } else {
+                mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+            }
+        }
+        if st[2] >= 0 {
+            if (tab[128 + us * 64 + from] & bit(st[2])) != 0 {
+                mv[mo + n] = mk(from, st[2], 0, 1)  n = n + 1
+            }
+        }
+    }
+
+    mut s = bb[3] & own
+    while s != 0 {
+        mut from = ctz(s)
+        s = s & (s - 1)
+        mut atk = tab[from] & bnot(own)
+        while atk != 0 {
+            mut to = ctz(atk)
+            atk = atk & (atk - 1)
+            mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+        }
+    }
+
+    s = bb[4] & own
+    while s != 0 {
+        mut from = ctz(s)
+        s = s & (s - 1)
+        mut atk = bish_atk(tab, from, occ) & bnot(own)
+        while atk != 0 {
+            mut to = ctz(atk)
+            atk = atk & (atk - 1)
+            mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+        }
+    }
+    s = bb[5] & own
+    while s != 0 {
+        mut from = ctz(s)
+        s = s & (s - 1)
+        mut atk = rook_atk(tab, from, occ) & bnot(own)
+        while atk != 0 {
+            mut to = ctz(atk)
+            atk = atk & (atk - 1)
+            mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+        }
+    }
+    s = bb[6] & own
+    while s != 0 {
+        mut from = ctz(s)
+        s = s & (s - 1)
+        mut atk = (rook_atk(tab, from, occ) | bish_atk(tab, from, occ)) & bnot(own)
+        while atk != 0 {
+            mut to = ctz(atk)
+            atk = atk & (atk - 1)
+            mv[mo + n] = mk(from, to, 0, 0)  n = n + 1
+        }
+    }
+
+    mut ksq = ctz(bb[7] & own)
+    mut katk = tab[64 + ksq] & bnot(own)
+    while katk != 0 {
+        mut to = ctz(katk)
+        katk = katk & (katk - 1)
+        mv[mo + n] = mk(ksq, to, 0, 0)  n = n + 1
+    }
+
+    // Rochade
+    if us == 0 {
+        if (st[1] & 1) != 0 and (occ & 96) == 0 {
+            if attacked(bb, tab, 4, 1) == 0 and attacked(bb, tab, 5, 1) == 0 and attacked(bb, tab, 6, 1) == 0 {
+                mv[mo + n] = mk(4, 6, 0, 2)  n = n + 1
+            }
+        }
+        if (st[1] & 2) != 0 and (occ & 14) == 0 {
+            if attacked(bb, tab, 4, 1) == 0 and attacked(bb, tab, 3, 1) == 0 and attacked(bb, tab, 2, 1) == 0 {
+                mv[mo + n] = mk(4, 2, 0, 2)  n = n + 1
+            }
+        }
+    } else {
+        if (st[1] & 4) != 0 and (occ & 6917529027641081856) == 0 {
+            if attacked(bb, tab, 60, 0) == 0 and attacked(bb, tab, 61, 0) == 0 and attacked(bb, tab, 62, 0) == 0 {
+                mv[mo + n] = mk(60, 62, 0, 2)  n = n + 1
+            }
+        }
+        if (st[1] & 8) != 0 and (occ & 1008806316530991104) == 0 {
+            if attacked(bb, tab, 60, 0) == 0 and attacked(bb, tab, 59, 0) == 0 and attacked(bb, tab, 58, 0) == 0 {
+                mv[mo + n] = mk(60, 58, 0, 2)  n = n + 1
+            }
+        }
+    }
+    n
+}
+
+// ---- perft (ohne Bulk-Counting: make/unmake laeuft auf jeder Ebene) -----
+fn perft(bb: Array[Int], mb: Array[Int], st: Array[Int], tab: Array[Int],
+         mv: Array[Int], ud: Array[Int], depth: Int, ply: Int) -> Int {
+    if depth == 0 { return 1 }
+    mut mo = ply * 256
+    mut uo = ply * 4
+    mut n = gen(bb, mb, st, tab, mv, mo)
+    mut nodes = 0
+    mut us = st[0]
+    mut i = 0
+    while i < n {
+        mut m = mv[mo + i]
+        make(bb, mb, st, ud, uo, m)
+        mut ksq = ctz(bb[7] & bb[us])
+        if attacked(bb, tab, ksq, 1 - us) == 0 {
+            nodes = nodes + perft(bb, mb, st, tab, mv, ud, depth - 1, ply + 1)
+        }
+        unmake(bb, mb, st, ud, uo, m)
+        i = i + 1
+    }
+    nodes
+}
+
+// ---- Stellungsaufbau ----------------------------------------------------
+fn clear_board(bb: Array[Int], mb: Array[Int], st: Array[Int]) {
+    mut i = 0
+    while i < 8 { bb[i] = 0  i = i + 1 }
+    i = 0
+    while i < 64 { mb[i] = 0  i = i + 1 }
+    st[0] = 0  st[1] = 0  st[2] = 0 - 1  st[3] = 0
+}
+
+fn setup(id: Int, bb: Array[Int], mb: Array[Int], st: Array[Int]) {
+    clear_board(bb, mb, st)
+    if id == 0 {
+        // Grundstellung
+        mut i = 0
+        while i < 8 { put(bb, mb, 8 + i, 0, 2)  put(bb, mb, 48 + i, 1, 2)  i = i + 1 }
+        put(bb, mb, 0, 0, 5)   put(bb, mb, 1, 0, 3)   put(bb, mb, 2, 0, 4)
+        put(bb, mb, 3, 0, 6)   put(bb, mb, 4, 0, 7)   put(bb, mb, 5, 0, 4)
+        put(bb, mb, 6, 0, 3)   put(bb, mb, 7, 0, 5)
+        put(bb, mb, 56, 1, 5)  put(bb, mb, 57, 1, 3)  put(bb, mb, 58, 1, 4)
+        put(bb, mb, 59, 1, 6)  put(bb, mb, 60, 1, 7)  put(bb, mb, 61, 1, 4)
+        put(bb, mb, 62, 1, 3)  put(bb, mb, 63, 1, 5)
+        st[1] = 15
+    }
+    if id == 1 {
+        // Kiwipete: r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -
+        put(bb, mb, 56, 1, 5)  put(bb, mb, 60, 1, 7)  put(bb, mb, 63, 1, 5)
+        put(bb, mb, 48, 1, 2)  put(bb, mb, 50, 1, 2)  put(bb, mb, 51, 1, 2)
+        put(bb, mb, 52, 1, 6)  put(bb, mb, 53, 1, 2)  put(bb, mb, 54, 1, 4)
+        put(bb, mb, 40, 1, 4)  put(bb, mb, 41, 1, 3)  put(bb, mb, 44, 1, 2)
+        put(bb, mb, 45, 1, 3)  put(bb, mb, 46, 1, 2)
+        put(bb, mb, 35, 0, 2)  put(bb, mb, 36, 0, 3)
+        put(bb, mb, 25, 1, 2)  put(bb, mb, 28, 0, 2)
+        put(bb, mb, 18, 0, 3)  put(bb, mb, 21, 0, 6)  put(bb, mb, 23, 1, 2)
+        put(bb, mb, 8, 0, 2)   put(bb, mb, 9, 0, 2)   put(bb, mb, 10, 0, 2)
+        put(bb, mb, 11, 0, 4)  put(bb, mb, 12, 0, 4)  put(bb, mb, 13, 0, 2)
+        put(bb, mb, 14, 0, 2)  put(bb, mb, 15, 0, 2)
+        put(bb, mb, 0, 0, 5)   put(bb, mb, 4, 0, 7)   put(bb, mb, 7, 0, 5)
+        st[1] = 15
+    }
+    if id == 2 {
+        // Position 3: 8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -
+        put(bb, mb, 50, 1, 2)
+        put(bb, mb, 43, 1, 2)
+        put(bb, mb, 32, 0, 7)  put(bb, mb, 33, 0, 2)  put(bb, mb, 39, 1, 5)
+        put(bb, mb, 25, 0, 5)  put(bb, mb, 29, 1, 2)  put(bb, mb, 31, 1, 7)
+        put(bb, mb, 12, 0, 2)  put(bb, mb, 14, 0, 2)
+        st[1] = 0
+    }
+    if id == 3 {
+        // Position 4: r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq -
+        put(bb, mb, 56, 1, 5)  put(bb, mb, 60, 1, 7)  put(bb, mb, 63, 1, 5)
+        put(bb, mb, 48, 0, 2)  put(bb, mb, 49, 1, 2)  put(bb, mb, 50, 1, 2)
+        put(bb, mb, 51, 1, 2)  put(bb, mb, 53, 1, 2)  put(bb, mb, 54, 1, 2)
+        put(bb, mb, 55, 1, 2)
+        put(bb, mb, 41, 1, 4)  put(bb, mb, 45, 1, 3)  put(bb, mb, 46, 1, 4)
+        put(bb, mb, 47, 0, 3)
+        put(bb, mb, 32, 1, 3)  put(bb, mb, 33, 0, 2)
+        put(bb, mb, 24, 0, 4)  put(bb, mb, 25, 0, 4)  put(bb, mb, 26, 0, 2)
+        put(bb, mb, 28, 0, 2)
+        put(bb, mb, 16, 1, 6)  put(bb, mb, 21, 0, 3)
+        put(bb, mb, 8, 0, 2)   put(bb, mb, 9, 1, 2)   put(bb, mb, 11, 0, 2)
+        put(bb, mb, 14, 0, 2)  put(bb, mb, 15, 0, 2)
+        put(bb, mb, 0, 0, 5)   put(bb, mb, 3, 0, 6)   put(bb, mb, 5, 0, 5)
+        put(bb, mb, 6, 0, 7)
+        st[1] = 12
+    }
+}
+
+fn maxdepth_of(id: Int) -> Int {
+    if id == 0 { return 5 }
+    if id == 1 { return 5 }
+    if id == 2 { return 5 }
+    5
+}
+
+fn main() {
+    mut bb = array(8)
+    mut mb = array(64)
+    mut st = array(4)
+    mut tab = array(272)
+    mut mv = array(4096)
+    mut ud = array(64)
+    init_tab(tab)
+
+    // Verifikation: alle vier Stellungen bis Tiefe 5, eine Zahl je Zeile.
+    mut id = 0
+    while id < 4 {
+        mut d = 1
+        while d <= maxdepth_of(id) {
+            setup(id, bb, mb, st)
+            print(perft(bb, mb, st, tab, mv, ud, d, 0))
+            d = d + 1
+        }
+        id = id + 1
+    }
+
+    // Messlauf: Grundstellung, Tiefe 6.
+    setup(0, bb, mb, st)
+    print(perft(bb, mb, st, tab, mv, ud, 6, 0))
+}
