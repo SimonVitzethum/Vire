@@ -553,6 +553,15 @@ fn run(f: &mut Function, param_lens: &[Option<i64>]) -> usize {
     // is a value S is ≡ S (loop-invariant). Necessary because the pessimistic
     // GVN would otherwise hold invariant values flowing around the loop as a phi.
     let repr = compute_repr(&it, &phi_inc, &incomplete);
+    // `len_of` was built during the GVN fixpoint, before `repr` existed, so its keys are
+    // RAW syms — while every lookup below canonicalizes first. Whenever a sym is not its
+    // own representative the two miss each other and the length is invisible, which is
+    // why an array reached through a parameter (whose sym is typically merged with the
+    // copies it flows through) never found its length. Re-key once, here.
+    let len_of: HashMap<u32, u32> = len_of
+        .iter()
+        .map(|(&k, &v)| (canon(&repr, k), canon(&repr, v)))
+        .collect();
     let nn = compute_nonneg(&it, &phi_inc, &repr, &incomplete);
     // Constant upper + lower bound per sym (proves `lo ≤ i ≤ hi` across loop phis) —
     // the binary-search midpoint and matmul affine index, against a constant length.
@@ -569,15 +578,12 @@ fn run(f: &mut Function, param_lens: &[Option<i64>]) -> usize {
         if pty != Ty::Ref || *minlen < 0 {
             continue;
         }
-        let psym = canon(&repr, it.intern(SymExpr::Opaque(0xF000_0000 | pi as u32)));
-        // `len_of` is keyed by the raw array sym, while everything here works on
-        // canonical ones — a direct lookup misses whenever the parameter's sym is not
-        // its own representative. Match through the canonicalization instead.
-        let found = len_of
-            .iter()
-            .find(|(k, _)| canon(&repr, **k) == psym)
-            .map(|(_, &v)| v);
-        let Some(lensym0) = found else { continue };
+        // A parameter local is symed as `Param(i)` where it is seeded, but falls back to
+        // `Opaque(0xF000_0000|i)` in `sym_of_operand` when the env has no entry. Both can
+        // reach an access, so try both rather than guess.
+        let psym = canon(&repr, it.intern(SymExpr::Param(pi as u32)));
+        let pofs = canon(&repr, it.intern(SymExpr::Opaque(0xF000_0000 | pi as u32)));
+        let Some(&lensym0) = len_of.get(&psym).or_else(|| len_of.get(&pofs)) else { continue };
         let ln = canon(&repr, lensym0) as usize;
         if ln >= lb_fix.len() {
             lb_fix.resize(ln + 1, None);
