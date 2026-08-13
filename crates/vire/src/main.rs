@@ -1192,6 +1192,14 @@ fn build_or_run(args: &[String]) {
     let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
     let _ = timed!("elide_pending_checks", fastllvm_solver::elide_pending_checks(&mut program));
     s.inlined_calls = timed!("inline_program", fastllvm_solver::inline_program(&mut program));
+    // Bounds again, AFTER inlining. The first run above sees `fn f(a: Array[Int])` with
+    // the array as a parameter: no allocation site, hence no length, hence
+    // `provably_in_bounds` bails out on its first line and NOTHING is elided — a
+    // function that takes an array as a parameter got no elision at all. Once the callee
+    // is inlined, the array and its `array(n)` are in the same function and every path
+    // (constant length, loop guard, affine index) can finally see them. Cheap: the pass
+    // is linear in the IR and only re-marks, it never un-elides.
+    let _ = timed!("elide_bounds_post_inline", fastllvm_solver::elide_bounds(&mut program));
     s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
     // provably fit in i32 to 4 bytes (RAM). Sound (widening).

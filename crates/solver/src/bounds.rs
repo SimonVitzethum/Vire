@@ -285,6 +285,21 @@ fn transfer_block(
             }
             _ => {}
         }
+        // An array reached through a PARAMETER has no allocation site in this function,
+        // so nothing above ever gave it a length sym — and `provably_in_bounds` bails out
+        // on the very first line for want of one. Give every touched array a symbolic
+        // length (`Len(arr)`), exactly as an explicit `len(a)` would. It carries no
+        // value, so the value-based paths are unaffected; what it enables is reasoning
+        // about the length's IDENTITY — two accesses to the same array share one length,
+        // which is all Path 5 needs. Without this, a function taking `Array[Int]` as a
+        // parameter got no elision at all.
+        if let Statement::ArrayLoad { arr, .. } | Statement::ArrayStore { arr, .. } = st {
+            let asym = sym_of_operand(arr, &env, it);
+            if !len_of.contains_key(&asym) {
+                let l = it.intern(SymExpr::Len(asym));
+                len_of.insert(asym, l);
+            }
+        }
     }
     env
 }
@@ -497,9 +512,24 @@ fn run(f: &mut Function) -> usize {
         // Carry env along at each statement.
         let mut env = env_in[b].clone();
         let mut dummy_len = len_of.clone();
+        // Path 5 state: per array-length sym, the largest CONSTANT index whose check
+        // has already been passed in this block. A check that stays is not just a
+        // cost — it is a *fact*: control only reaches the next statement if the index
+        // was in bounds, so `k < len` holds from there on, and hence `j < len` for
+        // every `j ≤ k`. Block-local (no merge across edges), which needs no dataflow
+        // and is trivially sound: within a block control is linear.
+        let mut proven_max: HashMap<u32, i64> = HashMap::new();
         let stmts = &mut f.blocks[b].statements;
         for si in 0..stmts.len() {
-            let elide = match &stmts[si] {
+            // Path 5: a constant index already covered by a passed check on the same
+            // array. `bb[0]…bb[7]` costs one check, not eight. Computed BEFORE the
+            // elision below, which would clear `checked` and hide the fact.
+            let cidx = const_idx_of(&f_stmt(stmts, si), &env, &len_of, &repr, &mut it);
+            let path5 = match cidx {
+                Some((lensym, k)) => proven_max.get(&lensym).is_some_and(|&m| m >= k),
+                None => false,
+            };
+            let elide = path5 || match &stmts[si] {
                 // Ref loads may be elided (pure GEP); ref stores not,
                 // since `jrt_?astore` carries the covariance check (ArrayStoreException)
                 // that the inline path would not have.
@@ -518,6 +548,15 @@ fn run(f: &mut Function) -> usize {
                         count += 1;
                     }
                     _ => {}
+                }
+            }
+            // Record the constant-index fact this access establishes. Both an elided
+            // and a kept check leave `k < len` true afterwards — the elided one because
+            // it was already proven, the kept one because control would have trapped.
+            if let Some((lensym, k)) = cidx {
+                let e = proven_max.entry(lensym).or_insert(k);
+                if k > *e {
+                    *e = k;
                 }
             }
             // Advance env past this statement (only sym definitions).
@@ -584,9 +623,48 @@ fn step_env(st: &Statement, b: usize, si: usize, env: &mut Env, it: &mut Interne
         }
         _ => {}
     }
+    // Symbolic length for a parameter-reached array — see the same step in
+    // `transfer_block`; both walks must agree or the marking pass sees a different
+    // `len_of` than the fixpoint built.
+    if let Statement::ArrayLoad { arr, .. } | Statement::ArrayStore { arr, .. } = st {
+        let asym = sym_of_operand(arr, env, it);
+        if !len_of.contains_key(&asym) {
+            let l = it.intern(SymExpr::Len(asym));
+            len_of.insert(asym, l);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `(length sym, constant index)` of an array access whose index is a compile-time
+/// constant and whose array has a known length sym. The vehicle for Path 5: a
+/// constant index is the one case where a *passed* check transfers to other accesses
+/// for free, because the constants are ordered without any analysis.
+fn const_idx_of(
+    st: &Statement,
+    env: &Env,
+    len_of: &HashMap<u32, u32>,
+    repr: &[u32],
+    it: &mut Interner,
+) -> Option<(u32, i64)> {
+    let (arr, index, checked) = match st {
+        Statement::ArrayLoad { arr, index, checked, .. } => (arr, index, *checked),
+        Statement::ArrayStore { arr, index, checked, kind, .. } if !kind.is_ref() => (arr, index, *checked),
+        _ => return None,
+    };
+    // An unchecked access proves nothing: it may be out of bounds without trapping.
+    if !checked {
+        return None;
+    }
+    let asym = canon(repr, sym_of_operand(arr, env, it));
+    let lensym = canon(repr, *len_of.get(&asym)?);
+    let isym = canon(repr, sym_of_operand(index, env, it));
+    match it.exprs[isym as usize] {
+        SymExpr::Const(k) if k >= 0 => Some((lensym, k)),
+        _ => None,
+    }
+}
+
 fn provably_in_bounds(
     arr: &Operand,
     index: &Operand,
