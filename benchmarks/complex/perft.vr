@@ -91,6 +91,33 @@ fn init_tab(tab: Array[Int]) {
 }
 
 // ---- Slider-Angriffe (Richtungsschleife; v2: Magic Bitboards) -----------
+// Die Richtungen stehen als Konstanten hier, nicht in tab[]: C++ hat sie als
+// `const SLIDE_D[8][2]` im .rodata, wo LLVM die Werte KENNT und die Schleife damit
+// ausrollt. Vire hat (noch) keine konstanten Arrays — jede Tabelle ist ein
+// Laufzeit-Array, dessen Inhalt der Compiler nie sieht. Gemessen kostet der
+// tab[]-Lookup 8,9 % Gesamtlaufzeit gegenüber diesen gefalteten Funktionen; mit
+// comptime-Arrays (siehe unten) wäre das Sache des Compilers statt des Benchmarks.
+fn dirf(d: Int) -> Int {
+    if d == 0 { return 0 }
+    if d == 1 { return 0 }
+    if d == 2 { return 1 }
+    if d == 3 { return 0 - 1 }
+    if d == 4 { return 1 }
+    if d == 5 { return 1 }
+    if d == 6 { return 0 - 1 }
+    0 - 1
+}
+fn dirr(d: Int) -> Int {
+    if d == 0 { return 1 }
+    if d == 1 { return 0 - 1 }
+    if d == 2 { return 0 }
+    if d == 3 { return 0 }
+    if d == 4 { return 1 }
+    if d == 5 { return 0 - 1 }
+    if d == 6 { return 1 }
+    0 - 1
+}
+
 fn slide(tab: Array[Int], sq: Int, occ: Int, d0: Int, d1: Int) -> Int {
     mut atk = 0
     mut d = d0
@@ -99,8 +126,8 @@ fn slide(tab: Array[Int], sq: Int, occ: Int, d0: Int, d1: Int) -> Int {
         mut r = sq >>> 3
         mut go = 1
         while go == 1 {
-            f = f + tab[256 + d]
-            r = r + tab[264 + d]
+            f = f + dirf(d)
+            r = r + dirr(d)
             if f < 0 or f > 7 or r < 0 or r > 7 {
                 go = 0
             } else {
