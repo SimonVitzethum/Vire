@@ -21,7 +21,7 @@ pub use constprop::propagate_const_scalars;
 pub use escape::stack_allocate;
 pub use inline::inline_program;
 pub use narrow::narrow_fields;
-pub use own::{classify as classify_ownership, OwnReport, OwnState};
+pub use own::{classify as classify_ownership, OwnReport, OwnState, OwnUse};
 pub use refcopy::elide_redundant_ref_copies;
 
 use std::collections::{BTreeMap, BTreeSet};

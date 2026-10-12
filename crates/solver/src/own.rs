@@ -33,10 +33,22 @@ pub enum OwnState {
     Shared,
 }
 
+/// Per-local use info for codegen: how many consuming uses (stores into owned
+/// parents + returns, saturated at 2) and whether a return consumes it.
+/// A Unique local with 0 consumes is freed at function exit; with 1 consume
+/// ownership transfers there (store/return) and the exit skips it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnUse {
+    pub consumes: u8,
+    pub returned: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct OwnReport {
     /// Per (function, local) ownership state (ref locals only).
     pub state: BTreeMap<(String, u32), OwnState>,
+    /// Per (function, local) use info (ref locals only).
+    pub uses: BTreeMap<(String, u32), OwnUse>,
     pub n_ref: usize,
     pub n_unique: usize,
     pub n_borrow: usize,
@@ -475,10 +487,13 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
     // Reads (GetField base, non-capturing call args, conditions) are free.
     // Two consumers (`store(x); return x`, or two live copies each consumed)
     // would free twice → Shared. Computed per New/FreshCall root over its web.
+    // `consumers`/`returned` are hoisted: the backend needs per-local use info
+    // (transfer vs exit-free) alongside the state map.
+    let mut consumers = vec![0u32; n];
+    let mut returned = vec![false; n];
     {
-        // Consumer count per local: PutField/ArrayStore value into a non-Shared
-        // parent, or a returned operand.
-        let mut consumers = vec![0u32; n];
+        // Consumer count per local: PutField/ArrayStore value into an owned
+        // (Unique/Region) parent, or a returned operand.
         let mut bad_root = BTreeSet::new();
         for b in &f.blocks {
             for st in &b.statements {
@@ -512,6 +527,7 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             }
             if let Terminator::Return(Some(Operand::Copy(r))) = &b.terminator {
                 consumers[r.0 as usize] += 1;
+                returned[r.0 as usize] = true;
             }
         }
         // Attribute each local's consumers to its New/FreshCall root (follow the
@@ -678,12 +694,13 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
                 }
             }
         }
-        // Copies of promoted locals follow their source.
+        // Copies of promoted locals follow their source — unless knocked (a
+        // knocked use breaks ownership; never promote a knocked local).
         for b in &f.blocks {
             for st in &b.statements {
                 if let Statement::Assign(dest, Rvalue::Use(Operand::Copy(s))) = st {
                     let (d, s) = (dest.0 as usize, s.0 as usize);
-                    if f.locals[d] == Ty::Ref && state[d] == OwnState::Shared && state[s] != OwnState::Shared {
+                    if f.locals[d] == Ty::Ref && state[d] == OwnState::Shared && state[s] != OwnState::Shared && !knock.contains(&dest.0) {
                         state[d] = state[s];
                         grew = true;
                     }
@@ -700,6 +717,10 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             continue;
         }
         rep.state.insert((f.name.clone(), i as u32), state[i]);
+        rep.uses.insert(
+            (f.name.clone(), i as u32),
+            OwnUse { consumes: consumers[i].min(2) as u8, returned: returned[i] },
+        );
     }
     // Shared New sites (E300 candidates).
     let mut idx = 0usize;
