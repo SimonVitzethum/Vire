@@ -55,8 +55,8 @@ pub fn run(program: &mut Program) -> Stats {
     let func_index: BTreeMap<String, usize> =
         program.functions.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
 
-    let mut roots: Vec<String> = if func_index.contains_key("java_main") {
-        vec!["java_main".to_string()]
+    let mut roots: Vec<String> = if func_index.contains_key("vire_main") {
+        vec!["vire_main".to_string()]
     } else {
         // Library mode: no entry point known → everything is a root.
         func_index.keys().cloned().collect()

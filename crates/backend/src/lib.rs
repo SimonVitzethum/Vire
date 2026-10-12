@@ -500,10 +500,10 @@ impl DebugGen {
         self.next += 1;
         self.subs.insert(name.to_string(), sub);
         let l = if line == 0 { 1 } else { line };
-        // The program entry is lowered under the symbol `java_main` (the `@main`
+        // The program entry is lowered under the symbol `vire_main` (the `@main`
         // wrapper installs the runtime and calls it). Show it as `main` in the debug
         // name so a backtrace reads `main`, keeping `linkageName` = the real symbol.
-        let (disp, linkage) = if name == "java_main" {
+        let (disp, linkage) = if name == "vire_main" {
             ("main".to_string(), format!(", linkageName: \"{}\"", escape_md(name)))
         } else {
             (escape_md(name), String::new())
@@ -1109,7 +1109,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         writeln!(w, "}}").unwrap();
     }
 
-    if defined.contains("java_main") {
+    if defined.contains("vire_main") {
         writeln!(w, "define i32 @main() {{").unwrap();
         // Vtable pointer for String/wrapper objects created at runtime —
         // only if the String class occurs at all (Vire programs without
@@ -1127,7 +1127,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         for c in &program.classes {
             emit_clinit_chain(w, &ctx, &c.name, &defined, &mut emitted);
         }
-        writeln!(w, "  call void @java_main()").unwrap();
+        writeln!(w, "  call void @vire_main()").unwrap();
         // Release static ref fields (GC roots until program end) —
         // keeps the heap balance clean.
         for c in &program.classes {
@@ -2291,11 +2291,11 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
 /// Compact symbol table for the freestanding backtrace: an unordered array of
 /// `{ i64 function-address, ptr name }` plus its length, consumed by the runtime's
 /// `jrt_symbolize` (greatest start ≤ return-address). Names come from the LLVM symbol,
-/// with the entry `java_main` shown as `main` (matching the DISubprogram). Tiny and
+/// with the entry `vire_main` shown as `main` (matching the DISubprogram). Tiny and
 /// freestanding-only, so hosted binaries are not bloated (they use libc `backtrace`).
 fn emit_symtab(w: &mut String, program: &Program) {
     for (i, f) in program.functions.iter().enumerate() {
-        let disp: &str = if f.name == "java_main" { "main" } else { &f.name };
+        let disp: &str = if f.name == "vire_main" { "main" } else { &f.name };
         let mut bytes: Vec<u8> = disp.bytes().collect();
         bytes.push(0);
         let len = bytes.len();

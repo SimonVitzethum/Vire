@@ -16,7 +16,7 @@ fn field_packing_i32_with_mixed_arithmetic() {
     let small = t.fields.iter().find(|f| f.name == "small").expect("small");
     assert_eq!(small.ty, Ty::I32, "I32 field must be packed as i32");
     // main contains a Convert (i32→i64 sext) for the mixed arithmetic.
-    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let main = p.functions.iter().find(|f| f.name == "vire_main").expect("main");
     let has_convert = main.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Convert(_))));
     assert!(has_convert, "mixed i32/i64 arithmetic must widen the i32 field to i64");
 }
@@ -77,16 +77,16 @@ fn lower(src: &str) -> fastllvm_ir::Program {
 }
 
 #[test]
-fn main_becomes_java_main_and_void() {
+fn main_becomes_vire_main_and_void() {
     let p = lower("fn main() {\n print(1)\n}\n");
-    let f = p.functions.iter().find(|f| f.name == "java_main").expect("java_main");
+    let f = p.functions.iter().find(|f| f.name == "vire_main").expect("vire_main");
     assert_eq!(f.ret, Ty::Void);
 }
 
 #[test]
 fn tail_expression_determines_return_type() {
     // Without `-> T`: return type estimated from the tail (Ident → I64 default).
-    let p = lower("fn f(n) {\n mut a = n\n a\n}\n");
+    let p = lower("fn f(n: Int) {\n mut a = n\n a\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
 }
@@ -103,7 +103,7 @@ fn binding_then_assignment_no_shadowing() {
     // `mut s = 0` binds; `s = s + 1` in the body is an assignment to the SAME local
     // (not a new one). Expectation: only one local carries `s` → accumulator works.
     let p = lower("fn main() {\n mut s = 0\n for i in 0..3 { s = s + i }\n print(s)\n}\n");
-    let f = p.functions.iter().find(|f| f.name == "java_main").unwrap();
+    let f = p.functions.iter().find(|f| f.name == "vire_main").unwrap();
     // The accumulator local (0) is assigned multiple times (init + reassign in the
     // loop), not freshly bound each iteration (no shadowing).
     let assigns_to_zero = f.blocks.iter().flat_map(|b| &b.statements).filter(|s| {
@@ -116,7 +116,7 @@ fn binding_then_assignment_no_shadowing() {
 fn if_as_expression_yields_value() {
     // `if a>b {a} else {b}` as tail → function returns I64 (not Void),
     // and the merge block yields a result local.
-    let p = lower("fn max(a, b) {\n if a > b { a } else { b }\n}\n");
+    let p = lower("fn max(a: Int, b: Int) -> Int {\n if a > b { a } else { b }\n}\n");
     let f = p.functions.iter().find(|f| f.name == "max").unwrap();
     assert_eq!(f.ret, Ty::I64);
     // The last block returns a value (Return(Some(..))), not Return(None).
@@ -164,7 +164,7 @@ fn field_mutation_produces_putfield() {
 #[test]
 fn capsule_wraps_body_with_arena() {
     // Pure form: arena_push before the body, arena_pop afterward; scalar result out.
-    let p = lower("fn f(n) {\n capsule(n) {\n mut s = 0\n s = s + n\n s\n }\n}\n");
+    let p = lower("fn f(n: Int) -> Int {\n capsule(n) {\n mut s = 0\n s = s + n\n s\n }\n}\n");
     let f = p.functions.iter().find(|f| f.name == "f").unwrap();
     assert_eq!(f.ret, Ty::I64);
     let calls: Vec<&str> = f.blocks.iter().flat_map(|b| &b.statements).filter_map(|s| {
@@ -321,7 +321,7 @@ fn auto_arena_promotes_non_escaping_loop() {
     // discards it → per-iteration arena (jrt_arena_push/pop in the body).
     let src = "type Tree { l: Tree  r: Tree }\nfn make(d: Int) -> Tree {\n if d == 0 { Tree(null, null) } else { Tree(make(d - 1), make(d - 1)) }\n}\nfn check(t: Tree, d: Int) -> Int {\n if d == 0 { 1 } else { 1 + check(t.l, d - 1) + check(t.r, d - 1) }\n}\nfn main() {\n mut s = 0\n mut n = 0\n while n < 10 {\n s = s + check(make(5), 5)\n n = n + 1\n }\n print(s)\n}\n";
     let p = lower(src);
-    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let main = p.functions.iter().find(|f| f.name == "vire_main").expect("main");
     let calls: Vec<&str> = main.blocks.iter().flat_map(|b| &b.statements).filter_map(|s| if let fastllvm_ir::Statement::Call { func, .. } = s { Some(func.as_str()) } else { None }).collect();
     assert!(calls.contains(&"jrt_arena_push"), "non-escaping alloc loop must get an auto-arena: {calls:?}");
     assert!(calls.contains(&"jrt_arena_pop"), "auto-arena needs pop");
@@ -334,7 +334,7 @@ fn auto_arena_avoids_escaping_loop() {
     // (otherwise dangling). `head = Node(head, i)` is a let of an outer ref.
     let src = "type Node { next: Node  v: Int }\nfn main() {\n mut head = null\n mut i = 0\n while i < 100 {\n head = Node(head, i)\n i = i + 1\n }\n mut s = 0\n mut cur = head\n while cur != null {\n s = s + cur.v\n cur = cur.next\n }\n print(s)\n}\n";
     let p = lower(src);
-    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let main = p.functions.iter().find(|f| f.name == "vire_main").expect("main");
     let has_arena = main.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_arena_push"));
     assert!(!has_arena, "escaping (list-building) loop must NOT get an auto-arena");
 }
@@ -347,7 +347,7 @@ fn macro_expands_and_is_hygienic() {
     let src = "macro add_one(x) = { mut tmp = 1\n x + tmp }\nfn main() {\n mut tmp = 10\n print(add_one(tmp))\n}\n";
     let p = lower(src);
     // The macro definition is gone; only main remains.
-    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let main = p.functions.iter().find(|f| f.name == "vire_main").expect("main");
     // The introduced `tmp` was renamed → the IR has an addition of the
     // argument (local of the caller's tmp) + the local 1, not a double argument.
     let adds = main.blocks.iter().flat_map(|b| &b.statements).filter(|s| {
@@ -372,7 +372,7 @@ fn higher_order_inline_defunctionalized() {
     let p = lower(src);
     assert!(!p.functions.iter().any(|f| f.name == "apply"), "higher-order template must not be emitted standalone");
     // The lambda body (y + c) is inlined in main → an Add with the capture c.
-    let main = p.functions.iter().find(|f| f.name == "java_main").expect("main");
+    let main = p.functions.iter().find(|f| f.name == "vire_main").expect("main");
     let has_add = main.blocks.iter().flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::Assign(_, fastllvm_ir::Rvalue::Binary(fastllvm_ir::BinOp::Add, ..)))
     });
@@ -464,4 +464,15 @@ fn traits_static_dispatch() {
     let calls_show = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements)
         .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "P.show"));
     assert!(calls_show, "monomorphized display must call P.show");
+}
+
+#[test]
+fn e100_uninferrable_signature_is_rejected() {
+    // E100 (AGENTS.md §4): a parameter whose type inference cannot resolve is a
+    // compile error — never a silent I64 default (which would miscompile).
+    let (mut m, diags) = parse("fn f(n) {\n mut a = n\n a\n}\n");
+    assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+    let _ = infer_module(&mut m);
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("E100")), "expected E100, got {errs:?}");
 }

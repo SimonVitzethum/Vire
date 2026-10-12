@@ -282,6 +282,11 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             if !f.sig.generics.is_empty() {
                 continue;
             }
+            // Higher-order templates are never lowered standalone (inlined at
+            // call sites, params bound there) — nothing to check here.
+            if is_higher_order(f) {
+                continue;
+            }
             for p in &f.sig.params {
                 if p.ty.is_none() {
                     errs.push(format!(
@@ -4403,7 +4408,7 @@ fn lower_fn(
     let ret = guess_ret_ty(f);
     let name = match sym {
         Some(s) => s.to_string(),
-        None if f.sig.name == "main" => "java_main".to_string(),
+        None if f.sig.name == "main" => "vire_main".to_string(),
         None => f.sig.name.clone(),
     };
     let mut fl = FnLower {

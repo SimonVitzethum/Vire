@@ -2510,7 +2510,7 @@ void jrt_checkcast(void *obj, void *target_td) {
     }
 }
 
-/* Called by @main after java_main: report an unhandled exception.
+/* Called by @main after vire_main: report an unhandled exception.
  * (Generic without runtime type info — class name/message would be a
  * later step, DESIGN.md §6.) */
 void jrt_check_uncaught(void) {

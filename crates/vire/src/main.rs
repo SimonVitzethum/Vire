@@ -1123,7 +1123,7 @@ fn build_or_run(args: &[String]) {
             eprintln!("--emit-module: expected at least one scalar `fn NAME(x: Int) -> Int` (entry `module_main` and/or an override)");
             exit(1);
         }
-    } else if !program.functions.iter().any(|f| f.name == "java_main") {
+    } else if !program.functions.iter().any(|f| f.name == "vire_main") {
         eprintln!("no entry point: expected `fn main()`");
         exit(1);
     }

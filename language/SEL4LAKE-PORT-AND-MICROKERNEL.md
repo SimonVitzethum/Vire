@@ -56,7 +56,7 @@ primarily a **runtime backend** (`FASTLLVM_FREESTANDING` exists as a skeleton).
    slab fit ideally into tight regions.
 3. **IO:** `plat_write/puts` → SEL4Lake IPC (endpoint to a console/serial
    server), no stdio. A tiny `println`→IPC shim.
-4. **Entry:** the loader calls the program entry; `main`→`java_main` stays, but
+4. **Entry:** the loader calls the program entry; `main`→`vire_main` stays, but
    without `atexit` (component runs permanently / terminated via supervisor).
 
 **Phase B — concurrency + interop:**

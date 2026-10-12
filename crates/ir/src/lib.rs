@@ -325,7 +325,8 @@ pub struct Program {
     pub class_objects: Vec<(String, u32)>,
     /// Entry class (internal name, e.g. `com/x/App`), if known
     /// (JAR manifest `Main-Class` or `--main`). Only its `main` becomes
-    /// `java_main`; if `None`, any `main` method applies (single-file mode).
+    /// Entry function name (`vire_main`); if `None`, any `main` applies
+    /// (single-file mode).
     pub main_class: Option<String>,
     /// Functions kept as reachability roots because they are invoked through
     /// generated/native glue invisible to RTA (e.g. a Vire `spawn` worker, called
@@ -449,10 +450,9 @@ pub fn sanitize(s: &str) -> String {
 }
 
 /// Linker symbol of a method. Must be consistent across all crates.
+/// (The old JVM-descriptor special case is gone with Java: Vire names its
+/// entry `vire_main` directly in lowering.)
 pub fn mangle(class: &str, name: &str, descriptor: &str) -> String {
-    if name == "main" && descriptor == "([Ljava/lang/String;)V" {
-        return "java_main".to_string();
-    }
     format!("J_{}_{}_{}", sanitize(class), sanitize(name), sanitize(descriptor))
 }
 
