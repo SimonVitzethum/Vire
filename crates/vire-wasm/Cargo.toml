@@ -16,3 +16,6 @@ path = "src/main.rs"
 [dependencies]
 vire = { path = "../vire", default-features = false }
 fastllvm-ir = { path = "../ir" }
+
+[lints]
+workspace = true

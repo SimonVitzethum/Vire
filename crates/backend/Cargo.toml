@@ -6,3 +6,6 @@ version.workspace = true
 
 [dependencies]
 fastllvm-ir = { path = "../ir" }
+
+[lints]
+workspace = true

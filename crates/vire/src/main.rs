@@ -446,7 +446,7 @@ fn verify_blocks_parallel(jobs: &[(usize, PathBuf, String, &'static str, String)
                 eprintln!(
                     "error: native \"{abi}\" block {i} is not provably memory-safe \
                      (rejected instead of trusted like `unsafe`):\n{report}\n       \
-                     Close the proof with a contract/`@assume`, or opt out with `--noverify`."
+                     Close the proof with a contract/`@assume` (E410: there is no opt-out)."
                 );
                 exit(1);
             }
@@ -748,11 +748,10 @@ fn build_or_run(args: &[String]) {
     let mut link_libs: Vec<String> = Vec::new();
     let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
-    // Memory-safety verification of `native "c"`/`native "asm"` blocks is ON BY
-    // DEFAULT (the sound alternative to a blind `unsafe`): each block is proven safe by
+    // Memory-safety verification of `native "c"`/`native "asm"` blocks is
+    // MANDATORY (the sound alternative to a blind `unsafe`): each block is proven safe by
     // the vendored CSolver verifier (linked in — no external binary) or it is a compile
-    // error. `--noverify` turns it off.
-    let mut noverify = false;
+    // error (E410). There is no opt-out (AGENTS.md §3).
     let mut threads_flag = false;
     let mut backtrace_flag = false;
     let mut debug_flag = false;
@@ -784,9 +783,13 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
-            // Disable the inline-C/asm memory-safety verifier for native blocks.
-            // `--unsafe-c` / `--no-verify-c` are explicit aliases of `--noverify`.
-            "--noverify" | "--unsafe-c" | "--no-verify-c" => noverify = true,
+            // REMOVED (AGENTS.md §3, E410): `--noverify`/`--unsafe-c`/`--no-verify-c`
+            // disabled the memory-safety proof for native blocks. There is no opt-out;
+            // use a contract/`@assume` or remove the block.
+            "--noverify" | "--unsafe-c" | "--no-verify-c" => {
+                eprintln!("error[E410]: `--noverify`/`--unsafe-c` is removed — native blocks must verify (AGENTS.md §3). Close the proof with a contract/`@assume`.");
+                exit(2);
+            }
             // Force the threads runtime even without `spawn` (atomic RC + pthreads).
             // `spawn` enables it automatically; this is for explicit control.
             "--threads" => threads_flag = true,
@@ -1248,12 +1251,12 @@ fn build_or_run(args: &[String]) {
             eprintln!("writing native block: {e}");
             exit(1);
         }
-        // Verification gate (ON BY DEFAULT): a `native "c"`/`native "asm"` block is
+        // Verification gate (MANDATORY): a `native "c"`/`native "asm"` block is
         // accepted only when the vendored CSolver memory-safety verifier PROVES it safe
         // (called as a library — structured verdicts, no subprocess) — the sound
         // replacement for a blind `unsafe`. A block that cannot be proven safe is a
-        // compile error, not a runtime hazard. `--noverify` opts out.
-        if !noverify && !glue && (ext == "c" || ext == "s") {
+        // compile error (E410), not a runtime hazard. No opt-out.
+        if !glue && (ext == "c" || ext == "s") {
             verify_jobs.push((i, p.clone(), code.clone(), ext, abi.clone()));
         }
         native_paths.push(p);

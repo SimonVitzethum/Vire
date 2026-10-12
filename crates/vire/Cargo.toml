@@ -39,3 +39,6 @@ native = [
     "dep:csolver-verifier",
     "dep:csolver-report",
 ]
+
+[lints]
+workspace = true
