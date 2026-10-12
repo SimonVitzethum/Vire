@@ -271,6 +271,52 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     let mut prog = Program::default();
     let mut errs = Vec::new();
 
+    // E100 (AGENTS.md §4, fully typed): after inference every `fn` parameter and
+    // return type must be known. Anything still un-annotated here was NOT inferred
+    // (inference only ever fills in, never defaults) — silently defaulting to I64
+    // would miscompile instead of rejecting. `main`'s return stays Void by design;
+    // `self` is always a Ref; generic fns are exempt (monomorphized per call site,
+    // their `T` params bind at instantiation).
+    for it in &m.items {
+        if let Item::Fn(f) = it {
+            if !f.sig.generics.is_empty() {
+                continue;
+            }
+            for p in &f.sig.params {
+                if p.ty.is_none() {
+                    errs.push(format!(
+                        "error[E100]: cannot infer type of parameter `{}` in `fn {}` — annotate it (e.g. `{}: Int`)",
+                        p.name, f.sig.name, p.name
+                    ));
+                }
+            }
+            if f.sig.ret.is_none() && f.sig.name != "main" {
+                errs.push(format!(
+                    "error[E100]: cannot infer return type of `fn {}` — annotate it (e.g. `-> Int`)",
+                    f.sig.name
+                ));
+            }
+        }
+        if let Item::Extern { items, .. } = it {
+            for s in items {
+                for p in &s.params {
+                    if p.ty.is_none() {
+                        errs.push(format!(
+                            "error[E100]: `extern` parameter `{}` in `{}` must be annotated (C-ABI needs the type)",
+                            p.name, s.name
+                        ));
+                    }
+                }
+                if s.ret.is_none() {
+                    errs.push(format!(
+                        "error[E100]: `extern` function `{}` must have an annotated return type",
+                        s.name
+                    ));
+                }
+            }
+        }
+    }
+
     // Product types → classes. Sum types → ONE tagged class: field `__tag`
     // (I64) + all variant fields flattened (`Variant_field`). Match dispatches
     // via `__tag`. (Space = sum of all variants; simple, fits the flat

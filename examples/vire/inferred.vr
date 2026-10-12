@@ -1,8 +1,9 @@
 // Type inference — the ergonomics claim, demonstrated instead of asserted.
 //
-// Not one type annotation appears on a local or a return, and one parameter
-// (`v` in `lensq`) has no annotation at all: the monomorphic unifier fixes it
-// to `Vec2` from the way it is used. Run it:  vire run examples/vire/inferred.vr
+// Locals never need annotations, and signatures need them only where the
+// monomorphic unifier cannot see through (object field types live in lowering,
+// not in inference — annotate the signature, E100). Run it:
+//   vire run examples/vire/inferred.vr
 //
 // (The graphics/thread examples in this folder annotate every signature for
 //  readability; that is a style choice, not a language requirement — as this
@@ -10,15 +11,15 @@
 
 type Vec2 { x: Int y: Int }
 
-fn dot(a: Vec2, b: Vec2) {           // no return type — inferred Int
+fn dot(a: Vec2, b: Vec2) -> Int {   // return type annotated (E100)
     a.x * b.x + a.y * b.y
 }
 
-fn lensq(v) {                         // no annotation at all — v inferred Vec2
+fn lensq(v: Vec2) -> Int {            // fully annotated (E100)
     dot(v, v)
 }
 
-fn scale(x) {                         // inferred Float, purely from the literal below
+fn scale(x: Float) -> Float {         // annotated (E100)
     x * 2.0
 }
 
