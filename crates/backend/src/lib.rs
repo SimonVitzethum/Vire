@@ -1051,10 +1051,14 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     // `dynamic fn` / `open fn`, initialized to the function's own body (the default). A call
     // to such a fn loads its slot and calls through it (see Statement::Call); the runtime's
     // `jrt_dyn_install` overwrites a slot with a loaded module's override. `extern void
-    // *jrt_dynslot[]` in runtime.c binds here. Emitted only when the program has seams.
+    // *jrt_dynslot[]` in runtime.c binds here. Always emitted (even empty): the
+    // runtime's `jrt_dyn_install` references it unconditionally, and link modes
+    // that keep unstripped symbols (`-rdynamic` for --backtrace) fail otherwise.
     if !program.dyn_fns.is_empty() {
         let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
         writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
+    } else {
+        writeln!(w, "@jrt_dynslot = global [0 x ptr] zeroinitializer").unwrap();
     }
     // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
     // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
@@ -1076,6 +1080,11 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
             .map(|(i, n)| format!("{{ i64, i64, ptr }} {{ i64 ptrtoint (ptr @{n} to i64), i64 14, ptr @.patchname.{i} }}"))
             .collect();
         writeln!(w, "@jrt_patchtab = constant [{} x {{ i64, i64, ptr }}] [{}]", patch_set.len(), recs.join(", ")).unwrap();
+    } else {
+        // Always emitted (even empty): the runtime patcher references the table
+        // unconditionally; unstripped link modes would fail otherwise (see dynslot).
+        writeln!(w, "@jrt_patchtab_len = constant i64 0").unwrap();
+        writeln!(w, "@jrt_patchtab = constant [0 x {{ i64, i64, ptr }}] zeroinitializer").unwrap();
     }
 
     // Freestanding: a compact symbol table (function address → name) so the runtime's

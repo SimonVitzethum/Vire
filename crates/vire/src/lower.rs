@@ -819,7 +819,10 @@ fn class_of(t: Option<&Type>) -> Option<String> {
         // `Ref` = an object reference of unknown class (the inference write-back name):
         // no class attached, exactly like `Str` — so a method call falls through to the
         // string-method / unknown-type path, never a bogus class named "Ref".
-        "Float" | "F64" | "F32" | "Bool" | "Str" | "Ref" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr" => None,
+        "Float" | "F64" | "F32" | "Bool" | "Str" | "Ref" | "I32" | "U32" | "Int" | "I64" | "U64" | "Unit" | "Ptr"
+        // Sub-word element types are scalars, not classes: `Array[Byte]` is a U8
+        // array, not a ref array (a missing name here misreads the slots as ptr).
+        | "Byte" | "U8" | "I8" | "Char" | "U16" | "I16" | "Short" => None,
         _ => Some(name.to_string()),
     }
 }
