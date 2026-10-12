@@ -1135,13 +1135,11 @@ fn build_or_run(args: &[String]) {
         else { $e } }} }
     let mut s = timed!("solver::run", fastllvm_solver::run(&mut program));
     let _ = timed!("elide_redundant_ref_copies", fastllvm_solver::elide_redundant_ref_copies(&mut program));
-    let _ = timed!("fuse_long_compares", fastllvm_solver::fuse_long_compares(&mut program));
     // Constant-propagate entry-block scalar constants first: a divisor that was a
     // `mut n = <const>` local becomes a literal → native srem/magic-multiply
     // instead of a jrt_lrem call, and constant sizes/bounds help the passes below.
     let _ = timed!("propagate_const_scalars", fastllvm_solver::propagate_const_scalars(&mut program));
     let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
-    let _ = timed!("elide_pending_checks", fastllvm_solver::elide_pending_checks(&mut program));
     s.inlined_calls = timed!("inline_program", fastllvm_solver::inline_program(&mut program));
     s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
