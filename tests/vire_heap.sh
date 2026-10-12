@@ -183,7 +183,7 @@ EOF
 #     in place through a ref param (was impossible: a ref param carried no ArrKind).
 #     Prints 1 iff fully sorted, and must end 0-live (the array is freed). ---
 case_ array_param_qsort 1 <<'EOF'
-fn qsort(a: Array[Int], lo: Int, hi: Int) {
+fn qsort(a: Array[Int], lo: Int, hi: Int) -> Unit {
     if lo < hi {
         mut pivot = a[hi]
         mut i = lo - 1

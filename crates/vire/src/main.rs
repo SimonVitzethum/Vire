@@ -1148,6 +1148,20 @@ fn build_or_run(args: &[String]) {
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
     // provably fit in i32 to 4 bytes (RAM). Sound (widening).
     let _narrowed = timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program));
+    // Solver-side ownership classification (borrowck offload, AGENTS.md §2):
+    // analysis-only report behind FASTLLVM_DUMP_OWN=1 — measures the provable
+    // fraction (Unique/Borrow/Region vs Shared). No codegen effect yet.
+    if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() {
+        let rep = fastllvm_solver::classify_ownership(&program);
+        eprintln!(
+            "[own] ref={} unique={} borrow={} region={} shared={} shared_new_sites={}",
+            rep.n_ref, rep.n_unique, rep.n_borrow, rep.n_region, rep.n_shared,
+            rep.shared_news.len()
+        );
+        for (f, i) in &rep.shared_news {
+            eprintln!("[own] shared-new {f} stmt#{i}");
+        }
+    }
     let acyclic = s.acyclic;
 
     if emit_ir {

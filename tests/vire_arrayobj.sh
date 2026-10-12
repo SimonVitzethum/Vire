@@ -109,7 +109,7 @@ EOF
 #    iteration through the callees → still arena. ids 0,10,20,30 sum = 60, ×1000.
 run refarray_param_calls promote 60000 <<'EOF'
 type Node { id: Int  next: Node }
-fn link(a: Array[Node], n: Int) {
+fn link(a: Array[Node], n: Int) -> Unit {
     mut j = 0
     while j < n - 1 { a[j].next = a[j + 1]  j = j + 1 }
 }
@@ -156,7 +156,7 @@ EOF
 reject reject_param_mismatch "array element is \`A\`, stored value is \`B\`" <<'EOF'
 type A { x: Int }
 type B { y: Int }
-fn put(a: Array[A]) { a[0] = B(1) }
+fn put(a: Array[A]) -> Unit { a[0] = B(1) }
 fn main() { mut a: Array[A] = array(2)  put(a)  print(0) }
 EOF
 

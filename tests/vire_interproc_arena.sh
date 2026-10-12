@@ -135,7 +135,7 @@ check callee_field_store decline 999 <<'EOF'
 type N { k: Int  v: Int  l: N  r: N }
 type Box { item: N }
 fn make(x: Int) -> N { N(0, x, null, null) }
-fn stash(b: Box, x: Int) { b.item = make(x) }
+fn stash(b: Box, x: Int) -> Unit { b.item = make(x) }
 fn main() {
     mut b = Box(null)
     mut i = 0
@@ -262,7 +262,7 @@ EOF
 check callee_fresh_mutation promote 80000 <<'EOF'
 type Node { id: Int  next: Node  side: Node }
 fn chain(len: Int) -> Node { if len == 0 { null } else { Node(len, chain(len - 1), null) } }
-fn link(a: Node, b: Node) { a.next = b }
+fn link(a: Node, b: Node) -> Unit { a.next = b }
 fn main() {
     mut sum = 0
     mut t = 0
@@ -284,7 +284,7 @@ EOF
 check callee_outer_base decline 999949972 <<'EOF'
 type Node { id: Int  next: Node  side: Node }
 fn mk(v: Int) -> Node { Node(v, null, null) }
-fn link(a: Node, b: Node) { a.next = b }
+fn link(a: Node, b: Node) -> Unit { a.next = b }
 fn main() {
     mut keep = mk(0)
     mut sum = 0
@@ -305,7 +305,7 @@ EOF
 check callee_outer_value decline 700000 <<'EOF'
 type Node { id: Int  next: Node  side: Node }
 fn mk(v: Int) -> Node { Node(v, null, null) }
-fn link(a: Node, b: Node) { a.next = b }
+fn link(a: Node, b: Node) -> Unit { a.next = b }
 fn main() {
     mut ext = mk(7)
     mut sum = 0
