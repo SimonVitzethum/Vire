@@ -24,9 +24,6 @@ use std::fmt::Write;
 
 use fastllvm_ir::*;
 
-mod nvptx;
-pub use nvptx::{emit_gpu_stubs, emit_ptx};
-pub mod spirv;
 
 fn llty(ty: Ty) -> &'static str {
     match ty {

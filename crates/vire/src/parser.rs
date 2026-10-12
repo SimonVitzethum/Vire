@@ -153,11 +153,10 @@ impl Parser {
                 // Dynamic-surface seam declarations: `dynamic fn` / `open trait|type|fn`.
                 | Tok::Kw(Kw::Dynamic) | Tok::Kw(Kw::Open)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
-            // `@derive(...)`/`@when(...)`/`@gpu` and the `@vulkan` shader stages
-            // (`@vertex`/`@fragment`/`@compute`/`@task`/`@mesh`) introduce a
+            // `@derive(...)`/`@when(...)` introduce a
             // declaration item (other `@…` stay expressions/script statements, e.g.
             // inline `@c`/`@asm` blocks).
-            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "gpu" | "vertex" | "fragment" | "compute" | "task" | "mesh" | "gpuvk" | "patchable")))
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "patchable")))
             // `name!(…)` — an item-macro invocation.
             || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }

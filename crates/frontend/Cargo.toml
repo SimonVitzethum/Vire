@@ -1,9 +1,0 @@
-[package]
-name = "fastllvm-frontend"
-license = "GPL-3.0-or-later"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-fastllvm-classfile = { path = "../classfile" }
-fastllvm-ir = { path = "../ir" }

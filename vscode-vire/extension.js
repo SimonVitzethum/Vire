@@ -192,10 +192,6 @@ const BUILTINS = [
     ['map', 'map() — hash map'],
     ['set', 'set() — hash set'],
     ['parallel_for', 'parallel_for(n, shared, worker) — fork/join over 0..n'],
-    ['gpu_gid', 'gpu_gid() — global GPU thread index (inside @gpu)'],
-    ['gpu_gsize', 'gpu_gsize() — total GPU thread count (grid stride)'],
-    ['gpu_tid', 'gpu_tid() — threadIdx.x'], ['gpu_bid', 'gpu_bid() — blockIdx.x'],
-    ['gpu_bdim', 'gpu_bdim() — blockDim.x'], ['gpu_gdim', 'gpu_gdim() — gridDim.x'],
 ];
 
 // Methods per receiver kind (name → [method, doc]).

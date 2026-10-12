@@ -10,39 +10,9 @@ use std::process::{exit, Command};
 
 mod cverify;
 
-// The same runtime as the Java driver (crates/driver/src/runtime.c) — a
-// shared `main`→`java_main` entry point, the same jrt_ helpers.
-const RUNTIME_C: &str = include_str!("../../driver/src/runtime.c");
-// Built-in Python bridge: allows Python libs from pure Vire (no user C).
-const PYBRIDGE_C: &str = include_str!("pybridge.c");
-// Host-side CUDA Driver-API runtime for `@gpu` kernels (see language/GPU-KERNELS.md).
-const GPU_RUNTIME_C: &str = include_str!("../../driver/src/gpu_runtime.c");
-const VK_RUNTIME_C: &str = include_str!("../../driver/src/vk_runtime.c");
-
-/// Emits `text` as a sequence of adjacent C string literals, one per line (so the
-/// PTX embeds as `const char jrt_gpu_ptx[] = "...\n" "...\n";`). Escapes `\`, `"`.
-fn c_string_literal(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.split_inclusive('\n') {
-        out.push('"');
-        for ch in line.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\t' => out.push_str("\\t"),
-                '\r' => out.push_str("\\r"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\{:03o}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out.push_str("\"\n");
-    }
-    if out.is_empty() {
-        out.push_str("\"\"");
-    }
-    out
-}
+// The minimal C support source (crates/runtime/runtime.c) — entry point,
+// print helpers. No GC, no RC, no collector (AGENTS.md §2).
+const RUNTIME_C: &str = include_str!("../../runtime/runtime.c");
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1064,16 +1034,10 @@ fn build_or_run(args: &[String]) {
     // FFI from the source: `extern "…" link "lib"` + `native "…" … """code"""`.
     // Link libs → clang `-l`; native blocks → compiled in automatically.
     let mut native_blocks: Vec<(String, String)> = cxx_native;
-    // Does the program use the built-in Python bridge (`vire_py_*`)? Then
-    // pybridge.c is compiled in automatically + libpython linked — NO user C.
-    let mut want_py_bridge = false;
     for it in &module.items {
         match it {
-            vire::ast::Item::Extern { items, links, .. } => {
+            vire::ast::Item::Extern { links, .. } => {
                 link_libs.extend(links.iter().cloned());
-                if items.iter().any(|s| s.name.starts_with("vire_py_") || s.name.starts_with("py_")) {
-                    want_py_bridge = true;
-                }
             }
             vire::ast::Item::Native { abi, code, links, .. } => {
                 link_libs.extend(links.iter().cloned());
@@ -1163,13 +1127,6 @@ fn build_or_run(args: &[String]) {
     // Spawn workers are called only from their generated C shim (invisible to the
     // solver's RTA) → keep them as reachability roots so they are not pruned.
     program.exported = spawn_workers;
-    // Also trigger the Python bridge when `py_*` is used WITHOUT an extern block
-    // (the signatures are built in) — detectable on the lowered program.
-    if !want_py_bridge {
-        want_py_bridge = program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|st| {
-            matches!(st, fastllvm_ir::Statement::Call { func, .. } if func.starts_with("py_") || func.starts_with("vire_py_"))
-        });
-    }
 
     // Solver + optimization passes — identical to the Java driver.
     let _tdbg = std::env::var_os("FASTLLVM_TIME_PASSES").is_some();
@@ -1261,245 +1218,6 @@ fn build_or_run(args: &[String]) {
     if let Err(e) = std::fs::write(&ll_path, &ll).and_then(|_| std::fs::write(&rt_path, RUNTIME_C)) {
         eprintln!("writing to {}: {e}", build_dir.display());
         exit(1);
-    }
-    // === GPU (@gpu kernels): NVPTX device module → PTX → embedded + launch stubs ===
-    // A `@gpu` function is compiled to an nvptx64 LLVM module, turned into PTX by
-    // `llc`, embedded as a C string, and paired with a generated launch stub whose
-    // symbol matches the kernel name (so the host `call @<name>` links to it). The
-    // whole thing links against libcuda. See language/GPU-KERNELS.md.
-    // @vulkan runtime: linked only when the program actually calls a `jrt_vk_*`
-    // builtin (so binaries without Vulkan don't pull in libvulkan). See
-    // crates/driver/src/vk_runtime.c, language/GPU-VULKAN.md.
-    let want_vulkan = program.functions.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.statements.iter().any(|s| {
-                matches!(s, fastllvm_ir::Statement::Call { func, .. } if func.starts_with("jrt_vk_"))
-            })
-        })
-    });
-    let mut vk_paths: Vec<PathBuf> = Vec::new();
-    if want_vulkan {
-        let vk_path = build_dir.join("vk_runtime.c");
-        if let Err(e) = std::fs::write(&vk_path, VK_RUNTIME_C) {
-            eprintln!("writing vulkan runtime: {e}");
-            exit(1);
-        }
-        vk_paths.push(vk_path);
-        // Generate the shader SPIR-V — Vire owns it: emit SPIR-V assembly
-        // (crates/backend/src/spirv.rs), assemble with `spirv-as` (graphics Shader
-        // flavor, which `llc -march=spirv64` does not do), and link the words in as
-        // a generated C TU. The @fragment color comes from the Vire source.
-        // Fragment: the Vire-compiled `@fragment` shader (crates/vire/src/shader.rs),
-        // or a default constant color when the program defines no fragment stage.
-        let frag_asm = program
-            .frag_spvasm
-            .clone()
-            .unwrap_or_else(|| fastllvm_backend::spirv::constant_fragment_spvasm([1.0, 0.4, 0.1, 1.0]));
-        // `target` selects the SPIR-V version: the graphics stages are 1.0, the mesh
-        // stage needs 1.4 (MeshShadingEXT / OpExecutionModeId).
-        let assemble = |asm: &str, stem: &str, target: Option<&str>| -> Vec<u32> {
-            let asm_path = build_dir.join(format!("{stem}.spvasm"));
-            let spv_path = build_dir.join(format!("{stem}.spv"));
-            if std::fs::write(&asm_path, asm).is_err() {
-                eprintln!("writing {stem}.spvasm failed");
-                exit(1);
-            }
-            let mut cmd = Command::new("spirv-as");
-            if let Some(t) = target {
-                cmd.arg("--target-env").arg(t);
-            }
-            match cmd.arg(&asm_path).arg("-o").arg(&spv_path).status() {
-                Ok(s) if s.success() => {}
-                _ => {
-                    eprintln!("error: `spirv-as` failed/absent — @vulkan shaders need spirv-tools");
-                    exit(1);
-                }
-            }
-            let bytes = std::fs::read(&spv_path).unwrap_or_default();
-            bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-        };
-        let vert_asm = program
-            .vert_spvasm
-            .clone()
-            .unwrap_or_else(fastllvm_backend::spirv::triangle_vertex_spvasm);
-        let vw = assemble(&vert_asm, "vk_vert", None);
-        let fw = assemble(&frag_asm, "vk_frag", None);
-        // Auto motion-vector shader pair (vk_motion): the vertex evaluates the transform
-        // twice (current/previous uniform) → per-pixel motion as the varying; the fragment
-        // passes it through. Empty when the program has no uniform-transforming @vertex.
-        let mvw: Vec<u32> = match &program.mv_vert_spvasm {
-            Some(asm) => assemble(asm, "vk_mv_vert", None),
-            None => Vec::new(),
-        };
-        let mvfw: Vec<u32> = if program.mv_vert_spvasm.is_some() {
-            assemble(&vire::shader::mv_fragment_spvasm(), "vk_mv_frag", None)
-        } else { Vec::new() };
-        // A fixed red fragment for the FIRST pass of the two-pass render-graph demo
-        // (vk_two_pass): pass 1 fills an offscreen texture, pass 2 (the program's
-        // @fragment) samples it. Always generated; small.
-        let p1w = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm([0.9, 0.2, 0.2, 1.0]), "vk_pass1", None);
-        // A fixed blue fragment for the second source pass of the multi-input graph.
-        let p2w = assemble(&fastllvm_backend::spirv::constant_fragment_spvasm([0.1, 0.2, 0.9, 1.0]), "vk_pass2", None);
-        // The GPU-driven mesh stage (VM milestone): the Vire `@mesh` shader if the
-        // program defines one, else a bootstrap `@mesh` that emits the triangle.
-        let mesh_asm = program
-            .mesh_spvasm
-            .clone()
-            .unwrap_or_else(fastllvm_backend::spirv::mesh_triangle_spvasm);
-        let mw = assemble(&mesh_asm, "vk_mesh_tri", Some("spv1.4"));
-        // The task (amplification) stage — only when the program defines an `@task`.
-        // An empty array (N=0) tells the runtime there is no task stage.
-        let tw: Vec<u32> = match &program.task_spvasm {
-            Some(asm) => assemble(asm, "vk_task", Some("spv1.4")),
-            None => Vec::new(),
-        };
-        // The compute meshlet builder (fills the scene SSBO on the GPU), when present.
-        let cw: Vec<u32> = match &program.comp_spvasm {
-            Some(asm) => assemble(asm, "vk_build", Some("spv1.4")),
-            None => Vec::new(),
-        };
-        // The @gpuvk vendor-neutral compute map, when present.
-        let gw: Vec<u32> = match &program.gpuvk_spvasm {
-            Some(asm) => assemble(asm, "vk_gpuvk", Some("spv1.4")),
-            None => Vec::new(),
-        };
-        let mut sc = String::from("/* Generated @vulkan shader SPIR-V (Vire-owned, via spirv-as). */\n#include <stdint.h>\n");
-        for (name, w) in [("VK_TRI_VERT", &vw), ("VK_TRI_FRAG", &fw), ("VK_MESH_TRI", &mw), ("VK_TASK_TRI", &tw), ("VK_BUILD_COMP", &cw), ("VK_GPUVK_COMP", &gw), ("VK_PASS1_FRAG", &p1w), ("VK_PASS2_FRAG", &p2w), ("VK_MV_VERT", &mvw), ("VK_MV_FRAG", &mvfw)] {
-            sc.push_str(&format!("const uint32_t {name}[] = {{"));
-            // A 0-length array is invalid ISO C; emit a dummy word (the _N stays 0).
-            if w.is_empty() {
-                sc.push_str("0");
-            }
-            for (i, x) in w.iter().enumerate() {
-                if i % 8 == 0 {
-                    sc.push_str("\n  ");
-                }
-                sc.push_str(&format!("0x{x:08x},"));
-            }
-            sc.push_str(&format!("\n}};\nconst unsigned {name}_N = {};\n", w.len()));
-        }
-        // The reflected descriptor/push interface (V3): the runtime builds its
-        // VkDescriptorSetLayout + VkPipelineLayout from THIS, derived from the shader
-        // stages' resource usage, instead of a hardcoded per-demo layout. Flat parallel
-        // arrays (no struct ABI to match). A 0-length array is invalid ISO C → dummy word.
-        let iface = &program.vk_iface;
-        let nb = iface.bindings.len();
-        let arr = |vals: Vec<String>| -> String {
-            if vals.is_empty() { "0".to_string() } else { vals.join(", ") }
-        };
-        sc.push_str(&format!(
-            "const unsigned VK_IFACE_NB = {nb};\n\
-             const unsigned VK_IFACE_BINDING[] = {{ {} }};\n\
-             const unsigned VK_IFACE_KIND[]    = {{ {} }};\n\
-             const unsigned VK_IFACE_STAGES[]  = {{ {} }};\n\
-             const unsigned VK_IFACE_PUSH_SIZE = {};\n\
-             const unsigned VK_IFACE_PUSH_STAGES = {};\n",
-            arr(iface.bindings.iter().map(|b| b.binding.to_string()).collect()),
-            arr(iface.bindings.iter().map(|b| (b.kind as u32).to_string()).collect()),
-            arr(iface.bindings.iter().map(|b| b.stages.to_string()).collect()),
-            iface.push_size,
-            iface.push_stages,
-        ));
-        let sc_path = build_dir.join("vk_shaders.c");
-        if std::fs::write(&sc_path, sc).is_err() {
-            eprintln!("writing vk_shaders.c failed");
-            exit(1);
-        }
-        vk_paths.push(sc_path);
-        link_libs.push("vulkan".into());
-        link_libs.push("glfw".into()); // windowing (vk_window); the runtime references it
-    }
-
-    let mut gpu_paths: Vec<PathBuf> = Vec::new();
-    let want_gpu = !program.gpu_kernels.is_empty();
-    if want_gpu {
-        let dev_ll = match fastllvm_backend::emit_ptx(&program) {
-            Ok(Some(s)) => s,
-            Ok(None) => String::new(),
-            Err(errs) => {
-                for e in &errs {
-                    eprintln!("error: {e}");
-                }
-                exit(1);
-            }
-        };
-        let dev_ll_path = build_dir.join("gpu_device.ll");
-        let dev_opt_path = build_dir.join("gpu_device.opt.ll");
-        let dev_ptx_path = build_dir.join("gpu_device.ptx");
-        if let Err(e) = std::fs::write(&dev_ll_path, &dev_ll) {
-            eprintln!("writing device IR: {e}");
-            exit(1);
-        }
-        // Run the LLVM middle-end on the device module BEFORE PTX codegen. The
-        // NVPTX emitter deliberately produces naive alloca-per-local IR (no phis);
-        // `llc` runs codegen passes but NOT the target-independent mid-end
-        // (mem2reg/SROA/LICM/inline/unroll/vectorize), so without this the
-        // loop-carried scalars can spill to slow `.local` device memory. This
-        // gives Vire kernels the same mid-end a Rust→PTX path gets for free from
-        // rustc's LLVM pipeline (design adapted from cuda-oxide — no code copied).
-        // Best-effort: if `opt` is absent/errors we fall back to the raw module
-        // (llc -O3 still runs), so builds never regress on a toolchain without it.
-        let llc_input = match Command::new("opt")
-            .args(["-O3", "-S"])
-            .arg(&dev_ll_path)
-            .arg("-o")
-            .arg(&dev_opt_path)
-            .status()
-        {
-            Ok(s) if s.success() => &dev_opt_path,
-            Ok(_) => {
-                eprintln!("warning: opt -O3 on the device module failed; using unoptimized IR");
-                &dev_ll_path
-            }
-            Err(_) => &dev_ll_path, // opt not present → llc's codegen-only opt
-        };
-        // sm_90 PTX: the CUDA driver JIT-compiles it forward onto the actual GPU
-        // (PTX is forward-compatible), so this build is not tied to one GPU arch.
-        let llc = Command::new("llc")
-            .args(["-march=nvptx64", "-mcpu=sm_90", "-O3"])
-            .arg(llc_input)
-            .arg("-o")
-            .arg(&dev_ptx_path)
-            .status();
-        match llc {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                eprintln!("llc (NVPTX) failed ({s}); device IR in {}", dev_ll_path.display());
-                exit(1);
-            }
-            Err(e) => {
-                eprintln!("llc not executable (need an LLVM build with the NVPTX target): {e}");
-                exit(1);
-            }
-        }
-        let ptx = match std::fs::read_to_string(&dev_ptx_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("reading generated PTX: {e}");
-                exit(1);
-            }
-        };
-        let stubs = fastllvm_backend::emit_gpu_stubs(&program).unwrap_or_default();
-        let mut gpu_c = String::new();
-        gpu_c.push_str("/* Generated: embedded PTX + @gpu launch stubs + jrt_gpu_* runtime. */\n");
-        gpu_c.push_str("const char jrt_gpu_ptx[] =\n");
-        gpu_c.push_str(&c_string_literal(&ptx));
-        gpu_c.push_str(";\n\n");
-        gpu_c.push_str(&stubs);
-        gpu_c.push_str(GPU_RUNTIME_C);
-        let gpu_c_path = build_dir.join("gpu_gen.c");
-        if let Err(e) = std::fs::write(&gpu_c_path, &gpu_c) {
-            eprintln!("writing GPU glue: {e}");
-            exit(1);
-        }
-        gpu_paths.push(gpu_c_path);
-        // Link the CUDA driver library.
-        link_libs.push("cuda".into());
-    }
-    // Enqueue the built-in Python bridge as a (Python) native block → it goes through
-    // the same auto-include/link path as a user `native "python"` block.
-    if want_py_bridge {
-        native_blocks.push(("python".into(), PYBRIDGE_C.to_string()));
     }
     // Write embedded native blocks to files (extension by ABI) and
     // add compile/link flags for C++/Python automatically.
@@ -1784,22 +1502,6 @@ fn build_or_run(args: &[String]) {
     }
     cmd.args(&pkg_cflags);
     for p in &native_paths {
-        cmd.arg(p);
-    }
-    // GPU glue: the CUDA driver header path + the generated PTX/stubs/runtime file.
-    if want_gpu {
-        cmd.arg("-I/opt/cuda/include");
-        for p in &gpu_paths {
-            cmd.arg(p);
-        }
-    }
-    // Vulkan glue: the generated headless-render runtime translation unit.
-    // Zero-cost validation gating (V5): `--debug` builds turn on the Khronos validation
-    // layer + debug-utils messenger in vk_runtime.c; release omits the macro entirely.
-    if want_vulkan && debug_flag {
-        cmd.arg("-DFASTLLVM_VK_VALIDATE");
-    }
-    for p in &vk_paths {
         cmd.arg(p);
     }
     if want_cpp {

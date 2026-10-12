@@ -1,5 +1,10 @@
 # Vire
 
+> **Ziel (bindend, s. `AGENTS.md`): mindestens so schnell wie Rust, leichter als
+> Python, vollständig getypt, speichersicher ohne `unsafe` — auch für Hardware
+> und Register. LLVM bleibt. Java-IR, GPU/Vulkan, Runtime/GC sind raus
+> (`Rc[T]` nur im Kernel als expliziter Opt-in).**
+
 **Vire** is a programming language: *as light as Python, as fast as C/Rust,
 memory-safe — without lifetimes, without ownership syntax, without manual memory
 management.* It compiles **AOT** to native binaries through a whole-program solver

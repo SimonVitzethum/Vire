@@ -137,18 +137,22 @@ pub fn infer_module(m: &mut Module) -> Vec<Diag> {
 /// type of every expression, keyed by source span. This is the Phase-1 foundation
 /// for the compile-time programming layer.
 pub fn infer_module_typed(m: &mut Module) -> (Vec<Diag>, ExprTypes) {
+    // REMOVED (AGENTS.md §1): GPU/Vulkan stages are gone — fail loudly here (before
+    // the body is inferred, whose shader-only forms would only confuse).
+    let mut removed: Vec<Diag> = Vec::new();
+    for it in &m.items {
+        if let Item::Fn(f) = it {
+            if let Some(a) = f.attrs.iter().find(|a| matches!(a.name.as_str(), "gpu" | "vertex" | "fragment" | "mesh" | "task" | "compute" | "gpuvk")) {
+                removed.push(Diag::error(&format!("removed: `@{}` is gone — GPU/Vulkan is out per AGENTS.md §1 (pure CPU project)", a.name), f.sig.span).with_hint("delete the attribute and the stage; keep the host logic"));
+            }
+        }
+    }
+    if !removed.is_empty() {
+        return (removed, HashMap::new());
+    }
     let mut u = Unifier::new();
     // Per-expression type record (type variables; resolved to concrete at the end).
     let mut rec: HashMap<Span, T> = HashMap::new();
-    // `@gpu` kernel names (param 0 = injected thread index, dropped at call sites).
-    let gpu_fns: std::collections::HashSet<String> = m
-        .items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Fn(f) if f.attrs.iter().any(|a| a.name == "gpu") => Some(f.sig.name.clone()),
-            _ => None,
-        })
-        .collect();
     // 1. Create global signature variables (annotated → concrete, otherwise fresh).
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for it in &m.items {
@@ -190,18 +194,11 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<Diag>, ExprTypes) {
             if !f.sig.generics.is_empty() {
                 continue; // generic → do not infer monomorphically
             }
-            // `@vertex`/`@fragment` are SPIR-V shaders compiled by shader.rs, not
-            // host code — their bodies use shader-only forms (`vecN`, vector math)
-            // that the host inference doesn't model, so skip them here.
-            if f.attrs.iter().any(|a| matches!(a.name.as_str(), "vertex" | "fragment" | "mesh" | "task" | "compute" | "gpuvk")) {
-                continue;
-            }
             if let Some(body) = &f.body {
                 let sig = &sigs[&f.sig.name];
                 let mut cx = Ctx {
                     u: &mut u,
                     sigs: &sigs,
-                    gpu: &gpu_fns,
                     scopes: vec![HashMap::new()],
                     ret: sig.ret,
                     types: &mut rec,
@@ -301,10 +298,6 @@ fn ty_name(t: T) -> &'static str {
 struct Ctx<'a> {
     u: &'a mut Unifier,
     sigs: &'a HashMap<String, Sig>,
-    /// Names of `@gpu` kernels: at a call site their parameter 0 (the injected
-    /// thread index) is not passed by the caller, so the call's args unify with
-    /// `sig.params[1..]`. The body still binds all params (index included).
-    gpu: &'a std::collections::HashSet<String>,
     scopes: Vec<HashMap<String, T>>,
     ret: T,
     /// Typed-AST side-table being populated: span → (unresolved) type variable.
@@ -490,30 +483,11 @@ impl<'a> Ctx<'a> {
                     if n == "print" {
                         return T::Void;
                     }
-                    // `@gpu` device intrinsics have fixed return types — teach them to
-                    // inference so one used as a kernel's tail (e.g. `gpu_sync()`)
-                    // doesn't look like a returned value (see lower::gpu_intrinsic_*).
-                    match n.as_str() {
-                        "gpu_sync" => return T::Void,
-                        "gpu_sqrt" | "gpu_fabs" | "gpu_floor" | "gpu_ceil" | "gpu_fmin"
-                        | "gpu_fmax" | "sqrt" | "sin" | "cos" | "floor" => return T::F64,
-                        "gpu_gid" | "gpu_gsize" | "gpu_tid" | "gpu_bid" | "gpu_bdim"
-                        | "gpu_gdim" | "gpu_atomic_add" | "gpu_shfl_down"
-                        | "gpu_warp_reduce_add" | "vk_triangle" | "vk_frame_bg" | "vk_window" | "vk_bench" | "vk_textured" | "vk_two_pass" | "vk_chain" | "vk_blend2" | "vk_frame" | "vk_window_mesh" | "vk_texture_draw" | "vk_draw_handle"
-                        | "vk_mesh" | "vk_mesh_c" | "vk_mesh_shader" | "vk_draw" | "vk_draw_tex" | "vk_draw_tex2" | "vk_draw_buf" | "vk_draw_tex_buf" | "vk_render_ppm" | "vk_render3d" | "vk_resolution" | "vk_pipeline_depth" | "vk_motion" | "vk_gpu_count" | "vk_gpu_list" | "vk_gpu_select" | "vk_jitter" | "vk_depth"
-                        | "vk_render_res" | "vk_display_res" | "vk_upscale"
-                        | "vk_mesh_scene" | "vk_mesh_scene_cull"
-                        | "vk_mesh_built" | "vk_built_color" | "gpuvk_run" => return T::I64,
-                        // Returns an RC-bound GPU texture handle (a Vire object).
-                        "vk_texture_new" | "vk_buffer_new" | "vk_session" => return T::Ref,
-                        "vk_buffer_get" => return T::F64,
-                        _ => {}
-                    }
+                    // REMOVED (AGENTS.md §1): `gpu_*`/`vk_*`/`gpuvk_*` builtins are gone —
+                    // such a call falls through to unknown-function (fresh var) and the
+                    // lowering rejects it loudly.
                     if let Some(sig) = self.sigs.get(n) {
-                        // `@gpu` kernels: skip param 0 (the injected thread index) —
-                        // the caller passes only params 1.. .
-                        let skip = if self.gpu.contains(n) { 1 } else { 0 };
-                        for (at, pt) in arg_ts.iter().zip(sig.params.iter().skip(skip)) {
+                        for (at, pt) in arg_ts.iter().zip(sig.params.iter()) {
                             self.u.unify(*at, *pt);
                         }
                         return sig.ret;

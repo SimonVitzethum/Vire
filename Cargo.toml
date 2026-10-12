@@ -1,21 +1,19 @@
 [workspace]
 resolver = "2"
-# Default build set: `vire` + the Java driver pull in every fastllvm-* and (transitively)
-# csolver-* library they need. The standalone `csolver-cli` (`solver`) binary is NOT a
+# Default build set: `vire` pulls in every fastllvm-* and (transitively)
+# csolver-* library it needs. The standalone `csolver-cli` (`solver`) binary is NOT a
 # dependency of vire (which calls the verifier as a library), so it is left out of the
 # default build to save its LTO — still buildable on demand with `cargo build -p csolver-cli`.
-default-members = ["crates/vire", "crates/driver"]
+default-members = ["crates/vire"]
 members = [
     "crates/vire",       # Vire front-end (lexer/parser/AST → SSA IR)
-    "crates/ir",         # shared mid-level IR (lowering target)
-    "crates/solver",     # shared: devirt/escape/RC/bounds
-    "crates/backend",    # shared: LLVM emission
+    "crates/ir",         # Vire-only SSA IR (lowering target)
+    "crates/solver",     # whole-program ownership/escape/bounds solver
+    "crates/backend",    # LLVM emission (only backend)
     "crates/vire-wasm",  # frontend-only diagnostics CLI (wasm32-wasip1) for the VS Code extension
-    # --- Bootstrap (Java→IR): backend soundness oracle + M0 measurement base,
-    #     removed per FRONTEND-PLAN §"Java retirement criteria" ---
-    "crates/classfile",
-    "crates/frontend",
-    "crates/driver",
+    # --- REMOVED per AGENTS.md §1 (pure CPU project, no Java): crates/classfile,
+    #     crates/frontend, crates/driver (fastjavac). The runtime C source that vire
+    #     embeds lives at crates/runtime/ (no driver crate anymore).
     # --- Vendored CSolver: the memory-safety verifier that gates inline C/asm
     #     (verified-C-asm, the sound replacement for `unsafe`). Kept in-repo so the
     #     whole toolchain builds offline with no external dependency. Package names
@@ -37,10 +35,7 @@ members = [
     "crates/csolver/report",
     "crates/csolver/cli",
 ]
-# Vendored upstream source with its own workspace — kept for reference/attribution
-# (Apache-2.0), NOT built by us. Excluded so cargo does not descend into it.
-# Refresh it with `sh crates/cuda-oxide/update.sh`.
-exclude = ["crates/cuda-oxide"]
+# No vendored third-party compiler trees: pure CPU project (AGENTS.md §1).
 
 [workspace.package]
 edition = "2021"

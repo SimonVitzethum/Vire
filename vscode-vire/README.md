@@ -5,7 +5,7 @@ Language support and native debugging for the **Vire** programming language
 
 ## Features
 
-- **Syntax highlighting** — keywords, types, `@gpu`/`@derive` attributes, strings,
+- **Syntax highlighting** — keywords, types, `@derive` attributes, strings,
   numbers, operators, function definitions/calls (TextMate grammar).
 - **Language intelligence** — **diagnostics** (parse/type/lowering errors
   underlined as you type, shown in the Problems panel), **hover** (function/type
@@ -20,7 +20,7 @@ Language support and native debugging for the **Vire** programming language
   stack **and local variables**. The extension compiles the file with `--debug`
   (DWARF, incl. `DILocalVariable` for locals) and drives
   [`lldb-dap`](https://lldb.llvm.org/).
-- **Snippets** — `fn`, `main`, `gpu`, `type`, `enum`, `match`, `while`, `for`,
+- **Snippets** — `fn`, `main`, `type`, `enum`, `match`, `while`, `for`,
   `trait`, `impl`.
 - **Commands** — `Vire: Build File`, `Vire: Run File`.
 

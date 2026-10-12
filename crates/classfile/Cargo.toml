@@ -1,7 +1,0 @@
-[package]
-name = "fastllvm-classfile"
-license = "GPL-3.0-or-later"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]

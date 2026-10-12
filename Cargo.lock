@@ -150,29 +150,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastllvm-classfile"
-version = "0.1.0"
-
-[[package]]
-name = "fastllvm-driver"
-version = "0.1.0"
-dependencies = [
- "fastllvm-backend",
- "fastllvm-classfile",
- "fastllvm-frontend",
- "fastllvm-ir",
- "fastllvm-solver",
-]
-
-[[package]]
-name = "fastllvm-frontend"
-version = "0.1.0"
-dependencies = [
- "fastllvm-classfile",
- "fastllvm-ir",
-]
-
-[[package]]
 name = "fastllvm-ir"
 version = "0.1.0"
 

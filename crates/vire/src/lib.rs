@@ -16,7 +16,6 @@ pub mod lexer;
 pub mod lower;
 pub mod parser;
 pub mod platform;
-pub mod shader;
 pub mod spawn;
 pub mod syntax;
 pub mod tygraph;
