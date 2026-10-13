@@ -1,0 +1,34 @@
+// Shared, topology-MUTATING, CYCLIC object graph in an EXPLICIT region —
+// the M3 answer to the class above: the per-iteration graph (build/mutate/drop,
+// including the back-edge cycle) lives and dies in a declared `region(4096)`
+// pool. No RC, no collector, no 0-live doubt: freed en bloc at the pop.
+// Compare with sharedgraph.vr (RC + collector path).
+type Node { id: Int  next: Node  side: Node }
+
+fn chain(len: Int) -> Node {
+    if len == 0 { null } else { Node(len, chain(len - 1), null) }
+}
+
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 400000 {
+        mut trial = region(4096) {
+            mut h = chain(20)
+            // share + mutate topology: side = grandchild (a second, shared reference)
+            mut c = h
+            while c.next != null {
+                if c.next.next != null { c.side = c.next.next }
+                c = c.next
+            }
+            // close a back-edge cycle: walk to the last node, point it at the head
+            mut last = h
+            while last.next != null { last = last.next }
+            last.next = h
+            (sum + h.id + h.side.id) % 1000000007
+        }
+        sum = trial
+        t = t + 1
+    }
+    print(sum)
+}
