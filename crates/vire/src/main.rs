@@ -1249,15 +1249,26 @@ fn build_or_run(args: &[String]) {
     // Solver-side ownership classification (borrowck offload, AGENTS.md §2):
     // analysis-only report behind FASTLLVM_DUMP_OWN=1 — measures the provable
     // fraction (Unique/Borrow/Region vs Shared). No codegen effect yet.
-    if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() {
+    // FASTLLVM_WARN_DYNAMIC=1 previews E300 (AGENTS.md §2.4, OWNERSHIP-STATIC.md):
+    // every Shared heap allocation site is a program point that would need a
+    // ceiling (`region(max)`) or a kernel `Rc` once E300 is enforced. Warning
+    // only — measures the blast radius without breaking the corpus.
+    if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() || std::env::var_os("FASTLLVM_WARN_DYNAMIC").is_some() {
         let rep = fastllvm_solver::classify_ownership(&program);
-        eprintln!(
-            "[own] ref={} unique={} borrow={} region={} shared={} shared_new_sites={}",
-            rep.n_ref, rep.n_unique, rep.n_borrow, rep.n_region, rep.n_shared,
-            rep.shared_news.len()
-        );
-        for (f, i) in &rep.shared_news {
-            eprintln!("[own] shared-new {f} stmt#{i}");
+        if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() {
+            eprintln!(
+                "[own] ref={} unique={} borrow={} region={} shared={} shared_new_sites={}",
+                rep.n_ref, rep.n_unique, rep.n_borrow, rep.n_region, rep.n_shared,
+                rep.shared_news.len()
+            );
+            for (f, i) in &rep.shared_news {
+                eprintln!("[own] shared-new {f} stmt#{i}");
+            }
+        }
+        if std::env::var_os("FASTLLVM_WARN_DYNAMIC").is_some() {
+            for (f, i) in &rep.shared_news {
+                eprintln!("warning[E300-preview]: heap allocation in `{f}` (site #{i}) has dynamic lifetime — will need `region(max)` or kernel `Rc` when E300 is enforced (AGENTS.md §2.4)");
+            }
         }
     }
     let acyclic = s.acyclic;

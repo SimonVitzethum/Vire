@@ -70,9 +70,22 @@ lie about performance (§7.1 EVALUATION.md: the RC path never competed).
 5. **M5 — delete the fallback:** any remaining retain/release emission is a
    compiler ICE (not a fallback).
 
-## 5. Testing (replaces the 0-live oracle)
+## 4b. E300 blast radius — MEASURED (2026-10-13)
 
-The Java heap-balance oracle is gone with Java. Its replacement:
+`FASTLLVM_WARN_DYNAMIC=1` previews enforcement (warn-only): 47 Shared heap
+sites across 43 corpus files, concentrated in 8 graph-builder programs
+(object_graph/btree/compiler 14 each, sharedgraph 3, list 3, ring 2,
+array_objects/arraygraph 1) — everything else is ZERO. Enforcement would only
+touch programs that genuinely build dynamic graphs, which is exactly the
+intended scope (AGENTS.md §2.4).
+
+Known refinement before enforcement (M3): loop-arena-proven allocations
+(btree/sharedgraph/compiler run on the loop arena today — bounded lifetime
+already proven by `while_arena_safe`) must not count. That needs the arena
+verdict threaded into the report; until then the count is conservative
+(sound direction: more Shared, never less).
+
+## 5. Testing (replaces the 0-live oracle)
 - **Free-balance:** every test program frees exactly what it allocates
   (ASan/LSan gate in `tests/vire_mem.sh`: `clang -fsanitize=address,undefined`,
   0 errors, matching output).
