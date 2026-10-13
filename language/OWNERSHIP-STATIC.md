@@ -65,6 +65,15 @@ lie about performance (§7.1 EVALUATION.md: the RC path never competed).
    heap suite asserts frees balance (replaces 0-live oracle, see §5).
 3. **M3 — region ceilings:** `region(max)` surface + emitted pools; loop arenas
    become pools with proven bounds; unbounded cases → E300.
+   **SHIPPED 2026-10-13 (explicit surface):** `region(max) { … }` mit
+   Byte-Ceiling (`jrt_region_push/pop`, Refuse per Abort `vire.region.Overflow`),
+   skalarem Ergebnis, E300 bei Pool-Unsicherheit (Freshness-Beweis aus den
+   Loop-Arenen wiederverwendet); inferierte Loop-Arenen feuern innen nicht
+   (unbounded Push würde den deklarierten Pool überschatten), Stack-Promotion
+   gilt weiter; Backend-Arena-Tiefe + Immortal-Pfad decken `region_push` ab
+   (kein Direct-Free auf Pool-Speicher). Tests: `tests/vire_region.sh` (6),
+   Beispiel `examples/vire/region_pool.vr`. Offen: E300-Enforcement als Default
+   (heute Warn-Vorschau), `region(max)`-Migration der 8 Graph-Files.
 4. **M4 — runtime shrink:** delete collector/slab/RC from `runtime.c`; header
    without counter; remove `FASTLLVM_*` knobs.
 5. **M5 — delete the fallback:** any remaining retain/release emission is a

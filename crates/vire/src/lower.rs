@@ -1166,6 +1166,10 @@ struct FnLower<'a> {
     /// (plain Ref local, RC no-ops via refcount -1); the table drives `readN`/`writeN`
     /// lowering to volatile accesses at base+offset. Propagated through copies.
     mmio: HashMap<u32, (String, u64, u64)>,
+    /// Explicit-`region` nesting depth. While > 0, inferred loop-arenas do NOT
+    /// fire (their unbounded push would shadow the declared bounded pool —
+    /// the explicit region's own admission check subsumes the loop check).
+    in_region: u32,
     /// Declared hardware regions (name → (base, len)) from `--hw-profile`, for
     /// resolving `Mmio.bind("name")` (E400 on unknown names).
     hw_regions: &'a HashMap<String, (u64, u64)>,
@@ -2439,7 +2443,9 @@ impl<'a> FnLower<'a> {
                 self.cur = bodyb.0 as usize;
                 // AUTO-ARENA (escape→arena): place provably non-escaping alloc.
                 // into a per-iteration bump arena (no malloc/free per node).
-                let arena = self.while_arena_safe(body);
+                // No inferred arena inside an explicit `region` (its unbounded push
+                // would shadow the declared bounded pool; the region's own check subsumes it).
+                let arena = self.in_region == 0 && self.while_arena_safe(body);
                 let body_locals_start = self.locals.len();
                 if arena {
                     self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
@@ -2587,7 +2593,9 @@ impl<'a> FnLower<'a> {
                 // iteration runs in a per-iteration bump arena (no malloc/free per node).
                 // `while_arena_safe` forbids body-level return/break/continue, so the
                 // arena_pop below is never skipped.
-                let arena = self.while_arena_safe(body);
+                // No inferred arena inside an explicit `region` (its unbounded push
+                // would shadow the declared bounded pool; the region's own check subsumes it).
+                let arena = self.in_region == 0 && self.while_arena_safe(body);
                 let body_locals_start = self.locals.len();
                 if arena {
                     self.emit(Statement::Call { dest: None, func: "jrt_arena_push".into(), args: vec![] });
@@ -2916,6 +2924,64 @@ impl<'a> FnLower<'a> {
             // allowed (hard errors otherwise): values cannot alias, and no
             // object pointer survives the arena → isolation + fault containment without
             // deep copy. Object-in/-out (deep copy) remains open.
+            Expr::Region { max, body, .. } => {
+                // M3 explicit bounded pool (OWNERSHIP-STATIC.md §2.4): `region(max)`
+                // brackets the body in `jrt_region_push(max)`/`pop` — body
+                // allocations land in the pool (immortal, no RC/collector) and are
+                // freed en bloc; past `max` bytes the program aborts (refuse-on-
+                // full, never silent). Admission reuses the loop-arena proof
+                // (`region_bad_block` with the region's own outer/fresh sets —
+                // `in_loop = false`, so boundary-crossing return/break/continue is
+                // rejected and the pop always runs). On failure: E300, and the
+                // body still lowers WITHOUT pooling (normal RC) so one error does
+                // not cascade into unknown-variable noise.
+                let mut outer = std::collections::HashSet::new();
+                for s in &self.scopes {
+                    for k in s.keys() {
+                        outer.insert(k.clone());
+                    }
+                }
+                let fresh = self.region_fresh_locals(body, &std::collections::HashSet::new(), None);
+                let mut seen = std::collections::HashSet::new();
+                let safe = !self.region_bad_block(body, false, false, None, &outer, &mut seen, &fresh);
+                // The ceiling: any Int expression (evaluated at runtime — the byte
+                // counter enforces it dynamically); must be an integer type.
+                let (mop, mty) = self.lower_expr(max);
+                let m64 = match mty {
+                    Ty::I64 => mop,
+                    Ty::I32 => {
+                        let w = self.new_local(Ty::I64);
+                        self.emit(Statement::Assign(w, Rvalue::Convert(mop)));
+                        Operand::Copy(w)
+                    }
+                    _ => {
+                        self.errs.push("error[E300]: `region(max)` ceiling must be an `Int` expression".into());
+                        Operand::ConstI64(0)
+                    }
+                };
+                if !safe {
+                    self.errs.push("error[E300]: `region` body is not pool-safe — a reference would outlive the pool (store outer refs into region objects, return region refs, or cross the boundary with return/break/continue). Name a bigger contract (restructure), or move the graph to a kernel `Rc` (AGENTS.md §2.4)".into());
+                    return self.lower_block_val(body);
+                }
+                self.emit(Statement::Call { dest: None, func: "jrt_region_push".into(), args: vec![m64] });
+                self.in_region += 1;
+                let body_locals_start = self.locals.len();
+                let (val, ty) = self.lower_block_val(body);
+                self.in_region -= 1;
+                if ty == Ty::Ref {
+                    self.errs.push("error[E300]: `region` body value must be scalar — references die with the pool (return plain values)".into());
+                }
+                // Ref locals created in the body point into the pool; null them
+                // before the pop so the function-end release does not read freed
+                // pool memory (UAF read) — identical to the loop-arena nulling.
+                for idx in body_locals_start..self.locals.len() {
+                    if self.locals[idx] == Ty::Ref {
+                        self.emit(Statement::Assign(Local(idx as u32), Rvalue::Use(Operand::ConstNull)));
+                    }
+                }
+                self.emit(Statement::Call { dest: None, func: "jrt_region_pop".into(), args: vec![] });
+                (val, ty)
+            }
             Expr::Capsule { inputs, body, .. } => {
                 // Classify inputs. Scalars pass by value. A primitive-array input
                 // takes the flat clone path; any other ref (struct/graph, string,
@@ -4843,6 +4909,7 @@ fn lower_fn(
         local_arr_class: HashMap::new(),
         arr_hint: None,
         mmio: HashMap::new(),
+        in_region: 0,
         hw_regions,
         local_lambda: HashMap::new(),
         strings,

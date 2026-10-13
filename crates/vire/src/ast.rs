@@ -243,6 +243,12 @@ pub enum Expr {
     /// `&`-marked inputs are borrowed/read-only (no copy). See
     /// language/CAPSULE-EVALUATION.md.
     Capsule { inputs: Vec<(String, bool)>, body: Block, span: Span },
+    /// `region(max) { … }` — explicit bounded pool (M3, OWNERSHIP-STATIC.md):
+    /// body allocations go into a pool of at most `max` bytes, freed en bloc;
+    /// past the ceiling the program aborts (refuse-on-full, never silent).
+    /// The body value must be scalar (no refs out); `return`/`break`/`continue`
+    /// crossing the boundary is rejected (the pop must run).
+    Region { max: Box<Expr>, body: Block, span: Span },
     /// `spawn f(arg)` — run a call on a new thread, safe by construction. The
     /// inner expression is the spawned call; lowering (see `spawn.rs`) desugars
     /// it to a generated worker shim + `jrt_spawn`, yielding a thread handle that

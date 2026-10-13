@@ -1140,6 +1140,16 @@ impl Parser {
                 let body = self.parse_block();
                 Expr::Capsule { inputs, body, span: sp }
             }
+            Tok::Kw(Kw::Region) => {
+                self.bump();
+                self.expect(&Tok::LParen, "'('");
+                self.skip_nl();
+                let max = self.parse_expr(0);
+                self.skip_nl();
+                self.expect(&Tok::RParen, "')'");
+                let body = self.parse_block();
+                Expr::Region { max: Box::new(max), body, span: sp }
+            }
             Tok::Kw(Kw::Spawn) => {
                 // `spawn f(arg)` — the inner call runs on a new thread. Parse the
                 // call at primary+postfix level so `f(arg)` is captured (but not a

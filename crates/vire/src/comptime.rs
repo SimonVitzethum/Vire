@@ -640,6 +640,10 @@ impl Walker<'_> {
                 self.block(body);
                 self.scopes.pop();
             }
+            Expr::Region { max, body, .. } => {
+                self.expr(max);
+                self.block(body);
+            }
             Expr::Spawn { call, .. } => self.expr(call),
         }
     }

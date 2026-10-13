@@ -511,3 +511,24 @@ net gain depends however on copy-in+copy-out and pays off only when much work fu
 into a **small** block value (not large-graph-in/large-graph-out). The
 copy-free variant `capsule(&x)` breaks isolation and is open research.
 Full rationale + design: [CAPSULE-EVALUATION.md](CAPSULE-EVALUATION.md).
+
+## 9c. `region(max)` — explicit bounded pool (shipped, M3)
+
+```vire
+mut total = region(100000) {
+    mut head = Node(0, null)
+    // ... build + consume a graph ...
+    s   // must be scalar
+}
+```
+
+Body allocations land in a pool of at most `max` bytes (immortal, no
+RC/collector, freed en bloc at the block end). Past the ceiling the program
+aborts with `vire.region.Overflow` (refuse-on-full — a checked failure, never
+silent growth, never UB). The body value must be scalar (references die with
+the pool); `return`/`break`/`continue` crossing the boundary, pool-unsafe
+stores (outer refs into region objects and vice versa), and non-`Int` ceilings
+are all E300 (fail loudly). Inferred loop-arenas do not fire inside an explicit
+region (their unbounded push would shadow the declared pool); stack promotion
+still applies (stack lifetime contains the region). Tests: `tests/vire_region.sh`;
+example: `examples/vire/region_pool.vr`. Design: [OWNERSHIP-STATIC.md](OWNERSHIP-STATIC.md) §2.4.

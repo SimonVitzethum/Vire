@@ -50,6 +50,12 @@ static void plat_uncaught(const char *msg) {
     plat_puts(msg);
     plat_write("\n", 1);
 }
+/* Forward declarations: defined with the backtrace machinery below, used by
+ * the region pool (refuse-on-full) above it. */
+static void capture_backtrace(void);
+static void print_backtrace(void);
+/* Arena pop (defined below with the arena); region pop is an alias. */
+void jrt_arena_pop(void);
 
 /* Signed decimal formatting into buf (>=24 bytes). */
 static int fmt_i64(char *buf, int64_t v) {
@@ -1487,6 +1493,11 @@ typedef struct ArenaChunk {
 typedef struct Arena {
     struct Arena *prev;
     ArenaChunk *chunk;
+    /* Declared ceiling for explicit `region(max)` pools (M3, OWNERSHIP-STATIC.md):
+     * 0 = unbounded (inferred loop arenas / capsules). A bounded pool refuses
+     * past its budget (fatal, never silent growth, never UB). */
+    size_t budget;
+    size_t spent;
 } Arena;
 #define ARENA_CHUNK_DEFAULT (1u << 16) /* 64 KiB standard chunk */
 #define ARENA_POOL_MAX 64              /* recycle up to 64 chunks (≈4 MiB) per thread */
@@ -1505,7 +1516,43 @@ void jrt_arena_push(void) {
     Arena *a = (Arena *)malloc(sizeof(Arena));
     a->prev = arena_top;
     a->chunk = NULL;
+    a->budget = 0;
+    a->spent = 0;
     arena_top = a;
+}
+/* Explicit bounded pool for `region(max) { ... }` (M3): like an arena, but the
+ * ceiling is declared and enforced — past `max` bytes the program aborts with a
+ * named message (refuse-on-full: a checked failure, never UB, never silent
+ * heap fallback which would invalidate the compiler's pooling proof). A
+ * non-positive max is itself a hard error (a zero-byte pool cannot hold
+ * anything — fail loudly, not vacuously). Nests with plain arenas. */
+void jrt_region_push(int64_t max_bytes) {
+    if (max_bytes <= 0) {
+        capture_backtrace();
+        plat_uncaught("vire.region.NonPositiveCeiling");
+        print_backtrace();
+        plat_abort();
+    }
+    Arena *a = (Arena *)malloc(sizeof(Arena));
+    a->prev = arena_top;
+    a->chunk = NULL;
+    a->budget = (size_t)max_bytes;
+    a->spent = 0;
+    arena_top = a;
+}
+void jrt_region_pop(void) {
+    jrt_arena_pop();
+}
+/* Fatal region overflow (refuse-on-full), in the style of the uncatchable
+ * bounds abort: deterministic message + backtrace, no unwinding. */
+_Noreturn static void jrt_region_overflow_fatal(size_t need, size_t budget) {
+    (void)need;
+    (void)budget;
+    capture_backtrace();
+    plat_uncaught("vire.region.Overflow");
+    print_backtrace();
+    plat_abort();
+    __builtin_unreachable();
 }
 void jrt_arena_pop(void) {
     if (!arena_top) return;
@@ -1532,6 +1579,10 @@ void jrt_arena_pop(void) {
 }
 static void *arena_alloc(size_t size) {
     size = (size + 15u) & ~(size_t)15u;
+    if (arena_top->budget && arena_top->spent + size > arena_top->budget) {
+        jrt_region_overflow_fatal(size, arena_top->budget);
+    }
+    arena_top->spent += size;
     ArenaChunk *c = arena_top->chunk;
     if (!c || c->used + size > c->cap) {
         ArenaChunk *nc;
@@ -1562,6 +1613,8 @@ static void *arena_alloc(size_t size) {
 #else
 void jrt_arena_push(void) {}
 void jrt_arena_pop(void) {}
+void jrt_region_push(int64_t max_bytes) { (void)max_bytes; }
+void jrt_region_pop(void) {}
 #endif
 
 void *jrt_alloc(int64_t size) {

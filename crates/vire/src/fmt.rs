@@ -401,6 +401,9 @@ impl Fmt {
                 let ins: Vec<String> = inputs.iter().map(|(n, borrowed)| if *borrowed { format!("&{n}") } else { n.clone() }).collect();
                 format!("capsule({}) {}", ins.join(", "), self.block_str(body))
             }
+            Expr::Region { max, body, .. } => {
+                format!("region({}) {}", self.expr(max), self.block_str(body))
+            }
             Expr::Spawn { call, .. } => format!("spawn {}", self.expr(call)),
         }
     }

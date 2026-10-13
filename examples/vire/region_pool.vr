@@ -1,0 +1,26 @@
+// Explicit bounded pool (M3, OWNERSHIP-STATIC.md): body allocations live in a
+// declared pool (freed en bloc, no RC/collector); past the ceiling the program
+// aborts (refuse-on-full). The body value must be scalar. Just `vire run`.
+type Node { val: Int next: Node }
+
+fn main() {
+    mut total = region(100000) {
+        mut head = Node(0, null)
+        mut cur = head
+        mut i = 1
+        while i < 100 {
+            mut x = Node(i, null)
+            cur.next = x
+            cur = x
+            i = i + 1
+        }
+        mut s = 0
+        mut c = head
+        while c != null {
+            s = s + c.val
+            c = c.next
+        }
+        s
+    }
+    print(total)                            // 4950
+}

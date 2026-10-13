@@ -36,6 +36,7 @@ pub enum Kw {
     Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Unsafe, Macro, Comptime,
     Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn, Capsule,
     And, Or, Not, As, True, False, SelfLower, SelfType, Native, With, Syscall,
+    Region,
     // Dynamic surface (DYNAMIC-VIRE-PLAN.md): `dynamic fn` = a runtime-overridable seam;
     // `open trait`/`open type` = extensible at runtime. Sealed is the keyword-free default.
     Dynamic, Open,
@@ -55,7 +56,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
         ("spawn", Spawn), ("capsule", Capsule), ("native", Native),
         ("and", And), ("or", Or), ("not", Not), ("as", As), ("with", With),
         ("true", True), ("false", False), ("self", SelfLower), ("Self", SelfType),
-        ("dynamic", Dynamic), ("open", Open), ("syscall", Syscall),
+        ("dynamic", Dynamic), ("open", Open), ("syscall", Syscall), ("region", Region),
     ]
 };
 

@@ -154,6 +154,8 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     // (no retain on the new value; the old slot is still released).
     ("jrt_free_unique", "void (ptr)"),
     ("jrt_aastore_move", "void (ptr, i32, ptr)"),
+    ("jrt_region_push", "void (i64)"),
+    ("jrt_region_pop", "void ()"),
     ("jrt_throw", "void (ptr)"),
     ("jrt_pending_set", "i32 ()"),
     ("jrt_take_pending", "ptr ()"),
@@ -1770,8 +1772,8 @@ fn arena_block_depths(f: &Function) -> Vec<Option<i32>> {
             bb.statements
                 .iter()
                 .map(|st| match st {
-                    Statement::Call { func, .. } if func == "jrt_arena_push" => 1,
-                    Statement::Call { func, .. } if func == "jrt_arena_pop" => -1,
+                    Statement::Call { func, .. } if func == "jrt_arena_push" || func == "jrt_region_push" => 1,
+                    Statement::Call { func, .. } if func == "jrt_arena_pop" || func == "jrt_region_pop" => -1,
                     _ => 0,
                 })
                 .sum()
@@ -1826,8 +1828,8 @@ fn arena_immortal_dests(f: &Function) -> (BTreeSet<u32>, BTreeSet<u32>) {
         let Some(mut depth) = entry[bi] else { continue };
         for st in &bb.statements {
             match st {
-                Statement::Call { func, .. } if func == "jrt_arena_push" => depth += 1,
-                Statement::Call { func, .. } if func == "jrt_arena_pop" => depth -= 1,
+                Statement::Call { func, .. } if func == "jrt_arena_push" || func == "jrt_region_push" => depth += 1,
+                Statement::Call { func, .. } if func == "jrt_arena_pop" || func == "jrt_region_pop" => depth -= 1,
                 Statement::New { dest, .. } | Statement::NewArray { dest, .. } if depth > 0 => {
                     new_dests.insert(dest.0);
                 }
@@ -1918,8 +1920,8 @@ fn arena_ctx_fns(program: &Program, heap_esc: &BTreeSet<String>) -> BTreeSet<Str
                             dispatch.insert(sym.as_str());
                         }
                     }
-                    Statement::Call { func, .. } if func == "jrt_arena_push" => depth += 1,
-                    Statement::Call { func, .. } if func == "jrt_arena_pop" => depth -= 1,
+                    Statement::Call { func, .. } if func == "jrt_arena_push" || func == "jrt_region_push" => depth += 1,
+                    Statement::Call { func, .. } if func == "jrt_arena_pop" || func == "jrt_region_pop" => depth -= 1,
                     Statement::Call { func, args, .. } | Statement::CallGuarded { func, args, .. } if !func.starts_with("jrt_") => {
                         let safe_args = args.iter().all(|a| match a {
                             Operand::Copy(l) => f.locals[l.0 as usize] != Ty::Ref, // ref arg unsafe

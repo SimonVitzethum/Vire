@@ -293,6 +293,7 @@ pub(crate) fn expr_span(e: &Expr) -> Span {
         | Expr::Comptime { span, .. }
         | Expr::Range { span, .. }
         | Expr::Capsule { span, .. }
+        | Expr::Region { span, .. }
         | Expr::Spawn { span, .. } => *span,
         Expr::Block(b) => b.span,
     }
