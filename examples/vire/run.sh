@@ -32,6 +32,7 @@ check compile_time          "$(printf '120\n10\nVersion(1, 4)\n1\n-1\nLogin(42)\
 check inferred              "$(printf '25\n3')"
 check object_graph          "$(printf '5120\n5120')"
 check hw_syscall            "$(printf 'ok!\n1\n4')"
+check hw_socket             "$(printf '0\n5\n5\n1\n0\n0')"
 
 echo "---"
 echo "$pass passed, $fail failed"

@@ -185,6 +185,45 @@ fn main() { fence(1) }
 EOF
 reject "fence arity rejected" "E421" "$work/fencebad.vr"
 
+# --- sockets in userspace: socketpair/send/recv/close over AF_UNIX --------
+cat > "$work/sock.vr" <<'EOF'
+syscall sys_socketpair(domain: Int, typ: Int, proto: Int, fds: Array[Byte]) -> Int = 53
+syscall sys_sendto(fd: Int, buf: Array[Byte], n: Int, flags: Int, addr: Int, addrlen: Int) -> Int = 44
+syscall sys_recvfrom(fd: Int, buf: Array[Byte], n: Int, flags: Int, addr: Int, addrlen: Int) -> Int = 45
+syscall sys_close(fd: Int) -> Int = 3
+
+fn read_i32_le(a: Array[Byte], off: Int) -> Int {
+    a[off] + a[off + 1] * 256 + a[off + 2] * 65536 + a[off + 3] * 16777216
+}
+
+fn main() {
+    mut fds = barray(8)
+    print(sys_socketpair(1, 1, 0, fds))
+    mut fd0 = read_i32_le(fds, 0)
+    mut fd1 = read_i32_le(fds, 4)
+    mut msg = barray(5)
+    msg[0] = 104  msg[1] = 101  msg[2] = 108  msg[3] = 108  msg[4] = 111
+    print(sys_sendto(fd0, msg, 5, 0, 0, 0))
+    mut out = barray(5)
+    print(sys_recvfrom(fd1, out, 5, 0, 0, 0))
+    mut ok = 1
+    mut i = 0
+    while i < 5 {
+        if out[i] != msg[i] { ok = 0 }
+        i = i + 1
+    }
+    print(ok)
+    print(sys_close(fd0))
+    print(sys_close(fd1))
+}
+EOF
+check "socketpair/send/recv/close roundtrip" "0
+5
+5
+1
+0
+0" "$work/sock.vr"
+
 # --- E422: handles never cross a capsule boundary ---------------------------
 cat > "$work/capin.vr" <<'EOF'
 fn main() {
