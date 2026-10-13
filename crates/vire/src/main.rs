@@ -1183,8 +1183,14 @@ fn build_or_run(args: &[String]) {
             .functions
             .iter()
             .any(|f| f.params == [fastllvm_ir::Ty::I64] && f.ret == fastllvm_ir::Ty::I64);
-        if !has_scalar {
-            eprintln!("--emit-module: expected at least one scalar `fn NAME(x: Int) -> Int` (entry `module_main` and/or an override)");
+        // Step 2b: an object entry `fn module_obj(o: T) -> T` is an entry too — a module
+        // may cross the boundary with objects only and never take a scalar at all.
+        let has_obj = program
+            .functions
+            .iter()
+            .any(|f| f.name == "module_obj" && f.params == [fastllvm_ir::Ty::Ref] && f.ret == fastllvm_ir::Ty::Ref);
+        if !has_scalar && !has_obj {
+            eprintln!("--emit-module: expected a scalar `fn NAME(x: Int) -> Int` (entry `module_main` and/or an override) or the object entry `fn module_obj(o: T) -> T`");
             exit(1);
         }
     } else if !program.functions.iter().any(|f| f.name == "vire_main") {
@@ -1208,10 +1214,38 @@ fn build_or_run(args: &[String]) {
     let _ = timed!("propagate_const_scalars", fastllvm_solver::propagate_const_scalars(&mut program));
     let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
     s.inlined_calls = timed!("inline_program", fastllvm_solver::inline_program(&mut program));
+    // Bounds again, AFTER inlining. The first run above sees `fn f(a: Array[Int])` with
+    // the array as a parameter: no allocation site, hence no length, hence
+    // `provably_in_bounds` bails out on its first line and NOTHING is elided — a
+    // function that takes an array as a parameter got no elision at all. Once the callee
+    // is inlined, the array and its `array(n)` are in the same function and every path
+    // (constant length, loop guard, affine index) can finally see them. Cheap: the pass
+    // is linear in the IR and only re-marks, it never un-elides.
+    let _ = timed!("elide_bounds_post_inline", fastllvm_solver::elide_bounds(&mut program));
     s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
     // provably fit in i32 to 4 bytes (RAM). Sound (widening).
-    let _narrowed = timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program));
+    //
+    // …but it is a WHOLE-PROGRAM decision, and step 2b's shared types have two programs.
+    // The narrowing depends on the ranges each side happens to observe: a host storing
+    // `Pair(3, 4)` narrows both fields to i32, while the module, which only sees them
+    // through a parameter, keeps i64 — the same source declaration, two layouts, and the
+    // module would read the host's objects at the wrong offsets. So a program that lets
+    // objects cross the boundary keeps its layouts FROZEN (the "frozen layouts" of P1
+    // step 2b). Deliberately whole-program rather than per-type: the RAM this gives up is
+    // a small constant, and a per-type rule would have to track exactly which types can
+    // reach the boundary — a soundness argument in exchange for a few bytes.
+    // The SCALAR boundary (`module_call`) is unaffected; no object crosses there.
+    let obj_boundary = (emit_module
+        && program.functions.iter().any(|f| f.name == "module_obj" && f.params == [fastllvm_ir::Ty::Ref] && f.ret == fastllvm_ir::Ty::Ref))
+        || program.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.statements
+                    .iter()
+                    .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_module_call_obj"))
+            })
+        });
+    let _narrowed = if obj_boundary { 0 } else { timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program)) };
     // Solver-side ownership classification (borrowck offload, AGENTS.md §2):
     // analysis-only report behind FASTLLVM_DUMP_OWN=1 — measures the provable
     // fraction (Unique/Borrow/Region vs Shared). No codegen effect yet.
@@ -1290,7 +1324,27 @@ fn build_or_run(args: &[String]) {
                 ));
             }
         }
+        // Step 2b — the OBJECT entry: `fn module_obj(o: T) -> T` → `vire_module_obj`.
+        // Boundary RC convention, identical to an ordinary Vire call: the argument is
+        // BORROWED (+0, the host keeps its count) and the result is OWNED (+1, handed to
+        // the host). The module allocates and retains through the *host's* runtime — it
+        // links no `runtime.c` of its own and resolves `jrt_*` from the executable — so
+        // there is exactly one heap and one set of counts across the boundary, which is
+        // what makes a two-module program's 0-live claim mean anything.
+        if program.functions.iter().any(|f| f.name == "module_obj" && f.params == [Ty::Ref] && f.ret == Ty::Ref) {
+            shim.push_str("define ptr @vire_module_obj(ptr %o) {\n  %r = call ptr @module_obj(ptr %o)\n  ret ptr %r\n}\n");
+        }
+        // The shared-type ABI table the host's load verifier checks (layout hash +
+        // ownership edges). Distinct symbol name from the host's on purpose — see
+        // `emit_typetab`.
+        shim.push_str(&fastllvm_backend::emit_typetab(&program, "vire_module_types"));
         format!("{ll}{shim}")
+    } else if uses_module_loader(&program) {
+        // The host side of the same table: the verifier needs the host's own layouts and
+        // type graph to compare against. Only emitted for a program that actually loads
+        // modules — otherwise it is dead weight that `--gc-sections` would strip anyway.
+        let tab = fastllvm_backend::emit_typetab(&program, "vire_host_types");
+        format!("{ll}{tab}")
     } else {
         ll
     };
@@ -1298,6 +1352,18 @@ fn build_or_run(args: &[String]) {
         eprintln!("writing to {}: {e}", build_dir.display());
         exit(1);
     }
+    // Does the program load native modules at runtime (`load_module`)? Decides
+    // the shared-type ABI table + `-rdynamic` (see below).
+    fn uses_module_loader(program: &fastllvm_ir::Program) -> bool {
+        program.functions.iter().any(|f| {
+            f.blocks.iter().any(|b| {
+                b.statements
+                    .iter()
+                    .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_load_module"))
+            })
+        })
+    }
+
     // Write embedded native blocks to files (extension by ABI) and
     // add compile/link flags for C++/Python automatically.
     let mut native_paths: Vec<PathBuf> = Vec::new();
@@ -1569,6 +1635,14 @@ fn build_or_run(args: &[String]) {
     // so libdl stays unreferenced). Cross targets get their own loader story later.
     if target.is_none() {
         cmd.arg("-ldl");
+    }
+    // A loaded module carries no runtime of its own (that would give it a second heap and
+    // a second set of reference counts — the boundary RC would then be a fiction). It
+    // resolves `jrt_alloc`/`jrt_retain`/`jrt_release`/… against the host executable at
+    // `dlopen` time, which only works if those symbols are in the host's dynamic symbol
+    // table. Costs nothing but a larger `.dynsym` in a program that loads modules anyway.
+    if !emit_module && uses_module_loader(&program) {
+        cmd.arg("-rdynamic");
     }
     // A dynamic module (`--emit-module`) is a position-independent shared object exporting
     // the scalar C-ABI entry, not an executable.

@@ -30,15 +30,145 @@ use fastllvm_ir::*;
 
 pub fn elide_bounds(program: &mut Program) -> usize {
     let dbg = std::env::var_os("FASTLLVM_DEBUG_BOUNDS").is_some();
+    let param_lens = param_min_lens(program);
+    if dbg {
+        for (name, v) in &param_lens {
+            if v.iter().any(|x| x.is_some()) {
+                eprintln!("[bounds] summary {name}: {v:?}");
+            }
+        }
+    }
     let mut total = 0;
     for f in &mut program.functions {
-        let c = run(f);
+        let pl = param_lens.get(&f.name).cloned().unwrap_or_default();
+        let c = run(f, &pl);
         if dbg && c > 0 {
             eprintln!("[bounds] {} elided {c} check(s)", f.name);
         }
         total += c;
     }
     total
+}
+
+/// A function is only summarizable if EVERY call to it is visible here. These are
+/// not: the entry points (called by the runtime), anything a dynamic module can
+/// redirect (`dyn_fns`), and the module boundary entries.
+fn summarizable(name: &str, program: &Program) -> bool {
+    !program.dyn_fns.iter().any(|n| n == name)
+        && name != "main"
+                && name != "module_main"
+        && name != "module_obj"
+        && !name.starts_with("vire_")
+        && !name.starts_with("jrt_")
+}
+
+/// Per function, a lower bound on the LENGTH of each array parameter, valid at every
+/// call site — the closed world's payoff. Without it a callee's `Array[Int]` parameter
+/// has no length at all and no bounds check in it can ever be elided; the caller's
+/// `array(8)` is right there but stops at the call.
+///
+/// Greatest fixpoint, and it has to be: starting pessimistic collapses instantly.
+/// `perft` calls `gen` calls `attacked`, all passing their own array parameters on;
+/// with a bottom start the first such call sets the callee to "unknown" before the
+/// caller's own bound is known, `min` never recovers, and every summary ends at −1.
+/// So start at `i64::MAX` ("no call seen yet") and only ever lower: a call passing a
+/// proven length `n` gives `min(bound, n)`, a call passing something opaque gives −1.
+/// Monotone downward from a finite start, hence terminating; and sound at the fixpoint
+/// because every call site has been applied.
+fn param_min_lens(program: &Program) -> HashMap<String, Vec<Option<i64>>> {
+    let idx: HashMap<&str, usize> =
+        program.functions.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let mut sum: Vec<Vec<i64>> =
+        program.functions.iter().map(|f| vec![i64::MAX; f.params.len()]).collect();
+
+    for _ in 0..32 {
+        let mut changed = false;
+        for (fi, f) in program.functions.iter().enumerate() {
+            // Locals holding an array of a known minimum length, within this function.
+            let mut minlen: HashMap<u32, i64> = HashMap::new();
+            // MAX belongs in here too: it is the optimistic "not yet constrained", and
+            // it has to travel through the recursive edge (`perft` passing its own array
+            // to `perft`). Dropping it would make the self-call look opaque and pin the
+            // summary to −1 before the real call site from `vire_main` is ever seen.
+            for (pi, b) in sum[fi].iter().enumerate() {
+                if *b >= 0 {
+                    minlen.insert(pi as u32, *b);
+                }
+            }
+            for blk in &f.blocks {
+                for st in &blk.statements {
+                    match st {
+                        // `array(n)` lowers the length through `to_i32`, so a literal
+                        // arrives as ConstI32 — matching only ConstI64 sees nothing.
+                        Statement::NewArray { dest, len, .. }
+                        | Statement::RegionNewArray { dest, len, .. } => match len {
+                            Operand::ConstI64(n) => {
+                                minlen.insert(dest.0, *n);
+                            }
+                            Operand::ConstI32(n) => {
+                                minlen.insert(dest.0, *n as i64);
+                            }
+                            _ => {}
+                        },
+                        Statement::StackNewArray { dest, len, .. } => {
+                            minlen.insert(dest.0, *len);
+                        }
+                        // Follow copies: the array is allocated into one local and passed
+                        // from another (`Local(0)` allocated, `Local(1) = Local(0)`, call
+                        // uses `Local(1)`), so without this the length stops at the copy.
+                        Statement::Assign(dest, Rvalue::Use(Operand::Copy(src))) => {
+                            match minlen.get(&src.0).copied() {
+                                Some(n) => {
+                                    minlen.insert(dest.0, n);
+                                }
+                                None => {
+                                    minlen.remove(&dest.0);
+                                }
+                            }
+                        }
+                        Statement::Call { func, args, .. }
+                        | Statement::CallGuarded { func, args, .. } => {
+                            let Some(&ci) = idx.get(func.as_str()) else { continue };
+                            if !summarizable(func, program) {
+                                continue;
+                            }
+                            for (ai, a) in args.iter().enumerate() {
+                                if ai >= sum[ci].len() || program.functions[ci].params[ai] != Ty::Ref {
+                                    continue;
+                                }
+                                let passed = match a {
+                                    Operand::Copy(l) => minlen.get(&l.0).copied(),
+                                    _ => None,
+                                };
+                                // Unknown argument ⇒ bottom: the parameter may be any length.
+                                let v = passed.unwrap_or(-1);
+                                let slot = &mut sum[ci][ai];
+                                if v < *slot {
+                                    *slot = v;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // MAX = never called with a visible argument ⇒ no claim (None).
+    program
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let v = sum[i].iter().map(|&x| if x == i64::MAX || x < 0 { None } else { Some(x) }).collect();
+            (f.name.clone(), v)
+        })
+        .collect()
 }
 
 /// Value-number expression. Each variant is unique through its fields, so
@@ -285,6 +415,21 @@ fn transfer_block(
             }
             _ => {}
         }
+        // An array reached through a PARAMETER has no allocation site in this function,
+        // so nothing above ever gave it a length sym — and `provably_in_bounds` bails out
+        // on the very first line for want of one. Give every touched array a symbolic
+        // length (`Len(arr)`), exactly as an explicit `len(a)` would. It carries no
+        // value, so the value-based paths are unaffected; what it enables is reasoning
+        // about the length's IDENTITY — two accesses to the same array share one length,
+        // which is all Path 5 needs. Without this, a function taking `Array[Int]` as a
+        // parameter got no elision at all.
+        if let Statement::ArrayLoad { arr, .. } | Statement::ArrayStore { arr, .. } = st {
+            let asym = sym_of_operand(arr, &env, it);
+            if !len_of.contains_key(&asym) {
+                let l = it.intern(SymExpr::Len(asym));
+                len_of.insert(asym, l);
+            }
+        }
     }
     env
 }
@@ -346,7 +491,7 @@ fn merge_in(f: &Function, b: usize, preds: &[usize], env_out: &[Env], it: &mut I
     env
 }
 
-fn run(f: &mut Function) -> usize {
+fn run(f: &mut Function, param_lens: &[Option<i64>]) -> usize {
     let nb = f.blocks.len();
     if nb == 0 {
         return 0;
@@ -407,11 +552,46 @@ fn run(f: &mut Function) -> usize {
     // is a value S is ≡ S (loop-invariant). Necessary because the pessimistic
     // GVN would otherwise hold invariant values flowing around the loop as a phi.
     let repr = compute_repr(&it, &phi_inc, &incomplete);
+    // `len_of` was built during the GVN fixpoint, before `repr` existed, so its keys are
+    // RAW syms — while every lookup below canonicalizes first. Whenever a sym is not its
+    // own representative the two miss each other and the length is invisible, which is
+    // why an array reached through a parameter (whose sym is typically merged with the
+    // copies it flows through) never found its length. Re-key once, here.
+    let len_of: HashMap<u32, u32> = len_of
+        .iter()
+        .map(|(&k, &v)| (canon(&repr, k), canon(&repr, v)))
+        .collect();
     let nn = compute_nonneg(&it, &phi_inc, &repr, &incomplete);
     // Constant upper + lower bound per sym (proves `lo ≤ i ≤ hi` across loop phis) —
     // the binary-search midpoint and matmul affine index, against a constant length.
     let ub_fix = compute_ub(&it, &phi_inc, &repr, &nn, &incomplete);
-    let lb_fix = compute_lb(&it, &phi_inc, &repr, &nn, &incomplete);
+    let mut lb_fix = compute_lb(&it, &phi_inc, &repr, &nn, &incomplete);
+    // Interprocedural: the caller's `array(8)` reaches the callee's parameter. Feed the
+    // call-site-wide minimum length in as a lower bound on that parameter's length sym,
+    // which is exactly what Path 3 reads (`0 ≤ i ≤ u < L ≤ len`). Without this a
+    // parameter array has no length at all and every path is dead on arrival.
+    // An entry-block parameter local is un-assigned, so `sym_of_operand` gives it the
+    // stable `Opaque(0xF000_0000 | local)` — the same sym its accesses see.
+    for (pi, &pty) in f.params.iter().enumerate() {
+        let Some(Some(minlen)) = param_lens.get(pi) else { continue };
+        if pty != Ty::Ref || *minlen < 0 {
+            continue;
+        }
+        // A parameter local is symed as `Param(i)` where it is seeded, but falls back to
+        // `Opaque(0xF000_0000|i)` in `sym_of_operand` when the env has no entry. Both can
+        // reach an access, so try both rather than guess.
+        let psym = canon(&repr, it.intern(SymExpr::Param(pi as u32)));
+        let pofs = canon(&repr, it.intern(SymExpr::Opaque(0xF000_0000 | pi as u32)));
+        let Some(&lensym0) = len_of.get(&psym).or_else(|| len_of.get(&pofs)) else { continue };
+        let ln = canon(&repr, lensym0) as usize;
+        if ln >= lb_fix.len() {
+            lb_fix.resize(ln + 1, None);
+        }
+        // Only ever raise: a bound proven locally is at least as good.
+        if lb_fix[ln].is_none_or(|cur| cur < *minlen) {
+            lb_fix[ln] = Some(*minlen);
+        }
+    }
     // Constant upper bound per sym: Const(c≥0) → c, And(_,m≥0) → m. For
     // indices without a loop guard (`sh[i & 1]`): in-bounds against a constant
     // length, if this bound < length.
@@ -497,9 +677,24 @@ fn run(f: &mut Function) -> usize {
         // Carry env along at each statement.
         let mut env = env_in[b].clone();
         let mut dummy_len = len_of.clone();
+        // Path 5 state: per array-length sym, the largest CONSTANT index whose check
+        // has already been passed in this block. A check that stays is not just a
+        // cost — it is a *fact*: control only reaches the next statement if the index
+        // was in bounds, so `k < len` holds from there on, and hence `j < len` for
+        // every `j ≤ k`. Block-local (no merge across edges), which needs no dataflow
+        // and is trivially sound: within a block control is linear.
+        let mut proven_max: HashMap<u32, i64> = HashMap::new();
         let stmts = &mut f.blocks[b].statements;
         for si in 0..stmts.len() {
-            let elide = match &stmts[si] {
+            // Path 5: a constant index already covered by a passed check on the same
+            // array. `bb[0]…bb[7]` costs one check, not eight. Computed BEFORE the
+            // elision below, which would clear `checked` and hide the fact.
+            let cidx = const_idx_of(&f_stmt(stmts, si), &env, &len_of, &repr, &mut it);
+            let path5 = match cidx {
+                Some((lensym, k)) => proven_max.get(&lensym).is_some_and(|&m| m >= k),
+                None => false,
+            };
+            let elide = path5 || match &stmts[si] {
                 // Ref loads may be elided (pure GEP); ref stores not,
                 // since `jrt_?astore` carries the covariance check (ArrayStoreException)
                 // that the inline path would not have.
@@ -518,6 +713,15 @@ fn run(f: &mut Function) -> usize {
                         count += 1;
                     }
                     _ => {}
+                }
+            }
+            // Record the constant-index fact this access establishes. Both an elided
+            // and a kept check leave `k < len` true afterwards — the elided one because
+            // it was already proven, the kept one because control would have trapped.
+            if let Some((lensym, k)) = cidx {
+                let e = proven_max.entry(lensym).or_insert(k);
+                if k > *e {
+                    *e = k;
                 }
             }
             // Advance env past this statement (only sym definitions).
@@ -584,9 +788,48 @@ fn step_env(st: &Statement, b: usize, si: usize, env: &mut Env, it: &mut Interne
         }
         _ => {}
     }
+    // Symbolic length for a parameter-reached array — see the same step in
+    // `transfer_block`; both walks must agree or the marking pass sees a different
+    // `len_of` than the fixpoint built.
+    if let Statement::ArrayLoad { arr, .. } | Statement::ArrayStore { arr, .. } = st {
+        let asym = sym_of_operand(arr, env, it);
+        if !len_of.contains_key(&asym) {
+            let l = it.intern(SymExpr::Len(asym));
+            len_of.insert(asym, l);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `(length sym, constant index)` of an array access whose index is a compile-time
+/// constant and whose array has a known length sym. The vehicle for Path 5: a
+/// constant index is the one case where a *passed* check transfers to other accesses
+/// for free, because the constants are ordered without any analysis.
+fn const_idx_of(
+    st: &Statement,
+    env: &Env,
+    len_of: &HashMap<u32, u32>,
+    repr: &[u32],
+    it: &mut Interner,
+) -> Option<(u32, i64)> {
+    let (arr, index, checked) = match st {
+        Statement::ArrayLoad { arr, index, checked, .. } => (arr, index, *checked),
+        Statement::ArrayStore { arr, index, checked, kind, .. } if !kind.is_ref() => (arr, index, *checked),
+        _ => return None,
+    };
+    // An unchecked access proves nothing: it may be out of bounds without trapping.
+    if !checked {
+        return None;
+    }
+    let asym = canon(repr, sym_of_operand(arr, env, it));
+    let lensym = canon(repr, *len_of.get(&asym)?);
+    let isym = canon(repr, sym_of_operand(index, env, it));
+    match it.exprs[isym as usize] {
+        SymExpr::Const(k) if k >= 0 => Some((lensym, k)),
+        _ => None,
+    }
+}
+
 fn provably_in_bounds(
     arr: &Operand,
     index: &Operand,

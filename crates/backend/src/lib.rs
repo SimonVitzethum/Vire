@@ -229,6 +229,8 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("llvm.sin.f64", "double (double)"),
     ("llvm.cos.f64", "double (double)"),
     ("llvm.floor.f64", "double (double)"),
+    ("llvm.cttz.i64", "i64 (i64, i1)"),
+    ("llvm.ctpop.i64", "i64 (i64)"),
     ("jrt_current_time_millis", "i64 ()"),
     ("jrt_nano_time", "i64 ()"),
     ("jrt_array_ref_drop", "void (ptr)"),
@@ -353,14 +355,16 @@ impl<'a> Ctx<'a> {
     }
 
     /// Instance fields in layout order: superclasses first.
-    fn flatten_fields(&self, class: &str) -> Vec<(String, String, Ty)> {
+    /// `(owner class, field name, type, weak)` — `weak` marks a non-owning ref field
+    /// (Vire `weak f: T`), which is stored without retain and dropped without release.
+    fn flatten_fields(&self, class: &str) -> Vec<(String, String, Ty, bool)> {
         let Some(ci) = self.class(class) else { return Vec::new() };
         let mut out = match &ci.super_name {
             Some(s) => self.flatten_fields(s),
             None => Vec::new(),
         };
         for f in &ci.fields {
-            out.push((ci.name.clone(), f.name.clone(), f.ty));
+            out.push((ci.name.clone(), f.name.clone(), f.ty, f.weak));
         }
         out
     }
@@ -371,8 +375,21 @@ impl<'a> Ctx<'a> {
         let (owner, ty) = self.program.resolve_field(class, field)?;
         let owner = owner.to_string();
         let flat = self.flatten_fields(&owner);
-        let idx = flat.iter().position(|(o, n, _)| *o == owner && n == field)?;
+        let idx = flat.iter().position(|(o, n, ..)| *o == owner && n == field)?;
         Some((owner, idx + HEADER_SLOTS, ty))
+    }
+
+    /// Is `class.field` a `weak` (non-owning) reference field? Resolved up the super
+    /// chain, like `resolve_field`.
+    fn field_is_weak(&self, class: &str, field: &str) -> bool {
+        let mut cur = self.class(class);
+        while let Some(ci) = cur {
+            if let Some(f) = ci.fields.iter().find(|f| f.name == field) {
+                return f.weak;
+            }
+            cur = ci.super_name.as_deref().and_then(|s| self.class(s));
+        }
+        false
     }
 
     /// Global symbol and type of a static field (up the super chain).
@@ -381,13 +398,14 @@ impl<'a> Ctx<'a> {
         Some((format!("@sf.{}.{}", sanitize(owner), sanitize(field)), ty))
     }
 
-    /// Ref fields of `class` (including inherited) as a GEP index list — for
-    /// the generated drop function.
+    /// **Owning** ref fields of `class` (including inherited) as a GEP index list — for
+    /// the generated drop and trace functions. `weak` fields are excluded on purpose:
+    /// they hold no count to give back (drop) and keep nothing alive (trace).
     fn ref_field_slots(&self, class: &str) -> Vec<usize> {
         self.flatten_fields(class)
             .iter()
             .enumerate()
-            .filter(|(_, (_, _, t))| *t == Ty::Ref)
+            .filter(|(_, (_, _, t, weak))| *t == Ty::Ref && !*weak)
             .map(|(i, _)| i + HEADER_SLOTS)
             .collect()
     }
@@ -570,6 +588,154 @@ fn escape_md(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Encoding of `Ty` in the shared-type ABI table. Fixed by the ABI, so it may not
+/// follow the enum's declaration order — a reordering of `Ty` must not silently
+/// change what a previously built module means.
+fn abi_kind(t: Ty) -> i32 {
+    match t {
+        Ty::I32 => 0,
+        Ty::I64 => 1,
+        Ty::F32 => 2,
+        Ty::F64 => 3,
+        Ty::Ref => 4,
+        Ty::Void => 5,
+    }
+}
+
+/// Instance fields of `class` in **memory layout order** (superclass fields first),
+/// mirroring `Ctx::flatten_fields` — but from `Program` alone, so the ABI table can be
+/// emitted without a full `Ctx`.
+fn abi_flat_fields(program: &Program, class: &str) -> Vec<FieldInfo> {
+    let Some(ci) = program.class(class) else { return Vec::new() };
+    let mut out = match &ci.super_name {
+        Some(s) => abi_flat_fields(program, s),
+        None => Vec::new(),
+    };
+    out.extend(ci.fields.iter().cloned());
+    out
+}
+
+/// FNV-1a over the flattened layout: field order, kind, weakness and ref target.
+/// This is the **layout fingerprint** the load verifier compares. It deliberately
+/// excludes the class name (that is the lookup key) and the methods (a module may
+/// carry its own code for a shared type — only the *shape* must agree).
+fn abi_layout_hash(program: &Program, class: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8], h: &mut u64| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for f in abi_flat_fields(program, class) {
+        eat(f.name.as_bytes(), &mut h);
+        eat(b":", &mut h);
+        eat(abi_kind(f.ty).to_string().as_bytes(), &mut h);
+        eat(if f.weak { b"w" } else { b"o" }, &mut h);
+        eat(f.ref_target.as_deref().unwrap_or("-").as_bytes(), &mut h);
+        eat(b";", &mut h);
+    }
+    h as i64
+}
+
+/// The **shared-type ABI** table (DYNAMIC-VIRE-PLAN.md P1 step 2b) — a C-readable
+/// description of every class's layout and of its *ownership* edges, emitted into the
+/// host executable and into every `--emit-module` `.so`. It exists so that
+/// `jrt_load_module`'s verifier can decide, at load time and without trusting the
+/// module, the two questions §6 makes the price of an open world:
+///
+/// 1. **Layout compatibility** — a type both sides declare must have the identical
+///    layout, or the module would read the host's objects at the wrong offsets.
+///    Decided by `hash`; a mismatch rejects the module (no partial linking).
+/// 2. **Acyclicity-or-weak** — linking the module's types into the host's type graph
+///    must not close a *new* ownership cycle, or pure RC would leak and the open world
+///    would need the collector back. Decided by walking `fields`/`super`/`ifaces`;
+///    `weak` fields carry no ownership and are therefore not edges.
+///
+/// The C mirror lives in `runtime.c` (`struct vire_type`); the two must be changed
+/// together, which is what `vire_module_abi` versions.
+///
+/// `symbol` is `vire_host_types` in an executable and `vire_module_types` in a module —
+/// **deliberately different names**: a host that loads modules links `-rdynamic`, and
+/// ELF symbol interposition would otherwise let the module's `dlsym` resolve to the
+/// *host's* table, so the verifier would compare the host against itself and pass
+/// everything.
+pub fn emit_typetab(program: &Program, symbol: &str) -> String {
+    let mut defs = String::new();
+    let mut body = String::new();
+    // Interned C strings: one definition per distinct name, referenced by pointer.
+    let mut pool: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cstr = |s: &str, pool: &mut BTreeMap<String, usize>, defs: &mut String| -> String {
+        if let Some(i) = pool.get(s) {
+            return format!("@vts.{i}");
+        }
+        let i = pool.len();
+        pool.insert(s.to_string(), i);
+        let b = s.as_bytes();
+        writeln!(
+            defs,
+            "@vts.{i} = private unnamed_addr constant [{n} x i8] c\"{esc}\\00\"",
+            n = b.len() + 1,
+            esc = escape_ll(b),
+        )
+        .unwrap();
+        format!("@vts.{i}")
+    };
+
+    let mut entries: Vec<String> = Vec::new();
+    for (ci_idx, c) in program.classes.iter().enumerate() {
+        let name_p = cstr(&c.name, &mut pool, &mut defs);
+        let super_p = match &c.super_name {
+            Some(s) if program.class(s).is_some() => cstr(s, &mut pool, &mut defs),
+            _ => "null".to_string(),
+        };
+        // Directly implemented interfaces, null-terminated. The verifier closes the
+        // relation transitively itself (it must anyway, across the two tables).
+        let ifaces: Vec<String> = c
+            .interfaces
+            .iter()
+            .filter(|i| program.class(i).is_some())
+            .map(|i| format!("ptr {}", cstr(i, &mut pool, &mut defs)))
+            .collect();
+        let ifaces_p = if ifaces.is_empty() {
+            "null".to_string()
+        } else {
+            writeln!(defs, "@vti.{ci_idx} = private constant [{n} x ptr] [{l}, ptr null]", n = ifaces.len() + 1, l = ifaces.join(", ")).unwrap();
+            format!("@vti.{ci_idx}")
+        };
+        // Flattened (real) layout: what the module would actually read and write.
+        let flat = abi_flat_fields(program, &c.name);
+        let fields_p = if flat.is_empty() {
+            "null".to_string()
+        } else {
+            let items: Vec<String> = flat
+                .iter()
+                .map(|f| {
+                    let fname = cstr(&f.name, &mut pool, &mut defs);
+                    let target = match &f.ref_target {
+                        Some(t) => format!("ptr {}", cstr(t, &mut pool, &mut defs)),
+                        None => "ptr null".to_string(),
+                    };
+                    format!("{{ ptr, i32, i32, ptr }} {{ ptr {fname}, i32 {k}, i32 {w}, {target} }}", k = abi_kind(f.ty), w = i32::from(f.weak))
+                })
+                .collect();
+            writeln!(defs, "@vtf.{ci_idx} = private constant [{n} x {{ ptr, i32, i32, ptr }}] [{l}]", n = flat.len(), l = items.join(", ")).unwrap();
+            format!("@vtf.{ci_idx}")
+        };
+        entries.push(format!(
+            "{{ ptr, ptr, ptr, i64, ptr, i64 }} {{ ptr {name_p}, ptr {super_p}, ptr {ifaces_p}, i64 {n}, ptr {fields_p}, i64 {h} }}",
+            n = flat.len(),
+            h = abi_layout_hash(program, &c.name),
+        ));
+    }
+    // A class-free program still needs the symbol (the runtime references it
+    // unconditionally); `[0 x T] []` is not valid IR, `zeroinitializer` is.
+    let init = if entries.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", entries.join(", ")) };
+    writeln!(body, "@{symbol} = constant [{n} x {{ ptr, ptr, ptr, i64, ptr, i64 }}] {init}", n = entries.len()).unwrap();
+    writeln!(body, "@{symbol}_len = constant i64 {}", entries.len()).unwrap();
+    format!("\n{defs}{body}")
+}
+
 pub fn emit(program: &Program) -> String {
     emit_full(program, None, false)
 }
@@ -726,7 +892,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     // Struct types: { i64 refcount, i64 rcflags, ptr vtable, fields… }.
     for c in &program.classes {
         let mut parts = vec!["i64".to_string(), "ptr".to_string()];
-        parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t)| llty(*t).to_string()));
+        parts.extend(ctx.flatten_fields(&c.name).iter().map(|(_, _, t, _)| llty(*t).to_string()));
         writeln!(w, "{} = type {{ {} }}", ctx.struct_name(&c.name), parts.join(", ")).unwrap();
     }
     // Array types (header + i64 length + flexible element field) and their
@@ -1048,11 +1214,18 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         writeln!(w, "  %vtp = getelementptr ptr, ptr %new, i64 {VTABLE_WORD}").unwrap();
         writeln!(w, "  store ptr @vt.{}, ptr %vtp", sanitize(class)).unwrap();
         writeln!(w, "  call void @jrt_copymap_put(ptr %map, ptr %src, ptr %new)").unwrap();
-        for (k, (_owner, _name, ty)) in ctx.flatten_fields(class).iter().enumerate() {
+        for (k, (_owner, _name, ty, weak)) in ctx.flatten_fields(class).iter().enumerate() {
             let slot = k + HEADER_SLOTS;
             writeln!(w, "  %sp{k} = getelementptr {sn}, ptr %src, i32 0, i32 {slot}").unwrap();
             writeln!(w, "  %np{k} = getelementptr {sn}, ptr %new, i32 0, i32 {slot}").unwrap();
-            if *ty == Ty::Ref {
+            if *ty == Ty::Ref && *weak {
+                // A weak field is a non-owning back-edge: deep-copying through it would
+                // clone the ancestor it points back at (and, on a cyclic shape, recurse).
+                // The copy aliases the SAME referent and stays non-owning — the pointer is
+                // moved verbatim, no retain, no descent.
+                writeln!(w, "  %fv{k} = load ptr, ptr %sp{k}").unwrap();
+                writeln!(w, "  store ptr %fv{k}, ptr %np{k}").unwrap();
+            } else if *ty == Ty::Ref {
                 writeln!(w, "  %fv{k} = load ptr, ptr %sp{k}").unwrap();
                 writeln!(w, "  %fc{k} = call ptr @jrt_deep_copy_ref(ptr %fv{k}, ptr %map)").unwrap();
                 writeln!(w, "  store ptr %fc{k}, ptr %np{k}").unwrap();
@@ -1157,14 +1330,11 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     // `dynamic fn` / `open fn`, initialized to the function's own body (the default). A call
     // to such a fn loads its slot and calls through it (see Statement::Call); the runtime's
     // `jrt_dyn_install` overwrites a slot with a loaded module's override. `extern void
-    // *jrt_dynslot[]` in runtime.c binds here. Always emitted (even empty): the
-    // runtime's `jrt_dyn_install` references it unconditionally, and link modes
-    // that keep unstripped symbols (`-rdynamic` for --backtrace) fail otherwise.
+    // *jrt_dynslot[]` in runtime.c binds here. Emitted only when the program has seams
+    // (the runtime carries a weak zero-filled fallback, so seam-less programs link).
     if !program.dyn_fns.is_empty() {
         let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
         writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
-    } else {
-        writeln!(w, "@jrt_dynslot = global [0 x ptr] zeroinitializer").unwrap();
     }
     // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
     // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
@@ -1186,11 +1356,6 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
             .map(|(i, n)| format!("{{ i64, i64, ptr }} {{ i64 ptrtoint (ptr @{n} to i64), i64 14, ptr @.patchname.{i} }}"))
             .collect();
         writeln!(w, "@jrt_patchtab = constant [{} x {{ i64, i64, ptr }}] [{}]", patch_set.len(), recs.join(", ")).unwrap();
-    } else {
-        // Always emitted (even empty): the runtime patcher references the table
-        // unconditionally; unstripped link modes would fail otherwise (see dynslot).
-        writeln!(w, "@jrt_patchtab_len = constant i64 0").unwrap();
-        writeln!(w, "@jrt_patchtab = constant [0 x {{ i64, i64, ptr }}] zeroinitializer").unwrap();
     }
 
     // Freestanding: a compact symbol table (function address → name) so the runtime's
@@ -2310,7 +2475,7 @@ impl<'a> FnEmitter<'a> {
 /// **exhaustive** match (no `_` arm) over every `Statement`/`Terminator` operand, so
 /// a use can never be silently missed (an under-count would be unsound); an
 /// over-count only forgoes the optimization.
-fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, imm: &BTreeSet<u32>) -> BTreeSet<u32> {
+fn moved_locals(f: &Function, ctx: &Ctx, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, imm: &BTreeSet<u32>) -> BTreeSet<u32> {
     let n = f.locals.len();
     let mut uses = vec![0u32; n];
     let mut consumed = vec![false; n]; // the local's use is a PutField-value / return
@@ -2347,11 +2512,17 @@ fn moved_locals(f: &Function, borrowed: &BTreeSet<u32>, borrow: &BTreeSet<u32>, 
                     owned[dest.0 as usize] = true;
                 }
                 Statement::GetField { obj, .. } => touch(&mut uses, obj),
-                Statement::PutField { obj, value, .. } => {
+                Statement::PutField { obj, class, field, value } => {
                     touch(&mut uses, obj);
                     touch(&mut uses, value);
+                    // A store into a `weak` field consumes NOTHING: the field takes no
+                    // ownership, so the local keeps its +1 and must still be released at
+                    // cleanup. Treating it as a move would drop that count on the floor
+                    // (a leak) — the one place `weak` has to reach into the move analysis.
                     if let Operand::Copy(l) = value {
-                        consumed[l.0 as usize] = true;
+                        if !ctx.field_is_weak(class, field) {
+                            consumed[l.0 as usize] = true;
+                        }
                     }
                 }
                 Statement::GetStatic { .. } | Statement::InstanceOfPending { .. } => {}
@@ -2568,7 +2739,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     let fw = ctx.field_writes.get(&f.name).unwrap_or(&empty_fw);
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
-    let moved = moved_locals(f, &borrowed, &borrow, &imm);
+    let moved = moved_locals(f, ctx, &borrowed, &borrow, &imm);
     let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, vt_tbaa: ctx.vt_tbaa, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
@@ -2749,6 +2920,21 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let t = e.fresh();
             let intr = match func.as_str() { "jrt_math_sin" => "llvm.sin.f64", "jrt_math_cos" => "llvm.cos.f64", _ => "llvm.floor.f64" };
             writeln!(w, "  {t} = call double @{intr}(double {a}){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
+        }
+        // ctz/popcount → the LLVM bit intrinsics. `cttz` with `i1 false` is DEFINED at
+        // zero (returns the bit width, 64) — no UB, the safety-first choice, and on x86
+        // `tzcnt` yields exactly that for free. `ctpop` → a single `popcnt`.
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_ctz" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i64 @llvm.cttz.i64(i64 {a}, i1 false){}", e.dbg()).unwrap();
+            store_dest(w, e, *d, &t, false);
+        }
+        Statement::Call { dest: Some(d), func, args } if func == "jrt_popcount" => {
+            let a = e.operand(w, &args[0]);
+            let t = e.fresh();
+            writeln!(w, "  {t} = call i64 @llvm.ctpop.i64(i64 {a}){}", e.dbg()).unwrap();
             store_dest(w, e, *d, &t, false);
         }
         Statement::Call { dest, func, args } => {
@@ -3027,7 +3213,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             let p = e.fresh();
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let tb = ctx.tbaa_suffix(&owner, field);
-            if ty == Ty::Ref {
+            if ty == Ty::Ref && ctx.field_is_weak(class, field) {
+                // `weak f: T` — a NON-OWNING back-edge (DYNAMIC-VIRE-PLAN.md §6). No
+                // retain (the field takes no count) and no release of the old value (it
+                // never held one), so the store is a bare pointer write. This is what
+                // makes a cycle closed through this field reference-countable: the edge
+                // contributes nothing to the referent's count, so the cycle cannot
+                // sustain itself. The referent must outlive the holder — Vire does not
+                // clear weak fields (the parent-pointer discipline, see LANGUAGE.md).
+                writeln!(w, "  store ptr {v}, ptr {p}{tb}").unwrap();
+            } else if ty == Ty::Ref {
                 // The field takes over an owning reference: retain new, release old.
                 // `retain(null)` is a provable no-op (constant null) → omit it.
                 // A move-on-last-use local (`moved`) hands the field its own +1 —

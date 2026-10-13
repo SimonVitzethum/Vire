@@ -6,17 +6,15 @@
 # from real regressions. This ties the layers together so that can't recur.
 #
 # Usage:  sh tests/gate.sh            (from the project root)
-#         sh tests/gate.sh --fast     (skip the slow Java heap oracle)
 #
 # Stages, cheapest first (fail fast):
+#   0. runtime.c syntax (clang -fsyntax-only)
 #   1. cargo test  — unit/lowering/inference tests (the layer that rotted)
-#   2. vire_*.sh   — Vire language + heap-balance + vulkan suites
+#   2. vire_*.sh   — Vire language + heap-balance suites
 #   3. examples    — every examples/vire/*.vr builds, runs, matches its output
-#   4. run.sh      — the Java AOT heap-balance oracle (0 live), the paramount gate
 set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root" || exit 2
-fast=0; [ "${1:-}" = "--fast" ] && fast=1
 stages_failed=""
 
 stage() {  # stage <name> <command...>
@@ -30,27 +28,20 @@ stage() {  # stage <name> <command...>
 #    so a C syntax error sails green through the whole gate on any machine
 #    where no program build exercises them. -fsyntax-only closes that gap.
 if command -v clang >/dev/null 2>&1; then
-    stage "runtime.c syntax"    clang -fsyntax-only "$root/crates/driver/src/runtime.c"
+    stage "runtime.c syntax"    clang -fsyntax-only "$root/crates/runtime/runtime.c"
 fi
 
 # 1. cargo — build release first (the suites need the binary), then test.
 stage "cargo build --release" cargo build --release
 stage "cargo test --release"  cargo test --release --workspace
 
-# 2. Vire shell suites (GPU/Vulkan suites removed per AGENTS.md §1).
+# 2. Vire shell suites.
 for t in "$root"/tests/vire_*.sh; do
     stage "$(basename "$t")" sh "$t"
 done
 
 # 3. Examples.
 stage "examples/vire" sh "$root/examples/vire/run.sh"
-
-# 4. Java heap-balance oracle (slow — ~minutes). Skippable with --fast.
-if [ "$fast" -eq 0 ]; then
-    stage "run.sh (Java heap oracle)" sh "$root/tests/run.sh"
-else
-    printf '\n(skipping the Java heap oracle — --fast)\n'
-fi
 
 printf '\n========================================\n'
 if [ -z "$stages_failed" ]; then

@@ -3,7 +3,7 @@
 //! for-over-Range), `print`, calls to own functions. Generics/traits/
 //! closures/capsule follow (FRONTEND-PLAN F5–F8).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
 
@@ -420,8 +420,31 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     // [(field name, type name)])]). Single-parameter; Result stays i64-erased.
     let mut generic_stypes: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)> = HashMap::new();
     let mut variant_owner_g: HashMap<String, String> = HashMap::new();
+    // `weak f: T` fields, keyed `Type.field` (DYNAMIC-VIRE-PLAN.md §6). A side table
+    // instead of a 4th element in `Layout`, which threads through two dozen signatures
+    // and means nothing to any of them: only `FieldInfo` construction reads this.
+    let mut weak_fields: BTreeSet<String> = BTreeSet::new();
     for it in &m.items {
         if let Item::Type(t) = it {
+            // `weak` is meaningful only on a product type's ref field. On a sum-type
+            // payload or a generic type parameter it would need per-variant / per-
+            // instantiation ownership tracking that step 2b does not build — reject it
+            // instead of silently ignoring the modifier (a silently-owning "weak" field
+            // would make the acyclicity gate lie).
+            for f in t.fields.iter().filter(|f| f.weak) {
+                if !t.generics.is_empty() {
+                    errs.push(format!("`weak` is not supported on a generic type ({}.{})", t.name, f.name));
+                } else if ty_of(Some(&f.ty)) != Ty::Ref {
+                    errs.push(format!("`weak {}: {}` — only a reference field can be weak", f.name, f.ty.name));
+                } else {
+                    weak_fields.insert(format!("{}.{}", t.name, f.name));
+                }
+            }
+            for v in &t.variants {
+                for f in v.fields.iter().filter(|f| f.weak) {
+                    errs.push(format!("`weak` is not supported on a sum-type payload ({}.{})", v.name, f.name));
+                }
+            }
             if !t.generics.is_empty() && t.variants.is_empty() {
                 generic_ptypes.insert(
                     t.name.clone(),
@@ -562,7 +585,12 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     for tname in &all_type_names {
         let fields = types[tname]
             .iter()
-            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo {
+                name: n.clone(),
+                ty: *ty,
+                ref_target: rt.clone(),
+                weak: weak_fields.contains(&format!("{tname}.{n}")),
+            })
             .collect();
         // Implemented traits → interfaces + the impl methods into the vtable
         // (mangled = `Typ.methode`, as collect_methods lowers them).
@@ -874,7 +902,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     for (mangled, layout) in &all_insts {
         let fields = layout
             .iter()
-            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone() })
+            .map(|(n, ty, rt)| fastllvm_ir::FieldInfo { name: n.clone(), ty: *ty, ref_target: rt.clone(), weak: false })
             .collect();
         prog.classes.push(fastllvm_ir::ClassInfo {
             name: mangled.clone(),
@@ -3786,6 +3814,18 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: None, func: sym.into(), args: vec![] });
             return (Operand::ConstI64(0), Ty::Void);
         }
+        // `ctz(x)` / `popcount(x)` — bit intrinsics on Int (i64). The backend emits
+        // @llvm.cttz.i64(x, i1 false) (so ctz(0) = 64, defined — no UB) and
+        // @llvm.ctpop.i64(x), each a single instruction (tzcnt / popcnt on x86).
+        // Guarded by `fn_defs`: a user's own `fn ctz` takes precedence over the builtin.
+        if (name == "ctz" || name == "popcount") && lowered.len() == 1 && !self.fn_defs.contains_key(&name) {
+            let (a, _at) = lowered.into_iter().next().unwrap();
+            let ai = to_i64(a);
+            let d = self.new_local(Ty::I64);
+            let func = if name == "ctz" { "jrt_ctz" } else { "jrt_popcount" };
+            self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![ai] });
+            return (Operand::Copy(d), Ty::I64);
+        }
         // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float), `barray(n)` (unsigned
         // byte, 0..255) — real bounds-checked/-elidable arrays (as opposed to the i64 list).
         // `barray` is the byte buffer for scanning file bytes in Vire (grep, binary I/O): one
@@ -3986,6 +4026,34 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call".into(), args: vec![h, a] });
             return (Operand::Copy(d), Ty::I64);
+        }
+        // ── Step 2b: the OBJECT boundary. `module_call_obj(handle, o: T) -> T` hands a
+        // live object to the loaded module's `fn module_obj(o: T) -> T` and takes its
+        // result back. Two things make this sound, and neither is checked here:
+        //   * The LAYOUT of `T` is proven identical on both sides by the load-time
+        //     verifier (`jrt_verify_module`) — a module whose `T` differs was already
+        //     rejected at `load_module`, so `handle` cannot name one.
+        //   * The COUNTS are real: the module links no runtime of its own, so its
+        //     retain/release/alloc are the host's. Argument is borrowed (+0), result is
+        //     owned (+1) — the ordinary Vire calling convention, which is why the result
+        //     needs no special cleanup here.
+        // The result's class is the ARGUMENT's class: `module_obj` is `T -> T` by
+        // signature, so there is nothing else it could be, and this keeps `r.field`
+        // resolving in the host without a second type channel across the boundary.
+        if name == "module_call_obj" {
+            let mut it = lowered.into_iter();
+            let h = it.next().map(|(o, _)| to_i64(o)).unwrap_or(Operand::ConstI64(0));
+            let (obj, _) = it.next().unwrap_or((Operand::ConstNull, Ty::Ref));
+            let arg_cls = match &obj {
+                Operand::Copy(l) => self.local_class.get(&l.0).cloned(),
+                _ => None,
+            };
+            let d = self.new_local(Ty::Ref);
+            self.emit(Statement::Call { dest: Some(d), func: "jrt_module_call_obj".into(), args: vec![h, obj] });
+            if let Some(c) = arg_cls {
+                self.local_class.insert(d.0, c);
+            }
+            return (Operand::Copy(d), Ty::Ref);
         }
         // `unload_module(handle) -> Int` — release the load reference. The module's `.so` is
         // dlclose'd (code unmapped) once no dyn-slot references it either, so a stale module
@@ -4806,7 +4874,12 @@ fn lower_fn(
             // array (arrkind_of_name defaults unknown names to Long, which would misread
             // the ref slots as i64). Record the element class so `a[i].field` resolves
             // and `a[i] = e` is class-checked in the body, exactly like a local ref array.
-            match pt.args.first().and_then(|a| class_of(Some(a))) {
+            // `class_of` only filters the INFERENCE type names, so it still answers "class"
+            // for the element-kind spellings `Byte`/`U8`/`I8`/`Long`/`Double` — taking
+            // those down the ref path made `a[i]` in an `Array[Byte]` callee load a Ref
+            // where an integer was expected. Ask `arrkind_of_name` first: anything it
+            // knows is a scalar element, never a class.
+            match pt.args.first().filter(|a| !is_scalar_elem_name(&a.name)).and_then(|a| class_of(Some(a))) {
                 Some(ec) => {
                     arr_kind = Some(ArrKind::Ref);
                     arr_cls = Some(ec);
@@ -4994,6 +5067,7 @@ fn const_eval(e: &Expr) -> Option<CVal> {
                     BinOp::BitXor => CVal::Int(a ^ b),
                     BinOp::Shl => CVal::Int(a << b),
                     BinOp::Shr => CVal::Int(a >> b),
+                    BinOp::UShr => CVal::Int(((a as u64) >> b) as i64),
                     _ => return None,
                 },
                 (CVal::Float(a), CVal::Float(b)) => match op {
@@ -5079,6 +5153,19 @@ fn field_arrkind(t: &Type) -> Option<ArrKind> {
     }
 }
 
+/// Is `n` an element-KIND spelling (a scalar/ref array element), as opposed to a user
+/// object class? Every name `arrkind_of_name` recognises explicitly, plus the `Int`/`I64`/
+/// `Long` family that it folds into its default arm. Guards the param path in `lower_fn`:
+/// `class_of` alone answers "class" for `Byte`/`U8`/`I8`/`Long`/`Double`, which would make
+/// `fn f(a: Array[Byte])` a ref array and mistype every `a[i]` in the body.
+fn is_scalar_elem_name(n: &str) -> bool {
+    matches!(
+        n,
+        "Float" | "F64" | "Double" | "F32" | "I32" | "U32" | "Byte" | "U8" | "I8"
+            | "Int" | "I64" | "U64" | "Long" | "Bool" | "Ref" | "Str"
+    )
+}
+
 fn arrkind_of_name(n: &str) -> ArrKind {
     match n {
         "Float" | "F64" | "Double" => ArrKind::Double,
@@ -5122,6 +5209,7 @@ fn map_op(o: BinOp) -> IB {
         BinOp::BitXor => IB::Xor,
         BinOp::Shl => IB::Shl,
         BinOp::Shr => IB::Shr,
+        BinOp::UShr => IB::UShr,
     }
 }
 
