@@ -941,6 +941,19 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         });
     }
     if errs.is_empty() {
+        // E300 enforcement (opt-in via FASTLLVM_DENY_DYNAMIC=1; preview via
+        // FASTLLVM_WARN_DYNAMIC=1 in main.rs): Shared heap allocations are hard
+        // errors — the program must name ceilings (`region(max)`) or move the
+        // graph to a kernel `Rc` (AGENTS.md §2.4, OWNERSHIP-STATIC.md §4b).
+        // The count is conservative (loop-arena-covered sites included until
+        // the arena verdict is threaded in); enforcement is the user's choice.
+        if std::env::var_os("FASTLLVM_DENY_DYNAMIC").is_some() {
+            for (f, i) in &fastllvm_solver::classify_ownership(&prog).shared_news {
+                errs.push(format!("error[E300]: heap allocation in `{f}` (site #{i}) has dynamic lifetime — name a ceiling (`region(max)`) or move the graph to a kernel `Rc` (AGENTS.md §2.4)"));
+            }
+        }
+    }
+    if errs.is_empty() {
         Ok(prog)
     } else {
         Err(errs)

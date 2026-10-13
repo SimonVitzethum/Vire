@@ -249,8 +249,15 @@ pub fn classify(program: &Program) -> OwnReport {
         }
     }
     // Fields and their classes, for parent-uniqueness of field stores.
+    // Pool depths first (per function), then pool-context (interprocedural),
+    // then per-function classification with both.
+    let mut depths: BTreeMap<String, Vec<Vec<u32>>> = BTreeMap::new();
     for f in &program.functions {
-        classify_function(f, &summ, &weak, &mut rep);
+        depths.insert(f.name.clone(), pool_depths(f));
+    }
+    let pctx = pool_ctx(program, &depths);
+    for f in &program.functions {
+        classify_function(f, &summ, &weak, &pctx, &mut rep);
     }
     rep.n_ref = rep.state.len();
     for s in rep.state.values() {
@@ -264,16 +271,224 @@ pub fn classify(program: &Program) -> OwnReport {
     rep
 }
 
+/// Pool depth per (block, statement) for one function (see classify). explicit `region` / inferred arenas /
+    // capsules): a `New` at depth > 0 allocates into the pool (immortal, freed
+    // en bloc), never onto the heap — classify Region, not Unique/Shared. Same
+    // dynamic extent the backend uses (push/pop calls); min-over-predecessors
+    // fixpoint for entries, exact walk within blocks (pushes usually sit mid-
+    // block, e.g. per-iteration loop-arenas — block-level depth would miss them
+    // and wrongly report heap).
+fn pool_depths(f: &Function) -> Vec<Vec<u32>> {
+    {
+        let nb = f.blocks.len();
+        let succ_of = |bi: usize| -> Vec<usize> {
+            match &f.blocks[bi].terminator {
+                Terminator::Goto(b) => vec![b.0 as usize],
+                Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+                Terminator::Switch { default, cases, .. } => {
+                    let mut v = vec![default.0 as usize];
+                    v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                    v
+                }
+                Terminator::Return(_) => vec![],
+            }
+        };
+        let delta_stmt = |st: &Statement| -> i32 {
+            match st {
+                Statement::Call { func, .. }
+                    if func == "jrt_arena_push" || func == "jrt_region_push" =>
+                {
+                    1
+                }
+                Statement::Call { func, .. }
+                    if func == "jrt_arena_pop" || func == "jrt_region_pop" =>
+                {
+                    -1
+                }
+                _ => 0,
+            }
+        };
+        let mut pred: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for bi in 0..nb {
+            for s in succ_of(bi) {
+                if s < nb {
+                    pred[s].push(bi);
+                }
+            }
+        }
+        // Block-entry depths: min over predecessor exits (0 if none).
+        // Block-entry depths: min over predecessor exits, from TOP (u32::MAX)
+        // downward — initializing 0 would stick (0 is the bottom of min).
+        // Unreachable entry (no preds, or still MAX) means depth 0.
+        let mut entry = vec![u32::MAX; nb];
+        if nb > 0 {
+            entry[0] = 0;
+        }
+        {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for bi in 0..nb {
+                    if bi == 0 {
+                        continue;
+                    }
+                    // Undecided predecessors (still MAX) contribute +inf (skip),
+                    // not 0: wrapping MAX to 0 would anchor every downstream
+                    // cycle at 0 and the fixpoint could never rise.
+                    let mut e = u32::MAX;
+                    for p in &pred[bi] {
+                        if entry[*p] == u32::MAX {
+                            continue;
+                        }
+                        let mut d = entry[*p] as i32;
+                        for st in &f.blocks[*p].statements {
+                            d += delta_stmt(st);
+                        }
+                        e = e.min(d.max(0) as u32);
+                    }
+                    let e = if pred[bi].is_empty() || e == u32::MAX { 0 } else { e };
+                    if e != entry[bi] {
+                        entry[bi] = e;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // Walk each block, recording depth before every statement.
+        let mut out: Vec<Vec<u32>> = Vec::with_capacity(nb);
+        for bi in 0..nb {
+            let mut depths = Vec::with_capacity(f.blocks[bi].statements.len());
+            let mut d = entry[bi] as i32;
+            for st in &f.blocks[bi].statements {
+                depths.push(d.max(0) as u32);
+                d += delta_stmt(st);
+            }
+            out.push(depths);
+        }
+        out
+    }
+}
+
+/// Functions whose result may be heap-allocated (capsule exports), mirroring
+/// the backend's `heap_escaping_fns`: such functions are never pool-context
+/// (their result is real heap, not pool memory).
+fn heap_esc_fns(program: &Program) -> BTreeSet<String> {
+    const HEAP_EXPORTS: &[&str] = &["jrt_deep_copy_heap", "jrt_arena_export_array"];
+    let mut esc: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for f in &program.functions {
+            if esc.contains(&f.name) {
+                continue;
+            }
+            let escapes = f.blocks.iter().flat_map(|b| &b.statements).any(|st| match st {
+                Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => {
+                    HEAP_EXPORTS.contains(&func.as_str()) || esc.contains(func)
+                }
+                _ => false,
+            });
+            if escapes {
+                esc.insert(f.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    esc
+}
+
+/// Pool-context functions: every non-self direct call site executes at pool
+/// depth > 0, so all their `New`s land in a pool (freed en bloc, never heap).
+/// Mirrors the backend's `arena_ctx_fns` minus the safe-args rule (containment
+/// of THEIR OWN allocations holds regardless of argument kinds — unlike the
+/// backend's immortal-RESULT rule, which needs it). Dispatch-reachable
+/// (methods, CallPoly targets) and heap-escaping functions are excluded.
+/// `depths`: per-function pool depths from `pool_depths`.
+fn pool_ctx(program: &Program, depths: &BTreeMap<String, Vec<Vec<u32>>>) -> BTreeSet<String> {
+    let heap_esc = heap_esc_fns(program);
+    let mut dispatch: BTreeSet<String> = BTreeSet::new();
+    for c in &program.classes {
+        for m in &c.methods {
+            dispatch.insert(m.mangled.clone());
+        }
+    }
+    for name in &heap_esc {
+        dispatch.insert(name.clone());
+    }
+    // Callee -> direct call sites (caller, in-pool?). Self-sites inherit the
+    // entry's depth, so only non-self sites gate context.
+    struct Site {
+        caller: String,
+        in_pool: bool,
+        is_self: bool,
+    }
+    let mut sites: BTreeMap<String, Vec<Site>> = BTreeMap::new();
+    for f in &program.functions {
+        let dd = &depths[&f.name];
+        for (bi, bb) in f.blocks.iter().enumerate() {
+            for (si, st) in bb.statements.iter().enumerate() {
+                match st {
+                    Statement::CallPoly { targets, .. } => {
+                        for (_, sym) in targets {
+                            dispatch.insert(sym.clone());
+                        }
+                    }
+                    Statement::Call { func, .. } | Statement::CallGuarded { func, .. }
+                        if !func.starts_with("jrt_") && program.functions.iter().any(|g| &g.name == func) =>
+                    {
+                        let in_pool = dd.get(bi).and_then(|v| v.get(si)).copied().unwrap_or(0) > 0;
+                        sites.entry(func.clone()).or_default().push(Site {
+                            caller: f.name.clone(),
+                            in_pool,
+                            is_self: func == &f.name,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut ctx: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for f in &program.functions {
+            let name = &f.name;
+            if ctx.contains(name) || dispatch.contains(name) {
+                continue;
+            }
+            let Some(ss) = sites.get(name) else { continue };
+            // A seed needs at least one non-self site; every non-self site must
+            // run pooled itself or inside an already-pooled caller (fixpoint).
+            // Self-sites inherit the entry depth and gate nothing.
+            let non_self: Vec<&Site> = ss.iter().filter(|s| !s.is_self).collect();
+            if non_self.is_empty() {
+                continue;
+            }
+            if non_self.iter().all(|s| s.in_pool || ctx.contains(&s.caller)) {
+                ctx.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ctx
+}
+
 fn classify_function(
     f: &Function,
     summ: &BTreeMap<String, Vec<bool>>,
     weak: &BTreeSet<(String, String)>,
+    pctx: &BTreeSet<String>,
     rep: &mut OwnReport,
 ) {
     let n = f.locals.len();
     // Def site of each ref local: New (unique candidate), call dest (fresh or
     // alias), GetField (borrow candidate), param, copy, other.
-    #[derive(Clone, Copy, PartialEq)]
+    #[derive(Clone, Copy, PartialEq, Debug)]
     enum Def {
         New,
         FreshCall,
@@ -289,19 +504,37 @@ fn classify_function(
             def[i] = Def::Param;
         }
     }
+    let pool_depth: Vec<Vec<u32>> = pool_depths(f);
+
+
     // Statement index counter for shared-New reporting.
     let mut stmt_idx = 0usize;
-    for b in &f.blocks {
-        for st in &b.statements {
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (si, st) in b.statements.iter().enumerate() {
+            let pooled = pool_depth[bi][si] > 0;
             match st {
+                Statement::New { dest, .. } if pooled => def[dest.0 as usize] = Def::Region,
+                // Pool-context callees (called only from pools): their News land
+                // in the caller's pool at runtime — Region, like textual depth.
+                Statement::New { dest, .. } if pctx.contains(&f.name) => def[dest.0 as usize] = Def::Region,
                 Statement::New { dest, .. } => def[dest.0 as usize] = Def::New,
                 Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } | Statement::RegionNewArray { dest, .. } => {
                     def[dest.0 as usize] = Def::Region
                 }
+                Statement::NewArray { dest, .. } if pooled => def[dest.0 as usize] = Def::Region,
+                Statement::NewArray { dest, .. } if pctx.contains(&f.name) => def[dest.0 as usize] = Def::Region,
                 Statement::NewArray { dest, .. } => def[dest.0 as usize] = Def::New,
-                Statement::Call { dest: Some(d), func, .. } | Statement::CallGuarded { dest: Some(d), func, .. } => {
+                Statement::Call { dest: Some(d), func, args, .. } | Statement::CallGuarded { dest: Some(d), func, args, .. } => {
                     // Fresh constructors yield Unique ownership; anything else may
-                    // alias its arguments or global state → MaybeAlias.
+                    // alias its arguments or global state → MaybeAlias. Inside a
+                    // pool, a USER call with all-scalar (non-Ref) args yields pool
+                    // memory (jrt_alloc routes by dynamic extent; no heap argument
+                    // to pass through) → Region. With Ref args the result may
+                    // alias a heap argument → MaybeAlias (conservative).
+                    let args_scalar = args.iter().all(|a| match a {
+                        Operand::Copy(l) => f.locals[l.0 as usize] != Ty::Ref,
+                        _ => true,
+                    });
                     let fresh = matches!(
                         func.as_str(),
                         "jrt_alloc"
@@ -314,7 +547,13 @@ fn classify_function(
                             | "jrt_atomic_new"
                             | "jrt_mutex_new"
                     );
-                    def[d.0 as usize] = if fresh { Def::FreshCall } else { Def::MaybeAlias };
+                    def[d.0 as usize] = if pooled && !func.starts_with("jrt_") && args_scalar {
+                        Def::Region
+                    } else if fresh {
+                        Def::FreshCall
+                    } else {
+                        Def::MaybeAlias
+                    };
                 }
                 Statement::CallVirtual { dest: Some(d), .. } | Statement::CallPoly { dest: Some(d), .. } => {
                     // Unknown dispatch target: the result may alias anything.
@@ -710,7 +949,54 @@ fn classify_function(
                     }
                 }
             }
-            // Knock ref locals defined in loop blocks.
+            // Pool membership: locals that can only hold pool memory — Region defs,
+            // copies thereof, and field/array loads off pool holders (pool objects
+            // hold only pool refs by admission). Calls excluded (conservative:
+            // a call result in a pool stays Shared and may count for E300).
+            // Loop-knock skips members (no per-iteration release needed — the
+            // pool frees en bloc); every OTHER knock rule still applies, so a
+            // pool value escaping to the heap is flagged and E300-counted.
+            let mut pool_mem = vec![false; n];
+            for (i, t) in f.locals.iter().enumerate() {
+                if *t == Ty::Ref && def[i] == Def::Region {
+                    pool_mem[i] = true;
+                }
+            }
+            loop {
+                let mut grew = false;
+                for b in &f.blocks {
+                    for st in &b.statements {
+                        match st {
+                            Statement::Assign(dest, Rvalue::Use(Operand::Copy(s))) => {
+                                if pool_mem[s.0 as usize] && !pool_mem[dest.0 as usize] {
+                                    pool_mem[dest.0 as usize] = true;
+                                    grew = true;
+                                }
+                            }
+                            Statement::GetField { dest, obj: Operand::Copy(o), .. } => {
+                                if pool_mem[o.0 as usize] && !pool_mem[dest.0 as usize] {
+                                    pool_mem[dest.0 as usize] = true;
+                                    grew = true;
+                                }
+                            }
+                            Statement::ArrayLoad { dest, arr: Operand::Copy(a), .. } => {
+                                if pool_mem[a.0 as usize] && !pool_mem[dest.0 as usize] {
+                                    pool_mem[dest.0 as usize] = true;
+                                    grew = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            // Knock ref locals defined in loop blocks — EXCEPT pool members (see
+            // above): per-iteration overwrites of pool refs need no release, and
+            // must not cascade onto the pool roots (that would E300-count sound
+            // pooling and reintroduce per-iteration RC traffic on no-op calls).
             for bi in reachable.iter().filter(|b| in_cycle[**b]) {
                 for st in &f.blocks[*bi].statements {
                     let dest = match st {
@@ -728,7 +1014,7 @@ fn classify_function(
                         _ => None,
                     };
                     if let Some(d) = dest {
-                        if f.locals[d as usize] == Ty::Ref {
+                        if f.locals[d as usize] == Ty::Ref && !pool_mem[d as usize] {
                             knock.insert(d);
                         }
                     }
@@ -794,10 +1080,15 @@ fn classify_function(
     // free(a) = double free; or a leak). Knock every root that reaches itself
     // through parent→value store edges. Type-level cyclicity is too coarse
     // (trees are Node-typed but acyclic instances) — this is instance-level.
+    // Pool-contained cycles (every member pool-defined) are EXEMPT: pools free
+    // blindly en bloc without traversal, so cycles are irrelevant to them —
+    // and the backend never direct-frees pool memory anyway (immortal path).
+    // A cycle touching heap stays knocked (and E300-counted).
     {
         // Edge value-root → parent-root for stores between rooted values.
         // `weak` stores are no edges (non-owning back-edge, like the solver's
-        // own graph exclusion).
+        // own graph exclusion). Self-stores ride the same map (a DFS that
+        // returns to its start through any path, length ≥ 1).
         let mut edges: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for b in &f.blocks {
             for st in &b.statements {
@@ -811,16 +1102,13 @@ fn classify_function(
                     _ => continue,
                 };
                 let (pr, vr) = (root_of[parent.0 as usize], root_of[value.0 as usize]);
-                if pr != u32::MAX && vr != u32::MAX && pr != vr {
+                if pr != u32::MAX && vr != u32::MAX {
                     edges.entry(vr).or_default().insert(pr);
-                } else if pr != u32::MAX && pr == vr {
-                    // Self-store (`a.next = a`): immediate cycle.
-                    knock.insert(pr);
                 }
             }
         }
         // Roots reaching themselves through edges (DFS per root; functions are
-        // small, quadratic is fine).
+        // small, quadratic is fine). Pool-contained SCCs don't knock.
         let mut cyclic = BTreeSet::new();
         for b in &f.blocks {
             for st in &b.statements {
@@ -828,19 +1116,30 @@ fn classify_function(
                     Statement::New { dest, .. } | Statement::NewArray { dest, .. } => dest.0,
                     _ => continue,
                 };
-                // DFS from r following edges.
+                // DFS from r following edges, collecting the reached set and
+                // whether the walk returns to r (through others or a self edge).
                 let mut seen = BTreeSet::from([r]);
                 let mut stack = vec![r];
+                let mut reaches_self = false;
                 while let Some(x) = stack.pop() {
                     if let Some(ns) = edges.get(&x) {
                         for y in ns {
                             if *y == r {
-                                cyclic.insert(r);
+                                reaches_self = true;
                             }
                             if seen.insert(*y) {
                                 stack.push(*y);
                             }
                         }
+                    }
+                }
+                if reaches_self {
+                    // Knock unless pool-contained (all reached members pool-defined).
+                    let all_pooled = seen.iter().all(|m| {
+                        def.get(*m as usize).is_some_and(|d| *d == Def::Region)
+                    });
+                    if !all_pooled {
+                        cyclic.insert(r);
                     }
                 }
             }
@@ -878,6 +1177,7 @@ fn classify_function(
             state[*k as usize] = OwnState::Shared;
         }
     }
+
 
     // Borrow promotion: never-reassigned, never-captured ref params that were
     // NOT knocked (a knocked use — e.g. passing it to a capturing call — breaks
@@ -1006,13 +1306,19 @@ fn classify_function(
             },
         );
     }
-    // Shared New sites (E300 candidates).
+    // Shared New sites (E300 candidates): heap allocations with dynamic
+    // lifetime. Pool-contained sites (Def::Region, never knocked for any
+    // escape-ish reason) already HAVE their ceiling (the pool) and don't count.
     let mut idx = 0usize;
     for b in &f.blocks {
         for st in &b.statements {
             if let Statement::New { dest, .. } = st {
                 if state[dest.0 as usize] == OwnState::Shared {
-                    rep.shared_news.push((f.name.clone(), idx));
+                    let pooled_clean =
+                        def[dest.0 as usize] == Def::Region && !knock.contains(&dest.0);
+                    if !pooled_clean {
+                        rep.shared_news.push((f.name.clone(), idx));
+                    }
                 }
             }
             idx += 1;
