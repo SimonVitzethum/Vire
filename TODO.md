@@ -353,6 +353,19 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   work. `tests/vire_iter.sh`. **Open:** `Str.split` (needs a typed `list[Str]`), and
   the full `Option`/`Result` surface (`.wrap(msg)` context/chain — core `?`/`match`
   works).
+- [ ] **Native Typen: Str u.ä. direkt nativ — PARKED (andere haben Vorrang).**
+  String-/Listen-Ops laufen heute über `runtime.c` (`jrt_str_*`, `vire_list_*`).
+  Ziel: Form direkt nativ — `length`/`is_empty` als Feld-Load (Offset 16, mit
+  NPE-Semantik), `char_at` als geprüfter Byte-Load, `equals` als Ptr-Fast-Path +
+  Längenvergleich + `memcmp`-Schleife (libc, kein Vire-Runtime), `concat`/
+  `substring` als `jrt_alloc` + `@llvm.memcpy` (Allokation bleibt zentral bis
+  M4), `list_len`/`list_get` als direkte Loads (VList-Layout `{header,len,cap,
+  data}`). Formatierung (`to_str`) und Wachstum (`push`, `upper/lower/trim`,
+  `startswith/indexof`) bleiben vorerst Runtime. Umsetzung als
+  Backend-Call-Interception (Lowering unberührt), bit-identische Semantik
+  (NPE-/Bounds-Pfade bleiben), Tests in `tests/vire_str.sh`/`vire_iter.sh`.
+  Vermessen 2026-10-13: JStr `{refcount,vtable,len:i64,bytes[]}`,
+  VList `{refcount,vtable,len,cap,data}`.
 
 ---
 
