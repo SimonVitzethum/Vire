@@ -14,13 +14,13 @@ fn lookup(keys: Array[Int], vals: Array[Int], cap: Int, key: Int) -> Int {
     }
     0
 }
-fn insert(keys: Array[Int], vals: Array[Int], cap: Int, key: Int, val: Int) {
+fn insert(keys: Array[Int], vals: Array[Int], cap: Int, key: Int, val: Int) -> Unit {
     mut idx = (key * 2654435761) % 2147483648 % cap
     while keys[idx] > 0 { idx = idx + 1  if idx >= cap { idx = 0 } }
     keys[idx] = key
     vals[idx] = val
 }
-fn remove(keys: Array[Int], cap: Int, key: Int) {
+fn remove(keys: Array[Int], cap: Int, key: Int) -> Unit {
     mut idx = (key * 2654435761) % 2147483648 % cap
     mut steps = 0
     while steps < cap {

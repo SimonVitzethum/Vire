@@ -4,7 +4,7 @@
 //   3. run 20k binary-search queries, counting hits
 //   4. bucket them into a 256-bin histogram, then fold a weighted checksum
 // Output: a single integer combining the hit count and the histogram checksum.
-fn qsort(a: Array[Int], lo: Int, hi: Int) {
+fn qsort(a: Array[Int], lo: Int, hi: Int) -> Unit {
     if lo < hi {
         mut p = a[hi]
         mut i = lo - 1

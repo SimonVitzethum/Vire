@@ -30,7 +30,7 @@ fn bnot(x: Int) -> Int { x ^ (0 - 1) }
 fn bit(sq: Int) -> Int { 1 << sq }
 
 // ---- Tabellenaufbau -----------------------------------------------------
-fn init_tab(tab: Array[Int]) {
+fn init_tab(tab: Array[Int]) -> Unit {
     // Richtungen: 0..3 gerade (Turm), 4..7 diagonal (Laeufer)
     tab[256] = 0   tab[264] = 1
     tab[257] = 0   tab[265] = 0 - 1
@@ -164,13 +164,13 @@ fn attacked(bb: Array[Int], tab: Array[Int], sq: Int, by: Int) -> Int {
 }
 
 // ---- Brettmutation ------------------------------------------------------
-fn put(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) {
+fn put(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) -> Unit {
     bb[color] = bb[color] | bit(sq)
     bb[piece] = bb[piece] | bit(sq)
     mb[sq] = piece
 }
 
-fn clr(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) {
+fn clr(bb: Array[Int], mb: Array[Int], sq: Int, color: Int, piece: Int) -> Unit {
     bb[color] = bb[color] & bnot(bit(sq))
     bb[piece] = bb[piece] & bnot(bit(sq))
     mb[sq] = 0
@@ -203,7 +203,7 @@ fn rook_to(to: Int) -> Int {
 // flag: 0 normal, 1 en passant, 2 Rochade, 3 Doppelschritt
 fn mk(f: Int, t: Int, p: Int, fl: Int) -> Int { f | (t << 6) | (p << 12) | (fl << 15) }
 
-fn make(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) {
+fn make(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) -> Unit {
     mut from = m & 63
     mut to = (m >>> 6) & 63
     mut promo = (m >>> 12) & 7
@@ -247,7 +247,7 @@ fn make(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int,
     st[0] = them
 }
 
-fn unmake(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) {
+fn unmake(bb: Array[Int], mb: Array[Int], st: Array[Int], ud: Array[Int], uo: Int, m: Int) -> Unit {
     mut from = m & 63
     mut to = (m >>> 6) & 63
     mut promo = (m >>> 12) & 7
@@ -460,7 +460,7 @@ fn perft(bb: Array[Int], mb: Array[Int], st: Array[Int], tab: Array[Int],
 }
 
 // ---- Stellungsaufbau ----------------------------------------------------
-fn clear_board(bb: Array[Int], mb: Array[Int], st: Array[Int]) {
+fn clear_board(bb: Array[Int], mb: Array[Int], st: Array[Int]) -> Unit {
     mut i = 0
     while i < 8 { bb[i] = 0  i = i + 1 }
     i = 0

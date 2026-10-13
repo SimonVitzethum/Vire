@@ -2,7 +2,7 @@
 // OWN 1M-element array (seeded per thread — no shared mutable state, so the safe
 // send-check is satisfied), then folds a positional checksum into a shared Atomic.
 // Exercises threading + deep recursion together. Output: sum of the 4 checksums.
-fn qsort(a: Array[Int], lo: Int, hi: Int) {
+fn qsort(a: Array[Int], lo: Int, hi: Int) -> Unit {
     if lo < hi {
         mut p = a[(lo + hi) / 2]
         mut i = lo
