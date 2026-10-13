@@ -1,0 +1,24 @@
+type Node {
+    next: Node
+    v: Int
+}
+// M3 variant of list.vr: the loop-carried list lives in a declared pool
+// (`region(n * 64)`) instead of RC cascade. Same values, freed en bloc.
+fn build_and_sum(n: Int) -> Int {
+    mut s = region(n * 64) {
+        mut head = null
+        mut i = 0
+        mut acc = 0
+        while i < n {
+            head = Node(head, i)
+            acc = acc + head.v
+            i = i + 1
+        }
+        acc
+    }
+    s
+}
+fn main() {
+    print(build_and_sum(1000))
+    print(build_and_sum(100000))
+}

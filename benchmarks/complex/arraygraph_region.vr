@@ -1,0 +1,34 @@
+// M3 variant of arraygraph.vr: the per-iteration node pool (array + nodes,
+// cross-linked) lives in a declared `region(8192)` pool instead of the inferred
+// loop-arena. Same values, freed en bloc, no RC/collector.
+type Node { id: Int  next: Node }
+
+fn main() {
+    mut sum = 0
+    mut t = 0
+    while t < 400000 {
+        mut trial = region(8192) {
+            mut pool: Array[Node] = array(20)
+            mut i = 0
+            while i < 20 {
+                pool[i] = Node(i, null)
+                i = i + 1
+            }
+            // cross-link: each node points at the next slot (a ref stored into a
+            // field of a pool node, the value read from a fresh array slot)
+            mut j = 0
+            while j < 19 {
+                pool[j].next = pool[j + 1]
+                j = j + 1
+            }
+            // consume: walk the chain from slot 0
+            mut c = pool[0]
+            mut acc = 0
+            while c != null { acc = acc + c.id  c = c.next }
+            (sum + acc) % 1000000007
+        }
+        sum = trial
+        t = t + 1
+    }
+    print(sum)
+}
