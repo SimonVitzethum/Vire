@@ -79,14 +79,17 @@ lie about performance (§7.1 EVALUATION.md: the RC path never competed).
 5. **M5 — delete the fallback:** any remaining retain/release emission is a
    compiler ICE (not a fallback).
 
-## 4b. E300 blast radius — MEASURED (2026-10-13)
+## 4b. E300 blast radius — MEASURED (2026-10-13, refined)
 
-`FASTLLVM_WARN_DYNAMIC=1` previews enforcement (warn-only): 47 Shared heap
-sites across 43 corpus files, concentrated in 8 graph-builder programs
-(object_graph/btree/compiler 14 each, sharedgraph 3, list 3, ring 2,
-array_objects/arraygraph 1) — everything else is ZERO. Enforcement would only
-touch programs that genuinely build dynamic graphs, which is exactly the
-intended scope (AGENTS.md §2.4).
+`FASTLLVM_WARN_DYNAMIC=1` previews enforcement (warn-only). After pool-depth
+(per-statement push extent), pool-context callees, and pool-fair knock rules,
+the count is precise: **0 sites** for everything pooled/arena-covered
+(`region_*`, `sharedgraph`, `btree`, `compiler`, `arraygraph`, `ring`), and
+only genuinely dynamic lifetimes remain — `object_graph` (14: program-lifetime
+tree, no pool), `list` (3: loop-carried, arena declined), `array_objects` (1).
+These are exactly the E300 target class (need ceilings or kernel `Rc`), not
+analysis gaps. Enforcement (`FASTLLVM_DENY_DYNAMIC=1`, hard errors) is
+available opt-in; `region_pool.vr` passes it clean.
 
 Known refinement before enforcement (M3): loop-arena-proven allocations
 (btree/sharedgraph/compiler run on the loop arena today — bounded lifetime
