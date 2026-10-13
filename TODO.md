@@ -1,5 +1,18 @@
 # Vire — Roadmap (open work)
 
+> **Neubau-Note (2026-10-13, bindend: [AGENTS.md](AGENTS.md)).** Seither gilt:
+> Ziel ≥Rust-Performance, leichter als Python, voll getypt, speichersicher ohne
+> `unsafe` (auch HW/Register), LLVM bleibt; **Java-IR, GPU/Vulkan, Runtime/GC
+> sind raus** (`Rc` nur Kernel). Abschnitte unten mit Stand 2026-07 (GPU-Tracks
+> als DONE, Java-Orakel als Gate, Tier-4-GPU-Plan) sind dadurch **überholt** und
+> bleiben nur als Historie stehen — sie werden nicht wieder eingebaut (Details:
+> AGENTS.md §1). Offene, weiter gültige Items: Front-end-Vervollständigung
+> (HM/Trait-Auflösung, Result[T,E] getypt), E300/Region-Ceilings, M4-Runtime-
+> Shrink, native Typen (Str u.ä.), QEMU-Abdeckung. Neu seitdem (in DONE bzw.
+> gemerged): E100 (kein stiller Int-Default), H1 (forbid unsafe, E410),
+> H2 (syscall/Mmio/Port/Fence + QEMU-Tests), Solver-Borrow-Checker `own.rs` +
+> M2-Direct-Free, `vire_main`-Rename, E300-Vorschau-Messung.
+
 Only **open** and **partial** items. Completed work lives in [DONE.md](DONE.md).
 Legend: `[ ]` open · `[~]` partial. Design basis: [language/](language/).
 

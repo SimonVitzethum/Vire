@@ -237,9 +237,20 @@ fn written_fields(f: &Function) -> BTreeSet<(String, String)> {
 pub fn classify(program: &Program) -> OwnReport {
     let mut rep = OwnReport::default();
     let summ = capture_summaries(&program.functions);
+    // `weak f: T` fields (owner class + name): non-owning edges — excluded from
+    // consumer counting, cycle edges, and borrow promotion, exactly like the
+    // solver's own ownership graph (their `cyclic_classes` exclusion).
+    let mut weak = BTreeSet::new();
+    for c in &program.classes {
+        for fl in &c.fields {
+            if fl.weak {
+                weak.insert((c.name.clone(), fl.name.clone()));
+            }
+        }
+    }
     // Fields and their classes, for parent-uniqueness of field stores.
     for f in &program.functions {
-        classify_function(f, &summ, &mut rep);
+        classify_function(f, &summ, &weak, &mut rep);
     }
     rep.n_ref = rep.state.len();
     for s in rep.state.values() {
@@ -253,7 +264,12 @@ pub fn classify(program: &Program) -> OwnReport {
     rep
 }
 
-fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut OwnReport) {
+fn classify_function(
+    f: &Function,
+    summ: &BTreeMap<String, Vec<bool>>,
+    weak: &BTreeSet<(String, String)>,
+    rep: &mut OwnReport,
+) {
     let n = f.locals.len();
     // Def site of each ref local: New (unique candidate), call dest (fresh or
     // alias), GetField (borrow candidate), param, copy, other.
@@ -600,7 +616,12 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             let live = reachable.contains(&bi);
             for st in &b.statements {
                 match st {
-                    Statement::PutField { obj, value: Operand::Copy(v), .. } => {
+                    Statement::PutField { obj, value: Operand::Copy(v), class, field, .. } => {
+                        // `weak` fields take no ownership (no transfer, no count):
+                        // the source keeps its +1 — never a consumer, never an edge.
+                        if weak.contains(&(class.clone(), field.clone())) {
+                            continue;
+                        }
                         // Only a Unique/Region parent keeps the value provably owned:
                         // a Shared OR Borrow parent has a lifetime we don't control
                         // (caller-owned) — storing there shares the value.
@@ -775,11 +796,17 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
     // (trees are Node-typed but acyclic instances) — this is instance-level.
     {
         // Edge value-root → parent-root for stores between rooted values.
+        // `weak` stores are no edges (non-owning back-edge, like the solver's
+        // own graph exclusion).
         let mut edges: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for b in &f.blocks {
             for st in &b.statements {
                 let (parent, value) = match st {
-                    Statement::PutField { obj: Operand::Copy(o), value: Operand::Copy(v), .. } => (*o, *v),
+                    Statement::PutField { obj: Operand::Copy(o), value: Operand::Copy(v), class, field, .. }
+                        if !weak.contains(&(class.clone(), field.clone())) =>
+                    {
+                        (*o, *v)
+                    }
                     Statement::ArrayStore { arr: Operand::Copy(a), value: Operand::Copy(v), .. } => (*a, *v),
                     _ => continue,
                 };
@@ -875,12 +902,17 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             }
         }
         // GetField dest promotion: base must be proven non-Shared and the field
-        // never written in this function (the field keeps the value alive).
+        // never written in this function (the field keeps the value alive) —
+        // except `weak` fields, whose referent lifetime is not base-owned
+        // (parent-pointer discipline, not checkable here).
         for b in &f.blocks {
             for st in &b.statements {
                 if let Statement::GetField { dest, obj, class, field } = st {
                     let d = dest.0 as usize;
                     if f.locals[d] != Ty::Ref || state[d] != OwnState::Shared || knock.contains(&dest.0) {
+                        continue;
+                    }
+                    if weak.contains(&(class.clone(), field.clone())) {
                         continue;
                     }
                     let base_ok = matches!(obj, Operand::Copy(l) if state[l.0 as usize] != OwnState::Shared);

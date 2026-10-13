@@ -171,6 +171,20 @@ type S {
 fn main() { print(1) }
 EOF
 
+# M2 interplay (own.rs): a value stored ONLY into a weak field is still owned by
+# its local (the weak store takes nothing) — it must be freed at function exit,
+# not leaked (cleanup skip) and not retained (no transfer). 0-live either way.
+run weak_only_store_frees 42 no <<'EOF'
+type N { x: Int }
+type H { weak w: N }
+fn main() {
+    mut h = H(null)
+    mut v = N(41)
+    h.w = v
+    print(v.x + 1)
+}
+EOF
+
 rm -rf "$work"
 echo "weak: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
