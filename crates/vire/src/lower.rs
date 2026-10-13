@@ -232,6 +232,16 @@ struct SyscallInfo {
     num: u64,
     params: Vec<SysParamKind>,
 }
+/// A bare `Result` annotation (no type arguments) is E-error — it would resolve
+/// to the reserved (empty) `Result` class with no layout. `Result[T, E]` (both
+/// given) is fine; anything else with that name is the user's own business.
+fn check_result_ann(t: &Option<Type>, errs: &mut Vec<String>, wh: &str) {
+    if let Some(tp) = t {
+        if tp.name == "Result" && tp.args.len() != 2 {
+            errs.push(format!("error[E100]: `{wh}` uses bare `Result` — give both type arguments (`Result[T, E]`)"));
+        }
+    }
+}
 /// Element kind (and, for a user object element, class) of an array return type
 /// (`Array[Elem]` / `array` / `farray`) — else `(None, None)`.
 fn arr_ret(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
@@ -318,6 +328,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                         p.name, f.sig.name, p.name
                     ));
                 }
+                check_result_ann(&p.ty, &mut errs, &format!("parameter `{}` of `fn {}`", p.name, f.sig.name));
             }
             if f.sig.ret.is_none() && f.sig.name != "main" {
                 errs.push(format!(
@@ -325,6 +336,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                     f.sig.name
                 ));
             }
+            check_result_ann(&f.sig.ret, &mut errs, &format!("return type of `fn {}`", f.sig.name));
         }
         if let Item::Extern { items, .. } = it {
             for s in items {
@@ -335,6 +347,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                             p.name, s.name
                         ));
                     }
+                    check_result_ann(&p.ty, &mut errs, &format!("parameter `{}` of `extern {}`", p.name, s.name));
                 }
                 if s.ret.is_none() {
                     errs.push(format!(
@@ -342,6 +355,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                         s.name
                     ));
                 }
+                check_result_ann(&s.ret, &mut errs, &format!("return type of `extern {}`", s.name));
             }
         }
         // `syscall NAME(params) -> Ret = NUM` (language/HW-SAFE.md §2): declarations
@@ -517,9 +531,11 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         variants.insert("None".into(), ("Option".into(), 1, vec![]));
     }
     if !types.contains_key("Result") {
-        types.insert("Result".into(), vec![("__tag".into(), Ty::I64, None), ("Ok_value".into(), Ty::I64, None), ("Err_error".into(), Ty::I64, None)]);
-        variants.insert("Ok".into(), ("Result".into(), 0, vec![("Ok_value".into(), Ty::I64, None)]));
-        variants.insert("Err".into(), ("Result".into(), 1, vec![("Err_error".into(), Ty::I64, None)]));
+        // Erased Result is gone (see generic_stypes below): a bare `Result`
+        // annotation with no type arguments is rejected where it is used
+        // (E-error, never a dangling class). The name stays reserved here so
+        // user types cannot claim it.
+        types.insert("Result".into(), vec![]);
     }
     // Built-in generic Option[T]: `Some(x)` is monomorphized type-correctly
     // (`Option$Float` carries F64), `None` stays over the erased Option (only __tag).
@@ -531,16 +547,25 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         variant_owner_g.entry("Some".into()).or_insert("Option".into());
         variant_owner_g.entry("None".into()).or_insert("Option".into());
     }
-    // NOTE (§7 two-parameter typed Result): registering Result[T, E] in
-    // generic_stypes (like Option[T]) monomorphizes it — but the ERASED `Result`
-    // (i64 Ok_value/Err_error, used by the ?/.wrap/.error machinery) and the
-    // monomorphized `Result$T$E` then coexist and get mixed at construction vs.
-    // match sites. They only agree when every payload is i64 (Result[Int,Int]
-    // works); with a Ref payload the layouts diverge and a Ref field can be read
-    // as i64 (or vice versa) → memory-unsafe under RC. Making this sound needs a
-    // coordinated pass (unify the erased/mono representation, teach ?/.wrap/.error
-    // the mono class, then gate on the 0-live heap oracle). Deliberately NOT a
-    // one-line registration — left erased for now (use `.error()` for the message).
+    // Built-in generic Result[T, E]: `Ok(x)`/`Err(e)` monomorphize to `Result$T$E`
+    // with fully typed payload slots (AGENTS.md §4) — no i64 erasure anywhere.
+    // There is deliberately NO erased fallback: mixed erased/mono layouts diverge
+    // for Ref payloads (memory-unsafe under RC), so every site resolves (T, E)
+    // from payload, annotation, or enclosing signature, or fails loudly.
+    if !generic_stypes.contains_key("Result") {
+        generic_stypes.insert(
+            "Result".into(),
+            (
+                vec!["T".into(), "E".into()],
+                vec![
+                    ("Ok".into(), vec![("Ok_value".into(), "T".into())]),
+                    ("Err".into(), vec![("Err_error".into(), "E".into())]),
+                ],
+            ),
+        );
+        variant_owner_g.entry("Ok".into()).or_insert("Result".into());
+        variant_owner_g.entry("Err".into()).or_insert("Result".into());
+    }
     // TRAIT OBJECTS (dynamic dispatch): traits are registered as interfaces,
     // `impl Trait for Typ` adds the methods into the type vtable at
     // consistent global slots (the backend's existing interface/CallVirtual
@@ -1161,6 +1186,13 @@ struct FnLower<'a> {
     /// Set while lowering a `mut x: Array[Cls] = …` RHS: the expected element object
     /// class, consumed once by the `array(n)` builtin to build a ref array of `Cls`.
     arr_hint: Option<String>,
+    /// Expected `(T, E)` for an `Ok(x)`/`Err(e)` under construction, from the
+    /// nearest annotation: a `mut r: Result[T, E] = …` let-annotation (one-shot,
+    /// like `arr_hint`) or the enclosing function's `-> Result[T, E]` return
+    /// type. Fills type parameters the payload cannot constrain (usually E for
+    /// `Ok`, T for `Err`); anything still free is E-error, never silent `Int`.
+    sum_hint: Option<(String, String)>,
+    expected_result: Option<(String, String)>,
     /// MMIO handles (local → (base address, region length)) from `Mmio.bind("name")`
     /// (language/HW-SAFE.md §2). The handle value is an immortal descriptor object
     /// (plain Ref local, RC no-ops via refcount -1); the table drives `readN`/`writeN`
@@ -1257,6 +1289,12 @@ impl<'a> FnLower<'a> {
     /// Concrete type name of a lowered value (for type argument inference of
     /// generic constructors): class of a ref, otherwise scalar name.
     fn ty_name(&self, op: &Operand, ty: Ty) -> String {
+        // A string literal IS a `Str` (immortal JStr) — not an opaque `Ref`.
+        // This lets `Some("x")`/`Err("msg")` infer `Option[Str]`/`E = Str`
+        // without annotation; anything else Ref stays opaque (sound).
+        if matches!(op, Operand::ConstStr(_)) {
+            return "Str".into();
+        }
         if let Some(c) = self.class_of_operand(op) {
             return c;
         }
@@ -2227,13 +2265,32 @@ impl<'a> FnLower<'a> {
             Stmt::Let { mutable, name, ty: ann, value, .. } => {
                 // An explicit `: Type` annotation names the object class the RHS may
                 // not carry (the inference escape hatch); used as a fallback below.
+                // Generic annotations (`Option[T]`, `Result[T, E]`) resolve to the
+                // monomorphized instance (`Option$Float`, `Result$Str$Str`); a bare
+                // `Result` (no arguments) is E-error, never a dangling class.
                 // An `Array[Cls]` annotation is NOT an object class for the local itself
                 // (the local is the array) — it declares the element class, handled via
                 // `arr_hint` below, so exclude it here.
                 let ann_class = ann
                     .as_ref()
                     .filter(|t| t.name != "Array" && t.name != "array")
-                    .and_then(|t| class_of(Some(t)));
+                    .and_then(|t| {
+                        if t.name == "Result" && t.args.len() != 2 {
+                            self.errs.push("error[E100]: `Result` needs both type arguments (`x: Result[T, E]`)".into());
+                            None
+                        } else {
+                            class_of_ann(Some(t), &self.generic_ptypes, &self.generic_stypes)
+                        }
+                    });
+                // `mut r: Result[T, E] = Ok(x)/Err(e)` — the annotation fixes what the
+                // payload leaves free (one-shot hint, like `arr_hint`).
+                let sum_hint = ann.as_ref().and_then(|t| {
+                    if t.name == "Result" && t.args.len() == 2 {
+                        Some((t.args[0].name.clone(), t.args[1].name.clone()))
+                    } else {
+                        None
+                    }
+                });
                 // `mut x: Array[Node] = array(n)` — the annotation's element type is a
                 // user object class → build a REF array of that class. Passed to the
                 // `array(n)` builtin through `arr_hint` (consumed once).
@@ -2268,11 +2325,13 @@ impl<'a> FnLower<'a> {
                     }
                 }
                 self.arr_hint = arr_hint;
+                self.sum_hint = sum_hint;
                 let (op, ty) = match value {
                     Some(v) => self.lower_expr(v),
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
                 self.arr_hint = None;
+                self.sum_hint = None;
                 let l = self.new_local(ty);
                 // Pass the object class resp. array element kind on to the new local.
                 // The explicit `: Type` annotation is the fallback when the RHS operand
@@ -2828,22 +2887,59 @@ impl<'a> FnLower<'a> {
             // `e?` — error propagation for Result: Ok(v) → v; Err(_) → return e.
             // (Desugared to match; the enclosing function must return Result.)
             Expr::Try { inner, .. } => {
+                // `e?` over a TYPED `Result[A, B]`: Ok(v) → v (typed A); Err(e) →
+                // return a reconstructed `Result[C, D]` (the enclosing signature)
+                // carrying the same error payload. Requires the error types to
+                // match EXACTLY (B == D) — else E-error (no silent cross-layout
+                // pass-through; the Ok slot types may differ, the Err value is
+                // rebuilt into the caller's layout).
                 let (obj, _) = self.lower_expr(inner);
+                let recv = self.class_of_operand(&obj).unwrap_or_default();
+                let (ra, rb) = Self::parse_result_class(&recv);
+                let (rc, rd) = match &self.expected_result {
+                    Some((t, e)) => (t.clone(), e.clone()),
+                    None => {
+                        self.errs.push("error[E100]: `?` needs an enclosing `-> Result[T, E]` return type (nothing to propagate into)".into());
+                        ("Int".into(), "Str".into())
+                    }
+                };
+                if recv.is_empty() || ra.is_empty() {
+                    self.errs.push("error[E100]: `?` needs a typed `Result[T, E]` value (annotate it)".into());
+                }
+                if !rb.is_empty() && rb != rd {
+                    self.errs.push(format!("error[E100]: cannot propagate `?` from `Result[{ra}, {rb}]` into `Result[{rc}, {rd}]` — the error types differ (convert explicitly with `match`)"));
+                }
+                // Layouts for both sides (instantiated on demand, like construction).
+                let caller = self.mono_result_class(&rc, &rd);
                 let tag = self.new_local(Ty::I64);
-                self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: recv.clone(), field: "__tag".into() });
                 let is_ok = self.new_local(Ty::I32);
                 self.emit(Statement::Assign(is_ok, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(0))));
                 let okb = self.new_block();
                 let errb = self.new_block();
                 let cur = self.cur;
                 self.term(cur, Terminator::Branch { cond: Operand::Copy(is_ok), then_blk: okb, else_blk: errb });
-                // Err branch: pass the whole Result on.
-                self.term(errb.0 as usize, Terminator::Return(Some(obj.clone())));
-                // Ok branch: extract the value.
+                // Err branch: rebuild the error in the CALLER's layout.
+                self.cur = errb.0 as usize;
+                let (err_ty, _) = self.result_payload_ty(&recv, "Err");
+                let epay = self.new_local(err_ty);
+                self.emit(Statement::GetField { dest: epay, obj: obj.clone(), class: recv.clone(), field: "Err_error".into() });
+                let newres = self.new_local(Ty::Ref);
+                self.local_class.insert(newres.0, caller.clone());
+                self.emit(Statement::New { dest: newres, class: caller.clone() });
+                self.emit(Statement::PutField { obj: Operand::Copy(newres), class: caller.clone(), field: "__tag".into(), value: Operand::ConstI64(1) });
+                self.emit(Statement::PutField { obj: Operand::Copy(newres), class: caller.clone(), field: "Err_error".into(), value: Operand::Copy(epay) });
+                self.term(self.cur, Terminator::Return(Some(Operand::Copy(newres))));
+                // Ok branch: extract the typed value.
                 self.cur = okb.0 as usize;
-                let v = self.new_local(Ty::I64);
-                self.emit(Statement::GetField { dest: v, obj, class: "Result".into(), field: "Ok_value".into() });
-                (Operand::Copy(v), Ty::I64)
+                let (ok_ty, ok_cls) = self.result_payload_ty(&recv, "Ok");
+                let v = self.new_local(ok_ty);
+                self.emit(Statement::GetField { dest: v, obj, class: recv.clone(), field: "Ok_value".into() });
+                // Attach the payload's object class (so `n.field` resolves when A is a type).
+                if let Some(c) = ok_cls {
+                    self.local_class.insert(v.0, c);
+                }
+                (Operand::Copy(v), ok_ty)
             }
             // List literal `[a, b, c]` → NewArray + ArrayStore. Element kind from the
             // first element (homogeneous). Empty list → Long (default).
@@ -3302,16 +3398,21 @@ impl<'a> FnLower<'a> {
             if let Some(sent) = self.class_of_operand(&obj) {
                 // Go-style error context: `result.wrap(msg)`. On `Err` (tag 1) it prepends
                 // "msg: " to the (string) error, keeping the message chain; on `Ok` it passes
-                // the Result through unchanged. Mirrors the `?`/Result representation. Scoped to
-                // string-message errors (the common Go case); typed sum-type errors are handled
-                // by `match` (REFERENCE §11). Result stays the return type, so `.wrap(m)?` works.
-                if sent == "Result" && name == "wrap" {
+                // the Result through unchanged. Requires a typed `Result[T, Str]`
+                // receiver (E must be `Str` — a wrapped chain IS a string); anything
+                // else (including untyped leftovers) is E-error, use `match`.
+                if (sent == "Result" || sent.starts_with("Result$")) && name == "wrap" {
+                    let (rt, re) = Self::parse_result_class(&sent);
+                    if re != "Str" {
+                        self.errs.push(format!("error[E100]: `.wrap(msg)` needs `E = Str` (receiver is `Result[{rt}, {re}]`) — a wrapped chain is a string; match typed errors explicitly"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
                     if args.len() != 1 {
                         self.errs.push(format!("wrap(msg) takes one Str argument, got {}", args.len()));
                     }
                     let (msg, _) = args.first().map(|e| self.lower_expr(e)).unwrap_or((Operand::ConstNull, Ty::Ref));
                     let tag = self.new_local(Ty::I64);
-                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: sent.clone(), field: "__tag".into() });
                     let is_err = self.new_local(Ty::I32);
                     self.emit(Statement::Assign(is_err, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(1))));
                     let errb = self.new_block();
@@ -3320,18 +3421,18 @@ impl<'a> FnLower<'a> {
                     let cur = self.cur;
                     self.term(cur, Terminator::Branch { cond: Operand::Copy(is_err), then_blk: errb, else_blk: okb });
                     let res = self.new_local(Ty::Ref);
-                    self.local_class.insert(res.0, "Result".into());
-                    // Err branch → Err(jrt_err_wrap(msg, old_error)).
+                    self.local_class.insert(res.0, sent.clone());
+                    // Err branch → Err(jrt_err_wrap(msg, old_error)) in the same layout.
                     self.cur = errb.0 as usize;
-                    let olderr = self.new_local(Ty::I64);
-                    self.emit(Statement::GetField { dest: olderr, obj: obj.clone(), class: "Result".into(), field: "Err_error".into() });
+                    let olderr = self.new_local(Ty::Ref);
+                    self.emit(Statement::GetField { dest: olderr, obj: obj.clone(), class: sent.clone(), field: "Err_error".into() });
                     let joined = self.new_local(Ty::Ref);
                     self.emit(Statement::Call { dest: Some(joined), func: "jrt_err_wrap".into(), args: vec![msg, Operand::Copy(olderr)] });
                     let newres = self.new_local(Ty::Ref);
-                    self.local_class.insert(newres.0, "Result".into());
-                    self.emit(Statement::New { dest: newres, class: "Result".into() });
-                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: "Result".into(), field: "__tag".into(), value: Operand::ConstI64(1) });
-                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: "Result".into(), field: "Err_error".into(), value: to_i64(Operand::Copy(joined)) });
+                    self.local_class.insert(newres.0, sent.clone());
+                    self.emit(Statement::New { dest: newres, class: sent.clone() });
+                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: sent.clone(), field: "__tag".into(), value: Operand::ConstI64(1) });
+                    self.emit(Statement::PutField { obj: Operand::Copy(newres), class: sent.clone(), field: "Err_error".into(), value: Operand::Copy(joined) });
                     self.emit(Statement::Assign(res, Rvalue::Use(Operand::Copy(newres))));
                     self.term(self.cur, Terminator::Goto(merge));
                     // Ok branch → the original Result, unchanged.
@@ -3341,14 +3442,17 @@ impl<'a> FnLower<'a> {
                     self.cur = merge.0 as usize;
                     return (Operand::Copy(res), Ty::Ref);
                 }
-                // `result.error()` — the Err message as a Str (`""` when Ok). Reads the
-                // i64-erased Err_error slot back as a JStr* (the string-message error case,
-                // Go's `err.Error()`); typed sum-type errors are handled by `match`. This is
-                // how a wrapped error chain is observed until two-parameter Result payloads are
-                // typed (single-param Option already round-trips; see the generic sum machinery).
-                if sent == "Result" && name == "error" {
+                // `result.error()` — the Err payload as a Str (`""` when Ok,
+                // Go's `err.Error()`). Requires `E = Str` (the payload IS the
+                // message — no conversion); anything else is E-error, use `match`.
+                if (sent == "Result" || sent.starts_with("Result$")) && name == "error" {
+                    let (rt, re) = Self::parse_result_class(&sent);
+                    if re != "Str" {
+                        self.errs.push(format!("error[E100]: `.error()` needs `E = Str` (receiver is `Result[{rt}, {re}]`) — match typed errors explicitly"));
+                        return (Operand::ConstI64(0), Ty::I64);
+                    }
                     let tag = self.new_local(Ty::I64);
-                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: "Result".into(), field: "__tag".into() });
+                    self.emit(Statement::GetField { dest: tag, obj: obj.clone(), class: sent.clone(), field: "__tag".into() });
                     let is_err = self.new_local(Ty::I32);
                     self.emit(Statement::Assign(is_err, Rvalue::Binary(IB::CmpEq, Operand::Copy(tag), Operand::ConstI64(1))));
                     let errb = self.new_block();
@@ -3358,10 +3462,8 @@ impl<'a> FnLower<'a> {
                     let res = self.new_local(Ty::Ref);
                     self.local_class.insert(res.0, "Str".into());
                     self.cur = errb.0 as usize;
-                    let raw = self.new_local(Ty::I64);
-                    self.emit(Statement::GetField { dest: raw, obj: obj.clone(), class: "Result".into(), field: "Err_error".into() });
                     let s = self.new_local(Ty::Ref);
-                    self.emit(Statement::Call { dest: Some(s), func: "jrt_as_str".into(), args: vec![Operand::Copy(raw)] });
+                    self.emit(Statement::GetField { dest: s, obj: obj.clone(), class: sent.clone(), field: "Err_error".into() });
                     self.emit(Statement::Assign(res, Rvalue::Use(Operand::Copy(s))));
                     self.term(self.cur, Terminator::Goto(merge));
                     self.cur = okb.0 as usize;
@@ -4553,9 +4655,48 @@ impl<'a> FnLower<'a> {
     /// Build a data-carrying variant of a generic sum type (`Some(3.5)`) type-correctly:
     /// infer the type arguments from the payload types, instantiate `Option$Float`
     /// (F64 payload), tagged instance with the instance class.
+    /// Split a monomorphized `Result$T$E` class into `(T, E)`; `("", "")` when
+    /// the class is not a typed Result (erased leftovers, user types, garbage).
+    fn parse_result_class(class: &str) -> (String, String) {
+        match class.strip_prefix("Result$") {
+            Some(rest) => {
+                let mut it = rest.split('$');
+                match (it.next(), it.next(), it.next()) {
+                    (Some(t), Some(e), None) => (t.into(), e.into()),
+                    _ => (String::new(), String::new()),
+                }
+            }
+            None => (String::new(), String::new()),
+        }
+    }
+    /// Ensure the mono `Result$T$E` layout exists (module-wide seeding covers
+    /// signatures; this covers reconstructed classes like `?` targets);
+    /// returns the class name.
+    fn mono_result_class(&mut self, t: &str, e: &str) -> String {
+        let (tparams, variants) = self.generic_stypes["Result"].clone();
+        inst_stype("Result", &tparams, &variants, &[t.into(), e.into()], &mut self.local_inst, &mut self.local_svars)
+    }
+    /// `(payload Ty, payload object class)` of variant `Ok`/`Err` in a mono
+    /// `Result$T$E` class (falls back to erased i64 shape on unknown classes —
+    /// callers E-error first, so this is unreachable in valid programs).
+    fn result_payload_ty(&self, class: &str, vname: &str) -> (Ty, Option<String>) {
+        if let Some((_, _, vf)) = self.variant_in(class, vname) {
+            if let Some((_, ty, cls)) = vf.first() {
+                return (*ty, cls.clone());
+            }
+        }
+        (Ty::I64, None)
+    }
     fn build_generic_variant(&mut self, vname: &str, args: &[Expr]) -> (Operand, Ty) {
         let sum = self.variant_owner_g[vname].clone();
         let (tparams, variants) = self.generic_stypes[&sum].clone();
+        // `Ok`/`Err` carry exactly one payload; anything else is E-error (a
+        // dataless `Ok` has no erased fallback anymore — there is no layout
+        // without a payload type).
+        if (vname == "Ok" || vname == "Err") && args.len() != 1 {
+            self.errs.push(format!("error[E100]: `{vname}` takes exactly one payload argument, got {}", args.len()));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
         let vdef = variants.iter().find(|(n, _)| n == vname).cloned().unwrap_or((vname.into(), vec![]));
         let lowered: Vec<(Operand, Ty)> = args.iter().map(|a| self.lower_expr(a)).collect();
         // Derive the type parameters from the payload fields that are exactly `T`.
@@ -4567,7 +4708,38 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
-        let targs: Vec<String> = tparams.iter().map(|tp| tmap.get(tp).cloned().unwrap_or_else(|| "Int".into())).collect();
+        // Anything the payload leaves free comes from the nearest annotation
+        // (one-shot let-hint, else the enclosing `-> Result[T, E]`); what is
+        // still free is E-error — never a silent `Int` (AGENTS.md §4). A mono
+        // `Result$T$E` with a wrongly defaulted parameter would read a Ref
+        // field as i64 (or vice versa) — memory-unsafe under RC.
+        let mut targs: Vec<String> = Vec::new();
+        for tp in &tparams {
+            if let Some(got) = tmap.get(tp) {
+                targs.push(got.clone());
+            } else if sum == "Result" {
+                let hinted = self
+                    .sum_hint
+                    .clone()
+                    .and_then(|(t, e)| (tp == "T").then(|| t.clone()).or_else(|| (tp == "E").then(|| e.clone())))
+                    .or_else(|| {
+                        self.expected_result.clone().and_then(|(t, e)| {
+                            (tp == "T").then(|| t.clone()).or_else(|| (tp == "E").then(|| e.clone()))
+                        })
+                    });
+                match hinted {
+                    Some(h) => targs.push(h),
+                    None => {
+                        self.errs.push(format!(
+                            "error[E100]: cannot infer `{tp}` of `{vname}` — annotate it (e.g. `mut r: Result[Int, Str] = {vname}(…)`) or return it from a `-> Result[T, E]` function"
+                        ));
+                        targs.push("Int".into());
+                    }
+                }
+            } else {
+                targs.push(tmap.get(tp).cloned().unwrap_or_else(|| "Int".into()));
+            }
+        }
         let mangled = inst_stype(&sum, &tparams, &variants, &targs, &mut self.local_inst, &mut self.local_svars);
         let (_, tag, vfields) = self.variant_in(&mangled, vname).unwrap();
         let obj = self.new_local(Ty::Ref);
@@ -4908,6 +5080,8 @@ fn lower_fn(
         local_arr: HashMap::new(),
         local_arr_class: HashMap::new(),
         arr_hint: None,
+        sum_hint: None,
+        expected_result: None,
         mmio: HashMap::new(),
         in_region: 0,
         hw_regions,
@@ -4923,6 +5097,17 @@ fn lower_fn(
     };
     // Block 0
     fl.new_block();
+    // Expected `(T, E)` for `Ok`/`Err` under construction, from the enclosing
+    // return type (AGENTS.md §4): `-> Result[T, E]` fixes what payloads alone
+    // leave free. A bare `-> Result` (no arguments) is E-error here, not a
+    // dangling class.
+    if let Some(t) = f.sig.ret.as_ref().filter(|t| t.name == "Result") {
+        if t.args.len() == 2 {
+            fl.expected_result = Some((t.args[0].name.clone(), t.args[1].name.clone()));
+        } else {
+            fl.errs.push("error[E100]: `-> Result` needs both type arguments (`-> Result[T, E]`)".into());
+        }
+    }
     // Parameter → Locals 0..n
     let mut param_tys = Vec::new();
     for p in &f.sig.params {

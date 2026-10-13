@@ -50,6 +50,92 @@ check "Result match Ok/Err + .error()" "42
 0
 must be positive" "$work/match.vr"
 
+# --- typed payloads: Err(e) binds typed, ? propagates typed ----------------
+cat > "$work/typed.vr" <<'EOF'
+type MyErr { code: Int }
+fn parse(s: Str) -> Result[Int, MyErr] {
+    if s == "ok" { Ok(42) } else { Err(MyErr(7)) }
+}
+fn doubled(s: Str) -> Result[Int, MyErr] {
+    mut v = parse(s)?
+    Ok(v + v)
+}
+fn main() {
+    match parse("ok") { Ok(v) -> print(v)  Err(e) -> print(0 - 1) }
+    match parse("xx") { Ok(v) -> print(0 - 1)  Err(e) -> print(e.code) }
+    match doubled("ok") { Ok(v) -> print(v)  Err(e) -> print(0 - 1) }
+    match doubled("xx") { Ok(v) -> print(0 - 1)  Err(e) -> print(e.code + 100) }
+}
+EOF
+check "typed Result payloads (? + match + field)" "42
+7
+84
+107" "$work/typed.vr"
+
+cat > "$work/floatres.vr" <<'EOF'
+fn half(x: Float) -> Result[Float, Str] {
+    if x > 0.0 { Ok(x / 2.0) } else { Err("negative") }
+}
+fn main() {
+    match half(9.0) { Ok(v) -> print(v)  Err(e) -> print(e) }
+    print(half(0.0 - 1.0).error())
+}
+EOF
+check "Float Result payloads" "4.5
+negative" "$work/floatres.vr"
+
+cat > "$work/annres.vr" <<'EOF'
+fn main() {
+    mut r: Result[Int, Str] = Ok(5)
+    match r { Ok(v) -> print(v + 1)  Err(e) -> print(e) }
+}
+EOF
+check "annotated Result construction" "6" "$work/annres.vr"
+
+# --- mismatches are loud, not miscompiled ------------------------------------
+cat > "$work/mismatch.vr" <<'EOF'
+fn f() -> Result[Int, Str] { Err("x") }
+fn g() -> Result[Int, Int] {
+    mut v = f()?
+    Ok(v)
+}
+fn main() { print(0) }
+EOF
+if "$vire" build "$work/mismatch.vr" -o "$work/mismatch.bin" >/dev/null 2>"$work/e"; then
+    echo "FAIL ? E-mismatch (compiled — must be rejected)"; fail=$((fail+1))
+elif grep -q "error types differ" "$work/e"; then
+    echo "ok   ? E-mismatch rejected"; pass=$((pass+1))
+else
+    echo "FAIL ? E-mismatch (wrong error: $(head -1 "$work/e"))"; fail=$((fail+1))
+fi
+
+cat > "$work/wraperr.vr" <<'EOF'
+type MyErr { code: Int }
+fn f() -> Result[Int, MyErr] { Err(MyErr(1)) }
+fn main() { print(f().wrap("ctx").error()) }
+EOF
+if "$vire" build "$work/wraperr.vr" -o "$work/wraperr.bin" >/dev/null 2>"$work/e"; then
+    echo "FAIL wrap-non-Str (compiled — must be rejected)"; fail=$((fail+1))
+elif grep -q "needs \`E = Str\`" "$work/e"; then
+    echo "ok   wrap-non-Str rejected"; pass=$((pass+1))
+else
+    echo "FAIL wrap-non-Str (wrong error: $(head -1 "$work/e"))"; fail=$((fail+1))
+fi
+
+cat > "$work/uninf.vr" <<'EOF'
+fn main() {
+    mut r = Ok(5)
+    print(0)
+}
+EOF
+if "$vire" build "$work/uninf.vr" -o "$work/uninf.bin" >/dev/null 2>"$work/e"; then
+    echo "FAIL uninferred-E (compiled — must be rejected)"; fail=$((fail+1))
+elif grep -q "cannot infer \`E\` of \`Ok\`" "$work/e"; then
+    echo "ok   uninferred-E rejected (no silent Int)"; pass=$((pass+1))
+else
+    echo "FAIL uninferred-E (wrong error: $(head -1 "$work/e"))"; fail=$((fail+1))
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 rm -rf "$work"

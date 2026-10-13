@@ -413,15 +413,34 @@ fn generic_sum_exhaustiveness_mandatory() {
 
 #[test]
 fn option_result_and_try() {
-    // Built-in sum types + `?` propagation.
-    let src = "fn d(a: Int, b: Int) -> Result {\n if b == 0 { Err(1) } else { Ok(a / b) }\n}\nfn c(a: Int, b: Int) -> Result {\n mut q = d(a, b)?\n Ok(q + 1)\n}\nfn main() {\n print(1)\n}\n";
+    // Built-in sum types + `?` propagation, fully typed (AGENTS.md §4): every
+    // site resolves (T, E); payloads keep their types (no i64 erasure).
+    let src = "fn d(a: Int, b: Int) -> Result[Int, Str] {\n if b == 0 { Err(\"div0\") } else { Ok(a / b) }\n}\nfn c(a: Int, b: Int) -> Result[Int, Str] {\n mut q = d(a, b)?\n Ok(q + 1)\n}\nfn main() {\n print(1)\n}\n";
     let p = lower(src);
-    // Result class registered; `?` reads __tag + Ok_value.
-    assert!(p.classes.iter().any(|c| c.name == "Result"));
+    // Mono class registered; `?` reads __tag + Ok_value from it.
+    assert!(p.classes.iter().any(|c| c.name == "Result$Int$Str"), "mono Result$Int$Str missing");
     let reads_ok = p.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.statements).any(|s| {
         matches!(s, fastllvm_ir::Statement::GetField { field, .. } if field == "Ok_value")
     });
     assert!(reads_ok, "`?` must extract Ok_value");
+}
+
+#[test]
+fn result_typed_payload_binds_typed() {
+    // `Err(e)` binds a TYPED `e` (e.g. field access resolves) — the §4 deliverable.
+    let src = "type MyErr { code: Int }\nfn f(x: Int) -> Result[Int, MyErr] {\n if x > 0 { Ok(x) } else { Err(MyErr(3)) }\n}\nfn main() {\n match f(0) { Ok(v) -> print(v)  Err(e) -> print(e.code) }\n}\n";
+    let p = lower(src);
+    assert!(p.classes.iter().any(|c| c.name == "Result$Int$MyErr"), "mono Result$Int$MyErr missing: {}", p.classes.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(","));
+}
+
+#[test]
+fn result_uninferred_param_is_rejected() {
+    // No silent `Int` default: an unresolvable E is E100, not a miscompile.
+    let (mut m, diags) = parse("fn main() {\n mut r = Ok(5)\n print(0)\n}\n");
+    assert!(diags.is_empty(), "parse diagnostics: {diags:?}");
+    let _ = infer_module(&mut m);
+    let errs = lower_module(&m).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("cannot infer `E` of `Ok`")), "expected E100, got {errs:?}");
 }
 
 #[test]

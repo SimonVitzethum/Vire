@@ -349,7 +349,10 @@ Vire does **not** use Go's `(T, error)` tuple with `nil`: a `nil` error would be
 `null` through the back door and violates guiding principle 4 (no `null`). Instead
 **one** consistent model: `Result[T, E]` (E typed, often a sum type or the
 `Error` interface). "Fallible" thus stands visibly in the signature (Go principle),
-but typed and without null.
+but typed and without null. **Shipped:** both payloads are fully typed
+(`Result$T$E` monomorphized layouts — no i64 erasure; `Err(e)` binds a typed `e`
+with field access). Unresolvable parameters are E100, never silent `Int`.
+Tests: `tests/vire_errors.sh`.
 ```vire
 type ConfigError { NotFound(path: Str), BadSyntax(path: Str, line: Int) }
 

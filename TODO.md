@@ -483,20 +483,15 @@ regalloc/scheduling tuning for raytracer (low ROI, no single pass).
   slot) + `jrt_as_str`; lowering in lower.rs (branch/merge on the tag). Also fixed a real backend
   crash: storing a pointer payload (a string literal) into the i64-ERASED Result/Option slot now
   emits `ptrtoint`, not an invalid `store i64 @jstr.0`. Test `tests/vire_errors.sh`; gate GREEN.
-- [ ] **Two-parameter typed Result payloads** (the honest remaining gap). Single-param generics
-  are monomorphized type-correctly (`Option[Str]` round-trips a string via `Option$Str`), but
-  `Result[T,E]` (two params) stays i64-erased, so `match Err(e) -> print(e)` yields the pointer as
-  a number — use `.error()` for the message meanwhile. Extend the generic sum-type instantiation
-  (`generic_stypes`, `class_of_ann`) to two type args (`Result$T$E`) + infer the unconstrained arg.
-  Soundness-sensitive (payload layout) — do NOT rush; gate on the heap oracle. Then `Err(e)` binds
-  a typed `e`, typed sum-type errors + attached debug path follow.
-  - **Attempted 2026-07-24, reverted (finding).** Registering Result in `generic_stypes` [T,E]
-    monomorphizes it and `match Err(e)` binds typed — BUT the erased `Result` (i64 payloads, used
-    by `?`/`.wrap`/`.error`) and `Result$T$E` then coexist and are mixed at construct-vs-match
-    sites. They agree ONLY when every payload is i64 (`Result[Int,Int]` works); with a Ref payload
-    (`Result[Str,_]`) the layouts diverge → a Ref field read as i64 (or vice versa) → memory-unsafe
-    under RC, and it regressed `vire_errors.sh`. The real fix must unify the erased/mono
-    representation and teach `?`/`.wrap`/`.error` the mono class before gating on the heap oracle.
+- [x] **Two-parameter typed Result payloads — DONE (2026-10-13).** `Result[T, E]`
+  monomorphizes to `Result$T$E` with fully typed slots (no erasure anywhere):
+  the erased class is deleted, construction resolves (T, E) from payload +
+  let-annotation + enclosing `-> Result[T, E]` (else E100, never silent `Int`),
+  `?` reconstructs the error in the caller's layout (E must match exactly),
+  `.wrap`/`.error()` require `E = Str` (else E-error, use `match`). The 2026-07
+  revert finding (mixed erased/mono layouts) is resolved by unifying on mono
+  everywhere. `Err(e)` binds typed (field access works). Gated: heap oracle
+  0-live + GUARD_FREE-clean + `tests/vire_errors.sh` (8) + 3 lowering unit tests.
 
 ### [8] Debug symbols + crash paths — DONE (2026-07-25)
 - [x] **Map `java_main` → `main` in the DISubprogram name.** The entry's DISubprogram now
