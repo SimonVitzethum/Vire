@@ -2828,6 +2828,37 @@ void jrt_aastore(void *arr, int32_t i, void *v) {
     jrt_release(*slot);
     *slot = v;
 }
+/* M2 static ownership (solver-proven unique, own.rs): transferring store — the
+ * caller's +1 moves into the slot, so no retain on the new value. The OLD slot
+ * value is still released (a reused slot's previous owner must die). */
+void jrt_aastore_move(void *arr, int32_t i, void *v) {
+    JArray *a = (JArray *)arr;
+    if (!arr_ok(a, i)) return;
+    void **slot = &((void **)(a + 1))[i];
+    jrt_release(*slot);
+    *slot = v;
+}
+/* M2 static ownership: direct free of a proven-unique object. Runs the exact
+ * tested free path (drop cascade + free, iterative/budgeted per mode) by
+ * presenting refcount 1 to jrt_release — no counter traffic, no collector
+ * registration. Immortal (arena/stack) objects are never uniq, but guard
+ * anyway: freeing one would corrupt the pool. NULL frees nothing. */
+void jrt_free_unique(void *p) {
+    if (!p) return;
+    JObjHeader *h = (JObjHeader *)p;
+    if (h->refcount < 0) return; /* immortal — not owned, never freed */
+    /* Dynamic guard (defense in depth behind the static proof): direct-free is
+     * only valid at sole ownership. A missed dynamic retain (counter != 1)
+     * falls back to a normal release — a potential leak, never a premature
+     * free. Fail-safe toward leaks (caught by balance tests), never UAF. */
+    if (RC_COUNT(h) != 1) { jrt_release(p); return; }
+    /* Present refcount 1 to jrt_release: identical to a normal release of a
+     * sole-owned object (same drop cascade, same free, same mode handling).
+     * Preserve the flag bits (color/buffered): clearing them would corrupt a
+     * pending collector-buffer entry exactly as a racy decrement would. */
+    h->refcount = (h->refcount & (int64_t)7) | RC_ONE;
+    jrt_release(p);
+}
 int32_t jrt_arraylen(void *arr) {
     if (!arr) {
         throw_runtime(&npe_exc_obj, NPE_MSG);

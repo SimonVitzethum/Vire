@@ -149,6 +149,11 @@ const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("jrt_throw_bounds_fatal", "void ()"),
     ("jrt_retain", "void (ptr)"),
     ("jrt_release", "void (ptr)"),
+    // M2 static ownership (own.rs): direct free of a proven-unique object
+    // (drop + free, no counters, no collector) + transferring ref-array store
+    // (no retain on the new value; the old slot is still released).
+    ("jrt_free_unique", "void (ptr)"),
+    ("jrt_aastore_move", "void (ptr, i32, ptr)"),
     ("jrt_throw", "void (ptr)"),
     ("jrt_pending_set", "i32 ()"),
     ("jrt_take_pending", "ptr ()"),
@@ -291,7 +296,10 @@ struct Ctx<'a> {
     static_writes: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Interprocedural instance-field write sets (+ opaque flag) for region inference.
     field_writes: BTreeMap<String, (BTreeSet<(String, String)>, bool)>,
-    /// Loop-vectorization control. `novec_id` = the shared
+    /// Solver-side ownership (borrowck offload, AGENTS.md §2): per-local
+    /// Unique/Borrow/Region/Shared + use dispositions for direct-free codegen
+    /// (M2). Computed once per program; read per function at emission.
+    own: fastllvm_solver::OwnReport,
     /// `!{!"llvm.loop.vectorize.enable", i1 false}` node; `loop_ids` maps
     /// (function index, header block) of each divergent/call-bearing loop to its
     /// distinct `!llvm.loop` node, attached to that loop's latch back-edge.
@@ -839,7 +847,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
             next_md += 1;
         }
     }
-    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv, arr_len_ty, arr_len_tbaa, arr_data_ty, arr_data_tbaa, vt_ty, vt_tbaa };
+    let ctx = Ctx { program, iface_slots, tbaa, static_writes, field_writes, novec_id, loop_ids, bw_then, bw_else, md_inv, arr_len_ty, arr_len_tbaa, arr_data_ty, arr_data_tbaa, vt_ty, vt_tbaa, own: fastllvm_solver::classify_ownership(program) };
     let mut dg = DebugGen::new(debug, next_md);
     // Declaration line per function (for DISubprograms of both live and inlined
     // functions referenced by DebugLine inline stacks).
@@ -1704,6 +1712,12 @@ struct FnEmitter<'a> {
     /// store (`PutField` value / `return`) — the store takes their +1 (no retain),
     /// and they are not released at cleanup. See `moved_locals`.
     moved: BTreeSet<u32>,
+    /// Solver-proven uniquely-owned locals (own.rs): single-owner chains with at
+    /// most one consumer. Transfers skip RC (ownership moves statically) and
+    /// exit-cleanup emits direct frees (`jrt_free_unique`) or skips. Keyed by
+    /// local; the disposition map carries per-local use info.
+    uniq: BTreeSet<u32>,
+    uniq_use: std::collections::HashMap<u32, fastllvm_solver::OwnUse>,
     /// Whole-program: no exception handler can catch a runtime exception, so an
     /// inline bounds/NPE failure aborts via the `_fatal` noreturn helpers
     /// (`unreachable` after) instead of the pending-continue merge.
@@ -2740,7 +2754,18 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     let borrow = borrow_slots(f, &borrowed, sw, fw);
     let nn = non_null_locals(f);
     let moved = moved_locals(f, ctx, &borrowed, &borrow, &imm);
-    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, vt_tbaa: ctx.vt_tbaa, marker_locs, cur_loc: default_loc };
+    // Solver-side uniqueness (own.rs, M2): locals proven single-owner.
+    let mut uniq = BTreeSet::new();
+    let mut uniq_use = std::collections::HashMap::new();
+    for ((fname, l), st) in ctx.own.state.iter() {
+        if fname == &f.name && *st == fastllvm_solver::OwnState::Unique {
+            uniq.insert(*l);
+            if let Some(u) = ctx.own.uses.get(&(fname.clone(), *l)) {
+                uniq_use.insert(*l, u.clone());
+            }
+        }
+    }
+    let mut e = FnEmitter { f, tmp: 0, label: 0, borrowed, sn: 0, sna: 0, region: has_region, imm, borrow, moved, uniq, uniq_use, uncatchable, nn, md_inv: ctx.md_inv, arr_len_tbaa: ctx.arr_len_tbaa, arr_data_tbaa: ctx.arr_data_tbaa, vt_tbaa: ctx.vt_tbaa, marker_locs, cur_loc: default_loc };
     // AOT hot path: static loop estimation → which branch stays
     // in the loop (hot). Sets `!prof` weights, LLVM optimizes the rest.
     // `FASTLLVM_NO_PROF` turns the weights off (for A/B measurement of the ceiling).
@@ -2796,7 +2821,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
                 writeln!(w, "  switch i32 {v}, label %bb{} [{arms}]", default.0).unwrap();
             }
             Terminator::Return(None) => {
-                emit_cleanup(w, ctx, &mut e);
+                emit_cleanup(w, ctx, &mut e, bi);
                 writeln!(w, "  ret void{}", e.dbg()).unwrap();
             }
             Terminator::Return(Some(op)) => {
@@ -2805,12 +2830,15 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
                 // The returned ref must survive the cleanup → retain, then the
                 // caller transfers the +1. A move-on-last-use local already holds
                 // the +1 handed to the caller (and is not released at cleanup), so
-                // its retain is omitted.
+                // its retain is omitted. Same for a solver-unique local (M2): the
+                // single consumer IS this return, so ownership transfers here and
+                // cleanup skips exactly this exit block (other exits free).
                 let moved_ret = matches!(op, Operand::Copy(l) if e.moved.contains(&l.0));
-                if ty == Ty::Ref && !moved_ret {
+                let uniq_ret = matches!(op, Operand::Copy(l) if e.uniq.contains(&l.0));
+                if ty == Ty::Ref && !moved_ret && !uniq_ret {
                     writeln!(w, "  call void @jrt_retain(ptr {v}){}", e.dbg()).unwrap();
                 }
-                emit_cleanup(w, ctx, &mut e);
+                emit_cleanup(w, ctx, &mut e, bi);
                 writeln!(w, "  ret {} {v}{}", llty(ty), e.dbg()).unwrap();
             }
         }
@@ -2825,7 +2853,12 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
 /// release: the field-sensitive escape analysis promotes container and contents
 /// only together (both-or-neither), so a stack container holds exclusively
 /// immortal contents — nothing that could leak.
-fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
+/// Releases all of the function's ref locals at one exit block (`exit_bb`).
+/// Solver-unique locals (M2, own.rs) take the static path: transferred ones
+/// are skipped (their +1 moved at the single consumer, which dominates this
+/// exit or is this very return), exit-owned ones are freed directly
+/// (`jrt_free_unique`: drop + free, no counters, no collector).
+fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter, exit_bb: usize) {
     // Close the per-function region (frees its bump allocations en bloc). Before
     // the ref releases below, but order is irrelevant — region arrays are immortal
     // (never released), and no released ref points into the region (non-escaping).
@@ -2841,6 +2874,21 @@ fn emit_cleanup(w: &mut String, _ctx: &Ctx, e: &mut FnEmitter) {
             && !e.borrow.contains(&(i as u32))
             && !e.moved.contains(&(i as u32))
         {
+            // M2 static path for solver-unique locals.
+            if e.uniq.contains(&(i as u32)) {
+                if let Some(u) = e.uniq_use.get(&(i as u32)) {
+                    if u.skip_exits.contains(&exit_bb) {
+                        continue;
+                    }
+                    if u.exit_free {
+                        let t = e.fresh();
+                        writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
+                        writeln!(w, "  call void @jrt_free_unique(ptr {t})").unwrap();
+                        continue;
+                    }
+                }
+                // Defensive: uniq without a usable disposition → normal RC.
+            }
             let t = e.fresh();
             writeln!(w, "  {t} = load ptr, ptr %l{i}").unwrap();
             writeln!(w, "  call void @jrt_release(ptr {t})").unwrap();
@@ -3228,16 +3276,18 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                 // A move-on-last-use local (`moved`) hands the field its own +1 —
                 // omit the retain here (the local's cleanup release is likewise
                 // skipped in emit_cleanup), removing the ownership-transfer churn.
-                // An IMMORTAL value (arena/stack, `imm`) needs no retain: retain is a
-                // runtime no-op on it. And when the OBJECT is immortal, its ref field
-                // held an immortal ref (both-or-neither / arena invariant), so the
-                // release of the old value is a no-op too — omit it. Together these
-                // strip the entire retain/release churn from an arena-local mutation
-                // (e.g. a per-iteration graph's topology rewrite), leaving a bare store.
+                // Same for a solver-unique local with this store as its single
+                // consumer (M2): the +1 moves statically into the parent, and
+                // cleanup skips it (the store dominates every exit it can reach).
                 let moved_in = matches!(value, Operand::Copy(l) if e.moved.contains(&l.0));
+                let uniq_in = matches!(value, Operand::Copy(l) if e.uniq.contains(&l.0)
+                    && e.uniq_use.get(&l.0).is_some_and(|u| u.consumes == 1 && !u.returned));
+                // Immortal value/object (arena/stack): retain/release are runtime
+                // no-ops → omit both (both-or-neither / arena invariant: an immortal
+                // object holds immortal refs).
                 let v_imm = matches!(value, Operand::Copy(l) if e.imm.contains(&l.0));
                 let obj_imm = matches!(obj, Operand::Copy(l) if e.imm.contains(&l.0));
-                if !matches!(value, Operand::ConstNull) && !moved_in && !v_imm {
+                if !matches!(value, Operand::ConstNull) && !moved_in && !uniq_in && !v_imm {
                     writeln!(w, "  call void @jrt_retain(ptr {v})").unwrap();
                 }
                 let old = e.fresh();
@@ -3370,7 +3420,16 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
                     emit_array_elem_store(w, e, &a, &i, &v, *kind);
                 }
             } else if bck && kind.is_ref() {
-                writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
+                // Solver-unique value with this store as its single consumer (M2):
+                // transfer without retain (`jrt_aastore_move` still releases the
+                // old slot — a reused slot's previous value must die).
+                let uniq_move = matches!(value, Operand::Copy(l) if e.uniq.contains(&l.0)
+                    && e.uniq_use.get(&l.0).is_some_and(|u| u.consumes == 1 && !u.returned));
+                if uniq_move {
+                    writeln!(w, "  call void @jrt_aastore_move(ptr {a}, i32 {i}, {} {v})", llty(vty)).unwrap();
+                } else {
+                    writeln!(w, "  call void @{}(ptr {a}, i32 {i}, {} {v})", arr_store_fn(*kind), llty(vty)).unwrap();
+                }
             } else if bck {
                 emit_array_elem_store_checked(w, e, &a, &i, &v, *kind, e.nonnull(arr));
             } else {
@@ -3709,6 +3768,11 @@ fn store_dest(w: &mut String, e: &mut FnEmitter, dest: Local, val: &str, retain_
         writeln!(w, "  store ptr {val}, ptr %l{}", dest.0).unwrap();
         return;
     }
+    // M2 solver-unique destination: the copied +1 transfers statically, so the
+    // retain is skipped — but the OLD slot value is still released. A single
+    // static definition is NOT a single dynamic execution (loop bodies reassign
+    // per iteration); the old value holds a live +1 that must die here.
+    let retain_new = retain_new && !e.uniq.contains(&dest.0);
     let old = e.fresh();
     writeln!(w, "  {old} = load ptr, ptr %l{}", dest.0).unwrap();
     // `retain(null)` is a no-op → omit it (constant null renders as "null").

@@ -27,7 +27,7 @@ int main(void) {
     return (int)(p[2] & 1);     /* USE-AFTER-FREE: SIGSEGV under the guard */
 }
 EOF
-if clang -O2 -w -DFASTLLVM_NO_CYCLES -c "$root/crates/driver/src/runtime.c" -o "$work/rt.o" 2>/dev/null \
+if clang -O2 -w -DFASTLLVM_NO_CYCLES -c "$root/crates/runtime/runtime.c" -o "$work/rt.o" 2>/dev/null \
    && clang -O2 -w "$work/pc.c" "$work/rt.o" -lm -o "$work/pc" 2>/dev/null; then
     # Capture via command substitution so the shell's "Segmentation fault" notice for
     # the (expected) crash under the guard lands in a discarded variable, not the log.

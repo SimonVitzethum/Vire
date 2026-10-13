@@ -37,10 +37,21 @@ pub enum OwnState {
 /// parents + returns, saturated at 2) and whether a return consumes it.
 /// A Unique local with 0 consumes is freed at function exit; with 1 consume
 /// ownership transfers there (store/return) and the exit skips it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OwnUse {
     pub consumes: u8,
     pub returned: bool,
+    /// Block index of the consuming return (if `returned`).
+    pub return_block: Option<usize>,
+    /// True for New/FreshCall dests (own at creation); copies borrow.
+    pub is_root: bool,
+    /// Total consumers across the copy web, saturated at 2 (roots only).
+    pub root_total: u8,
+    /// Free at function exits (roots with 0 consumers; returned roots at all
+    /// exits except their own return block).
+    pub exit_free: bool,
+    /// Exits to skip at cleanup (transferred there). Sorted block indices.
+    pub skip_exits: Vec<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -482,6 +493,87 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
         }
         root_of
     };
+    // Reachability + dominance (for transfer soundness): a store-transfer is
+    // only valid if it dominates every reachable exit — otherwise one path
+    // would double-free (parent frees) and another would leak (local owns).
+    // Unreachable blocks never execute: their consumers don't count (the owner
+    // keeps the value → exit-free), but knock rules still see them (Shared is
+    // always a safe fallback).
+    let n_blocks = f.blocks.len();
+    let succ = |bi: usize| -> Vec<usize> {
+        match &f.blocks[bi].terminator {
+            Terminator::Goto(b) => vec![b.0 as usize],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![then_blk.0 as usize, else_blk.0 as usize],
+            Terminator::Switch { default, cases, .. } => {
+                let mut v = vec![default.0 as usize];
+                v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                v
+            }
+            Terminator::Return(_) => vec![],
+        }
+    };
+    let mut reachable = BTreeSet::from([0usize]);
+    {
+        let mut stack = vec![0usize];
+        while let Some(bi) = stack.pop() {
+            for s in succ(bi) {
+                if s < n_blocks && reachable.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    let exits: BTreeSet<usize> = (0..n_blocks)
+        .filter(|bi| reachable.contains(bi) && matches!(f.blocks[*bi].terminator, Terminator::Return(_)))
+        .collect();
+    // Iterative dominators over reachable blocks.
+    let mut dom: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n_blocks];
+    dom[0].insert(0);
+    {
+        let all: BTreeSet<usize> = reachable.iter().copied().collect();
+        for bi in reachable.iter().skip_while(|b| **b == 0) {
+            dom[*bi] = all.clone();
+        }
+        // Predecessors.
+        let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n_blocks];
+        for bi in reachable.iter() {
+            for s in succ(*bi) {
+                if reachable.contains(&s) {
+                    pred[s].push(*bi);
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for bi in reachable.iter().filter(|b| **b != 0) {
+                let mut new = all.clone();
+                for p in &pred[*bi] {
+                    new = new.intersection(&dom[*p]).copied().collect();
+                }
+                new.insert(*bi);
+                if new != dom[*bi] {
+                    dom[*bi] = new;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let dominates = |t: usize, e: usize| -> bool { dom[e].contains(&t) };
+    // Forward reachability per block (for the transfer rule below).
+    let mut fwd: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n_blocks];
+    for bi in reachable.iter() {
+        let mut seen = BTreeSet::from([*bi]);
+        let mut stack = vec![*bi];
+        while let Some(x) = stack.pop() {
+            for s in succ(x) {
+                if s < n_blocks && reachable.contains(&s) && seen.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        fwd[*bi] = seen;
+    }
     // LINEARITY (soundness-critical for direct-free codegen): a Unique object must
     // have AT MOST ONE consuming use across its whole copy web — a store into a
     // non-Shared parent, a return, or (implicitly) the function-exit cleanup.
@@ -492,11 +584,20 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
     // (transfer vs exit-free) alongside the state map.
     let mut consumers = vec![0u32; n];
     let mut returned = vec![false; n];
+    // Block index of the single consumer (store or return) per local.
+    let mut cons_block: Vec<Option<usize>> = vec![None; n];
+    // Per-root consumer block (store) / return block, for the dominance rule.
+    let mut root_cons_block: Vec<Option<usize>> = vec![None; n];
+    let mut root_ret_block: Vec<Option<usize>> = vec![None; n];
+    let mut root_has_ret = vec![false; n];
     {
         // Consumer count per local: PutField/ArrayStore value into an owned
-        // (Unique/Region) parent, or a returned operand.
+        // (Unique/Region) parent, or a returned operand. Unreachable blocks
+        // never execute: consumers there don't count (the owner keeps the
+        // value → exit-free is correct for them).
         let mut bad_root = BTreeSet::new();
-        for b in &f.blocks {
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let live = reachable.contains(&bi);
             for st in &b.statements {
                 match st {
                     Statement::PutField { obj, value: Operand::Copy(v), .. } => {
@@ -505,7 +606,14 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
                         // (caller-owned) — storing there shares the value.
                         let parent_owned = matches!(obj, Operand::Copy(o) if matches!(state[o.0 as usize], OwnState::Unique | OwnState::Region));
                         if parent_owned {
-                            consumers[v.0 as usize] += 1;
+                            if live {
+                                consumers[v.0 as usize] += 1;
+                                cons_block[v.0 as usize] = Some(bi);
+                                let r = root_of[v.0 as usize];
+                                if r != u32::MAX {
+                                    root_cons_block[r as usize] = Some(bi);
+                                }
+                            }
                         } else {
                             bad_root.insert(v.0);
                         }
@@ -517,7 +625,14 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
                     Statement::ArrayStore { arr, value: Operand::Copy(v), .. } => {
                         let parent_owned = matches!(arr, Operand::Copy(a) if matches!(state[a.0 as usize], OwnState::Unique | OwnState::Region));
                         if parent_owned {
-                            consumers[v.0 as usize] += 1;
+                            if live {
+                                consumers[v.0 as usize] += 1;
+                                cons_block[v.0 as usize] = Some(bi);
+                                let r = root_of[v.0 as usize];
+                                if r != u32::MAX {
+                                    root_cons_block[r as usize] = Some(bi);
+                                }
+                            }
                         } else {
                             bad_root.insert(v.0);
                         }
@@ -527,8 +642,76 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
                 }
             }
             if let Terminator::Return(Some(Operand::Copy(r))) = &b.terminator {
-                consumers[r.0 as usize] += 1;
-                returned[r.0 as usize] = true;
+                // Return blocks are always reachable when executed; a return in an
+                // unreachable block never transfers.
+                if live {
+                    consumers[r.0 as usize] += 1;
+                    returned[r.0 as usize] = true;
+                    cons_block[r.0 as usize] = Some(bi);
+                    let rt = root_of[r.0 as usize];
+                    if rt != u32::MAX {
+                        root_has_ret[rt as usize] = true;
+                        root_ret_block[rt as usize] = Some(bi);
+                    }
+                }
+            }
+        }
+        // LOOP REASSIGNMENT (soundness-critical): a single static definition is
+        // not a single dynamic execution — a local defined inside a loop body
+        // is reassigned per iteration, so the old value's +1 must be released
+        // per iteration (normal RC). A block is on a cycle iff one of its
+        // successors reaches it back (`fwd` sets above — simple and exact).
+        // Knocking the defined local (bidirectional propagation knocks its web)
+        // restores per-iteration releases.
+        {
+            let succ_of = |bi: usize| -> Vec<usize> {
+                let mut succs = match &f.blocks[bi].terminator {
+                    Terminator::Goto(b) => vec![b.0 as usize],
+                    Terminator::Branch { then_blk, else_blk, .. } => {
+                        vec![then_blk.0 as usize, else_blk.0 as usize]
+                    }
+                    Terminator::Switch { default, cases, .. } => {
+                        let mut v = vec![default.0 as usize];
+                        v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                        v
+                    }
+                    Terminator::Return(_) => vec![],
+                };
+                succs.retain(|s| *s < n_blocks && reachable.contains(s));
+                succs
+            };
+            let mut in_cycle = vec![false; n_blocks];
+            for bi in reachable.iter() {
+                for s in succ_of(*bi) {
+                    if fwd[s].contains(bi) {
+                        in_cycle[*bi] = true;
+                        break;
+                    }
+                }
+            }
+            // Knock ref locals defined in loop blocks.
+            for bi in reachable.iter().filter(|b| in_cycle[**b]) {
+                for st in &f.blocks[*bi].statements {
+                    let dest = match st {
+                        Statement::Assign(d, _) => Some(d.0),
+                        Statement::Call { dest: Some(d), .. }
+                        | Statement::CallGuarded { dest: Some(d), .. }
+                        | Statement::CallVirtual { dest: Some(d), .. }
+                        | Statement::CallPoly { dest: Some(d), .. }
+                        | Statement::New { dest: d, .. }
+                        | Statement::StackNew { dest: d, .. }
+                        | Statement::StackNewArray { dest: d, .. }
+                        | Statement::RegionNewArray { dest: d, .. }
+                        | Statement::NewArray { dest: d, .. }
+                        | Statement::GetField { dest: d, .. } => Some(d.0),
+                        _ => None,
+                    };
+                    if let Some(d) = dest {
+                        if f.locals[d as usize] == Ty::Ref {
+                            knock.insert(d);
+                        }
+                    }
+                }
             }
         }
         // Attribute each local's consumers to its New/FreshCall root (follow the
@@ -549,6 +732,29 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             if *t == Ty::Ref && state[i] == OwnState::Unique && root_of[i] as usize == i {
                 if root_consumers[i] > 1 {
                     knock.insert(i as u32);
+                }
+            }
+        }
+        // TRANSFER RULE (soundness-critical, unified for stores and returns):
+        // a single transfer T is statically decidable per exit E iff either
+        // T dominates E (all paths ran the transfer → parent/caller owns →
+        // skip) or T cannot reach E (no path ran it → local owns-or-null →
+        // free). If some paths run T and others avoid it (T reaches E without
+        // dominating it), neither choice is safe → Shared (RC fallback).
+        // Returns are a special case for free (a return block reaches only
+        // itself, so other exits always free).
+        for (i, t) in f.locals.iter().enumerate() {
+            if *t == Ty::Ref && state[i] == OwnState::Unique && root_of[i] as usize == i {
+                if root_consumers[i] == 1 && !root_has_ret[i] {
+                    match root_cons_block[i] {
+                        Some(cb) => {
+                            let ok = exits.iter().all(|e| dominates(cb, *e) || !fwd[cb].contains(e));
+                            if !ok {
+                                knock.insert(i as u32);
+                            }
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -616,13 +822,21 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             knock.insert(r);
         }
     }
-    // Propagate the cycle knock-down through copies to fixpoint.
+    // Propagate knock-down through copies to fixpoint — BIDIRECTIONAL (soundness-
+    // critical): a knocked copy shares its object, so the whole web (including
+    // the root and earlier copies) is Shared. Forward-only propagation misses
+    // the case of a directly-knocked copy (e.g. passed to a capturing call)
+    // whose root would otherwise be exit-freed while the copy still holds a
+    // retained +1 → release-after-free. Either direction knocks the web.
     loop {
         let mut grew = false;
         for b in &f.blocks {
             for st in &b.statements {
                 if let Statement::Assign(dest, Rvalue::Use(Operand::Copy(s))) = st {
                     if knock.contains(&s.0) && knock.insert(dest.0) {
+                        grew = true;
+                    }
+                    if knock.contains(&dest.0) && knock.insert(s.0) {
                         grew = true;
                     }
                 }
@@ -636,24 +850,6 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
         if f.locals[*k as usize] == Ty::Ref {
             state[*k as usize] = OwnState::Shared;
         }
-    }
-    loop {
-        let mut grew = false;
-        for b in &f.blocks {
-            for st in &b.statements {
-                if let Statement::Assign(dest, Rvalue::Use(Operand::Copy(s))) = st {
-                    if knock.contains(&s.0) && knock.insert(dest.0) {
-                        grew = true;
-                    }
-                }
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-    for k in &knock {
-        state[*k as usize] = OwnState::Shared;
     }
 
     // Borrow promotion: never-reassigned, never-captured ref params that were
@@ -718,9 +914,64 @@ fn classify_function(f: &Function, summ: &BTreeMap<String, Vec<bool>>, rep: &mut
             continue;
         }
         rep.state.insert((f.name.clone(), i as u32), state[i]);
+        // Disposition for codegen (only meaningful when Unique; the backend
+        // ignores the rest and runs normal RC):
+        // - root + 0 consumers → exit_free everywhere (frees what it owns);
+        // - root + 1 store (decidable everywhere, enforced above) → skip
+        //   dominated exits, free the rest (unreachable from T);
+        // - root + 1 return at T → exit_free with skip at T (other exits free:
+        //   their paths never ran the transfer);
+        // - copies → skip every exit (borrows; the root disposes).
+        let is_root = root_of[i] as usize == i && state[i] == OwnState::Unique;
+        let (exit_free, skip_exits, ret_block, total) = if state[i] != OwnState::Unique {
+            (false, Vec::new(), None, 0)
+        } else if !is_root {
+            // Copies never own: skip every exit (borrows; the root disposes).
+            let mut sk: Vec<usize> = exits.iter().copied().collect();
+            sk.sort_unstable();
+            (false, sk, None, 0)
+        } else {
+            // Root: web total + the consuming return block, if any.
+            let mut tot = 0u32;
+            let mut rb = None;
+            for (j, t) in f.locals.iter().enumerate() {
+                if *t == Ty::Ref && root_of[j] as usize == i && consumers[j] > 0 {
+                    tot += consumers[j];
+                    if returned[j] {
+                        rb = cons_block[j];
+                    }
+                }
+            }
+            if tot == 0 {
+                (true, Vec::new(), None, 0)
+            } else if let Some(t) = rb {
+                // Return-transfer at T: skip T, free all other exits (their
+                // paths never ran the transfer — T reaches only itself).
+                (true, vec![t], Some(t), 1)
+            } else {
+                // Store-transfer (decidable everywhere by the rule above):
+                // skip dominated exits, free the rest (unreachable from T).
+                let cb = root_cons_block[i];
+                let mut sk: Vec<usize> = exits
+                    .iter()
+                    .filter(|e| cb.is_some_and(|c| dominates(c, **e)))
+                    .copied()
+                    .collect();
+                sk.sort_unstable();
+                (false, sk, None, 1)
+            }
+        };
         rep.uses.insert(
             (f.name.clone(), i as u32),
-            OwnUse { consumes: consumers[i].min(2) as u8, returned: returned[i] },
+            OwnUse {
+                consumes: consumers[i].min(2) as u8,
+                returned: returned[i],
+                return_block: ret_block,
+                is_root,
+                root_total: total.min(2) as u8,
+                exit_free,
+                skip_exits: skip_exits,
+            },
         );
     }
     // Shared New sites (E300 candidates).

@@ -147,6 +147,7 @@ name = "fastllvm-backend"
 version = "0.1.0"
 dependencies = [
  "fastllvm-ir",
+ "fastllvm-solver",
 ]
 
 [[package]]
