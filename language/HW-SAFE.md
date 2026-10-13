@@ -73,8 +73,23 @@ syscall sys_write(fd: Int, buf: Bytes, n: Int) -> Int
    `--unsafe-c` (default becomes the only mode). `native` blocks without a
    proof become error E410 (with hint). *Glue exemption:* emitter-generated
    shims (`c-glue`, e.g. spawn) stay, counted in one registry.
+   **SHIPPED 2026-10-13** (forbid in all crates, E410 instead of opt-out).
 2. **H2 — `hw` surface:** `Reg*`/`Mmio`/`Port`/`syscall` items + target
    profiles with named regions; first QEMU-backed test per profile.
+   **SHIPPED 2026-10-13 (substance, prozedural statt OO):** `syscall NAME() -> Int
+   = NUM` items (via libc, max 6 params `Int`/`Array[Byte]`, E100/E421),
+   `Mmio.bind("name")` + `read8/16/32/64`/`write8/16/32/64` against
+   `--hw-profile` (volatile per-site accessors generated per program, offsets
+   literal-checked, E400), `port_inb`/`port_outb` (per-program generated TU —
+   the single justified toolchain-side asm), `fence()`/`fence_acq`/`fence_rel`
+   (pure LLVM, generated per program). Handles are immortal capabilities
+   (RC no-ops, trace/drop-safe); capsule crossing is E422. Zero new runtime
+   code: everything is user code + per-program compiler output.
+   Tests: `tests/vire_hw.sh` (21), example `examples/vire/hw_syscall.vr`.
+   NOT YET: `Reg*` cell types distinct from `Int` values (handles carry the
+   region; values are plain `Int` — volatile-ness comes from the accessor),
+   QEMU-backed execution for MMIO reads/writes (suite asserts compile + LL;
+   execution needs real hardware), interrupts/DMA items.
 3. **H3 — `Ptr` opacity:** `Ptr`-as-`i64` removed from user paths; backend
    `ptrtoint`/`inttoptr` gated to declared items (else ICE).
 4. **H4 — FFI narrowing:** header-binding checker rejects unmappable shapes;

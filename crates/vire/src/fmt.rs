@@ -111,6 +111,17 @@ impl Fmt {
                 self.ind -= 1;
                 self.line("}");
             }
+            Item::Syscall { name, params, ret, num, .. } => {
+                let ps: Vec<String> = params
+                    .iter()
+                    .map(|p| match &p.ty {
+                        Some(t) => format!("{}: {}", p.name, type_str(t)),
+                        None => p.name.clone(),
+                    })
+                    .collect();
+                let r = ret.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
+                self.line(&format!("syscall {name}({}){r} = {num}", ps.join(", ")));
+            }
         }
     }
 

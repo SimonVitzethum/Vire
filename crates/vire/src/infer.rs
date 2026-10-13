@@ -187,6 +187,20 @@ pub fn infer_module_typed(m: &mut Module) -> (Vec<Diag>, ExprTypes) {
                 sigs.insert(s.name.clone(), Sig { params, ret });
             }
         }
+        // Declared syscalls are fully annotated by construction (E100/E421 in
+        // lowering reject anything else) → concrete types like extern.
+        // `Array[Byte]` buffers constrain as Ref (arrays).
+        if let Item::Syscall { name, params, .. } = it {
+            let ps = params
+                .iter()
+                .map(|p| match p.ty.as_ref().map(|t| t.name.as_str()) {
+                    Some("Array" | "array") => T::Ref,
+                    Some(_) => ann_ty(p.ty.as_ref()).unwrap_or(T::I64),
+                    None => T::I64,
+                })
+                .collect();
+            sigs.insert(name.clone(), Sig { params: ps, ret: T::I64 });
+        }
     }
     // 2. Traverse bodies, collect constraints.
     for it in &m.items {

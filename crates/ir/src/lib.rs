@@ -342,6 +342,11 @@ pub struct Program {
     /// ordinary direct calls whose entry the runtime patcher redirects in place (hot-update).
     /// Not inlined (a single entry must remain to patch). Empty for Java/sealed programs.
     pub patch_fns: Vec<String>,
+    /// Declared hardware regions (name, base address, length in bytes) from
+    /// `--hw-profile` (see language/HW-SAFE.md). `Mmio::bind("name")` resolves
+    /// against this table; the backend emits volatile accesses at base+offset.
+    /// Empty = no hardware access (any bind is E400).
+    pub hw_regions: Vec<(String, u64, u64)>,
 }
 
 impl Program {

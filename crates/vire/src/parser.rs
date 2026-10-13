@@ -149,7 +149,7 @@ impl Parser {
             self.peek(),
             Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
-                | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native)
+                | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native) | Tok::Kw(Kw::Syscall)
                 // Dynamic-surface seam declarations: `dynamic fn` / `open trait|type|fn`.
                 | Tok::Kw(Kw::Dynamic) | Tok::Kw(Kw::Open)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
@@ -240,6 +240,7 @@ impl Parser {
                 Some(Item::Use { path, span: sp })
             }
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
+            Tok::Kw(Kw::Syscall) => Some(self.parse_syscall()),
             Tok::Ident(n) if n == "cxx" => Some(self.parse_cxx()),
             // `name!(args)` — item-macro invocation.
             Tok::Ident(_) if matches!(self.peek_at(1), Tok::Bang) => Some(self.parse_macro_invoke()),
@@ -648,6 +649,28 @@ impl Parser {
             self.expect(&Tok::RBrace, "'}'");
         }
         Item::Extern { abi, items, links, header, span: sp }
+    }
+
+    /// `syscall NAME(params) -> Ret = NUM` — a declared OS system call (no
+    /// inline asm, no user-written wrapper; see language/HW-SAFE.md). Params
+    /// are `name: Type` (checked in lowering: `Int` or `Array[Byte]`); the
+    /// return type must be annotated (`-> Int`); `NUM` is the OS syscall number
+    /// (decimal or `0x`-hex literal).
+    fn parse_syscall(&mut self) -> Item {
+        let sp = self.span();
+        self.expect(&Tok::Kw(Kw::Syscall), "'syscall'");
+        let name = self.ident();
+        let params = self.parse_params();
+        let ret = if self.eat(&Tok::Arrow) || self.eat(&Tok::Gt) { Some(self.parse_type()) } else { None };
+        self.expect(&Tok::Eq, "'=' (the OS syscall number)");
+        let num = match self.bump() {
+            Tok::Int(v) if v >= 0 => v as u64,
+            _ => {
+                self.err("syscall number must be a non-negative integer literal (decimal or 0x-hex)");
+                0
+            }
+        };
+        Item::Syscall { name, params, ret, num, span: sp }
     }
 
     fn parse_type(&mut self) -> Type {

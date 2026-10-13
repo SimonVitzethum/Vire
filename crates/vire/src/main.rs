@@ -523,6 +523,14 @@ fn fmt_cmd(args: &[String]) {
 }
 
 fn check(args: &[String]) {
+    // Optional `--hw-profile FILE` (same as build): without it every
+    // `Mmio.bind` reports E400 (addresses never come from user integers).
+    let hw_profile: Vec<(String, u64, u64)> = args
+        .iter()
+        .position(|a| a == "--hw-profile")
+        .and_then(|i| args.get(i + 1))
+        .map(|f| load_hw_profile(f))
+        .unwrap_or_default();
     let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
         eprintln!("Usage: vire check FILE.vr");
         exit(2);
@@ -604,7 +612,7 @@ fn check(args: &[String]) {
         had_error = true;
         emit_plain(&e);
     }
-    if let Err(errs) = vire::lower_module_src(&module, "") {
+    if let Err(errs) = vire::lower_module_src(&module, "", &hw_profile) {
         for e in errs {
             had_error = true;
             emit_plain(&e);
@@ -613,6 +621,46 @@ fn check(args: &[String]) {
     if had_error {
         exit(1);
     }
+}
+
+/// Load a hardware profile for `Mmio.bind` (language/HW-SAFE.md §2): lines
+/// `name base len` (`#` comments, decimal or `0x`-hex). A malformed line is a
+/// hard error — silently skipping it would turn an address typo into E400
+/// confusion (or worse, a wrong mapping).
+fn load_hw_profile(path: &str) -> Vec<(String, u64, u64)> {
+    fn num(s: &str) -> Option<u64> {
+        let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).map(|h| (h, 16)).unwrap_or((s, 10));
+        u64::from_str_radix(s.0, s.1).ok()
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("--hw-profile {path}: {e}");
+            exit(1);
+        }
+    };
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.as_slice() {
+            [name, base, len] => match (num(base), num(len)) {
+                (Some(b), Some(l)) if l > 0 => out.push((name.to_string(), b, l)),
+                _ => {
+                    eprintln!("--hw-profile {path}:{}: bad base/len in `{line}` (need `name base len`, numbers decimal or 0x-hex, len > 0)", i + 1);
+                    exit(1);
+                }
+            },
+            _ => {
+                eprintln!("--hw-profile {path}:{}: bad line `{line}` (need `name base len`)", i + 1);
+                exit(1);
+            }
+        }
+    }
+    out
 }
 
 fn load_syntax(src: &str, src_path: &str, explicit: Option<&str>) -> vire::Syntax {
@@ -773,6 +821,7 @@ fn build_or_run(args: &[String]) {
     let mut header_deps: Vec<String> = Vec::new();
     // Custom keyword syntax is opt-in only (`--syntax FILE`), never folder-auto-loaded.
     let mut syntax_file: Option<String> = None;
+    let mut hw_profile_file: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -851,6 +900,16 @@ fn build_or_run(args: &[String]) {
                 Some(f) => syntax_file = Some(f.clone()),
                 None => {
                     eprintln!("--syntax needs a config file");
+                    exit(2);
+                }
+            },
+            // Hardware profile for `Mmio.bind("name")` (language/HW-SAFE.md §2):
+            // lines `name base len` (`#` comments, decimal or 0x-hex). Without it
+            // every bind is E400 — addresses never come from user integers.
+            "--hw-profile" => match it.next() {
+                Some(f) => hw_profile_file = Some(f.clone()),
+                None => {
+                    eprintln!("--hw-profile needs a profile file");
                     exit(2);
                 }
             },
@@ -1101,7 +1160,12 @@ fn build_or_run(args: &[String]) {
     // markers; non-debug builds pass no source (no markers → no interference with
     // the optimizing passes, IR byte-for-byte as before).
     let lower_src = if debug_flag { src.as_str() } else { "" };
-    let mut program = match vire::lower_module_src(&module, lower_src) {
+    // Hardware profile for `Mmio.bind` (language/HW-SAFE.md §2).
+    let hw_profile: Vec<(String, u64, u64)> = hw_profile_file
+        .as_deref()
+        .map(load_hw_profile)
+        .unwrap_or_default();
+    let mut program = match vire::lower_module_src(&module, lower_src, &hw_profile) {
         Ok(p) => p,
         Err(errs) => {
             for e in &errs {
@@ -1276,6 +1340,33 @@ fn build_or_run(args: &[String]) {
         native_paths.push(p);
     }
     verify_blocks_parallel(&verify_jobs, &build_dir);
+    // Raw port I/O helpers (language/HW-SAFE.md §2): x86 `in`/`out` have no
+    // alternative encoding, so the compiler generates this tiny TU into the
+    // PROGRAM's own build (never a shared runtime, never user-written asm).
+    // Counted toolchain-side glue like the `spawn` shim. Only when used.
+    {
+        let mut want_port = false;
+        for f in &program.functions {
+            for bb in &f.blocks {
+                for st in &bb.statements {
+                    if let fastllvm_ir::Statement::Call { func, .. } = st {
+                        if func == "__vire_port_outb" || func == "__vire_port_inb" {
+                            want_port = true;
+                        }
+                    }
+                }
+            }
+        }
+        if want_port {
+            let code = "/* Generated per program (language/HW-SAFE.md H2): raw x86 port I/O.\n * The ONLY toolchain-side asm in Vire output; user code can never emit asm.\n * `asm volatile` + memory clobber: the compiler may neither reorder nor drop it. */\n#include <stdint.h>\nvoid __vire_port_outb(int64_t port, int64_t val) { __asm__ volatile (\"outb %0, %1\" :: \"a\"((uint8_t)val), \"Nd\"((uint16_t)port) : \"memory\"); }\nint64_t __vire_port_inb(int64_t port) { uint8_t v; __asm__ volatile (\"inb %1, %0\" : \"=a\"(v) : \"Nd\"((uint16_t)port) : \"memory\"); return (int64_t)v; }\n";
+            let p = build_dir.join("vire_port.c");
+            if let Err(e) = std::fs::write(&p, code) {
+                eprintln!("writing port helpers: {e}");
+                exit(1);
+            }
+            native_paths.push(p);
+        }
+    }
     // Python: include path + libpython automatically (from python3/sysconfig).
     let mut py_include: Option<String> = None;
     if want_python {

@@ -43,6 +43,11 @@ pub enum Item {
     /// signatures are registered as Vire `extern`. Saves the
     /// handwritten facade. See language/CPP-INTEROP.md.
     Cxx { links: Vec<String>, preamble: String, fns: Vec<(FnSig, String)>, span: Span },
+    /// `syscall NAME(params) -> Ret = NUM` — a declared OS system call (see
+    /// language/HW-SAFE.md). No inline asm, no libc wrapper written by the user:
+    /// calls lower to `syscall(NUM, args…)` via libc. Params are `Int` or
+    /// `Array[Byte]` (buffer → data pointer); at most 6. Ret must be annotated.
+    Syscall { name: String, params: Vec<Param>, ret: Option<Type>, num: u64, span: Span },
 }
 
 #[derive(Debug, Clone)]

@@ -218,6 +218,20 @@ struct Sig {
     ret_arr_class: Option<String>,
 }
 
+/// A declared `syscall` item (language/HW-SAFE.md §2): OS number + per-param
+/// shape. `Int` passes directly; `Buf` (`Array[Byte]`) passes the data pointer
+/// (the length stays an explicit user argument — no hidden pairing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SysParamKind {
+    Int,
+    Buf,
+}
+
+#[derive(Clone)]
+struct SyscallInfo {
+    num: u64,
+    params: Vec<SysParamKind>,
+}
 /// Element kind (and, for a user object element, class) of an array return type
 /// (`Array[Elem]` / `array` / `farray`) — else `(None, None)`.
 fn arr_ret(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
@@ -250,7 +264,7 @@ fn arr_ret_generic(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
 }
 
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
-    lower_module_src(m, "")
+    lower_module_src(m, "", &[])
 }
 
 /// Byte offset → 1-based source line (for debug info); 0 if unknown.
@@ -261,7 +275,9 @@ fn line_of(line_starts: &[usize], byte: usize) -> u32 {
     line_starts.partition_point(|&s| s <= byte) as u32
 }
 
-pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
+/// `hw`: declared hardware regions (name → (base, len)) from `--hw-profile`
+/// (language/HW-SAFE.md §2), resolved by `Mmio.bind("name")`.
+pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Result<Program, Vec<String>> {
     let line_starts: Vec<usize> = if src.is_empty() {
         Vec::new()
     } else {
@@ -270,6 +286,14 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     let ls = &line_starts[..];
     let mut prog = Program::default();
     let mut errs = Vec::new();
+    // The backend emits volatile accesses + descriptors from this table.
+    prog.hw_regions = hw.iter().cloned().collect();
+    // Declared syscalls (name → number + param shapes), filled by the E100/E421
+    // pre-pass below and consulted at every call site + in `sigs`.
+    let mut syscalls: HashMap<String, SyscallInfo> = HashMap::new();
+    // Declared hardware regions (name → (base, len)) for `Mmio.bind("name")`.
+    let hw_regions: HashMap<String, (u64, u64)> =
+        hw.iter().map(|(n, b, l)| (n.clone(), (*b, *l))).collect();
 
     // E100 (AGENTS.md §4, fully typed): after inference every `fn` parameter and
     // return type must be known. Anything still un-annotated here was NOT inferred
@@ -317,6 +341,61 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                         "error[E100]: `extern` function `{}` must have an annotated return type",
                         s.name
                     ));
+                }
+            }
+        }
+        // `syscall NAME(params) -> Ret = NUM` (language/HW-SAFE.md §2): declarations
+        // are always fully typed (E100) and narrowly shaped (E421): at most 6 params
+        // (the kernel ABI), each `Int` or `Array[Byte]`, return `Int`.
+        if let Item::Syscall { name, params, ret, num, span: _ } = it {
+            let mut kinds = Vec::new();
+            let mut bad = false;
+            for p in params {
+                match p.ty.as_ref().map(|t| t.name.as_str()) {
+                    None => {
+                        errs.push(format!(
+                            "error[E100]: `syscall` parameter `{}` in `{}` must be annotated (`Int` or `Array[Byte]`)",
+                            p.name, name
+                        ));
+                        bad = true;
+                    }
+                    Some("Int" | "I64" | "U64" | "I32" | "U32") => kinds.push(SysParamKind::Int),
+                    Some("Array" | "array") if p.ty.as_ref().and_then(|t| t.args.first()).is_some_and(|a| matches!(a.name.as_str(), "Byte" | "U8")) => {
+                        kinds.push(SysParamKind::Buf)
+                    }
+                    Some(other) => {
+                        errs.push(format!(
+                            "error[E421]: `syscall` parameter `{}` in `{}` has type `{other}` — only `Int` and `Array[Byte]` cross into a syscall (no objects, no strings; use `.bytes()`)",
+                            p.name, name
+                        ));
+                        bad = true;
+                    }
+                }
+            }
+            if params.len() > 6 {
+                errs.push(format!(
+                    "error[E421]: `syscall {name}` has {} parameters — the kernel ABI carries at most 6",
+                    params.len()
+                ));
+                bad = true;
+            }
+            match ret.as_ref().map(|t| t.name.as_str()) {
+                Some("Int" | "I64" | "U64" | "I32" | "U32") => {}
+                _ => {
+                    errs.push(format!(
+                        "error[E421]: `syscall {name}` must declare `-> Int` (a syscall returns a machine word)"
+                    ));
+                    bad = true;
+                }
+            }
+            if !bad {
+                if let Some(prev) = syscalls.get(name) {
+                    errs.push(format!(
+                        "error[E421]: duplicate `syscall {name}` (previous number {})",
+                        prev.num
+                    ));
+                } else {
+                    syscalls.insert(name.clone(), SyscallInfo { num: *num, params: kinds });
                 }
             }
         }
@@ -550,6 +629,20 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
                 sigs.insert(sig.name.clone(), Sig { params: ps, ret: ret_ty(sig), ret_class: class_of(sig.ret.as_ref()), ret_arr: ra, ret_arr_class: rac });
             }
         }
+        // Declared syscalls resolve like functions (same arity/type checking at
+        // call sites); the call itself lowers to `syscall(NUM, …)` (see lower_call).
+        // A name clash with a `fn` is a loud error, not a shadowing.
+        if let Item::Syscall { name, .. } = it {
+            if sigs.contains_key(name) {
+                errs.push(format!("error[E421]: `syscall {name}` clashes with a function of the same name"));
+            } else if let Some(info) = syscalls.get(name) {
+                let ps = info.params.iter().map(|k| match k {
+                    SysParamKind::Int => Ty::I64,
+                    SysParamKind::Buf => Ty::Ref,
+                }).collect();
+                sigs.insert(name.clone(), Sig { params: ps, ret: Ty::I64, ret_class: None, ret_arr: None, ret_arr_class: None });
+            }
+        }
     }
     // Built-in Python bridge: always register the signatures, so that `py_import`
     // & co. are callable from pure Vire WITHOUT an `extern` block (the lowering
@@ -699,7 +792,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
             if is_higher_order(f) {
                 continue; // higher-order template → only inline (defunctionalization)
             }
-            match lower_fn(f, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
+            match lower_fn(f, &sigs, &syscalls, &hw_regions, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, None, line_of(ls, f.sig.span.0), ls) {
                 Ok((func, mono, insts, names)) => {
                     prog.debug_local_names.insert(func.name.clone(), names);
                     prog.functions.push(func);
@@ -713,7 +806,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
     }
     for (class, meth) in &methods {
         let sym = format!("{class}.{}", meth.sig.name);
-        match lower_fn(meth, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
+        match lower_fn(meth, &sigs, &syscalls, &hw_regions, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, Some(class), Some(&sym), line_of(ls, meth.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
@@ -763,7 +856,7 @@ pub fn lower_module_src(m: &Module, src: &str) -> Result<Program, Vec<String>> {
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         let (ra, rac) = arr_ret(inst.sig.ret.as_ref());
         sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
-        match lower_fn(&inst, &sigs, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
+        match lower_fn(&inst, &sigs, &syscalls, &hw_regions, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
                 prog.functions.push(func);
@@ -828,6 +921,9 @@ fn class_of(t: Option<&Type>) -> Option<String> {
         // Sub-word element types are scalars, not classes: `Array[Byte]` is a U8
         // array, not a ref array (a missing name here misreads the slots as ptr).
         | "Byte" | "U8" | "I8" | "Char" | "U16" | "I16" | "Short" => None,
+        // `Mmio` is an opaque compiler handle (bound to a `--hw-profile` region),
+        // not a heap class — field resolution must not invent a class `Mmio`.
+        "Mmio" => None,
         _ => Some(name.to_string()),
     }
 }
@@ -989,6 +1085,9 @@ struct FnLower<'a> {
     cur: usize,
     scopes: Vec<HashMap<String, (Local, Ty)>>,
     sigs: &'a HashMap<String, Sig>,
+    /// Declared syscalls (name → number + param shapes) for `syscall(NUM, …)`
+    /// lowering at call sites (language/HW-SAFE.md §2).
+    syscalls: &'a HashMap<String, SyscallInfo>,
     /// User type layouts (name → fields) for New/GetField.
     types: &'a HashMap<String, Layout>,
     /// (type, field) → element kind for array-typed struct fields, so
@@ -1034,6 +1133,14 @@ struct FnLower<'a> {
     /// Set while lowering a `mut x: Array[Cls] = …` RHS: the expected element object
     /// class, consumed once by the `array(n)` builtin to build a ref array of `Cls`.
     arr_hint: Option<String>,
+    /// MMIO handles (local → (base address, region length)) from `Mmio.bind("name")`
+    /// (language/HW-SAFE.md §2). The handle value is an immortal descriptor object
+    /// (plain Ref local, RC no-ops via refcount -1); the table drives `readN`/`writeN`
+    /// lowering to volatile accesses at base+offset. Propagated through copies.
+    mmio: HashMap<u32, (String, u64, u64)>,
+    /// Declared hardware regions (name → (base, len)) from `--hw-profile`, for
+    /// resolving `Mmio.bind("name")` (E400 on unknown names).
+    hw_regions: &'a HashMap<String, (u64, u64)>,
     /// Lambda locals: `mut f = x -> …` → (parameter, body). The call `f(a)` is
     /// inline-expanded at that spot (capturing closures in the same scope for free).
     local_lambda: HashMap<u32, (Vec<String>, Expr)>,
@@ -1155,6 +1262,97 @@ impl<'a> FnLower<'a> {
             Operand::Copy(l) => self.local_arr_class.get(&l.0).cloned(),
             _ => None,
         }
+    }
+    /// MMIO handle region of an operand, if it is a bound handle local.
+    fn mmio_of_operand(&self, op: &Operand) -> Option<(String, u64, u64)> {
+        match op {
+            Operand::Copy(l) => self.mmio.get(&l.0).cloned(),
+            _ => None,
+        }
+    }
+    /// `Mmio.bind("name")` → immortal descriptor handle (`GetStatic $mmio`).
+    /// E400 if the name is not in `--hw-profile` or the argument is not a
+    /// string literal (the region must be statically known — never computed).
+    fn lower_mmio_bind(&mut self, args: &[Expr]) -> (Operand, Ty) {
+        let name = match (args.len(), args.first()) {
+            (1, Some(Expr::Str(s, _))) => s.clone(),
+            _ => {
+                self.errs.push("error[E400]: `Mmio.bind` takes one string literal naming a `--hw-profile` region (e.g. `Mmio.bind(\"uart0\")`)".into());
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        let Some((base, len)) = self.hw_regions.get(&name).copied() else {
+            let mut known: Vec<&String> = self.hw_regions.keys().collect();
+            known.sort();
+            let hint = if known.is_empty() {
+                "no `--hw-profile` was given (every bind is E400 without one)".to_string()
+            } else {
+                format!("known regions: {}", known.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+            };
+            self.errs.push(format!("error[E400]: unknown hardware region `{name}` — {hint}"));
+            return (Operand::ConstI64(0), Ty::I64);
+        };
+        let d = self.new_local(Ty::Ref);
+        self.emit(Statement::GetStatic { dest: d, class: "$mmio".into(), field: name.clone() });
+        self.mmio.insert(d.0, (name, base, len));
+        (Operand::Copy(d), Ty::Ref)
+    }
+    /// `dev.readN(off)` / `dev.writeN(off, v)` (N = 8/16/32/64) on a bound
+    /// handle → calls to generated per-site volatile accessors
+    /// (`__vire_mmio_r32_<base>_<off>`, emitted by the backend — no inline asm,
+    /// no runtime). The offset must be an integer literal with
+    /// `off + width <= len` (E400 otherwise — the address stays static).
+    fn lower_mmio_access(&mut self, obj: Operand, name: &str, args: &[Expr]) -> (Operand, Ty) {
+        let (region, base, len) = self.mmio_of_operand(&obj).expect("mmio handle checked by caller");
+        let (width, is_write) = match name {
+            "read8" => (1u64, false),
+            "read16" => (2, false),
+            "read32" => (4, false),
+            "read64" => (8, false),
+            "write8" => (1, true),
+            "write16" => (2, true),
+            "write32" => (4, true),
+            "write64" => (8, true),
+            _ => {
+                self.errs.push(format!("error[E400]: `{name}` is not an MMIO operation (use read8/16/32/64, write8/16/32/64)"));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        let arity = if is_write { 2 } else { 1 };
+        if args.len() != arity {
+            self.errs.push(format!("error[E400]: `{name}` takes {arity} argument(s), got {}", args.len()));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
+        let off = match &args[0] {
+            Expr::Int(v, _) if *v >= 0 => *v as u64,
+            _ => {
+                self.errs.push(format!("error[E400]: `{name}` offset must be a non-negative integer literal (the address stays static, region `{region}`)"));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+        };
+        if off + width > len {
+            self.errs.push(format!(
+                "error[E400]: `{name}` at offset {off} + {width} bytes exceeds region `{region}` (length {len})"
+            ));
+            return (Operand::ConstI64(0), Ty::I64);
+        }
+        let dir = if is_write { "w" } else { "r" };
+        let sym = format!("__vire_mmio_{dir}{}_{base:x}_{off:x}", width * 8);
+        if is_write {
+            let (vop, vty) = self.lower_expr(&args[1]);
+            let v = if vty == Ty::I32 {
+                let w = self.new_local(Ty::I64);
+                self.emit(Statement::Assign(w, Rvalue::Convert(vop)));
+                Operand::Copy(w)
+            } else {
+                vop
+            };
+            self.emit(Statement::Call { dest: None, func: sym, args: vec![v] });
+            return (Operand::ConstI64(0), Ty::Void);
+        }
+        let d = self.new_local(Ty::I64);
+        self.emit(Statement::Call { dest: Some(d), func: sym, args: vec![] });
+        (Operand::Copy(d), Ty::I64)
     }
     /// Bring an operand to i32 (array index/length are Java `int`).
     fn to_i32(&mut self, op: Operand) -> Operand {
@@ -2057,6 +2255,10 @@ impl<'a> FnLower<'a> {
                 if let Some(c) = self.arr_class_of_operand(&op) {
                     self.local_arr_class.insert(l.0, c);
                 }
+                // Propagate a bound MMIO handle (`mut u2 = uart` stays a handle).
+                if let Some(m) = self.mmio_of_operand(&op) {
+                    self.mmio.insert(l.0, m);
+                }
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
             }
@@ -2067,6 +2269,9 @@ impl<'a> FnLower<'a> {
                         if op.is_none() {
                             if let Some(c) = self.class_of_operand(&rhs) {
                                 self.local_class.insert(l.0, c);
+                            }
+                            if let Some(m) = self.mmio_of_operand(&rhs) {
+                                self.mmio.insert(l.0, m);
                             }
                         }
                         let rv = match op {
@@ -2693,6 +2898,14 @@ impl<'a> FnLower<'a> {
                 let mut object_inputs: Vec<(String, Local)> = Vec::new();
                 for (nm, _borrowed) in inputs {
                     if let Some((l, Ty::Ref)) = self.lookup(nm) {
+                        // E422: MMIO handles are capabilities bound to a global
+                        // descriptor (vtable slot 3 is null — no deep-copy). The
+                        // handle is bound AS-IS (no copy: copying a capability is
+                        // meaningless); only crossing it OUT is forbidden (below).
+                        if self.mmio.get(&l.0).is_some() {
+                            self.errs.push(format!("error[E422]: capsule input `{nm}` is an MMIO handle — handles cannot be deep-copied into/out of a capsule (use it inside, or pass plain values)"));
+                            continue;
+                        }
                         match self.local_arr.get(&l.0).copied() {
                             Some(kind) if kind != ArrKind::Ref => array_inputs.push((nm.clone(), l, kind)),
                             _ => object_inputs.push((nm.clone(), l)),
@@ -2749,6 +2962,12 @@ impl<'a> FnLower<'a> {
                 // outlives the arena. Other object results still need deep-copy-out.
                 let null_end = self.locals.len();
                 let (result_op, result_ty): (Operand, Ty) = if ty == Ty::Ref {
+                    // E422: an MMIO handle must not leave the capsule (no deep-copy).
+                    if let Operand::Copy(rl) = &val {
+                        if self.mmio.get(&rl.0).is_some() {
+                            self.errs.push("error[E422]: capsule result is an MMIO handle — handles cannot be deep-copied out of a capsule (return plain values)".into());
+                        }
+                    }
                     match self.arr_of_operand(&val) {
                         Some(kind) if kind != ArrKind::Ref => {
                             let out = self.new_local(Ty::Ref);
@@ -2957,11 +3176,27 @@ impl<'a> FnLower<'a> {
                 }
                 // Not an adapter → fall through (range-as-value is an error below).
             }
+            // `Mmio.bind("name")` — a memory-mapped hardware handle, WITHOUT inline
+            // asm and WITHOUT an integer address in user code (language/HW-SAFE.md
+            // §2). The name resolves against `--hw-profile` (E400 if unknown); the
+            // handle is an immortal descriptor object (plain Ref local — RC no-ops
+            // via refcount -1, exactly like string literals). Intercepted BEFORE
+            // the base lowers (bare `Mmio` is a type name, not a variable).
+            if let Expr::Ident(id, _) = base.as_ref() {
+                if id == "Mmio" && name == "bind" {
+                    return self.lower_mmio_bind(args);
+                }
+            }
             let (obj, base_ty) = self.lower_expr(base);
             // `xs.len()` on an array → ArrayLen.
             if name == "len" && args.is_empty() && self.arr_of_operand(&obj).is_some() {
                 let l = self.array_len_i64(obj);
                 return (l, Ty::I64);
+            }
+            // MMIO register access `dev.readN(off)` / `dev.writeN(off, v)` on a
+            // bound handle → volatile accesses at base+offset (checked E400).
+            if self.mmio_of_operand(&obj).is_some() {
+                return self.lower_mmio_access(obj, &name, args);
             }
             // Iterator adapters over a $List receiver (fold/map/filter/sum/…).
             if self.class_of_operand(&obj).as_deref() == Some("$List") {
@@ -3451,6 +3686,105 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(Ty::F64);
             self.emit(Statement::Call { dest: Some(d), func: func.into(), args: vec![af] });
             return (Operand::Copy(d), Ty::F64);
+        }
+        // Declared `syscall NAME(…)`: lowers to `syscall(NUM, args…)` via libc —
+        // no inline asm, no user-written wrapper (language/HW-SAFE.md §2). `Int`
+        // args pass directly (I32 widens); `Array[Byte]` args pass the data
+        // pointer (the length stays an explicit user argument). At most 6 args
+        // (checked at declaration); the backend declares libc `syscall`.
+        if let Some(info) = self.syscalls.get(&name).cloned() {
+            if lowered.len() != info.params.len() {
+                self.errs.push(format!(
+                    "error[E421]: `syscall {name}` takes {} arguments, got {}",
+                    info.params.len(),
+                    lowered.len()
+                ));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+            let mut call_args = vec![Operand::ConstI64(info.num as i64)];
+            for ((op, ty), kind) in lowered.into_iter().zip(info.params.iter()) {
+                match kind {
+                    SysParamKind::Int => {
+                        if ty == Ty::I32 {
+                            let w = self.new_local(Ty::I64);
+                            self.emit(Statement::Assign(w, Rvalue::Convert(op)));
+                            call_args.push(Operand::Copy(w));
+                        } else {
+                            call_args.push(op);
+                        }
+                    }
+                    SysParamKind::Buf => {
+                        if self.arr_of_operand(&op).is_none() {
+                            self.errs.push(format!(
+                                "error[E421]: `syscall {name}` buffer argument must be an `Array[Byte]` (got a non-array value)"
+                            ));
+                            return (Operand::ConstI64(0), Ty::I64);
+                        }
+                        let ptr = self.new_local(Ty::Ref);
+                        self.emit(Statement::Call { dest: Some(ptr), func: "jrt_array_data".into(), args: vec![op] });
+                        call_args.push(Operand::Copy(ptr));
+                    }
+                }
+            }
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "syscall".into(), args: call_args });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        // Raw port I/O + compiler fences WITHOUT inline asm (language/HW-SAFE.md
+        // §2, prozedural statt OO: plain functions, no classes). `port_outb(p, v)`
+        // / `port_inb(p)` lower to generated per-program helpers (`__vire_port_*`,
+        // emitted by the driver into the program's own TU — the single justified
+        // toolchain-side `asm`, never user code). `fence()` (+`_acq`/`_rel`) lower
+        // to generated functions containing a single LLVM fence (no asm at all).
+        if name == "port_outb" {
+            if lowered.len() != 2 {
+                self.errs.push(format!("error[E421]: `port_outb` takes 2 arguments (port, value), got {}", lowered.len()));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+            let args64: Vec<Operand> = lowered
+                .into_iter()
+                .map(|(op, ty)| {
+                    if ty == Ty::I32 {
+                        let w = self.new_local(Ty::I64);
+                        self.emit(Statement::Assign(w, Rvalue::Convert(op)));
+                        Operand::Copy(w)
+                    } else {
+                        op
+                    }
+                })
+                .collect();
+            self.emit(Statement::Call { dest: None, func: "__vire_port_outb".into(), args: args64 });
+            return (Operand::ConstI64(0), Ty::Void);
+        }
+        if name == "port_inb" {
+            if lowered.len() != 1 {
+                self.errs.push(format!("error[E421]: `port_inb` takes 1 argument (port), got {}", lowered.len()));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+            let (op, ty) = lowered.into_iter().next().unwrap();
+            let port = if ty == Ty::I32 {
+                let w = self.new_local(Ty::I64);
+                self.emit(Statement::Assign(w, Rvalue::Convert(op)));
+                Operand::Copy(w)
+            } else {
+                op
+            };
+            let d = self.new_local(Ty::I64);
+            self.emit(Statement::Call { dest: Some(d), func: "__vire_port_inb".into(), args: vec![port] });
+            return (Operand::Copy(d), Ty::I64);
+        }
+        if name == "fence" || name == "fence_acq" || name == "fence_rel" {
+            if !lowered.is_empty() {
+                self.errs.push(format!("error[E421]: `{name}` takes no arguments, got {}", lowered.len()));
+                return (Operand::ConstI64(0), Ty::I64);
+            }
+            let sym = match name.as_str() {
+                "fence" => "__vire_fence",
+                "fence_acq" => "__vire_fence_acq",
+                _ => "__vire_fence_rel",
+            };
+            self.emit(Statement::Call { dest: None, func: sym.into(), args: vec![] });
+            return (Operand::ConstI64(0), Ty::Void);
         }
         // Sized typed arrays: `array(n)` (Int), `farray(n)` (Float), `barray(n)` (unsigned
         // byte, 0..255) — real bounds-checked/-elidable arrays (as opposed to the i64 list).
@@ -4387,6 +4721,8 @@ use crate::ast::Block as Block2;
 fn lower_fn(
     f: &FnDef,
     sigs: &HashMap<String, Sig>,
+    syscalls: &HashMap<String, SyscallInfo>,
+    hw_regions: &HashMap<String, (u64, u64)>,
     types: &HashMap<String, Layout>,
     field_arr: &HashMap<(String, String), ArrKind>,
     variants: &HashMap<String, VariantInfo>,
@@ -4418,6 +4754,7 @@ fn lower_fn(
         cur: 0,
         scopes: vec![HashMap::new()],
         sigs,
+        syscalls,
         field_arr,
         types,
         variants,
@@ -4437,6 +4774,8 @@ fn lower_fn(
         local_arr: HashMap::new(),
         local_arr_class: HashMap::new(),
         arr_hint: None,
+        mmio: HashMap::new(),
+        hw_regions,
         local_lambda: HashMap::new(),
         strings,
         str_idx,

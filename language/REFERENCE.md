@@ -400,6 +400,34 @@ unsafe { db = sql.sqlite3_open("app.db") }   // FFI call is unsafe
 C native/complete; C++/Rust via the C ABI (see [EVALUATION.md](EVALUATION.md) §1.C).
 `unsafe` blocks only at the boundary; within them `Ptr[T]`, `null_ptr()`, `x.addr()`.
 
+### 13a. Hardware without inline asm (shipped, H2)
+
+No `unsafe`, no inline asm, no integer addresses in user code — prozedural
+statt OO (plain items and free functions, no classes). Full design:
+[HW-SAFE.md](HW-SAFE.md); tests: `tests/vire_hw.sh`.
+
+```vire
+syscall sys_getpid() -> Int = 39
+syscall sys_write(fd: Int, buf: Array[Byte], n: Int) -> Int = 1
+
+fn main() {
+    mut pid = sys_getpid()          // via libc `syscall`, no user asm
+    fence()                         // compiler fence (also fence_acq/rel)
+    port_outb(1024, 0)              // generated per-program helper (only x86 asm
+    mut k = port_inb(1024)          //   in Vire output, never user-written)
+    mut uart = Mmio.bind("uart0")   // needs --hw-profile (E400 otherwise)
+    uart.write32(0, 96)             // volatile, offset literal-checked
+    mut v = uart.read32(0)          // E400 past the region end
+}
+```
+
+Rules: syscall params are `Int`/`Array[Byte]` (≤6), return `-> Int`, number as
+`0x`-hex or decimal literal (E421 otherwise, E100 unannotated). MMIO offsets
+are non-negative literals with `off + width <= len` (E400). Handles are
+immortal capabilities: they may live in locals/args/returns (RC no-ops), but
+never cross a capsule boundary (E422). Interrupts/DMA declarations are future
+work (HW-SAFE.md §4).
+
 ## 14. Standard library: logger — *Point 6*
 
 ```vire

@@ -70,6 +70,7 @@ fn call_captures(func: &str, summaries: &BTreeMap<String, Vec<bool>>) -> Vec<boo
     if matches!(
         func,
         "jrt_null_check"
+            | "syscall"
             | "jrt_println_str"
             | "jrt_println_long"
             | "jrt_println_double"

@@ -36,8 +36,11 @@ fn llty(ty: Ty) -> &'static str {
     }
 }
 
-/// Intrinsics and runtime helpers that the mini-runtime (runtime.c) defines.
+/// Intrinsics and helpers with hand-written declarations: the mini-runtime
+/// (`runtime.c`) — plus libc `syscall` (declared, never defined here; linked
+/// from libc for declared `syscall` items, language/HW-SAFE.md §2).
 const RUNTIME_DECLS: &[(&str, &str)] = &[
+    ("syscall", "i64 (i64, ...)"),
     ("jrt_println_str", "void (ptr)"),
     ("jrt_println_int", "void (i32)"),
     ("jrt_println_ln", "void ()"),
@@ -905,6 +908,102 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
         writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_copy_string]").unwrap();
     }
+    // MMIO descriptors (language/HW-SAFE.md §2): one immortal object per used
+    // `--hw-profile` region — `{ refcount -1, vtable, base, len }`. RC no-ops
+    // via refcount -1 (like string literals); drop/trace are no-ops (a handle
+    // owns no heap); slot 3 is null (handles are capabilities — E422 rejects
+    // any deep-copy across a capsule boundary instead of mis-copying).
+    let mut mmio_used: BTreeSet<String> = BTreeSet::new();
+    for f in &program.functions {
+        for bb in &f.blocks {
+            for st in &bb.statements {
+                if let Statement::GetStatic { class, field, .. } = st {
+                    if class == "$mmio" {
+                        mmio_used.insert(field.clone());
+                    }
+                }
+            }
+        }
+    }
+    if !mmio_used.is_empty() {
+        writeln!(w, "@vt.mmio = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr null]").unwrap();
+        for r in &mmio_used {
+            let (base, len) = program.hw_regions.iter().find(|(n, _, _)| n == r).map(|(_, b, l)| (*b, *l)).unwrap_or((0, 0));
+            writeln!(w, "@.mmio.{} = internal unnamed_addr constant {{ i64, ptr, i64, i64 }} {{ i64 -1, ptr @vt.mmio, i64 {}, i64 {} }}", sanitize(r), base, len).unwrap();
+        }
+    }
+    // Per-site MMIO accessors + compiler fences (language/HW-SAFE.md §2): tiny
+    // generated functions with a single volatile load/store or fence — no inline
+    // asm, no runtime. The name encodes everything (`__vire_mmio_r32_<base>_<off>`).
+    {
+        let mut sites: BTreeSet<(char, u32, u64, u64)> = BTreeSet::new();
+        let mut fences: BTreeSet<&str> = BTreeSet::new();
+        for f in &program.functions {
+            for bb in &f.blocks {
+                for st in &bb.statements {
+                    if let Statement::Call { func, .. } | Statement::CallGuarded { func, .. } = st {
+                        if let Some(rest) = func.strip_prefix("__vire_mmio_") {
+                            let mut it = rest.split('_');
+                            if let (Some(dw), Some(b), Some(o)) = (it.next(), it.next(), it.next()) {
+                                let dir = dw.chars().next().unwrap_or('r');
+                                let width = dw[1..].parse::<u32>().unwrap_or(0) / 8;
+                                let base = u64::from_str_radix(b, 16).unwrap_or(0);
+                                let off = u64::from_str_radix(o, 16).unwrap_or(0);
+                                if matches!(width, 1 | 2 | 4 | 8) && matches!(dir, 'r' | 'w') {
+                                    sites.insert((dir, width, base, off));
+                                }
+                            }
+                        } else if matches!(func.as_str(), "__vire_fence" | "__vire_fence_acq" | "__vire_fence_rel") {
+                            fences.insert(func.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        for (dir, width, base, off) in &sites {
+            let addr = base + off;
+            let llty = match width {
+                1 => "i8",
+                2 => "i16",
+                4 => "i32",
+                _ => "i64",
+            };
+            let d = if *dir == 'r' { "r" } else { "w" };
+            if *dir == 'r' {
+                writeln!(w, "define internal i64 @__vire_mmio_{d}{}_{base:x}_{off:x}() {{", width * 8).unwrap();
+                writeln!(w, "  %p = inttoptr i64 {addr} to ptr").unwrap();
+                writeln!(w, "  %v = load volatile {llty}, ptr %p").unwrap();
+                if *width == 8 {
+                    writeln!(w, "  ret i64 %v").unwrap();
+                } else {
+                    writeln!(w, "  %x = zext {llty} %v to i64").unwrap();
+                    writeln!(w, "  ret i64 %x").unwrap();
+                }
+            } else {
+                writeln!(w, "define internal void @__vire_mmio_{d}{}_{base:x}_{off:x}(i64 %v) {{", width * 8).unwrap();
+                writeln!(w, "  %p = inttoptr i64 {addr} to ptr").unwrap();
+                if *width == 8 {
+                    writeln!(w, "  store volatile i64 %v, ptr %p").unwrap();
+                } else {
+                    writeln!(w, "  %t = trunc i64 %v to {llty}").unwrap();
+                    writeln!(w, "  store volatile {llty} %t, ptr %p").unwrap();
+                }
+                writeln!(w, "  ret void").unwrap();
+            }
+            writeln!(w, "}}").unwrap();
+        }
+        for f in &fences {
+            let order = match *f {
+                "__vire_fence_acq" => "acquire",
+                "__vire_fence_rel" => "release",
+                _ => "seq_cst",
+            };
+            writeln!(w, "define internal void @{f}() {{").unwrap();
+            writeln!(w, "  fence {order}").unwrap();
+            writeln!(w, "  ret void").unwrap();
+            writeln!(w, "}}").unwrap();
+        }
+    }
     writeln!(w).unwrap();
 
     // Drop functions: release the object's ref fields (the runtime
@@ -1003,6 +1102,13 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
                 if let Statement::Call { dest, func, args } = st {
                     if defined.contains(func.as_str())
                         || RUNTIME_DECLS.iter().any(|(n, _)| n == func)
+                        // Compiler-generated per-site helpers (MMIO accessors,
+                        // fences) are always *defined* by the backend above —
+                        // never redeclare them as external. Port helpers
+                        // (`__vire_port_*`, defined in the generated C TU) DO
+                        // need a declaration, inferred from the call below.
+                        || func.starts_with("__vire_mmio_")
+                        || func.starts_with("__vire_fence")
                     {
                         continue;
                     }
@@ -1359,7 +1465,11 @@ fn clinit_deps(ctx: &Ctx, f: &Function) -> BTreeSet<String> {
                 | Statement::InstanceOf { class, .. }
                 | Statement::InstanceOfPending { class, .. }
                 | Statement::CheckCast { class, .. } => {
-                    deps.insert(class.clone());
+                    // `$mmio` is a compiler pseudo-class (descriptor handles), not a
+                    // real class with `<clinit>` — never a static-init dependency.
+                    if class != "$mmio" {
+                        deps.insert(class.clone());
+                    }
                 }
                 Statement::Call { func, .. } | Statement::CallGuarded { func, .. } => {
                     if let Some(c) = sym_class(func) {
@@ -2958,11 +3068,20 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             }
         }
         Statement::GetStatic { dest, class, field } => {
+            // MMIO descriptor handle (language/HW-SAFE.md §2): the address of the
+            // immortal per-region descriptor (emitted above from hw_regions) — no
+            // load, no retain (immortal). The local is recorded in lowering's mmio
+            // table, which drives readN/writeN to volatile accesses.
+            if class == "$mmio" {
+                let g = format!("@.mmio.{}", sanitize(field));
+                store_dest(w, e, *dest, &g, false);
+            } else {
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("static field {class}.{field} missing"));
             let t = e.fresh();
             writeln!(w, "  {t} = load {}, ptr {g}", llty(ty)).unwrap();
             // Ref copied from a global field into the local → owned (retain).
             store_dest(w, e, *dest, &t, ty == Ty::Ref);
+            }
         }
         Statement::PutStatic { class, field, value } => {
             let (g, ty) = ctx.static_field(class, field).unwrap_or_else(|| panic!("static field {class}.{field} missing"));

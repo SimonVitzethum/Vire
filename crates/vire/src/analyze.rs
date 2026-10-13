@@ -74,7 +74,7 @@ pub fn analyze_json(src: &str, _file: &str) -> String {
             for e in crate::eval_comptime(&mut module) {
                 push_plain(&mut diags, &e);
             }
-            if let Err(errs) = crate::lower_module_src(&module, "") {
+            if let Err(errs) = crate::lower_module_src(&module, "", &[]) {
                 for e in errs {
                     push_plain(&mut diags, &e);
                 }
