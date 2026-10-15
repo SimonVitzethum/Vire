@@ -845,6 +845,117 @@ fn main() {
 }
 EOF
 
+# --- H2: real gates from user `--abi` knowledge (nothing invented) -----------
+# The user supplies target/registers/gates; the emitter wires them, the
+# checker holds every line. Syscalls still run under the oracle (exit 0;
+# the write goes nowhere observable here). MMIO is compile-only (the host
+# cannot execute device memory).
+cat > "$work/t.abi" <<'EOF'
+target lnx abi linux arch x86_64
+device uart0
+  reg tx u32 rw 0x0
+syscall write
+  gate sys_write
+  number 1
+  in rdi rsi rdx
+  out rax
+  clobber rcx r11
+  errors
+  assume write_ok "Write keeps its contract." falsifier sonde_write
+  requires count <= 1024
+  ensures result <= count
+EOF
+printf 'uart0 0x1000 256\n' > "$work/hw.profile"
+cat > "$work/gab_sysreal.vr" <<'EOF'
+syscall write(fd: Int, buf: Int, count: Int) -> Int = 1
+fn main() {
+    print(write(1, 0, 0))
+}
+EOF
+if "$vire" build "$work/gab_sysreal.vr" --emit=gab --abi "$work/t.abi" > "$work/gab_sysreal.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_sysreal.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "syscall write(fd : i64, buf : i64, count : i64) -> i64 via sys_write" "$work/gab_sysreal.gab" \
+    && grep -q "sys_write = number 1" "$work/gab_sysreal.gab" \
+    && grep -q "target lnx;" "$work/gab_sysreal.gab" \
+    && [ "$("$vire" run "$work/gab_sysreal.vr" 2>/dev/null)" = "0" ]; then
+    echo "ok   gab_sysreal"; pass=$((pass+1))
+else echo "FAIL gab_sysreal ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+cat > "$work/gab_mmioreal.vr" <<'EOF'
+fn main() {
+    mut u = Mmio.bind("uart0")
+    u.write32(0, 65)
+    mut v = u.read32(0)
+    print(v)
+}
+EOF
+if "$vire" build "$work/gab_mmioreal.vr" --emit=gab --hw-profile "$work/hw.profile" --abi "$work/t.abi" > "$work/gab_mmioreal.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_mmioreal.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "pub device uart0(base : u64) at mmio" "$work/gab_mmioreal.gab" \
+    && grep -q "reg tx : u32 @0x0 class rw" "$work/gab_mmioreal.gab" \
+    && grep -q "l0.tx = u32(65)" "$work/gab_mmioreal.gab"; then
+    echo "ok   gab_mmioreal"; pass=$((pass+1))
+else echo "FAIL gab_mmioreal ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+# --- undeclared register offset: graceful head fallback (still checked) -----
+# With `--abi`, declared regs become device slots; anything else keeps the
+# scalar-head path (H1) — gradual adoption, no silent anything (both check).
+cat > "$work/gab_regmissing.vr" <<'EOF'
+fn main() {
+    mut u = Mmio.bind("uart0")
+    u.write32(64, 65)
+    print(1)
+}
+EOF
+if "$vire" build "$work/gab_regmissing.vr" --emit=gab --hw-profile "$work/hw.profile" --abi "$work/t.abi" > "$work/gab_regmissing.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_regmissing.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "extern fn vire_mmio_w32_1000_40(a0 : i64)" "$work/gab_regmissing.gab"; then
+    echo "ok   gab_regmissing"; pass=$((pass+1))
+else echo "FAIL gab_regmissing ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+# --- decline: gate without a target (E500) ------------------------------------
+cat > "$work/notarget.abi" <<'EOF'
+syscall write
+  gate sys_write
+  number 1
+  in rdi rsi rdx
+  out rax
+  clobber rcx r11
+  errors
+  assume write_ok "Write keeps its contract." falsifier sonde_write
+EOF
+if "$vire" build "$work/gab_sysreal.vr" --emit=gab --abi "$work/notarget.abi" > /dev/null 2>"$work/e"; then
+    echo "FAIL gab_notarget (emitted — must be rejected)"; fail=$((fail+1))
+elif grep -q "E500" "$work/e"; then echo "ok   gab_notarget (rejected)"; pass=$((pass+1));
+else echo "FAIL gab_notarget (wrong error: $(head -1 "$work/e"))"; fail=$((fail+1)); fi
+
+# --- decline: buffer syscall on the Gabbro path (E500, words only) ------------
+cat > "$work/gab_sysbuf.vr" <<'EOF'
+syscall send(buf: Array[Byte]) -> Int = 2
+fn main() {
+    mut b: Array[Byte] = array(4)
+    print(send(b))
+}
+EOF
+cat > "$work/buf.abi" <<'EOF'
+target lnx abi linux arch x86_64
+syscall send
+  gate sys_send
+  number 2
+  in rdi
+  out rax
+  clobber rcx r11
+  errors
+  assume send_ok "Send keeps its contract." falsifier sonde_send
+EOF
+if "$vire" build "$work/gab_sysbuf.vr" --emit=gab --abi "$work/buf.abi" > /dev/null 2>"$work/e"; then
+    echo "FAIL gab_sysbuf (emitted — must be rejected)"; fail=$((fail+1))
+elif grep -q "takes a buffer" "$work/e"; then echo "ok   gab_sysbuf (rejected)"; pass=$((pass+1));
+else echo "FAIL gab_sysbuf (wrong error: $(head -1 "$work/e"))"; fail=$((fail+1)); fi
+
 # --- runtime-freedom: no jrt_* may leak into any emitted .gab ----------------
 if grep -l "jrt_" "$work"/*.gab >/dev/null 2>&1; then
     echo "FAIL gab_no_runtime (jrt_ reference in .gab: $(grep -l "jrt_" "$work"/*.gab | head -1))"; fail=$((fail+1))

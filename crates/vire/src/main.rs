@@ -399,6 +399,257 @@ fn load_hw_profile(path: &str) -> Vec<(String, u64, u64)> {
     out
 }
 
+/// User-supplied target ABI knowledge (`--abi FILE`) for the Gabbro path:
+/// the target kernel + ISA, device register maps, and syscall gates. The
+/// emitter cannot invent these (registers, clobbers, errors, assumptions),
+/// so the user declares them; the checker holds every line.
+///
+/// ```text
+/// target <tname> abi <abi> arch <arch>
+/// device <dname>
+///   reg <rname> <u8|u16|u32|u64> <r|w|rw> <off>
+/// syscall <sname>
+///   gate <gname>
+///   number <n>
+///   in <regs...>
+///   out <regs...>
+///   clobber <regs...>
+///   errors [<A=>B> ...]
+///   assume <aname> "<text>" falsifier <fname>
+///   requires <pred>     # optional, verbatim Gabbro predicate
+///   ensures <pred>      # optional, verbatim Gabbro predicate
+/// ```
+struct AbiFile {
+    target: Option<fastllvm_ir::HwTarget>,
+    devices: Vec<fastllvm_ir::HwDeviceSpec>,
+    syscalls: Vec<fastllvm_ir::HwSyscallSpec>,
+}
+
+fn load_abi_file(path: &str) -> AbiFile {
+    fn fail(path: &str, i: usize, line: &str, why: &str) -> ! {
+        eprintln!("--abi {path}:{}: bad line `{line}` ({why})", i + 1);
+        exit(1);
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("--abi {path}: {e}");
+            exit(1);
+        }
+    };
+    let mut target: Option<fastllvm_ir::HwTarget> = None;
+    let mut devices: Vec<fastllvm_ir::HwDeviceSpec> = Vec::new();
+    let mut syscalls: Vec<fastllvm_ir::HwSyscallSpec> = Vec::new();
+    enum Section {
+        None,
+        Device(usize),
+        Syscall(usize),
+    }
+    let mut section = Section::None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        let w: Vec<&str> = line.split_whitespace().collect();
+        if !indented {
+            section = Section::None;
+            match w.as_slice() {
+                ["target", tname, "abi", abi, "arch", arch] => {
+                    if target.is_some() {
+                        fail(path, i, line.trim(), "duplicate `target`");
+                    }
+                    for (w, what) in [(tname, "target"), (abi, "abi"), (arch, "arch")] {
+                        if !abi_ident_ok(w) {
+                            fail(path, i, line.trim(), &format!("bad {what} name"));
+                        }
+                    }
+                    target = Some(fastllvm_ir::HwTarget {
+                        name: tname.to_string(),
+                        abi: abi.to_string(),
+                        arch: arch.to_string(),
+                    });
+                }
+                ["device", dname] => {
+                    if devices.iter().any(|d| d.name == *dname) {
+                        fail(path, i, line.trim(), "duplicate `device`");
+                    }
+                    if !abi_ident_ok(dname) {
+                        fail(path, i, line.trim(), "bad device name");
+                    }
+                    devices.push(fastllvm_ir::HwDeviceSpec {
+                        name: dname.to_string(),
+                        regs: vec![],
+                    });
+                    section = Section::Device(devices.len() - 1);
+                }
+                ["syscall", sname] => {
+                    if syscalls.iter().any(|s| s.name == *sname) {
+                        fail(path, i, line.trim(), "duplicate `syscall`");
+                    }
+                    if !abi_ident_ok(sname) {
+                        fail(path, i, line.trim(), "bad syscall name");
+                    }
+                    syscalls.push(fastllvm_ir::HwSyscallSpec {
+                        name: sname.to_string(),
+                        gate: String::new(),
+                        number: 0,
+                        ins: vec![],
+                        outs: vec![],
+                        clobbers: vec![],
+                        errors: vec![],
+                        assume: String::new(),
+                        assume_text: String::new(),
+                        falsifier: String::new(),
+                        requires: vec![],
+                        ensures: vec![],
+                    });
+                    section = Section::Syscall(syscalls.len() - 1);
+                }
+                _ => fail(path, i, line.trim(), "need `target ...`, `device ...`, or `syscall ...`"),
+            }
+            continue;
+        }
+        let t = line.trim();
+        match &mut section {
+            Section::Device(k) => {
+                let d = &mut devices[*k];
+                match w.as_slice() {
+                    ["reg", rname, rty, class, off] => {
+                        if !matches!(*rty, "u8" | "u16" | "u32" | "u64") {
+                            fail(path, i, t, "reg type must be u8/u16/u32/u64");
+                        }
+                        if !matches!(*class, "r" | "w" | "rw") {
+                            fail(path, i, t, "reg class must be r/w/rw");
+                        }
+                        if !abi_ident_ok(rname) {
+                            fail(path, i, t, "bad reg name");
+                        }
+                        let off = parse_abi_num(off).unwrap_or_else(|| fail(path, i, t, "bad offset"));
+                        if d.regs.iter().any(|r| r.name == *rname) {
+                            fail(path, i, t, "duplicate reg");
+                        }
+                        d.regs.push(fastllvm_ir::HwReg {
+                            name: rname.to_string(),
+                            ty: rty.to_string(),
+                            class: class.to_string(),
+                            off,
+                        });
+                    }
+                    _ => fail(path, i, t, "need `reg <name> <u8|u16|u32|u64> <r|w|rw> <off>`"),
+                }
+            }
+            Section::Syscall(k) => {
+                let s = &mut syscalls[*k];
+                match w.as_slice() {
+                    ["gate", g] => {
+                        if !abi_ident_ok(g) {
+                            fail(path, i, t, "bad gate name");
+                        }
+                        s.gate = g.to_string();
+                    }
+                    ["number", n] => {
+                        s.number = parse_abi_num(n).unwrap_or_else(|| fail(path, i, t, "bad number")) as i64;
+                    }
+                    ["in", regs @ ..] => {
+                        for r in regs {
+                            if !abi_reg_ok(r) {
+                                fail(path, i, t, "bad register name");
+                            }
+                        }
+                        s.ins = regs.iter().map(|r| r.to_string()).collect();
+                    }
+                    ["out", regs @ ..] => {
+                        for r in regs {
+                            if !abi_reg_ok(r) {
+                                fail(path, i, t, "bad register name");
+                            }
+                        }
+                        s.outs = regs.iter().map(|r| r.to_string()).collect();
+                    }
+                    ["clobber", regs @ ..] => {
+                        for r in regs {
+                            if !abi_reg_ok(r) {
+                                fail(path, i, t, "bad register name");
+                            }
+                        }
+                        s.clobbers = regs.iter().map(|r| r.to_string()).collect();
+                    }
+                    ["errors", pairs @ ..] => {
+                        for p in pairs {
+                            match p.split_once("=>") {
+                                Some((a, b)) if abi_reg_ok(a) && abi_reg_ok(b) => {
+                                    s.errors.push((a.to_string(), b.to_string()));
+                                }
+                                _ => fail(path, i, t, "errors need `A=>B` pairs"),
+                            }
+                        }
+                    }
+                    _ if w.first() == Some(&"assume") => {
+                        // `assume <aname> "<free text>" falsifier <fname>` —
+                        // the text may hold spaces, so split at `falsifier`.
+                        let fi = w.iter().position(|x| *x == "falsifier").unwrap_or_else(|| fail(path, i, t, "assume needs `falsifier <name>`"));
+                        if w.len() < 2 || fi < 2 || fi + 1 >= w.len() {
+                            fail(path, i, t, "need `assume <name> \"<text>\" falsifier <name>`");
+                        }
+                        if !abi_ident_ok(w[1]) || !abi_ident_ok(w[fi + 1]) {
+                            fail(path, i, t, "bad assumption/falsifier name");
+                        }
+                        let raw_text = w[2..fi].join(" ");
+                        let inner = raw_text.trim_matches('"');
+                        if inner.contains('"') {
+                            fail(path, i, t, "assumption text must not hold quotes");
+                        }
+                        s.assume = w[1].to_string();
+                        s.assume_text = w[2..fi].join(" ").trim_matches('"').to_string();
+                        s.falsifier = w[fi + 1].to_string();
+                    }
+                    ["requires", pred @ ..] => s.requires.push(pred.join(" ")),
+                    ["ensures", pred @ ..] => s.ensures.push(pred.join(" ")),
+                    _ => fail(
+                        path,
+                        i,
+                        t,
+                        "need `gate|number|in|out|clobber|errors|assume|requires|ensures`",
+                    ),
+                }
+            }
+            Section::None => fail(path, i, t, "indented line outside a `device`/`syscall` section"),
+        }
+    }
+    // Completeness: gates, numbers, and assumptions are mandatory (the
+    // checker would refuse nameless gates; fail here with the file/line).
+    for s in &syscalls {
+        if s.gate.is_empty() || s.assume.is_empty() || s.falsifier.is_empty() {
+            eprintln!(
+                "--abi {path}: `syscall {}` needs `gate`, `number`, and `assume ... falsifier ...`",
+                s.name
+            );
+            exit(1);
+        }
+    }
+    AbiFile { target, devices, syscalls }
+}
+
+fn parse_abi_num(s: &str) -> Option<u64> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).map(|h| (h, 16)).unwrap_or((s, 10));
+    u64::from_str_radix(s.0, s.1).ok()
+}
+
+/// Gabbro identifiers for user-supplied ABI names (device/reg/gate/syscall/
+/// target/assume/falsifier): plain `[_A-Za-z][_0-9A-Za-z]*`. Machine register
+/// names (`in`/`out`/`clobber`, errno keys) only forbid structural characters.
+fn abi_ident_ok(s: &str) -> bool {
+    let mut cs = s.chars();
+    matches!(cs.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn abi_reg_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
 fn load_syntax(src: &str, src_path: &str, explicit: Option<&str>) -> vire::Syntax {
     let src_dir = std::path::Path::new(src_path).parent().unwrap_or_else(|| std::path::Path::new("."));
     let cfg = if let Some(f) = explicit {
@@ -509,6 +760,11 @@ fn build_or_run(args: &[String]) {
     // Custom keyword syntax is opt-in only (`--syntax FILE`), never folder-auto-loaded.
     let mut syntax_file: Option<String> = None;
     let mut hw_profile_file: Option<String> = None;
+    // User-supplied target ABI knowledge (`--abi FILE`): the target kernel +
+    // ISA, device register maps, and syscall gates the Gabbro path cannot
+    // invent (devices/regs, `syscall ... via ...`). Without it, syscalls and
+    // machine intrinsics map to scalar `extern fn` heads.
+    let mut abi_file: Option<String> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -597,6 +853,13 @@ fn build_or_run(args: &[String]) {
                 Some(f) => hw_profile_file = Some(f.clone()),
                 None => {
                     eprintln!("--hw-profile needs a profile file");
+                    exit(2);
+                }
+            },
+            "--abi" => match it.next() {
+                Some(f) => abi_file = Some(f.clone()),
+                None => {
+                    eprintln!("--abi needs an ABI file");
                     exit(2);
                 }
             },
@@ -843,6 +1106,14 @@ fn build_or_run(args: &[String]) {
             exit(1);
         }
     };
+    // User-supplied target ABI knowledge attaches after lowering (plain data
+    // the solver never reads; the Gabbro emitter consumes it).
+    if let Some(f) = abi_file.as_deref() {
+        let abi = load_abi_file(f);
+        program.hw_target = abi.target;
+        program.hw_devices = abi.devices;
+        program.hw_syscalls = abi.syscalls;
+    }
     // A dynamic module has no `main` — its entry is `fn module_main(x: Int) -> Int`
     // (exported by the shim as `vire_module_main`). Everything else needs `fn main`.
     if emit_module {

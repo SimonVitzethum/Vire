@@ -57,15 +57,15 @@ oracle first, then promote + decline tests, 0 errors, run parity.
 
 ## Phase 6 — errors, hardware, threads, capsules
 
-- [~] **Syscalls + machine intrinsics (H1, done):** `syscall NAME(..) = NUM`
-  items and the `__vire_*` family (MMIO/port/fence from `Mmio`/`Port`/`fence`)
-  become per-site `extern fn` heads (number rides as data); `$mmio` handles are
-  compile-time descriptors; user shadowing of the intrinsic namespace is E500.
-  Full `device`/`reg` decls and `syscall ... via ...` gates need target ABI
-  knowledge — later step, never faked. MMIO/port are compile-only (the host
-  cannot execute them); `fence` + `getpid`-class syscalls carry run parity.
+- [x] **Syscalls + machine intrinsics (H1):** scalar `extern fn` heads.
+- [x] **Real gates from user `--abi` knowledge (H2):** target/registers/gates
+  come from the user spec file (nothing invented); the emitter wires
+  `syscall ... via ...` + `target` + `device`/`reg` decls, the checker holds
+  every line. Numbers/names/arity/widths disagreeing is loud E500; undeclared
+  regs and specless syscalls keep the scalar-head path (gradual, still
+  checked). MMIO/port are compile-only (the host cannot execute them);
+  getpid-class syscalls carry run parity under the oracle.
 - [ ] `Result` across functions, panic paths → `abort`/refuse.
-- [ ] `hw`/`syscall` → `device`/`reg` + syscall gates (solver-built ABI/costs).
 - [ ] `spawn` → Gabbro concurrency (probe 05 first: locks + `shared` guards).
 - [ ] `capsule` → arenas with copy in/out loops.
 

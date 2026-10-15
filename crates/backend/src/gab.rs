@@ -73,6 +73,222 @@ fn hw_head_name(cname: &str) -> String {
     }
 }
 
+/// Width in bytes of a Gabbro `u8/u16/u32/u64` register type.
+fn hw_reg_width(ty: &str) -> Option<u64> {
+    match ty {
+        "u8" => Some(1),
+        "u16" => Some(2),
+        "u32" => Some(4),
+        "u64" => Some(8),
+        _ => None,
+    }
+}
+
+/// Parse a lowered MMIO helper name (`__vire_mmio_{r,w}{bits}_{base:x}_{off:x}`)
+/// into (is_write, width_bytes, base, offset).
+fn mmio_sym_info(name: &str) -> Option<(bool, u64, u64, u64)> {
+    let rest = name.strip_prefix("__vire_mmio_")?;
+    let (dir, rest) = match rest.strip_prefix('r') {
+        Some(r) => (false, r),
+        None => (true, rest.strip_prefix('w')?),
+    };
+    let mut it = rest.split('_');
+    let width: u64 = it.next()?.parse().ok()?;
+    let base = u64::from_str_radix(it.next()?, 16).ok()?;
+    let off = u64::from_str_radix(it.next()?, 16).ok()?;
+    if it.next().is_some() || width % 8 != 0 {
+        return None;
+    }
+    Some((dir, width / 8, base, off))
+}
+
+/// A resolved MMIO access: region, device, register, register type/class.
+#[derive(Clone)]
+struct MmioSite {
+    region: String,
+    dev: String,
+    reg: String,
+    reg_ty: String,
+    reg_class: String,
+    base: u64,
+}
+
+/// Resolve a (base, offset, width) access against `--hw-profile` regions and
+/// `--abi` device/register declarations. None = no user knowledge → the
+/// scalar `extern fn` fallback (never invented registers).
+fn resolve_mmio(program: &Program, base: u64, off: u64, width: u64) -> Option<MmioSite> {
+    let addr = base.checked_add(off)?;
+    let end = addr.checked_add(width)?;
+    let (region, rbase, rlen) = program.hw_regions.iter().find(|(_, b, l)| {
+        addr >= *b && end <= b.checked_add(*l).unwrap_or(u64::MAX)
+    })?;
+    let _ = rlen;
+    let dev = program.hw_devices.iter().find(|d| d.name == *region)?;
+    let rel = off;
+    let reg = dev.regs.iter().find(|r| r.off == rel && hw_reg_width(&r.ty) == Some(width))?;
+    Some(MmioSite {
+        region: region.clone(),
+        dev: dev.name.clone(),
+        reg: reg.name.clone(),
+        reg_ty: reg.ty.clone(),
+        reg_class: reg.class.clone(),
+        base: *rbase,
+    })
+}
+
+/// A real syscall gate ready to emit: Vire declaration + user spec.
+struct SysGate {
+    decl: String,
+    gate: String,
+    params: Vec<(String, Ty)>,
+    ret: Ty,
+    spec_idx: usize,
+}
+
+/// Used hardware: real syscall gates by number + used devices by region.
+struct HwPlan {
+    /// syscall number → gate (only for used syscalls with decl + spec).
+    sys_by_num: BTreeMap<i64, SysGate>,
+    /// regions with emitted device declarations.
+    devs: BTreeMap<String, (String, u64)>,
+}
+
+/// Build the hardware plan: which user-declared syscalls and devices are
+/// actually used by reachable code (no dead items), with all cross-checks
+/// (name/number/arity/width agreement — disagreement is loud E500, never a
+/// guess). Infallible-looking but pushes diagnostics.
+fn plan_hw(
+    program: &Program,
+    reachable: &BTreeSet<String>,
+    errs: &mut Vec<String>,
+) -> HwPlan {
+    let mut plan = HwPlan { sys_by_num: BTreeMap::new(), devs: BTreeMap::new() };
+    // Used syscall numbers (const only; computed numbers stay on heads).
+    let mut used_nums: BTreeSet<i64> = BTreeSet::new();
+    // Used (base, off, width) MMIO triples.
+    let mut used_mmio: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+    for f in &program.functions {
+        if !reachable.contains(&f.name) {
+            continue;
+        }
+        for b in &f.blocks {
+            for st in &b.statements {
+                if let Statement::Call { func, args, .. } = st {
+                    if func == "syscall" {
+                        match args.first() {
+                            Some(Operand::ConstI64(n)) if *n >= 0 => {
+                                used_nums.insert(*n);
+                            }
+                            Some(Operand::ConstI32(n)) if *n >= 0 => {
+                                used_nums.insert(*n as i64);
+                            }
+                            _ => {}
+                        }
+                    } else if func.starts_with("__vire_mmio_") {
+                        if let Some((_, w, base, off)) = mmio_sym_info(func) {
+                            used_mmio.insert((base, off, w));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Real gates: Vire decl + user spec, names AND numbers agreeing.
+    let user_fns: BTreeSet<&str> =
+        program.functions.iter().map(|f| f.name.as_str()).collect();
+    for d in &program.syscall_decls {
+        if !used_nums.contains(&d.num) {
+            continue;
+        }
+        let spec_idx = match program.hw_syscalls.iter().position(|s| s.name == d.name) {
+            Some(i) => i,
+            None => continue,
+        };
+        let spec = &program.hw_syscalls[spec_idx];
+        if spec.number != d.num {
+            errs.push(e500(format!(
+                "syscall `{}` declares number {} but `--abi` gives {} (fix one)",
+                d.name, d.num, spec.number
+            )));
+            continue;
+        }
+        if user_fns.contains(d.name.as_str()) {
+            errs.push(e500(format!(
+                "syscall `{}` collides with a Vire function of the same name (rename one)",
+                d.name
+            )));
+            continue;
+        }
+        if user_fns.contains(spec.gate.as_str()) {
+            errs.push(e500(format!(
+                "syscall gate `{}` collides with a Vire function of the same name (rename one)",
+                spec.gate
+            )));
+            continue;
+        }
+        if spec.ins.len() != d.params.len() {
+            errs.push(e500(format!(
+                "syscall `{}` declares {} params but `--abi` lists {} input registers (fix one)",
+                d.name,
+                d.params.len(),
+                spec.ins.len()
+            )));
+            continue;
+        }
+        for (pname, pty) in d.params.iter() {
+            if !is_ident(pname) {
+                errs.push(e500(format!("syscall `{}` parameter `{pname}` is not emittable (M1: plain idents)", d.name)));
+            }
+            if *pty == Ty::Ref {
+                errs.push(e500(format!(
+                    "syscall `{}` takes a buffer (M4: array-buffer syscalls need a later step — pass words)",
+                    d.name
+                )));
+            }
+        }
+        if plan.sys_by_num.contains_key(&d.num) {
+            errs.push(e500(format!(
+                "syscall number {} claimed twice on the Gabbro path (one gate per number)",
+                d.num
+            )));
+            continue;
+        }
+        plan.sys_by_num.insert(
+            d.num,
+            SysGate {
+                decl: d.name.clone(),
+                gate: spec.gate.clone(),
+                params: d.params.clone(),
+                ret: d.ret,
+                spec_idx,
+            },
+        );
+    }
+    // Used devices: resolved triples only (unresolved stay on heads).
+    for (base, off, w) in used_mmio.iter() {
+        if let Some(site) = resolve_mmio(program, *base, *off, *w) {
+            plan.devs.insert(site.region.clone(), (site.dev.clone(), site.base));
+        }
+    }
+    // Gates need their target: a gate without a bound kernel is E500 here
+    // (the checker would refuse the dangling `via` just as loudly).
+    if !plan.sys_by_num.is_empty() && program.hw_target.is_none() {
+        errs.push(e500(
+            "syscall gates need a `target` in `--abi` (the kernel + ISA every gate binds to)".to_string(),
+        ));
+    }
+    // Gate names must not collide with Vire functions (the output would
+    // declare `syscall GATE;` beside `fn GATE` — N280 at the checker).
+    for gate in plan.sys_by_num.values().map(|g| g.gate.clone()).collect::<Vec<_>>() {
+        if user_fns.contains(gate.as_str()) {
+            errs.push(e500(format!(
+                "syscall gate `{gate}` collides with a Vire function of the same name (rename one)"
+            )));
+        }
+    }
+    plan
+}
+
 fn gab_ty(t: Ty) -> Option<&'static str> {
     match t {
         Ty::I64 => Some("i64"),
@@ -98,6 +314,8 @@ fn gab_extern_ty(t: Ty) -> Option<&'static str> {
 fn analyze_externs(
     program: &Program,
     errs: &mut Vec<String>,
+    sys_real: &BTreeSet<i64>,
+    mmio_real: &BTreeSet<(u64, u64, u64)>,
 ) -> (BTreeMap<String, ExternDecl>, BTreeMap<String, String>) {
     let mut ok: BTreeMap<String, ExternDecl> = BTreeMap::new();
     let mut bad: BTreeMap<String, String> = BTreeMap::new();
@@ -214,11 +432,17 @@ fn analyze_externs(
                 if cname == "syscall" {
                     // [num, args..]; the number rides along as data (a static
                     // head per arity class would hide it — the name carries
-                    // it when constant, `dyn` when computed).
-                    let (num_key, rest) = match args.first() {
-                        Some(Operand::ConstI64(n)) if *n >= 0 => (format!("{n}"), &args[1..]),
-                        Some(Operand::ConstI32(n)) if *n >= 0 => (format!("{n}"), &args[1..]),
-                        Some(_) => ("dyn".to_string(), &args[1..]),
+                    // it when constant, `dyn` when computed). Numbers with a
+                    // real gate (user decl + `--abi` spec) skip synthesis:
+                    // the gate path renders them.
+                    let (num_key, num_real) = match args.first() {
+                        Some(Operand::ConstI64(n)) if *n >= 0 => {
+                            (format!("{n}"), sys_real.contains(n))
+                        }
+                        Some(Operand::ConstI32(n)) if *n >= 0 => {
+                            (format!("{n}"), sys_real.contains(&(*n as i64)))
+                        }
+                        Some(_) => ("dyn".to_string(), false),
                         None => {
                             let m = "syscall without a number (M4: internal)".to_string();
                             errs.push(e500(m.clone()));
@@ -226,6 +450,10 @@ fn analyze_externs(
                             continue;
                         }
                     };
+                    if num_real {
+                        continue;
+                    }
+                    let rest = &args[1..];
                     let mut params = vec![];
                     let mut okk = true;
                     for a in args.iter() {
@@ -266,7 +494,16 @@ fn analyze_externs(
                         ret,
                     );
                 } else if cname.starts_with("__vire_") {
-                    // Machine helper: static name, scalar shapes.
+                    // Machine helper: static name, scalar shapes. MMIO calls
+                    // covered by a user device declaration skip synthesis:
+                    // the device-slot path renders them.
+                    if cname.starts_with("__vire_mmio_") {
+                        if let Some((_, w, base, off)) = mmio_sym_info(cname) {
+                            if mmio_real.contains(&(base, off, w)) {
+                                continue;
+                            }
+                        }
+                    }
                     let mut params = vec![];
                     let mut okk = true;
                     for a in args.iter() {
@@ -1196,6 +1433,13 @@ fn compute_effects(
     for e in &program.extern_fns {
         eff.insert(e.name.clone(), (BTreeSet::new(), BTreeSet::from(["ausgabe".to_string()])));
     }
+    // Real syscall gates (user decl + `--abi` spec): same conservative sink
+    // as `extern fn` (scalars cannot address module carriers).
+    for d in &program.syscall_decls {
+        if program.hw_syscalls.iter().any(|s| s.name == d.name) {
+            eff.insert(d.name.clone(), (BTreeSet::new(), BTreeSet::from(["ausgabe".to_string()])));
+        }
+    }
     for f in &program.functions {
         if !reachable.contains(&f.name) {
             continue;
@@ -1214,12 +1458,30 @@ fn compute_effects(
                         if func == "jrt_println_long" || func == "jrt_println_str" {
                             w.insert("ausgabe".to_string());
                         }
+                        // A `Call "syscall"` reaches `ausgabe` directly (both
+                        // the gate path and the head path are held to that
+                        // conservative sink — the IR call never names the
+                        // gate, so the propagation fixpoint cannot see it).
+                        if func == "syscall" {
+                            w.insert("ausgabe".to_string());
+                        }
                         // Region push/pop writes its arena (`reset` at pop;
                         // the push declares it). Unpaired pops carry no name.
                         if func == "jrt_region_push" || func == "jrt_region_pop" {
                             if let Some(m) = rmarks.get(&(bi as u32, si)) {
                                 if !m.name.is_empty() {
                                     w.insert(m.name.clone());
+                                }
+                            }
+                        }
+                        // Device-slot accesses touch their device carrier.
+                        if func.starts_with("__vire_mmio_") {
+                            if let Some((is_write, wid, base, off)) = mmio_sym_info(func) {
+                                if let Some(site) = resolve_mmio(program, base, off, wid) {
+                                    w.insert(site.dev.clone());
+                                    if !is_write {
+                                        r.insert(site.dev.clone());
+                                    }
                                 }
                             }
                         }
@@ -1445,6 +1707,14 @@ struct BodyEmit<'a> {
     obj_rets: BTreeMap<String, String>,
     /// Proven reference parameters (whole program; fn → param → class).
     obj_params: BTreeMap<String, BTreeMap<u32, String>>,
+    /// Real syscall gates (Phase H2): number → (decl, params, ret).
+    sys_real: BTreeMap<i64, (String, Vec<(String, Ty)>, Ty)>,
+    /// Resolved MMIO accesses (Phase H2): (base, off, width) → site.
+    mmio_sites: BTreeMap<(u64, u64, u64), MmioSite>,
+    /// Bound device values (Phase H2): region → local name.
+    dev_binds: BTreeMap<String, String>,
+    /// Device declarations (Phase H2): region → (device, base).
+    hw_devs: BTreeMap<String, (String, u64)>,
     out: String,
 }
 
@@ -3441,6 +3711,181 @@ impl<'a> BodyEmit<'a> {
                     )));
                     return;
                 }
+                if func.starts_with("jrt_") {
+                    self.fe.errs.push(e500(format!(
+                        "runtime call `{func}` not emittable to Gabbro (M1: integer code only)"
+                    )));
+                    return;
+                }
+                // Real syscall gates (Phase H2, user `--abi` knowledge): the
+                // call renders as its declared gate, number and arity checked
+                // here (lowering already arity-checks; this is the emission
+                // half — disagreements are internal errors, never guesses).
+                if func == "syscall" {
+                    let num = match args.first() {
+                        Some(Operand::ConstI64(n)) if *n >= 0 => Some(*n),
+                        Some(Operand::ConstI32(n)) if *n >= 0 => Some(*n as i64),
+                        _ => None,
+                    };
+                    if let Some(n) = num {
+                        if let Some((decl, params, ret)) = self.sys_real.get(&n).cloned() {
+                            let rest = &args[1..];
+                            if rest.len() != params.len() {
+                                self.fe.errs.push(e500(format!(
+                                    "syscall `{decl}` arity mismatch (M4: internal)"
+                                )));
+                                return;
+                            }
+                            let mut ats = vec![];
+                            for ((pname, pty), a) in params.iter().zip(rest.iter()) {
+                                if *pty == Ty::Ref {
+                                    self.fe.errs.push(e500(format!(
+                                        "syscall `{decl}` takes a buffer (M4: array-buffer syscalls need a later step — pass words)"
+                                    )));
+                                    return;
+                                }
+                                match a {
+                                    Operand::ConstI64(v) => {
+                                        if *pty == Ty::I32 && (*v < i32::MIN as i64 || *v > i32::MAX as i64) {
+                                            self.fe.errs.push(e500(format!(
+                                                "syscall `{decl}` argument `{pname}` exceeds i32 (M4: internal)"
+                                            )));
+                                            return;
+                                        }
+                                        ats.push(format!("{v}"));
+                                    }
+                                    Operand::ConstI32(v) => {
+                                        if *pty == Ty::I64 && *v < 0 {
+                                            self.fe.errs.push(e500(format!(
+                                                "syscall `{decl}` argument `{pname}` is a negative i32 into i64 (M4: internal)"
+                                            )));
+                                            return;
+                                        }
+                                        ats.push(format!("{v}"));
+                                    }
+                                    Operand::Copy(l) => {
+                                        match self.fe.func.locals.get(l.0 as usize) {
+                                            Some(Ty::I64) if *pty == Ty::I64 => {
+                                                ats.push(self.lname(*l));
+                                            }
+                                            _ => {
+                                                self.fe.errs.push(e500(format!(
+                                                    "syscall `{decl}` argument `{pname}` has a non-word type (M4: internal)"
+                                                )));
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        self.fe.errs.push(e500(format!(
+                                            "syscall `{decl}` argument `{pname}` is not emittable (M4: internal)"
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+                            match dest {
+                                None => {
+                                    if ret != Ty::Void {
+                                        self.fe.errs.push(e500(format!(
+                                            "syscall `{decl}` value discarded (M1: internal)"
+                                        )));
+                                        return;
+                                    }
+                                    let _ = writeln!(self.out, "    {decl}({});", ats.join(", "));
+                                }
+                                Some(dd) => {
+                                    if self.fe.func.locals.get(dd.0 as usize) != Some(&ret) {
+                                        self.fe.errs.push(e500(format!(
+                                            "syscall `{decl}` dest type mismatch (M1: internal)"
+                                        )));
+                                        return;
+                                    }
+                                    let want = match ret {
+                                        Ty::I32 => "i32",
+                                        _ => "i64",
+                                    };
+                                    self.emit_assign(*dd, format!("{decl}({})", ats.join(", ")), want);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    // No gate: fall through to the scalar-head path below.
+                }
+                // Device-slot accesses (Phase H2): resolved `__vire_mmio_*`
+                // calls render as register reads/writes through the bound
+                // device value; unresolved ones fall through to heads.
+                if func.starts_with("__vire_mmio_") {
+                    if let Some((is_write, wid, base, off)) = mmio_sym_info(func) {
+                        if let Some(site) = self.mmio_sites.get(&(base, off, wid)).cloned() {
+                            let d = match self.dev_binds.get(&site.region).cloned() {
+                                Some(d) => d,
+                                None => {
+                                    self.fe.errs.push(e500(
+                                        "MMIO use before bind (M4: internal — binds dominate uses)".to_string(),
+                                    ));
+                                    return;
+                                }
+                            };
+                            if is_write {
+                                if site.reg_class != "w" && site.reg_class != "rw" {
+                                    self.fe.errs.push(e500(format!(
+                                        "writing read-only register `{}.{}` (declare it `w`/`rw` in `--abi`)",
+                                        site.dev, site.reg
+                                    )));
+                                    return;
+                                }
+                                if dest.is_some() {
+                                    self.fe.errs.push(e500("MMIO write with a value dest (M4: internal)".to_string()));
+                                    return;
+                                }
+                                let v = match args.first() {
+                                    Some(Operand::ConstI64(n)) if *n >= 0 => format!("{n}"),
+                                    Some(Operand::ConstI32(n)) if *n >= 0 => format!("{n}"),
+                                    Some(Operand::Copy(l))
+                                        if self.fe.func.locals.get(l.0 as usize) == Some(&Ty::I64) =>
+                                    {
+                                        self.lname(*l)
+                                    }
+                                    _ => {
+                                        self.fe.errs.push(e500("MMIO write needs a non-negative word value (M4: internal)".to_string()));
+                                        return;
+                                    }
+                                };
+                                let _ = writeln!(self.out, "    {d}.{} = {}({v});", site.reg, site.reg_ty);
+                            } else {
+                                if site.reg_class != "r" && site.reg_class != "rw" {
+                                    self.fe.errs.push(e500(format!(
+                                        "reading write-only register `{}.{}` (declare it `r`/`rw` in `--abi`)",
+                                        site.dev, site.reg
+                                    )));
+                                    return;
+                                }
+                                let dd = match dest {
+                                    Some(dd) => dd,
+                                    None => {
+                                        self.fe.errs.push(e500("MMIO read with discarded value (later step — clear-on-read idioms)".to_string()));
+                                        return;
+                                    }
+                                };
+                                if self.fe.func.locals.get(dd.0 as usize) != Some(&Ty::I64) {
+                                    self.fe.errs.push(e500("MMIO read into a non-i64 local (M4: internal)".to_string()));
+                                    return;
+                                }
+                                // `i64(...)` converts integers with ranges, and
+                                // the argument must carry one: bind the slot
+                                // first (the `let` carries the promise — M145),
+                                // then convert (measured shape).
+                                let u = self.fresh_u();
+                                let _ = writeln!(self.out, "    let mut {u} : {} = {d}.{};", site.reg_ty, site.reg);
+                                self.emit_assign(*dd, format!("i64({u})"), "i64");
+                            }
+                            return;
+                        }
+                    }
+                    // Unresolved: fall through to the scalar-head path below.
+                }
                 // `extern "C"` calls: mappable decls become direct `extern fn`
                 // calls (rendered with the declared param types); unmappable
                 // ones decline with their reason (Ptr/layouts never cross).
@@ -3996,13 +4441,24 @@ impl<'a> BodyEmit<'a> {
                 // Values widen identically (Vire-truncated at construction).
                 self.emit_assign(*dest, val, "i64");
             }
-            Statement::GetStatic { class, .. } => {
+            Statement::GetStatic { dest, class, field } => {
                 // `$mmio` handles are compile-time descriptors (bound to a
                 // `--hw-profile` region, consumed into specialized
-                // `__vire_mmio_*` calls): no value to bind, like array
-                // aliases vanishing into their tables. Escaping uses stay
-                // loud (unknown-class reference args are E500 at calls).
+                // `__vire_mmio_*` calls): with a user device declaration the
+                // bind instantiates the device value; without one there is
+                // no value to bind (the scalar-head fallback carries the
+                // call). Escaping uses stay loud (unknown-class reference
+                // args are E500 at calls).
                 if class == "$mmio" {
+                    if let Some((dev, base)) = self.hw_devs.get(field).cloned() {
+                        let dn = self.lname(*dest);
+                        if self.bound.insert(dest.0) {
+                            let _ = writeln!(self.out, "    let mut {dn} = {dev}({base});");
+                        } else {
+                            let _ = writeln!(self.out, "    {dn} = {dev}({base});");
+                        }
+                        self.dev_binds.insert(field.clone(), dn);
+                    }
                     return;
                 }
                 self.fe.errs.push(e500(format!(
@@ -4613,6 +5069,7 @@ impl<'a> BodyEmit<'a> {
             let saved_bound = self.bound.clone();
             let saved_prelude = std::mem::take(&mut self.fe.prelude);
             let saved_region = self.region_stack.clone();
+            let saved_dev = self.dev_binds.clone();
             let blk = &self.fe.func.blocks[bi as usize];
             for (si, st) in blk.statements.iter().enumerate() {
                 self.emit_stmt(st, (bi, si), funcs);
@@ -4649,6 +5106,7 @@ impl<'a> BodyEmit<'a> {
             self.bound = saved_bound;
             self.fe.prelude = saved_prelude;
             self.region_stack = saved_region;
+            self.dev_binds = saved_dev;
         }
     }
 
@@ -4867,6 +5325,9 @@ fn emit_function(
     obj_rows: BTreeMap<(u32, usize), (String, u64)>,
     obj_rets: &BTreeMap<String, String>,
     obj_params_all: &BTreeMap<String, BTreeMap<u32, String>>,
+    sys_real: &BTreeMap<i64, (String, Vec<(String, Ty)>, Ty)>,
+    mmio_sites: &BTreeMap<(u64, u64, u64), MmioSite>,
+    hw_devs: &BTreeMap<String, (String, u64)>,
 ) -> String {
     // Signature validation.
     // (`vire_main` is the compiler-known entry, exempt from the namespace
@@ -5067,7 +5528,7 @@ fn emit_function(
     }
     let mut fe = FnEmit { func, strings, str_max, arr_site, arr_sites, arr_conflict, len32, i64free, opt_locs, wide32: BTreeSet::new(), trace_hints: BTreeMap::new(), bools, used, temps: 0, prelude: PreludeUse::default(), errs: vec![] };
     let headers: BTreeSet<u32> = loops.keys().copied().collect();
-    let mut be = BodyEmit { fe: &mut fe, is_main, active: vec![], seen: BTreeSet::new(), nparams: func.params.len(), bound: BTreeSet::new(), loops: vec![], loop_seq: 0, loop_info: loops, headers, pdom, out: String::new(), region_sites, region_stack: vec![], externs: externs.clone(), unmapped_externs: unmapped_externs.clone(), obj_classes: obj_classes.clone(), obj_locals, obj_rows, obj_rets: obj_rets.clone(), obj_params: obj_params_all.clone() };
+    let mut be = BodyEmit { fe: &mut fe, is_main, active: vec![], seen: BTreeSet::new(), nparams: func.params.len(), bound: BTreeSet::new(), loops: vec![], loop_seq: 0, loop_info: loops, headers, pdom, out: String::new(), region_sites, region_stack: vec![], externs: externs.clone(), unmapped_externs: unmapped_externs.clone(), obj_classes: obj_classes.clone(), obj_locals, obj_rows, obj_rets: obj_rets.clone(), obj_params: obj_params_all.clone(), sys_real: sys_real.clone(), mmio_sites: mmio_sites.clone(), dev_binds: BTreeMap::new(), hw_devs: hw_devs.clone() };
     // Option pairs bound once at function top (dominator-safe: every later
     // write — branches, joins, loop passes — is a plain assign).
     {
@@ -5592,9 +6053,45 @@ pub fn emit_gab(program: &Program, modname: &str) -> Result<String, Vec<String>>
         }
     }
     let mut prelude = PreludeUse::default();
+    // Hardware plan first: real syscall gates + device declarations consume
+    // user `--abi` knowledge; the extern synthesis below skips what the plan
+    // covers (no dead heads, no double emission).
+    let hw_plan = plan_hw(program, &reachable, &mut errs);
+    // Real-gate table for call rendering: number → (decl, params, ret).
+    let mut sys_real: BTreeMap<i64, (String, Vec<(String, Ty)>, Ty)> = BTreeMap::new();
+    for (num, gate) in hw_plan.sys_by_num.iter() {
+        sys_real.insert(*num, (gate.decl.clone(), gate.params.clone(), gate.ret));
+    }
+    // Resolved MMIO triples for device-slot rendering.
+    let mut mmio_sites: BTreeMap<(u64, u64, u64), MmioSite> = BTreeMap::new();
+    for f in &program.functions {
+        if !reachable.contains(&f.name) {
+            continue;
+        }
+        for b in &f.blocks {
+            for st in &b.statements {
+                if let Statement::Call { func, .. } = st {
+                    if func.starts_with("__vire_mmio_") {
+                        if let Some((_, w, base, off)) = mmio_sym_info(func) {
+                            if mmio_sites.contains_key(&(base, off, w)) {
+                                continue;
+                            }
+                            if let Some(site) = resolve_mmio(program, base, off, w) {
+                                if hw_plan.devs.contains_key(&site.region) {
+                                    mmio_sites.insert((base, off, w), site);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mmio_real: BTreeSet<(u64, u64, u64)> = mmio_sites.keys().copied().collect();
+    let sys_real_nums: BTreeSet<i64> = sys_real.keys().copied().collect();
     // `extern "C"` boundary: scalar decls become `extern fn` heads
     // (checked here, once); the rest declines loudly at its call.
-    let (externs, unmapped_externs) = analyze_externs(program, &mut errs);
+    let (externs, unmapped_externs) = analyze_externs(program, &mut errs, &sys_real_nums, &mmio_real);
     // Object tables used by static rows (name → (rows, ordered slots)).
     for (class, count) in obj_info.row_counts.iter() {
         let mut slots = vec![];
@@ -5638,7 +6135,7 @@ pub fn emit_gab(program: &Program, modname: &str) -> Result<String, Vec<String>>
                 obj_rows.insert((*bi, *si), v.clone());
             }
         }
-        bodies.push_str(&emit_function(f, is_main, &er, &ew, est, loops, pdom, &program.strings, str_max, len32, &funcs, &mut errs, &mut prelude, &externs, &unmapped_externs, &obj_classes, obj_locals, obj_rows, &obj_info.ret_class, &obj_info.params));
+        bodies.push_str(&emit_function(f, is_main, &er, &ew, est, loops, pdom, &program.strings, str_max, len32, &funcs, &mut errs, &mut prelude, &externs, &unmapped_externs, &obj_classes, obj_locals, obj_rows, &obj_info.ret_class, &obj_info.params, &sys_real, &mmio_sites, &hw_plan.devs));
     }
     if !errs.is_empty() {
         // Dedupe identical diagnostics (loops report E501 per enclosed branch).
@@ -5692,6 +6189,132 @@ pub fn emit_gab(program: &Program, modname: &str) -> Result<String, Vec<String>>
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out, "");
+    }
+    // Real hardware gates (Phase H2, user `--abi` knowledge only — nothing
+    // invented): kernel assumptions, gate variables, `syscall ... via ...`
+    // declarations, device declarations, and the single target block. Every
+    // name/number/arity agreement was checked in `plan_hw`; disagreement
+    // never reaches this text.
+    if !hw_plan.sys_by_num.is_empty() || !hw_plan.devs.is_empty() {
+        // Kernel assumptions (deduped by name).
+        let mut anames: Vec<&String> = vec![];
+        let mut aseen = BTreeSet::new();
+        for gate in hw_plan.sys_by_num.values() {
+            let spec = &program.hw_syscalls[gate.spec_idx];
+            if aseen.insert(spec.assume.clone()) {
+                anames.push(&spec.assume);
+            }
+        }
+        anames.sort();
+        for a in anames {
+            let spec = program
+                .hw_syscalls
+                .iter()
+                .find(|s| &s.assume == a)
+                .unwrap();
+            let _ = writeln!(out, "assume {} \"{}\" falsifier {};", spec.assume, spec.assume_text, spec.falsifier);
+        }
+        if !aseen.is_empty() {
+            let _ = writeln!(out, "");
+        }
+        // Gate variables.
+        let mut gates: Vec<&String> = hw_plan.sys_by_num.values().map(|g| &g.gate).collect();
+        gates.sort();
+        gates.dedup();
+        for g in gates {
+            let _ = writeln!(out, "syscall {g};");
+        }
+        if !hw_plan.sys_by_num.is_empty() {
+            let _ = writeln!(out, "");
+        }
+        // `syscall ... via ...` declarations (sorted by decl name).
+        let mut decls: Vec<&SysGate> = hw_plan.sys_by_num.values().collect();
+        decls.sort_by(|a, b| a.decl.cmp(&b.decl));
+        for gate in decls.iter() {
+            let spec = &program.hw_syscalls[gate.spec_idx];
+            let mut ps = vec![];
+            for (pname, pty) in gate.params.iter() {
+                let gt = match pty {
+                    Ty::I32 => "i32",
+                    _ => "i64",
+                };
+                ps.push(format!("{pname} : {gt}"));
+            }
+            let ret = match gate.ret {
+                Ty::I32 => " -> i32",
+                _ => " -> i64",
+            };
+            let mut clauses = vec![format!("via {}", gate.gate)];
+            for r in spec.requires.iter() {
+                clauses.push(format!("requires {r}"));
+            }
+            for e in spec.ensures.iter() {
+                clauses.push(format!("ensures {e}"));
+            }
+            clauses.push("effects { writes ausgabe }".to_string());
+            clauses.push("costs <= 64 ops".to_string());
+            let _ = writeln!(out, "syscall {}({}){} {};", gate.decl, ps.join(", "), ret, clauses.join(" "));
+        }
+        if !hw_plan.sys_by_num.is_empty() {
+            let _ = writeln!(out, "");
+        }
+        // Device declarations (sorted by region).
+        let mut devs: Vec<(&String, &(String, u64))> = hw_plan.devs.iter().collect();
+        devs.sort();
+        for (region, (dev, _)) in devs.iter() {
+            let spec = match program.hw_devices.iter().find(|d| d.name == **dev) {
+                Some(s) => s,
+                None => continue,
+            };
+            let _ = writeln!(out, "pub device {dev}(base : u64) at mmio {{");
+            let mut regs = spec.regs.iter().collect::<Vec<_>>();
+            regs.sort_by(|a, b| a.off.cmp(&b.off));
+            for r in regs {
+                let _ = writeln!(out, "    reg {} : {} @{:#x} class {}", r.name, r.ty, r.off, r.class);
+            }
+            let _ = writeln!(out, "}}");
+            let _ = writeln!(out, "-- region `{region}` binds `{dev}`");
+        }
+        if !hw_plan.devs.is_empty() {
+            let _ = writeln!(out, "");
+        }
+        // The single target block + binding (a gate without a target is E500
+        // in `plan_hw` — unreachable here, but checked, not assumed).
+        if !hw_plan.sys_by_num.is_empty() {
+            if let Some(t) = program.hw_target.as_ref() {
+                let _ = writeln!(out, "target {} abi {} arch {} {{", t.name, t.abi, t.arch);
+                for gate in decls.iter() {
+                    let spec = &program.hw_syscalls[gate.spec_idx];
+                    let ins: Vec<String> = spec
+                        .ins
+                        .iter()
+                        .zip(gate.params.iter())
+                        .map(|(r, (p, _))| format!("{r} = {p}"))
+                        .collect();
+                    let errs = spec
+                        .errors
+                        .iter()
+                        .map(|(a, b)| format!("{a} => {b}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(
+                        out,
+                        "    {} = number {} regs in {{ {} }} regs out {{ {} }} clobbers {{ {} }} errors {{ {} }} assume {} falsifier {};",
+                        gate.gate,
+                        spec.number,
+                        ins.join(", "),
+                        spec.outs.join(", "),
+                        spec.clobbers.join(", "),
+                        errs,
+                        spec.assume,
+                        spec.falsifier
+                    );
+                }
+                let _ = writeln!(out, "}}");
+                let _ = writeln!(out, "target {};", t.name);
+                let _ = writeln!(out, "");
+            }
+        }
     }
     // `extern "C"` heads: scalar C functions become `extern fn` (Gabbro has
     // no `extern "C"` form — the contract is the signature + effects +

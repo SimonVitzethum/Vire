@@ -873,6 +873,26 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                     ));
                 } else {
                     syscalls.insert(name.clone(), SyscallInfo { num: *num, params: kinds });
+                    // Record the declaration in the IR (param names + wraps
+                    // for the Gabbro path's `syscall ... via ...` gates).
+                    // Int kinds lower to I64 at call sites (I32 is widened);
+                    // buffers lower to Ref (declined on the Gabbro path).
+                    let ps = params
+                        .iter()
+                        .map(|p| {
+                            let ty = match p.ty.as_ref().map(|t| t.name.as_str()) {
+                                Some("Array" | "array") => Ty::Ref,
+                                _ => Ty::I64,
+                            };
+                            (p.name.clone(), ty)
+                        })
+                        .collect();
+                    prog.syscall_decls.push(fastllvm_ir::SyscallDecl {
+                        name: name.clone(),
+                        params: ps,
+                        ret: Ty::I64,
+                        num: *num as i64,
+                    });
                 }
             }
         }

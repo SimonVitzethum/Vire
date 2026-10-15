@@ -333,6 +333,62 @@ pub struct ExternDecl {
     pub ptr_ret: bool,
 }
 
+/// A Vire `syscall NAME(params) -> Ret = NUM` declaration (always fully
+/// typed at lowering; `Buf` params lower to `Ref`).
+#[derive(Debug, Clone)]
+pub struct SyscallDecl {
+    pub name: String,
+    pub params: Vec<(String, Ty)>,
+    pub ret: Ty,
+    pub num: i64,
+}
+
+/// One user-declared hardware register (`--abi` file): a named, typed,
+/// classed window at a region-relative offset.
+#[derive(Debug, Clone)]
+pub struct HwReg {
+    pub name: String,
+    /// `u8`/`u16`/`u32`/`u64`.
+    pub ty: String,
+    /// `r`/`w`/`rw`.
+    pub class: String,
+    pub off: u64,
+}
+
+/// One user-declared device (`--abi` file), linked by name to a
+/// `--hw-profile` region (which carries base/length).
+#[derive(Debug, Clone)]
+pub struct HwDeviceSpec {
+    pub name: String,
+    pub regs: Vec<HwReg>,
+}
+
+/// One user-supplied syscall gate (`--abi` file): the target ABI knowledge
+/// the emitter cannot invent (registers, clobbers, errors, assumption).
+#[derive(Debug, Clone)]
+pub struct HwSyscallSpec {
+    pub name: String,
+    pub gate: String,
+    pub number: i64,
+    pub ins: Vec<String>,
+    pub outs: Vec<String>,
+    pub clobbers: Vec<String>,
+    pub errors: Vec<(String, String)>,
+    pub assume: String,
+    pub assume_text: String,
+    pub falsifier: String,
+    pub requires: Vec<String>,
+    pub ensures: Vec<String>,
+}
+
+/// One user-supplied target (`--abi` file): the kernel + ISA a gate binds to.
+#[derive(Debug, Clone)]
+pub struct HwTarget {
+    pub name: String,
+    pub abi: String,
+    pub arch: String,
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub functions: Vec<Function>,
@@ -375,6 +431,14 @@ pub struct Program {
     /// scalar-only decls to `extern fn` heads (`Ptr` stays rejected there —
     /// no `int -> ptr`).
     pub extern_fns: Vec<ExternDecl>,
+    /// Vire `syscall` declarations (always fully typed at lowering).
+    pub syscall_decls: Vec<SyscallDecl>,
+    /// User-supplied target (`--abi` file): the kernel + ISA gates bind to.
+    pub hw_target: Option<HwTarget>,
+    /// User-declared devices (`--abi` file), linked by name to `hw_regions`.
+    pub hw_devices: Vec<HwDeviceSpec>,
+    /// User-supplied syscall gates (`--abi` file), linked by syscall name.
+    pub hw_syscalls: Vec<HwSyscallSpec>,
 }
 
 impl Program {
