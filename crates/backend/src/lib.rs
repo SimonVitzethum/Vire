@@ -1,5 +1,10 @@
 //! Naive lowering of mid-level IR → textual LLVM IR.
 //!
+//! PAUSIERT (2026-10-13, AGENTS.md §1): kein Ausbau, keine Fixes außer
+//! Bau-Fähigkeit. Dieser Emitter + `clang`-Pfad bleiben kompilierbar und
+//! ausführbar als Differenzial-Orakel für den Gabbro-Pfad (Bit-Parität).
+//! Neue Compiler-Arbeit geht ausschließlich in `gab.rs`.
+//!
 //! Deliberately kept dumb: every IR local becomes an `alloca`, every access
 //! a load/store — LLVM's mem2reg/SROA restores SSA. Textual
 //! `.ll` output instead of API bindings, because llvm-sys/inkwell lag
@@ -24,6 +29,9 @@ use std::fmt::Write;
 
 use fastllvm_ir::*;
 
+mod gab;
+pub use gab::emit_gab;
+
 
 fn llty(ty: Ty) -> &'static str {
     match ty {
@@ -38,7 +46,7 @@ fn llty(ty: Ty) -> &'static str {
 
 /// Intrinsics and helpers with hand-written declarations: the mini-runtime
 /// (`runtime.c`) — plus libc `syscall` (declared, never defined here; linked
-/// from libc for declared `syscall` items, language/HW-SAFE.md §2).
+/// from libc for declared `syscall` items, the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2).
 const RUNTIME_DECLS: &[(&str, &str)] = &[
     ("syscall", "i64 (i64, ...)"),
     ("jrt_println_str", "void (ptr)"),
@@ -648,7 +656,7 @@ fn abi_layout_hash(program: &Program, class: &str) -> i64 {
     h as i64
 }
 
-/// The **shared-type ABI** table (DYNAMIC-VIRE-PLAN.md P1 step 2b) — a C-readable
+/// The **shared-type ABI** table (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1 step 2b) — a C-readable
 /// description of every class's layout and of its *ownership* edges, emitted into the
 /// host executable and into every `--emit-module` `.so`. It exists so that
 /// `jrt_load_module`'s verifier can decide, at load time and without trusting the
@@ -1084,7 +1092,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
     if !instantiated.contains("java/lang/String") && (!program.strings.is_empty() || !program.classes.is_empty()) {
         writeln!(w, "@vt.java_lang_String = internal unnamed_addr constant [4 x ptr] [ptr @jrt_noop_drop, ptr @jrt_noop_trace, ptr null, ptr @jrt_copy_string]").unwrap();
     }
-    // MMIO descriptors (language/HW-SAFE.md §2): one immortal object per used
+    // MMIO descriptors (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): one immortal object per used
     // `--hw-profile` region — `{ refcount -1, vtable, base, len }`. RC no-ops
     // via refcount -1 (like string literals); drop/trace are no-ops (a handle
     // owns no heap); slot 3 is null (handles are capabilities — E422 rejects
@@ -1108,7 +1116,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
             writeln!(w, "@.mmio.{} = internal unnamed_addr constant {{ i64, ptr, i64, i64 }} {{ i64 -1, ptr @vt.mmio, i64 {}, i64 {} }}", sanitize(r), base, len).unwrap();
         }
     }
-    // Per-site MMIO accessors + compiler fences (language/HW-SAFE.md §2): tiny
+    // Per-site MMIO accessors + compiler fences (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): tiny
     // generated functions with a single volatile load/store or fence — no inline
     // asm, no runtime. The name encodes everything (`__vire_mmio_r32_<base>_<off>`).
     {
@@ -1336,7 +1344,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         emit_function(w, &ctx, fi, f, &mut dg, &fn_lines, uncatchable, program.debug_local_names.get(&f.name), arena_ctx.contains(&f.name), &heap_esc, freestanding);
     }
 
-    // Dynamic-fn dispatch table (DYNAMIC-VIRE-PLAN.md P1): one mutable code pointer per
+    // Dynamic-fn dispatch table (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1): one mutable code pointer per
     // `dynamic fn` / `open fn`, initialized to the function's own body (the default). A call
     // to such a fn loads its slot and calls through it (see Statement::Call); the runtime's
     // `jrt_dyn_install` overwrites a slot with a loaded module's override. `extern void
@@ -1346,7 +1354,7 @@ fn emit_full(program: &Program, debug: Option<(&str, &str)>, freestanding: bool)
         let inits: Vec<String> = program.dyn_fns.iter().map(|n| format!("ptr @{n}")).collect();
         writeln!(w, "@jrt_dynslot = global [{} x ptr] [{}]", program.dyn_fns.len(), inits.join(", ")).unwrap();
     }
-    // Binary patch table (DYNAMIC-VIRE-PATCH.md B0): one record per patchable function —
+    // Binary patch table (the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B0): one record per patchable function —
     // { i64 entry-address, i64 sled-length (bytes), ptr name } — so the runtime patcher
     // locates a function's reserved NOP sled by name. Static, read-only data (it cannot
     // leak); the sleds it points at stay inert until a patch is applied. Covers both the
@@ -2627,7 +2635,7 @@ fn emit_function(w: &mut String, ctx: &Ctx, fn_idx: usize, f: &Function, dg: &mu
     // its return address symbolizes via `jrt_symtab`. `#0` = { "frame-pointer"="all" },
     // emitted once at module end. Hosted builds keep the optimizer's default (no cost).
     let fp = if freestanding { "#0 " } else { "" };
-    // Binary patch point (DYNAMIC-VIRE-PATCH.md B0): a 5-byte NOP sled at the entry of a
+    // Binary patch point (the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B0): a 5-byte NOP sled at the entry of a
     // patchable function (currently the `dynamic fn`/`open fn` seams), so the runtime
     // patcher can later rewrite it into a `jmp`/`call` (hot-update, JIT collapse, mixin,
     // probe) — never over a real instruction. Inert (plain NOPs) until patched; only opted-
@@ -2989,7 +2997,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
         }
         Statement::Call { dest, func, args } => {
             let avs = call_args(w, e, args);
-            // A `dynamic fn` / `open fn` seam (DYNAMIC-VIRE-PLAN.md P1): dispatch through the
+            // A `dynamic fn` / `open fn` seam (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1): dispatch through the
             // mutable slot `@jrt_dynslot[slot]` (default = its own body) so a loaded module
             // can override it. `dyn_fns` is empty for Java and sealed programs → this branch
             // is never taken there (a plain direct call, unchanged).
@@ -3264,7 +3272,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             writeln!(w, "  {p} = getelementptr {}, ptr {o}, i32 0, i32 {idx}", ctx.struct_name(&owner)).unwrap();
             let tb = ctx.tbaa_suffix(&owner, field);
             if ty == Ty::Ref && ctx.field_is_weak(class, field) {
-                // `weak f: T` — a NON-OWNING back-edge (DYNAMIC-VIRE-PLAN.md §6). No
+                // `weak f: T` — a NON-OWNING back-edge (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6). No
                 // retain (the field takes no count) and no release of the old value (it
                 // never held one), so the store is a bare pointer write. This is what
                 // makes a cycle closed through this field reference-countable: the edge
@@ -3315,7 +3323,7 @@ fn emit_statement(w: &mut String, ctx: &Ctx, e: &mut FnEmitter, st: &Statement) 
             }
         }
         Statement::GetStatic { dest, class, field } => {
-            // MMIO descriptor handle (language/HW-SAFE.md §2): the address of the
+            // MMIO descriptor handle (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): the address of the
             // immortal per-region descriptor (emitted above from hw_regions) — no
             // load, no retain (immortal). The local is recorded in lowering's mmio
             // table, which drives readN/writeN to volatile accesses.

@@ -344,7 +344,7 @@ fn is_acyclic(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> bool {
             for f in &info.fields {
                 // A `weak` field is non-owning (no retain/release) — it can never keep
                 // an object alive, so it is not an edge of the OWNERSHIP graph and a
-                // cycle closed through it is not a leak (DYNAMIC-VIRE-PLAN.md §6).
+                // cycle closed through it is not a leak (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6).
                 if f.weak {
                     continue;
                 }
@@ -409,7 +409,7 @@ fn cyclic_classes(classes: &[ClassInfo], instantiated: &BTreeSet<String>) -> BTr
             for f in &info.fields {
                 // A `weak` field is non-owning (no retain/release) — it can never keep
                 // an object alive, so it is not an edge of the OWNERSHIP graph and a
-                // cycle closed through it is not a leak (DYNAMIC-VIRE-PLAN.md §6).
+                // cycle closed through it is not a leak (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6).
                 if f.weak {
                     continue;
                 }

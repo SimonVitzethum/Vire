@@ -30,9 +30,9 @@ pub fn inline_program(program: &mut Program) -> usize {
 
     // A `dynamic fn` / `open fn` seam must NOT be inlined — its calls dispatch through the
     // mutable slot so a loaded module can override it; inlining would bake in the default
-    // and bypass the override (DYNAMIC-VIRE-PLAN.md P1). Empty for sealed/Java programs.
+    // and bypass the override (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1). Empty for sealed/Java programs.
     let mut pinned = program.dyn_fns.clone();
-    // `@patchable` fns must keep a single entry to redirect (DYNAMIC-VIRE-PATCH.md B1), so
+    // `@patchable` fns must keep a single entry to redirect (the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B1), so
     // they are pinned against inlining too.
     pinned.extend(program.patch_fns.iter().cloned());
     // Copy candidates so callers stay mutable.

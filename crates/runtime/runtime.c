@@ -1,5 +1,9 @@
 /* fastllvm mini-runtime (platform layer: hosted-libc or freestanding/seL4).
  *
+ * PAUSIERT (2026-10-13, AGENTS.md §1): kein Ausbau — bleibt bau-fähig als
+ * Differenzial-Orakel für den Gabbro-Pfad (der LLVM-Pfad nutzt es weiter).
+ * Neue Compiler-Arbeit geht ausschließlich in den Gabbro-Pfad (`gab.rs`).
+ *
  * Deliberately small (DESIGN.md §6): println intrinsics, Java-semantics helpers
  * for idiv/irem and reference counting (stage 4, DESIGN.md §6/§7). The
  * no_std/seL4 variant replaces stdio/malloc with the primitives available there.

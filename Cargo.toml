@@ -1,76 +1,24 @@
 [workspace]
 resolver = "2"
-# Default build set: `vire` pulls in every fastllvm-* and (transitively)
-# csolver-* library it needs. The standalone `csolver-cli` (`solver`) binary is NOT a
-# dependency of vire (which calls the verifier as a library), so it is left out of the
-# default build to save its LTO — still buildable on demand with `cargo build -p csolver-cli`.
 default-members = ["crates/vire"]
 members = [
-    "crates/vire",       # Vire front-end (lexer/parser/AST → SSA IR)
-    "crates/ir",         # Vire-only SSA IR (lowering target)
-    "crates/solver",     # whole-program ownership/escape/bounds solver
-    "crates/backend",    # LLVM emission (only backend)
-    "crates/vire-wasm",  # frontend-only diagnostics CLI (wasm32-wasip1) for the VS Code extension
-    # --- REMOVED per AGENTS.md §1 (pure CPU project, no Java): crates/classfile,
-    #     crates/frontend, crates/driver (fastjavac). The runtime C source that vire
-    #     embeds lives at crates/runtime/ (no driver crate anymore).
-    # --- Vendored CSolver: the memory-safety verifier that gates inline C/asm
-    #     (verified-C-asm, the sound replacement for `unsafe`). Kept in-repo so the
-    #     whole toolchain builds offline with no external dependency. Package names
-    #     are `csolver-*`, disjoint from `fastllvm-*`. See language/VERIFIED-C-ASM.md.
-    "crates/csolver/core",
-    "crates/csolver/ir",
-    "crates/csolver/cfg",
-    "crates/csolver/parser",
-    "crates/csolver/mir",
-    "crates/csolver/llvm",
-    "crates/csolver/contracts",
-    "crates/csolver/asm",
-    "crates/csolver/elf",
-    "crates/csolver/memory",
-    "crates/csolver/absint",
-    "crates/csolver/symbolic",
-    "crates/csolver/solver",
-    "crates/csolver/verifier",
-    "crates/csolver/report",
-    "crates/csolver/cli",
+    "crates/vire",    # Vire front-end (lexer/parser/AST → SSA IR) + driver binary
+    "crates/ir",      # Vire-only SSA IR (lowering target)
+    "crates/solver",  # whole-program ownership/escape/bounds solver
+    "crates/backend", # Gabbro source emission (target) + LLVM execution oracle (paused)
+    # The runtime C source that vire embeds for the LLVM oracle lives at
+    # crates/runtime/ (data file, not a crate).
 ]
-# No vendored third-party compiler trees: pure CPU project (AGENTS.md §1).
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-# Extra fields inherited by the vendored CSolver crates (they use `field.workspace`).
-# CSolver (crates/csolver/**) is licensed under Apache-2.0 (see crates/csolver/LICENSE);
-# the rest of the project is GPL-3.0-or-later (see the root LICENSE). See LICENSING.md.
 rust-version = "1.94"
-license = "Apache-2.0"
-authors = ["CSolver contributors"]
-repository = "https://example.invalid/csolver"
-description = "FastLLVM / Vire toolchain (with vendored CSolver memory-safety verifier)."
+license = "GPL-3.0-or-later"
+authors = ["Vire contributors"]
+repository = "https://example.invalid/vire"
+description = "Vire language toolchain (Vire→Gabbro compiler with LLVM execution oracle)."
 
-# Path deps for the vendored CSolver crates — referenced by every csolver-* member via
-# the `csolver-x.workspace = true` shorthand. Path-only (no version pin) so they inherit
-# this workspace's version.
-[workspace.dependencies]
-csolver-core = { path = "crates/csolver/core" }
-csolver-ir = { path = "crates/csolver/ir" }
-csolver-cfg = { path = "crates/csolver/cfg" }
-csolver-parser = { path = "crates/csolver/parser" }
-csolver-mir = { path = "crates/csolver/mir" }
-csolver-llvm = { path = "crates/csolver/llvm" }
-csolver-contracts = { path = "crates/csolver/contracts" }
-csolver-asm = { path = "crates/csolver/asm" }
-csolver-elf = { path = "crates/csolver/elf" }
-csolver-memory = { path = "crates/csolver/memory" }
-csolver-absint = { path = "crates/csolver/absint" }
-csolver-symbolic = { path = "crates/csolver/symbolic" }
-csolver-solver = { path = "crates/csolver/solver" }
-csolver-verifier = { path = "crates/csolver/verifier" }
-csolver-report = { path = "crates/csolver/report" }
-
-# Lints for the vendored CSolver crates (they opt in via `[lints] workspace = true`).
-# FastLLVM's own crates do not opt in, so they are unaffected.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

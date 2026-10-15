@@ -41,13 +41,16 @@ pub enum Item {
     /// generator: for each `fn` an `extern "C"` trampoline is generated (with a
     /// C++ body) that is compiled/linked via the `native "c++"` path; the
     /// signatures are registered as Vire `extern`. Saves the
-    /// handwritten facade. See language/CPP-INTEROP.md.
+    /// handwritten facade. See the former language/CPP-INTEROP.md (removed in cleanup; see git history).
     Cxx { links: Vec<String>, preamble: String, fns: Vec<(FnSig, String)>, span: Span },
     /// `syscall NAME(params) -> Ret = NUM` — a declared OS system call (see
-    /// language/HW-SAFE.md). No inline asm, no libc wrapper written by the user:
+    /// the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history)). No inline asm, no libc wrapper written by the user:
     /// calls lower to `syscall(NUM, args…)` via libc. Params are `Int` or
     /// `Array[Byte]` (buffer → data pointer); at most 6. Ret must be annotated.
     Syscall { name: String, params: Vec<Param>, ret: Option<Type>, num: u64, span: Span },
+    /// `kernel [name]` — marks this compilation unit as a kernel module
+    /// (AGENTS.md §2.5). Only here (plus `use kernel::Rc`) is `Rc[T]` available.
+    Kernel { name: Option<String>, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -136,7 +139,7 @@ pub struct MacroParam {
 pub struct Field {
     pub name: String,
     pub ty: Type,
-    /// `weak f: T` — a **non-owning** reference field (DYNAMIC-VIRE-PLAN.md §6). It does
+    /// `weak f: T` — a **non-owning** reference field (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6). It does
     /// not retain on store and is not released on drop, so it carries no ownership and
     /// forms no ownership edge: it is the declared back-edge that lets an otherwise
     /// cyclic graph stay reference-counted without a collector. The referent must outlive
@@ -241,9 +244,9 @@ pub enum Expr {
     /// `capsule(a, b) { … }` — isolated arena scope: only `inputs` in, only the
     /// block value out (deep-copied), the interior RC-/collector-free (own arena).
     /// `&`-marked inputs are borrowed/read-only (no copy). See
-    /// language/CAPSULE-EVALUATION.md.
+    /// the former language/the former CAPSULE-the former EVALUATION.md (removed in cleanup; see git history) (removed in cleanup; see git history) (removed in cleanup; see git history).
     Capsule { inputs: Vec<(String, bool)>, body: Block, span: Span },
-    /// `region(max) { … }` — explicit bounded pool (M3, OWNERSHIP-STATIC.md):
+    /// `region(max) { … }` — explicit bounded pool (M3, the former OWNERSHIP-STATIC.md (removed in cleanup; see git history)):
     /// body allocations go into a pool of at most `max` bytes, freed en bloc;
     /// past the ceiling the program aborts (refuse-on-full, never silent).
     /// The body value must be scalar (no refs out); `return`/`break`/`continue`
@@ -252,7 +255,7 @@ pub enum Expr {
     /// `spawn f(arg)` — run a call on a new thread, safe by construction. The
     /// inner expression is the spawned call; lowering (see `spawn.rs`) desugars
     /// it to a generated worker shim + `jrt_spawn`, yielding a thread handle that
-    /// `join(h)` awaits. See language/REFERENCE.md §10.
+    /// `join(h)` awaits. See the former language/the former REFERENCE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §10.
     Spawn { call: Box<Expr>, span: Span },
 }
 

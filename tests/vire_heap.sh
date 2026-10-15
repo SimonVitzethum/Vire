@@ -279,9 +279,13 @@ fn main() {
 EOF
 
 # --- capsule struct CYCLE: a self-referential result is deep-copied out to the
-#     heap; the copied cycle must be collected (0-live) and preserve the self-link ---
+#     heap; the copied cycle must be collected (0-live) and preserve the self-link.
+#     The input back-edge is `weak` (the static-model discipline, AGENTS.md §2.6):
+#     a strong cycle in userspace is an E300 error (needs a ceiling or kernel Rc),
+#     while a weak back-edge keeps the input singly owned AND still exercises the
+#     copymap cycle termination + self-link preservation. ---
 case_ capsule_struct_cycle 16 <<'EOF'
-type Node { v: Int  next: Node }
+type Node { v: Int weak next: Node }
 fn main() {
     mut a = Node(7, null)
     a.next = a
@@ -295,16 +299,21 @@ fn main() {
 EOF
 
 # --- capsule struct SHARING: two fields alias one node → the deep copy must keep
-#     them shared (one copy via the map), so a mutation shows through both ---
+#     them shared (one copy via the map), so a mutation shows through both.
+#     The shared graph is built inside an explicit `region(max)` (AGENTS.md §2.3):
+#     bounded, pool-owned, freed en bloc — a loop-free shared DAG without a ceiling
+#     is an E300 error (needs a ceiling or kernel Rc). ---
 case_ capsule_struct_share 30 <<'EOF'
 type Node { v: Int  next: Node }
 type Pair { a: Node  b: Node }
 fn main() {
-    mut shared = Node(5, null)
-    mut p = Pair(shared, shared)
-    mut r = capsule(p) {
-        p.a.v = p.a.v + 10
-        p.a.v + p.b.v
+    mut r = region(4096) {
+        mut shared = Node(5, null)
+        mut p = Pair(shared, shared)
+        capsule(p) {
+            p.a.v = p.a.v + 10
+            p.a.v + p.b.v
+        }
     }
     print(r)
 }

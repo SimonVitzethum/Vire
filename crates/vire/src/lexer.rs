@@ -1,6 +1,6 @@
 //! Vire lexer: `&str → Vec<Token>`.
 //!
-//! Peculiarities (see language/PARSER.md §2): newline is a *soft*
+//! Peculiarities (see the former language/PARSER.md (removed in cleanup; see git history) §2): newline is a *soft*
 //! statement terminator (like Go — only after tokens that can end a statement),
 //! generics go in `[]` (never `<>`), comments `//` and nestable
 //! `/* */`, numbers with `_`/base/suffix, strings with escapes.
@@ -33,11 +33,13 @@ pub enum Tok {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kw {
-    Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Unsafe, Macro, Comptime,
+    Fn, Type, Trait, Impl, Mut, Const, Use, Pub, Extern, Macro, Comptime,
     Match, If, Elif, Else, While, For, In, Break, Continue, Return, Spawn, Capsule,
     And, Or, Not, As, True, False, SelfLower, SelfType, Native, With, Syscall,
     Region,
-    // Dynamic surface (DYNAMIC-VIRE-PLAN.md): `dynamic fn` = a runtime-overridable seam;
+    // `kernel` — marks a kernel module (AGENTS.md §2.5: `Rc[T]` lives only here).
+    Kernel,
+    // Dynamic surface (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history)): `dynamic fn` = a runtime-overridable seam;
     // `open trait`/`open type` = extensible at runtime. Sealed is the keyword-free default.
     Dynamic, Open,
 }
@@ -49,7 +51,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
     &[
         ("fn", Fn), ("type", Type), ("trait", Trait), ("impl", Impl),
         ("mut", Mut), ("const", Const), ("use", Use), ("pub", Pub),
-        ("extern", Extern), ("unsafe", Unsafe), ("macro", Macro),
+        ("extern", Extern), ("macro", Macro),
         ("comptime", Comptime), ("match", Match), ("if", If), ("elif", Elif),
         ("else", Else), ("while", While), ("for", For), ("in", In),
         ("break", Break), ("continue", Continue), ("return", Return),
@@ -57,6 +59,7 @@ pub const KW_TABLE: &[(&str, Kw)] = {
         ("and", And), ("or", Or), ("not", Not), ("as", As), ("with", With),
         ("true", True), ("false", False), ("self", SelfLower), ("Self", SelfType),
         ("dynamic", Dynamic), ("open", Open), ("syscall", Syscall), ("region", Region),
+        ("kernel", Kernel),
     ]
 };
 
@@ -260,6 +263,15 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("").to_string();
+        // AGENTS.md §3: there is no `unsafe` keyword in Vire (not even as an
+        // identifier). Reject at lex time with a numbered diagnostic so the
+        // user learns the typed replacement (hw items / contracts).
+        if s == "unsafe" {
+            self.diags.push(Diag::error(
+                "error[E410]: there is no `unsafe` in Vire — hardware/register access uses typed `hw` items (`Mmio::bind`, `syscall`, `Port`, `fence`), FFI uses `extern \"C\" header` (AGENTS.md §3)",
+                Span(start, self.pos),
+            ));
+        }
         match self.syntax.keyword(&s) {
             Some(kw) => Tok::Kw(kw),
             None => Tok::Ident(s),

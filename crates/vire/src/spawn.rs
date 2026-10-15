@@ -14,7 +14,7 @@
 //!
 //! The generated shim is compiler glue, not user `unsafe`, so it is emitted with
 //! abi `"c-glue"`: compiled as C but exempt from the CSolver verification gate and
-//! the `vire audit` trust boundary (it contains only a function-pointer handoff to
+//! the former `vire audit` trust boundary (removed) (it contains only a function-pointer handoff to
 //! a trusted runtime entry point).
 
 use crate::ast::*;
@@ -247,7 +247,7 @@ impl Ctx {
                 self.generated.push(Item::Native { abi: "c-glue".into(), code, links: vec![], span });
                 let param = Param { name: "a".into(), ty: Some(ptys[0].clone().unwrap_or_else(|| ty("Int"))), default: None };
                 let sig = FnSig { name: shim.clone(), generics: vec![], params: vec![param], ret: Some(ty("$Thread")), span };
-                self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+                self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![sig], links: vec![], header: None, span });
             }
             return Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: cargs, span });
         }
@@ -282,9 +282,9 @@ impl Ctx {
             // extern __envpack_f(a0: T0, …) -> $Env   and   __spawn_f(e: $Env) -> $Thread
             let pack_params = ptys.iter().enumerate().map(|(i, pt)| Param { name: format!("a{i}"), ty: Some(pt.clone().unwrap_or_else(|| ty("Int"))), default: None }).collect();
             let pack_sig = FnSig { name: pack.clone(), generics: vec![], params: pack_params, ret: Some(ty("$Env")), span };
-            self.generated.push(Item::Extern { abi: "C".into(), items: vec![pack_sig], links: vec![], header: None, span });
+            self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![pack_sig], links: vec![], header: None, span });
             let spawn_sig = FnSig { name: shim.clone(), generics: vec![], params: vec![Param { name: "e".into(), ty: Some(ty("$Env")), default: None }], ret: Some(ty("$Thread")), span };
-            self.generated.push(Item::Extern { abi: "C".into(), items: vec![spawn_sig], links: vec![], header: None, span });
+            self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![spawn_sig], links: vec![], header: None, span });
         }
         let env = Expr::Call { callee: Box::new(Expr::Ident(pack, span)), args: cargs, span };
         Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![env], span })
@@ -349,7 +349,7 @@ impl Ctx {
                 Param { name: "shared".into(), ty: Some(ptys[1].clone().unwrap_or_else(|| ty("Int"))), default: None },
             ];
             let sig = FnSig { name: shim.clone(), generics: vec![], params, ret: Some(ty("Int")), span };
-            self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+            self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![sig], links: vec![], header: None, span });
         }
         Some(Expr::Call { callee: Box::new(Expr::Ident(shim, span)), args: vec![args[0].clone(), args[1].clone()], span })
     }
@@ -417,7 +417,7 @@ impl Ctx {
                 Param { name: "arr".into(), ty: Some(Type { name: "Array".into(), args: vec![ty("Int")], borrowed: false, span }), default: None },
             ];
             let sig = FnSig { name: shim.clone(), generics: vec![], params, ret: Some(ty("Int")), span };
-            self.generated.push(Item::Extern { abi: "C".into(), items: vec![sig], links: vec![], header: None, span });
+            self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![sig], links: vec![], header: None, span });
         }
         // { mut __n = <count>  mut __s = <shared>  mut __r = array(__n)
         //   __pmap_shim(__n, __s, __r)  __r }

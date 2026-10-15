@@ -65,8 +65,14 @@ pub struct OwnReport {
     pub n_borrow: usize,
     pub n_region: usize,
     pub n_shared: usize,
-    /// `New` sites classified Shared: (function, statement-index) — E300 candidates.
+    /// `New` sites classified ownership-Shared: (function, statement-index) —
+    /// E300 candidates (transfer-dominance-only sites are singly owned and
+    /// do NOT count, though M2 keeps them on the RC path).
     pub shared_news: Vec<(String, usize)>,
+    /// Functions containing a strong `Rc`-only reference cycle (AGENTS.md §2.6):
+    /// with no collector nothing could reclaim it — break with `weak` or move
+    /// to a ceiling. Reported per function (a cycle has no single site).
+    pub rc_cycle_fns: Vec<String>,
 }
 
 /// Does ref argument `j` of a call to `func` possibly get captured (stored into
@@ -78,13 +84,18 @@ fn call_captures(func: &str, summaries: &BTreeMap<String, Vec<bool>>) -> Vec<boo
         return s.clone();
     }
     // Known-pure runtime helpers: observe but never retain the ref.
+    // (Includes the capsule deep-copy-IN functions: they copy the reachable
+    // data into the callee arena and never retain the original — the caller's
+    // ownership is unaffected, so the input stays singly owned. The arena copy
+    // dies with the pop; only the original's lifetime counts for E300.
+    // Includes the deep-copy-OUT functions too: they read the (arena) original
+    // and return a fresh heap copy without retaining the original.)
     if matches!(
         func,
         "jrt_null_check"
             | "syscall"
             | "jrt_println_str"
             | "jrt_println_long"
-            | "jrt_println_double"
             | "jrt_println_char"
             | "jrt_print_str"
             | "jrt_print_long"
@@ -105,6 +116,10 @@ fn call_captures(func: &str, summaries: &BTreeMap<String, Vec<bool>>) -> Vec<boo
             | "vire_set_contains"
             | "jrt_atomic_get"
             | "jrt_mutex_get"
+            | "jrt_array_clone"
+            | "jrt_deep_copy_arena"
+            | "jrt_deep_copy_heap"
+            | "jrt_arena_export_array"
     ) {
         return vec![false; 8];
     }
@@ -499,6 +514,9 @@ fn classify_function(
         Other,
     }
     let mut def = vec![Def::Other; n];
+    // Kernel `Rc$T` New dests: forced-shared roots (AGENTS.md §2.5). Collected
+    // at def time (class is on the statement); applied at state init.
+    let mut rc_forced = BTreeSet::new();
     for (i, t) in f.params.iter().enumerate() {
         if *t == Ty::Ref && (i as u32) < n as u32 {
             def[i] = Def::Param;
@@ -517,6 +535,14 @@ fn classify_function(
                 // Pool-context callees (called only from pools): their News land
                 // in the caller's pool at runtime — Region, like textual depth.
                 Statement::New { dest, .. } if pctx.contains(&f.name) => def[dest.0 as usize] = Def::Region,
+                // Kernel `Rc$T` instances (AGENTS.md §2.5): forced-shared — the
+                // explicit opt-in to counting. Never Unique/Borrow/Region, never
+                // elided, never arena'd (pool-contained Rc News above stay pool:
+                // en-bloc free subsumes counting while contained).
+                Statement::New { dest, class, .. } if class.starts_with("Rc$") => {
+                    def[dest.0 as usize] = Def::New;
+                    rc_forced.insert(dest.0);
+                }
                 Statement::New { dest, .. } => def[dest.0 as usize] = Def::New,
                 Statement::StackNew { dest, .. } | Statement::StackNewArray { dest, .. } | Statement::RegionNewArray { dest, .. } => {
                     def[dest.0 as usize] = Def::Region
@@ -611,6 +637,12 @@ fn classify_function(
         if *t != Ty::Ref {
             continue;
         }
+        // Forced-shared `Rc$T` roots first (explicit opt-in — never Unique even
+        // though freshly allocated; the count is the semantics).
+        if rc_forced.contains(&(i as u32)) {
+            state[i] = OwnState::Shared;
+            continue;
+        }
         match def[i] {
             Def::New | Def::FreshCall => state[i] = OwnState::Unique,
             Def::Region => state[i] = OwnState::Region,
@@ -639,10 +671,22 @@ fn classify_function(
 
     // Knock-down: any use that breaks uniqueness/borrow makes the value Shared
     // (propagated forward through copies at the end).
+    //
+    // THREE SETS (AGENTS.md §2): `knock` feeds M2 codegen (any doubt → RC path,
+    // including M2-decidability doubts like the transfer-dominance rule below);
+    // `oother` + `oloop` feed E300 (ownership reasons only). `oother` = capture,
+    // escape, cycles, multi-owner use. `oloop` = loop-carried overwrite (needs a
+    // per-iteration release under RC). A conditionally-transferred single owner
+    // is ownable (accepted by E300) even where M2 keeps the RC path
+    // (conservative codegen). Loop-filled-into-owned collections are forgiven
+    // separately (see `forgiven` at the E300 count below).
     let mut knock = BTreeSet::new();
-    let bad_use_of = |op: &Operand, knock: &mut BTreeSet<u32>| {
+    let mut oother = BTreeSet::new();
+    let mut oloop = BTreeSet::new();
+    let bad_use_of = |op: &Operand, knock: &mut BTreeSet<u32>, oother: &mut BTreeSet<u32>| {
         if let Operand::Copy(l) = op {
             knock.insert(l.0);
+            oother.insert(l.0);
         }
     };
     for b in &f.blocks {
@@ -652,31 +696,41 @@ fn classify_function(
                     let cap = call_captures(func, summ);
                     for (j, a) in args.iter().enumerate() {
                         if cap.get(j).copied().unwrap_or(true) {
-                            bad_use_of(a, &mut knock);
+                            bad_use_of(a, &mut knock, &mut oother);
                         }
                     }
                 }
                 // Unknown dispatch target → all ref args conservatively captured.
                 Statement::CallVirtual { args, .. } | Statement::CallPoly { args, .. } => {
                     for a in args {
-                        bad_use_of(a, &mut knock);
+                        bad_use_of(a, &mut knock, &mut oother);
                     }
                 }
-                Statement::PutStatic { value, .. } => bad_use_of(value, &mut knock),
-                Statement::PutField { obj, value, .. } => {
+                Statement::PutStatic { value, .. } => bad_use_of(value, &mut knock, &mut oother),
+                Statement::PutField { obj, value, class, .. } => {
                     // Storing into a Shared parent shares the value. (Parent
                     // states resolve in the propagation fixpoint below; the
                     // direct cases are handled here, the rest iteratively.)
+                    // Exception (E300-precision, M2-conservative): a store into
+                    // an `Rc$` parent is owned-via-counting — the value rides
+                    // the parent's lifetime. It knocks for M2 (RC path, as
+                    // before) but NOT for E300 (no false positive on owned
+                    // subgraphs of shared graphs).
                     if let Operand::Copy(o) = obj {
                         if state[o.0 as usize] == OwnState::Shared {
-                            bad_use_of(value, &mut knock);
+                            if let Operand::Copy(l) = value {
+                                knock.insert(l.0);
+                                if !class.starts_with("Rc$") {
+                                    oother.insert(l.0);
+                                }
+                            }
                         }
                     }
                 }
                 Statement::ArrayStore { arr, value, .. } => {
                     if let Operand::Copy(a) = arr {
                         if state[a.0 as usize] == OwnState::Shared {
-                            bad_use_of(value, &mut knock);
+                            bad_use_of(value, &mut knock, &mut oother);
                         }
                     }
                 }
@@ -689,7 +743,96 @@ fn classify_function(
     // Reassignment kills uniqueness (the old value's owner is unclear without
     // release tracking — conservative): a Unique local assigned twice → Shared,
     // except the single defining statement.
+    //
+    // EXEMPTION — exclusive-path merges (sound): an if/match value-merge assigns
+    // its result local once per branch (`res = a` / `res = b`) — dynamically only
+    // ONE of them executes, so the merged value still has exactly one owner.
+    // Exempt a Unique local whose every (reachable) definition is a pure move
+    // `Assign(d, Use(Copy))` and no definition block reaches another (the
+    // if/match diamond; a loop-carried or straight-line double-assign reaches
+    // itself or the other and stays knocked). Sources still knock through the
+    // bidirectional copy propagation below, so a merge with a Shared arm knocks.
     {
+        // Block successors (local copy — the shared one is computed below).
+        let succ_of = |bi: usize| -> Vec<usize> {
+            if bi >= f.blocks.len() {
+                return vec![];
+            }
+            match &f.blocks[bi].terminator {
+                Terminator::Goto(b) => vec![b.0 as usize],
+                Terminator::Branch { then_blk, else_blk, .. } => {
+                    vec![then_blk.0 as usize, else_blk.0 as usize]
+                }
+                Terminator::Switch { default, cases, .. } => {
+                    let mut v = vec![default.0 as usize];
+                    v.extend(cases.iter().map(|(_, b)| b.0 as usize));
+                    v
+                }
+                Terminator::Return(_) => vec![],
+            }
+        };
+        // Blocks reachable from entry (dead-code defs never execute).
+        let mut entry_reach = BTreeSet::from([0usize]);
+        {
+            let mut stack = vec![0usize];
+            while let Some(bi) = stack.pop() {
+                for s in succ_of(bi) {
+                    if s < f.blocks.len() && entry_reach.insert(s) {
+                        stack.push(s);
+                    }
+                }
+            }
+        }
+        // `reaches(a, b)`: block a can reach block b (reflexive).
+        let reaches = |a: usize, b: usize| -> bool {
+            if a == b {
+                return true;
+            }
+            let mut seen = BTreeSet::from([a]);
+            let mut stack = vec![a];
+            while let Some(x) = stack.pop() {
+                for s in succ_of(x) {
+                    if s == b {
+                        return true;
+                    }
+                    if s < f.blocks.len() && seen.insert(s) {
+                        stack.push(s);
+                    }
+                }
+            }
+            false
+        };
+        // Per-local: definition blocks + whether every definition is a pure move.
+        // A `res = null` definition carries no ownership (null needs no owner),
+        // so it is merge-compatible like a move (the match fallthrough arm).
+        let mut def_blocks: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut all_pure = vec![true; n];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for st in &b.statements {
+                let (dest, pure) = match st {
+                    Statement::Assign(d, Rvalue::Use(Operand::Copy(_))) => (Some(d.0), true),
+                    Statement::Assign(d, Rvalue::Use(Operand::ConstNull)) => (Some(d.0), true),
+                    Statement::Assign(d, _) => (Some(d.0), false),
+                    Statement::Call { dest: Some(d), .. }
+                    | Statement::CallGuarded { dest: Some(d), .. }
+                    | Statement::CallVirtual { dest: Some(d), .. }
+                    | Statement::CallPoly { dest: Some(d), .. }
+                    | Statement::New { dest: d, .. }
+                    | Statement::StackNew { dest: d, .. }
+                    | Statement::StackNewArray { dest: d, .. }
+                    | Statement::RegionNewArray { dest: d, .. }
+                    | Statement::NewArray { dest: d, .. }
+                    | Statement::GetField { dest: d, .. } => (Some(d.0), false),
+                    _ => (None, true),
+                };
+                if let Some(d) = dest {
+                    def_blocks[d as usize].push(bi);
+                    if !pure {
+                        all_pure[d as usize] = false;
+                    }
+                }
+            }
+        }
         let mut def_count = vec![0u32; n];
         for b in &f.blocks {
             for st in &b.statements {
@@ -713,7 +856,42 @@ fn classify_function(
             }
         }
         for (i, t) in f.locals.iter().enumerate() {
-            if *t == Ty::Ref && state[i] == OwnState::Unique && def_count[i] > 1 {
+            if *t != Ty::Ref || state[i] != OwnState::Unique || def_count[i] <= 1 {
+                continue;
+            }
+            // Merge exemption: all live defs pure moves on mutually-exclusive paths.
+            // (One or zero live defs: no dynamic reassignment at all — exempt.)
+            //
+            // The exemption applies to E300 (`oother`) ONLY: the merged value is
+            // singly owned, so a dynamic-lifetime error would be a false
+            // positive. M2 codegen (`knock`) stays conservative — its per-root
+            // exit-free needs path decisions the merge does not give it (a
+            // 0-consumer branch root would be freed at exit while the merged
+            // value was returned). Same value, two lenses; both sound.
+            let live_defs: Vec<usize> =
+                def_blocks[i].iter().copied().filter(|b| entry_reach.contains(b)).collect();
+            let exclusive = live_defs.len() <= 1
+                || (all_pure[i] && {
+                    let mut ok = true;
+                    for (x, a) in live_defs.iter().enumerate() {
+                        for b in live_defs.iter().skip(x + 1) {
+                            if reaches(*a, *b) || reaches(*b, *a) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                    }
+                    ok
+                });
+            // NOT exclusive: genuinely reassigned → both sets (M2 + E300).
+            if !exclusive {
+                knock.insert(i as u32);
+                oother.insert(i as u32);
+            } else if live_defs.len() > 1 {
+                // Exclusive merge: M2-conservative (RC path, as before), E300-clean.
                 knock.insert(i as u32);
             }
         }
@@ -851,6 +1029,11 @@ fn classify_function(
         // never execute: consumers there don't count (the owner keeps the
         // value → exit-free is correct for them).
         let mut bad_root = BTreeSet::new();
+        // Values stored into Shared `Rc$` parents: owned-via-counting (same
+        // E300-precision/M2-conservative split as the direct check above —
+        // knock for M2, never `oother` for E300). Tracked separately so the
+        // web-knock below can split them.
+        let mut bad_root_rc = BTreeSet::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             let live = reachable.contains(&bi);
             for st in &b.statements {
@@ -864,6 +1047,7 @@ fn classify_function(
                         // Only a Unique/Region parent keeps the value provably owned:
                         // a Shared OR Borrow parent has a lifetime we don't control
                         // (caller-owned) — storing there shares the value.
+                        // (`Rc$` parents below: owned-via-counting, see `bad_root_rc`.)
                         let parent_owned = matches!(obj, Operand::Copy(o) if matches!(state[o.0 as usize], OwnState::Unique | OwnState::Region));
                         if parent_owned {
                             if live {
@@ -874,6 +1058,8 @@ fn classify_function(
                                     root_cons_block[r as usize] = Some(bi);
                                 }
                             }
+                        } else if class.starts_with("Rc$") {
+                            bad_root_rc.insert(v.0);
                         } else {
                             bad_root.insert(v.0);
                         }
@@ -997,6 +1183,13 @@ fn classify_function(
             // above): per-iteration overwrites of pool refs need no release, and
             // must not cascade onto the pool roots (that would E300-count sound
             // pooling and reintroduce per-iteration RC traffic on no-op calls).
+            //
+            // TRAVERSAL exemption (E300 only): `cur = cur.next` re-points within
+            // the SAME ownership web — no ownership changes hands, so no
+            // per-iteration release is owed and E300 must not fire. Detected as
+            // an in-cycle `d = s` where s's web root equals d's root (s itself a
+            // same-root copy, or a same-block GetField off a same-root base).
+            // M2 (`knock`) still knocks — only the E300 loop set skips.
             for bi in reachable.iter().filter(|b| in_cycle[**b]) {
                 for st in &f.blocks[*bi].statements {
                     let dest = match st {
@@ -1016,6 +1209,30 @@ fn classify_function(
                     if let Some(d) = dest {
                         if f.locals[d as usize] == Ty::Ref && !pool_mem[d as usize] {
                             knock.insert(d);
+                            // Traversal re-point? (E300 loop set skips; M2 knocks.)
+                            let mut traversal = false;
+                            if let Statement::Assign(_, Rvalue::Use(Operand::Copy(s))) = st {
+                                let droot = root_of[d as usize];
+                                if droot != u32::MAX {
+                                    // Web root of the source: a same-block GetField
+                                    // result resolves to its base's root, else its own.
+                                    let mut sroot = root_of[s.0 as usize];
+                                    if sroot == u32::MAX {
+                                        for st2 in &f.blocks[*bi].statements {
+                                            if let Statement::GetField { dest, obj: Operand::Copy(base), .. } = st2 {
+                                                if dest.0 == s.0 {
+                                                    sroot = root_of[base.0 as usize];
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    traversal = sroot == droot;
+                                }
+                            }
+                            if !traversal {
+                                oloop.insert(d);
+                            }
                         }
                     }
                 }
@@ -1039,17 +1256,19 @@ fn classify_function(
             if *t == Ty::Ref && state[i] == OwnState::Unique && root_of[i] as usize == i {
                 if root_consumers[i] > 1 {
                     knock.insert(i as u32);
+                    oother.insert(i as u32);
                 }
             }
         }
-        // TRANSFER RULE (soundness-critical, unified for stores and returns):
-        // a single transfer T is statically decidable per exit E iff either
-        // T dominates E (all paths ran the transfer → parent/caller owns →
-        // skip) or T cannot reach E (no path ran it → local owns-or-null →
+        // TRANSFER RULE (soundness-critical for M2 codegen, NOT an ownership
+        // verdict): a single transfer T is statically decidable per exit E iff
+        // either T dominates E (all paths ran the transfer → parent/caller owns
+        // → skip) or T cannot reach E (no path ran it → local owns-or-null →
         // free). If some paths run T and others avoid it (T reaches E without
-        // dominating it), neither choice is safe → Shared (RC fallback).
-        // Returns are a special case for free (a return block reaches only
-        // itself, so other exits always free).
+        // dominating it), M2 keeps the RC path — but the value is still singly
+        // owned, so E300 (`oother`) does NOT count it. Returns are a special
+        // case for free (a return block reaches only itself, so other exits
+        // always free).
         for (i, t) in f.locals.iter().enumerate() {
             if *t == Ty::Ref && state[i] == OwnState::Unique && root_of[i] as usize == i {
                 if root_consumers[i] == 1 && !root_has_ret[i] {
@@ -1067,6 +1286,19 @@ fn classify_function(
         }
         // Values stored into Shared parents: knock their whole web via the root.
         for v in &bad_root {
+            let r = root_of[*v as usize];
+            if r != u32::MAX {
+                knock.insert(r);
+                oother.insert(r);
+            } else {
+                knock.insert(*v);
+                oother.insert(*v);
+            }
+        }
+        // Values stored into Shared `Rc$` parents: owned-via-counting — knock
+        // the web for M2 (RC path, retains balance) but keep E300 clean (the
+        // value rides the explicitly-counted parent's lifetime).
+        for v in &bad_root_rc {
             let r = root_of[*v as usize];
             if r != u32::MAX {
                 knock.insert(r);
@@ -1089,9 +1321,58 @@ fn classify_function(
         // `weak` stores are no edges (non-owning back-edge, like the solver's
         // own graph exclusion). Self-stores ride the same map (a DFS that
         // returns to its start through any path, length ≥ 1).
-        let mut edges: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-        for b in &f.blocks {
+        //
+        // TRANSFER-shape stores form no edges: `New(p)` + same-block
+        // `Assign(h, Copy(p))` (h ≠ p, carrier takeover) + same-block
+        // `p.f = h` (old value into the new node, before the takeover).
+        // At static-root granularity this is a self-edge, but dynamically it
+        // is the push-front chain (each instance points to its predecessor —
+        // acyclic); only a separate backward store (new into old, which never
+        // matches this shape) can close a real cycle, and that edge is kept.
+        // Without this, every `head = Node(head, i)` would read as a cycle.
+        let mut transfer_store: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            // New-dests of this block.
+            let news: BTreeSet<u32> = b
+                .statements
+                .iter()
+                .filter_map(|st| match st {
+                    Statement::New { dest, .. } => Some(dest.0),
+                    _ => None,
+                })
+                .collect();
+            if news.is_empty() {
+                continue;
+            }
+            // Carrier takeovers `h = p` of those News in this block.
+            let mut takeovers: Vec<(u32, u32)> = Vec::new();
             for st in &b.statements {
+                if let Statement::Assign(dest, Rvalue::Use(Operand::Copy(s))) = st {
+                    if news.contains(&s.0) && dest.0 != s.0 {
+                        takeovers.push((dest.0, s.0));
+                    }
+                }
+            }
+            if takeovers.is_empty() {
+                continue;
+            }
+            for (si, st) in b.statements.iter().enumerate() {
+                let (p, v) = match st {
+                    Statement::PutField { obj: Operand::Copy(o), value: Operand::Copy(v), .. } => (o.0, v.0),
+                    Statement::ArrayStore { arr: Operand::Copy(a), value: Operand::Copy(v), .. } => (a.0, v.0),
+                    _ => continue,
+                };
+                if news.contains(&p) && takeovers.iter().any(|(h, q)| *h == v && *q == p) {
+                    transfer_store.insert((bi, si));
+                }
+            }
+        }
+        let mut edges: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (si, st) in b.statements.iter().enumerate() {
+                if transfer_store.contains(&(bi, si)) {
+                    continue;
+                }
                 let (parent, value) = match st {
                     Statement::PutField { obj: Operand::Copy(o), value: Operand::Copy(v), class, field, .. }
                         if !weak.contains(&(class.clone(), field.clone())) =>
@@ -1141,11 +1422,23 @@ fn classify_function(
                     if !all_pooled {
                         cyclic.insert(r);
                     }
+                    // Strong `Rc`-only cycles (AGENTS.md §2.6): with no collector
+                    // there is nothing that could reclaim them — a silent leak.
+                    // Every member forced-shared via `Rc$` (weak back-edges form
+                    // no edges, so they never appear here). Reported separately
+                    // (see `rc_cycle_fns`): break with `weak` or a ceiling.
+                    // Mixed cycles already E300-fire through their plain members.
+                    if reaches_self && !seen.is_empty() && seen.iter().all(|m| rc_forced.contains(m)) {
+                        if !rep.rc_cycle_fns.contains(&f.name) {
+                            rep.rc_cycle_fns.push(f.name.clone());
+                        }
+                    }
                 }
             }
         }
         for r in cyclic {
             knock.insert(r);
+            oother.insert(r);
         }
     }
     // Propagate knock-down through copies to fixpoint — BIDIRECTIONAL (soundness-
@@ -1154,6 +1447,9 @@ fn classify_function(
     // the case of a directly-knocked copy (e.g. passed to a capturing call)
     // whose root would otherwise be exit-freed while the copy still holds a
     // retained +1 → release-after-free. Either direction knocks the web.
+    // (Mirrored for `oother`/`oloop`: a knocked copy knocks its web in the same
+    // source class, so E300 sees the whole dynamically-shared web, not just
+    // the use site — and loop-only knock stays loop-only through copies.)
     loop {
         let mut grew = false;
         for b in &f.blocks {
@@ -1163,6 +1459,18 @@ fn classify_function(
                         grew = true;
                     }
                     if knock.contains(&dest.0) && knock.insert(s.0) {
+                        grew = true;
+                    }
+                    if oother.contains(&s.0) && oother.insert(dest.0) {
+                        grew = true;
+                    }
+                    if oother.contains(&dest.0) && oother.insert(s.0) {
+                        grew = true;
+                    }
+                    if oloop.contains(&s.0) && oloop.insert(dest.0) {
+                        grew = true;
+                    }
+                    if oloop.contains(&dest.0) && oloop.insert(s.0) {
                         grew = true;
                     }
                 }
@@ -1306,14 +1614,199 @@ fn classify_function(
             },
         );
     }
-    // Shared New sites (E300 candidates): heap allocations with dynamic
-    // lifetime. Pool-contained sites (Def::Region, never knocked for any
-    // escape-ish reason) already HAVE their ceiling (the pool) and don't count.
+    // Shared New sites (E300 candidates): heap allocations with genuinely
+    // dynamic lifetime — `oother`-knocked (capture, escape, cycles, multi-owner
+    // use), or loop-knocked (`oloop`) without a static home. Transfer-dominance
+    // (M2-codegen doubt) does NOT count: the value is still singly owned.
+    // Pool-contained sites (Def::Region, never knocked for any escape-ish
+    // reason) already HAVE their ceiling (the pool) and don't count.
+    //
+    // FORGIVEN (loop-allocated into owned homes): a loop-knocked `New` whose
+    // value reaches an owned home unconditionally is array-/chain-owned (freed
+    // with the home at any size — the unbounded-but-ownable class, AGENTS.md
+    // §2.6). Two shapes, both same-block straight-line (⇒ unconditional):
+    // (a) direct anchor: stored into an owned (Unique/Region) parent;
+    // (c) carrier takeover (push-front idiom `head = Node(head, i)`): taken over
+    // by a carrier `h`, whose old value the same block stored into the new node
+    // BEFORE the takeover (old owned by new, new owned by carrier — a chain).
+    // Copies (other than the single takeover), calls, returns, or stores
+    // elsewhere (or a non-loop knock source) disqualify — doubt stays counted.
+    // A direct anchor AND a takeover together are two homes (shared) — also out.
+    // M2 (`knock`) is unaffected: the site keeps the RC path; only E300 is cleaned.
+    let mut forgiven = BTreeSet::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (si, st) in b.statements.iter().enumerate() {
+            let d = match st {
+                Statement::New { dest, .. } => dest.0,
+                _ => continue,
+            };
+            if !oloop.contains(&d) || oother.contains(&d) {
+                continue;
+            }
+            let uses_d = |op: &Operand| matches!(op, Operand::Copy(l) if l.0 == d);
+            // Anchor: a same-block store of d into an owned parent.
+            let mut anchored = false;
+            // Carrier takeovers `h = d` (at most one; recorded with position).
+            let mut takeovers: Vec<(u32, usize, usize)> = Vec::new();
+            // All Copy(d) uses must be anchors, the single takeover, or reads.
+            let mut clean = true;
+            for (bi2, b2) in f.blocks.iter().enumerate() {
+                for (si2, st2) in b2.statements.iter().enumerate() {
+                    // The New itself defines d — not a use.
+                    if bi2 == bi && si2 == si {
+                        continue;
+                    }
+                    match st2 {
+                        Statement::PutField { obj, value, .. } if uses_d(value) => {
+                            let owned_parent = match obj {
+                                Operand::Copy(p) => matches!(
+                                    state[p.0 as usize],
+                                    OwnState::Unique | OwnState::Region
+                                ),
+                                _ => false,
+                            };
+                            if bi2 == bi && owned_parent {
+                                anchored = true;
+                            } else {
+                                clean = false;
+                            }
+                        }
+                        Statement::ArrayStore { arr, value, .. } if uses_d(value) => {
+                            let owned_parent = match arr {
+                                Operand::Copy(p) => matches!(
+                                    state[p.0 as usize],
+                                    OwnState::Unique | OwnState::Region
+                                ),
+                                _ => false,
+                            };
+                            if bi2 == bi && owned_parent {
+                                anchored = true;
+                            } else {
+                                clean = false;
+                            }
+                        }
+                        // A carrier takeover `h = d` is validated below (needs
+                        // the old-value transfer store); record, don't decide.
+                        Statement::Assign(dest, Rvalue::Use(op))
+                            if uses_d(op) && dest.0 != d =>
+                        {
+                            takeovers.push((dest.0, bi2, si2));
+                        }
+                        // Mutating d through a field/array base: no ownership effect.
+                        Statement::PutField { obj, .. } if uses_d(obj) => {}
+                        Statement::ArrayStore { arr, .. } if uses_d(arr) => {}
+                        // Reads: field/array loads off d borrow.
+                        Statement::GetField { obj, .. } if uses_d(obj) => {}
+                        Statement::ArrayLoad { arr, .. } if uses_d(arr) => {}
+                        _ => {
+                            // Any other Copy(d) occurrence (call arg, other
+                            // Assign shape, return, PutStatic, Binary, cond…) —
+                            // be strict: conservatively disqualify. (Carrier
+                            // chains like `mut t = Node(..); a[i] = t` stay
+                            // counted: open precision, documented.)
+                            let mut found = false;
+                            match st2 {
+                                Statement::Assign(_, r) => match r {
+                                    Rvalue::Use(op) => {
+                                        if uses_d(op) {
+                                            found = true;
+                                        }
+                                    }
+                                    Rvalue::Binary(_, a, c) => {
+                                        if uses_d(a) || uses_d(c) {
+                                            found = true;
+                                        }
+                                    }
+                                    Rvalue::Convert(op) | Rvalue::Neg(op) => {
+                                        if uses_d(op) {
+                                            found = true;
+                                        }
+                                    }
+                                },
+                                Statement::Call { args, .. }
+                                | Statement::CallGuarded { args, .. }
+                                | Statement::CallVirtual { args, .. }
+                                | Statement::CallPoly { args, .. } => {
+                                    if args.iter().any(|a| uses_d(a)) {
+                                        found = true;
+                                    }
+                                }
+                                Statement::PutStatic { value, .. } => {
+                                    if uses_d(value) {
+                                        found = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            // Terminator returns of d also disqualify (strict).
+                            if found {
+                                clean = false;
+                            }
+                        }
+                    }
+                    if !clean {
+                        break;
+                    }
+                }
+                if !clean {
+                    break;
+                }
+            }
+            // Terminator check: `return d` disqualifies (strict).
+            if clean {
+                for b2 in &f.blocks {
+                    if let Terminator::Return(Some(op)) = &b2.terminator {
+                        if uses_d(op) {
+                            clean = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            // Carrier-takeover validation (c): exactly one `h = d`, same block
+            // as the New, plus a same-block store of the old carrier value `h`
+            // into the new node `d` positioned BEFORE the takeover (old owned
+            // by new, new owned by carrier — straight-line ⇒ unconditional).
+            // A direct anchor alongside means two homes (shared) — out.
+            let mut took_over = false;
+            if clean && !anchored && takeovers.len() == 1 {
+                let (h, tbi, tsi) = takeovers[0];
+                if tbi == bi {
+                    for (ssi, sst) in b.statements.iter().enumerate() {
+                        let transfer = match sst {
+                            Statement::PutField { obj, value, .. } => {
+                                matches!(obj, Operand::Copy(p) if p.0 == d)
+                                    && matches!(value, Operand::Copy(v) if v.0 == h)
+                            }
+                            Statement::ArrayStore { arr, value, .. } => {
+                                matches!(arr, Operand::Copy(p) if p.0 == d)
+                                    && matches!(value, Operand::Copy(v) if v.0 == h)
+                            }
+                            _ => false,
+                        };
+                        if transfer && ssi < tsi {
+                            took_over = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if clean && ((anchored && takeovers.is_empty()) || took_over) {
+                forgiven.insert(d);
+            }
+        }
+    }
     let mut idx = 0usize;
     for b in &f.blocks {
         for st in &b.statements {
-            if let Statement::New { dest, .. } = st {
-                if state[dest.0 as usize] == OwnState::Shared {
+            if let Statement::New { dest, class, .. } = st {
+                // Explicit kernel `Rc$T` opt-ins never count (AGENTS.md §2.5):
+                // sharing is the declared semantics, served by counting.
+                // (Strong `Rc`-only cycles are reported separately above.)
+                let counted = !class.starts_with("Rc$")
+                    && (oother.contains(&dest.0)
+                        || (oloop.contains(&dest.0) && !forgiven.contains(&dest.0)));
+                if counted {
                     let pooled_clean =
                         def[dest.0 as usize] == Def::Region && !knock.contains(&dest.0);
                     if !pooled_clean {

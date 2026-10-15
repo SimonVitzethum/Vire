@@ -5,7 +5,7 @@
 //! (parameter-substituted, hygienized) body. The remaining recursion
 //! base is preserved (termination unchanged).
 //!
-//! Two effects (see language/RECURSION-INLINING.md):
+//! Two effects (see the former language/RECURSION-INLINING.md (removed in cleanup; see git history)):
 //!  1. **Halving of call overhead** — each inline-expanded frame computes
 //!     several levels without a real `call`. Applies to EVERY recursion.
 //!  2. **Branching reduction** — exposes overlapping subcalls (fib(n-1) and

@@ -5,11 +5,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
+use fastllvm_ir::{ArrKind, BasicBlock, BinOp as IB, Block, ExternDecl, Function, Local, Operand, Program, Rvalue, Statement, Terminator, Ty};
 
 use crate::ast::*;
 
-/// Frozen dynamic-ABI version (DYNAMIC-VIRE-PLAN.md §3). Bumped on any change to the
+/// Frozen dynamic-ABI version (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §3). Bumped on any change to the
 /// object header / descriptor / dispatch-slot layout a loaded module depends on. `1` = the
 /// initial reflection substrate (P0). Exposed to programs via `abi_version()`.
 const VIRE_ABI_VERSION: i64 = 1;
@@ -216,9 +216,29 @@ struct Sig {
     /// For a ref-array return (`-> Array[Node]`): the element object class, so
     /// `f()[i].field` resolves and the result threads on like a local ref array.
     ret_arr_class: Option<String>,
+    /// Per-parameter `Ptr` shape (parallel to `params`): true where the declared
+    /// annotation is `Ptr`. Only meaningful for `extern` callees (see E421).
+    ptr_params: Vec<bool>,
+    /// True where the declared return annotation is `Ptr` (extern callees).
+    ptr_ret: bool,
+    /// True for `extern "C"` declarations (C-ABI boundary: Ptr provenance applies).
+    is_extern: bool,
 }
 
-/// A declared `syscall` item (language/HW-SAFE.md §2): OS number + per-param
+/// A type annotation that may cross the C-ABI boundary (`extern "C"` params and
+/// returns, mirroring the `vire bindgen` mapping in main.rs): scalars + the
+/// opaque `Ptr` handle. Anything else (Str, arrays, user objects, Result/Option)
+/// has no C layout — passing it would hand a heap-object pointer to C, so it is
+/// rejected (E421), never silently passed. `Unit` is allowed as a return (void).
+fn extern_mappable(name: &str) -> bool {
+    matches!(
+        name,
+        "Int" | "I64" | "U64" | "I32" | "U32" | "F64" | "Float" | "F32" | "Bool" | "Char"
+            | "Byte" | "U8" | "I8" | "U16" | "I16" | "Short" | "Ptr" | "Unit"
+    )
+}
+
+/// A declared `syscall` item (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): OS number + per-param
 /// shape. `Int` passes directly; `Buf` (`Array[Byte]`) passes the data pointer
 /// (the length stays an explicit user argument — no hidden pairing).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,6 +293,449 @@ fn arr_ret_generic(t: Option<&Type>) -> (Option<ArrKind>, Option<String>) {
     }
 }
 
+/// `Rc` gate scan (AGENTS.md §2.5, E300). The name `Rc` is reserved: any mention
+/// (type, definition, binding, constructor call, pattern, import) outside a gated
+/// kernel module (`kernel` marker + `use kernel::Rc`) is a loud error — never a
+/// silent scalar/class fallback. Inside a gated module each `Rc[T]` is validated
+/// (exactly one argument, a plain user object type — no nesting, no scalars,
+/// no arrays, no Option/Result) and its instance class `Rc$T` is collected for
+/// layout aliasing.
+fn rc_gate_msg(where_: &str) -> String {
+    format!("error[E300]: `Rc` in {where_} is only available in kernel modules — add a top-level `kernel` marker plus `use kernel::Rc`, or restructure without shared ownership (AGENTS.md §2.5)")
+}
+
+/// Scalar-ish names that can never be an `Rc` payload (they need no sharing).
+fn rc_scalar_name(n: &str) -> bool {
+    matches!(
+        n,
+        "Int" | "I64" | "U64" | "I32" | "U32" | "F64" | "Float" | "F32" | "Bool" | "Char"
+            | "Byte" | "U8" | "I8" | "U16" | "I16" | "Short" | "Unit" | "Ptr" | "Str"
+            | "Array" | "array" | "farray" | "Mmio" | "Ref" | "Option" | "Result"
+    )
+}
+
+fn rc_scan_type(
+    t: &Type,
+    where_: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    if t.name != "Rc" {
+        for a in &t.args {
+            rc_scan_type(a, where_, allowed, types, tparams, needs, errs);
+        }
+        return;
+    }
+    if !allowed {
+        errs.push(rc_gate_msg(where_));
+        for a in &t.args {
+            rc_scan_type(a, where_, allowed, types, tparams, needs, errs);
+        }
+        return;
+    }
+    if t.args.len() != 1 {
+        errs.push(format!("error[E100]: `Rc` in {where_} needs exactly one type argument (`Rc[T]`)"));
+        return;
+    }
+    let inner = &t.args[0];
+    if inner.name == "Rc" {
+        errs.push(format!("error[E300]: nested `Rc[Rc[T]]` in {where_} is not meaningful — flatten to a single `Rc[T]` (AGENTS.md §2.5)"));
+        return;
+    }
+    if !inner.args.is_empty() {
+        errs.push(format!("error[E300]: `Rc[{}]` in {where_} needs a plain object type (generic instances are not supported) (AGENTS.md §2.5)", inner.name));
+        return;
+    }
+    if rc_scalar_name(&inner.name) {
+        errs.push(format!("error[E300]: `Rc[{}]` in {where_} needs an object type — scalars need no sharing, arrays are already owned (AGENTS.md §2.5)", inner.name));
+        return;
+    }
+    if tparams.contains(&inner.name) {
+        errs.push(format!("error[E300]: `Rc[{}]` in {where_} over a generic parameter is not supported yet (AGENTS.md §2.5)", inner.name));
+        return;
+    }
+    if !types.contains_key(&inner.name) {
+        errs.push(format!("error[E300]: `Rc[{}]` in {where_} refers to unknown type `{}` (AGENTS.md §2.5)", inner.name, inner.name));
+        return;
+    }
+    needs.push((format!("Rc${}", inner.name), inner.name.clone()));
+}
+
+fn rc_scan_sig(
+    sig: &FnSig,
+    what: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    if sig.name == "Rc" {
+        errs.push("error[E300]: `Rc` is a reserved name (the kernel shared-ownership type) — rename the function (AGENTS.md §2.5)".into());
+    }
+    for p in &sig.params {
+        if p.name == "Rc" {
+            errs.push(format!("error[E300]: `Rc` is a reserved name — rename parameter `Rc` of `{what}` (AGENTS.md §2.5)"));
+        }
+        if let Some(t) = p.ty.as_ref() {
+            rc_scan_type(t, &format!("parameter `{}` of `{what}`", p.name), allowed, types, tparams, needs, errs);
+        }
+    }
+    if let Some(t) = sig.ret.as_ref() {
+        rc_scan_type(t, &format!("return type of `{what}`"), allowed, types, tparams, needs, errs);
+    }
+}
+
+fn rc_scan_block(
+    b: &Block2,
+    where_: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    for s in &b.stmts {
+        rc_scan_stmt(s, where_, allowed, types, tparams, needs, errs);
+    }
+    if let Some(t) = b.tail.as_deref() {
+        rc_scan_expr(t, where_, allowed, types, tparams, needs, errs);
+    }
+}
+
+fn rc_scan_stmt(
+    s: &Stmt,
+    where_: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    match s {
+        Stmt::Let { name, ty, value, .. } => {
+            if name == "Rc" {
+                errs.push(format!("error[E300]: `Rc` is a reserved name — rename the binding in `{where_}` (AGENTS.md §2.5)"));
+            }
+            if let Some(t) = ty.as_ref() {
+                rc_scan_type(t, &format!("annotation of `{name}` in `{where_}`"), allowed, types, tparams, needs, errs);
+            }
+            if let Some(v) = value.as_ref() {
+                rc_scan_expr(v, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Stmt::Assign { target, value, .. } => {
+            rc_scan_expr(target, where_, allowed, types, tparams, needs, errs);
+            rc_scan_expr(value, where_, allowed, types, tparams, needs, errs);
+        }
+        Stmt::Expr(e) => rc_scan_expr(e, where_, allowed, types, tparams, needs, errs),
+        Stmt::Return(e, _) => {
+            if let Some(e) = e.as_ref() {
+                rc_scan_expr(e, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Stmt::While { cond, body, .. } => {
+            rc_scan_expr(cond, where_, allowed, types, tparams, needs, errs);
+            rc_scan_block(body, where_, allowed, types, tparams, needs, errs);
+        }
+        Stmt::For { pat, iter, body, .. } => {
+            rc_scan_pattern(pat, where_, errs);
+            rc_scan_expr(iter, where_, allowed, types, tparams, needs, errs);
+            rc_scan_block(body, where_, allowed, types, tparams, needs, errs);
+        }
+        Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+fn rc_scan_pattern(pat: &Pattern, where_: &str, errs: &mut Vec<String>) {
+    match pat {
+        Pattern::Bind(n, _) if n == "Rc" => {
+            errs.push(format!("error[E300]: `Rc` is a reserved name — rename the binding in `{where_}` (AGENTS.md §2.5)"));
+        }
+        Pattern::Ctor { name, args, .. } if name == "Rc" => {
+            errs.push(format!("error[E300]: `Rc(..)` pattern in `{where_}` — `Rc` values are built via `mut r: Rc[T] = T(..)`, not patterns (AGENTS.md §2.5)"));
+            for a in args {
+                rc_scan_pattern(a, where_, errs);
+            }
+        }
+        Pattern::Ctor { args, .. } => {
+            for a in args {
+                rc_scan_pattern(a, where_, errs);
+            }
+        }
+        Pattern::Tuple(ps, _) | Pattern::Or(ps, _) => {
+            for a in ps {
+                rc_scan_pattern(a, where_, errs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rc_scan_expr(
+    e: &Expr,
+    where_: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    match e {
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Str(..)
+        | Expr::Char(..)
+        | Expr::Bool(..)
+        | Expr::Ident(..)
+        | Expr::SelfExpr(..) => {}
+        Expr::Unary { rhs, .. } => rc_scan_expr(rhs, where_, allowed, types, tparams, needs, errs),
+        Expr::Binary { lhs, rhs, .. } => {
+            rc_scan_expr(lhs, where_, allowed, types, tparams, needs, errs);
+            rc_scan_expr(rhs, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(n, _) = callee.as_ref() {
+                if n == "Rc" {
+                    if allowed {
+                        errs.push(format!("error[E300]: `Rc(..)` constructor call in `{where_}` is not supported — build via `mut r: Rc[T] = T(..)` (AGENTS.md §2.5)"));
+                    } else {
+                        errs.push(rc_gate_msg(&format!("call in `{where_}`")));
+                    }
+                }
+            } else {
+                rc_scan_expr(callee, where_, allowed, types, tparams, needs, errs);
+            }
+            for a in args {
+                rc_scan_expr(a, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::TurboCall { targs, args, .. } => {
+            for t in targs {
+                if let Expr::Ident(n, _) = t {
+                    if n == "Rc" {
+                        errs.push(rc_gate_msg(&format!("type argument in `{where_}`")));
+                    }
+                } else {
+                    rc_scan_expr(t, where_, allowed, types, tparams, needs, errs);
+                }
+            }
+            for a in args {
+                rc_scan_expr(a, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::Field { base, .. } => rc_scan_expr(base, where_, allowed, types, tparams, needs, errs),
+        Expr::Index { base, index, .. } => {
+            rc_scan_expr(base, where_, allowed, types, tparams, needs, errs);
+            rc_scan_expr(index, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::If { cond, then, elifs, els, .. } => {
+            rc_scan_expr(cond, where_, allowed, types, tparams, needs, errs);
+            rc_scan_block(then, where_, allowed, types, tparams, needs, errs);
+            for (c, b) in elifs {
+                rc_scan_expr(c, where_, allowed, types, tparams, needs, errs);
+                rc_scan_block(b, where_, allowed, types, tparams, needs, errs);
+            }
+            if let Some(b) = els.as_ref() {
+                rc_scan_block(b, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            rc_scan_expr(scrutinee, where_, allowed, types, tparams, needs, errs);
+            for (p, g, b) in arms {
+                rc_scan_pattern(p, where_, errs);
+                if let Some(g) = g.as_ref() {
+                    rc_scan_expr(g, where_, allowed, types, tparams, needs, errs);
+                }
+                rc_scan_expr(b, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::Block(b) => rc_scan_block(b, where_, allowed, types, tparams, needs, errs),
+        Expr::Lambda { params, body, .. } => {
+            for p in params {
+                if p == "Rc" {
+                    errs.push(format!("error[E300]: `Rc` is a reserved name — rename the parameter in `{where_}` (AGENTS.md §2.5)"));
+                }
+            }
+            rc_scan_expr(body, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::List(xs, _) => {
+            for x in xs {
+                rc_scan_expr(x, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::Comprehension { elem, var, iter, cond, .. } => {
+            if var == "Rc" {
+                errs.push(format!("error[E300]: `Rc` is a reserved name — rename the variable in `{where_}` (AGENTS.md §2.5)"));
+            }
+            rc_scan_expr(elem, where_, allowed, types, tparams, needs, errs);
+            rc_scan_expr(iter, where_, allowed, types, tparams, needs, errs);
+            if let Some(c) = cond.as_deref() {
+                rc_scan_expr(c, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::MapLit(kvs, _) => {
+            for (k, v) in kvs {
+                rc_scan_expr(k, where_, allowed, types, tparams, needs, errs);
+                rc_scan_expr(v, where_, allowed, types, tparams, needs, errs);
+            }
+        }
+        Expr::Try { inner, .. } | Expr::Comptime { inner, .. } => {
+            rc_scan_expr(inner, where_, allowed, types, tparams, needs, errs)
+        }
+        Expr::Cast { inner, ty, .. } => {
+            rc_scan_expr(inner, where_, allowed, types, tparams, needs, errs);
+            rc_scan_type(ty, &format!("cast in `{where_}`"), allowed, types, tparams, needs, errs);
+        }
+        Expr::Range { start, end, .. } => {
+            rc_scan_expr(start, where_, allowed, types, tparams, needs, errs);
+            rc_scan_expr(end, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::Capsule { inputs, body, .. } => {
+            for (n, _) in inputs {
+                if n == "Rc" {
+                    errs.push(format!("error[E300]: `Rc` is a reserved name — rename the input in `{where_}` (AGENTS.md §2.5)"));
+                }
+            }
+            rc_scan_block(body, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::Region { max, body, .. } => {
+            rc_scan_expr(max, where_, allowed, types, tparams, needs, errs);
+            rc_scan_block(body, where_, allowed, types, tparams, needs, errs);
+        }
+        Expr::Spawn { call, .. } => rc_scan_expr(call, where_, allowed, types, tparams, needs, errs),
+    }
+}
+
+fn rc_scan_fndef(
+    f: &FnDef,
+    what: &str,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    outer_tparams: &[String],
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    let mut tparams: Vec<String> = outer_tparams.to_vec();
+    for g in &f.sig.generics {
+        tparams.push(g.name.clone());
+        if let Some(t) = g.ty.as_ref() {
+            rc_scan_type(t, &format!("generic bound of `{what}`"), allowed, types, &tparams, needs, errs);
+        }
+    }
+    rc_scan_sig(&f.sig, what, allowed, types, &tparams, needs, errs);
+    if let Some(b) = f.body.as_ref() {
+        rc_scan_block(b, what, allowed, types, &tparams, needs, errs);
+    }
+}
+
+fn rc_scan_item(
+    it: &Item,
+    allowed: bool,
+    types: &HashMap<String, Layout>,
+    needs: &mut Vec<(String, String)>,
+    errs: &mut Vec<String>,
+) {
+    match it {
+        Item::Fn(f) => rc_scan_fndef(f, &format!("fn {}", f.sig.name), allowed, types, &[], needs, errs),
+        Item::Type(t) => {
+            if t.name == "Rc" {
+                errs.push("error[E300]: `Rc` is a reserved name (the kernel shared-ownership type) — rename the type (AGENTS.md §2.5)".into());
+            }
+            if t.name == "Rc" {
+                return;
+            }
+            let mut tparams: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
+            for g in &t.generics {
+                if let Some(ty) = g.ty.as_ref() {
+                    rc_scan_type(ty, &format!("generic bound of `type {}`", t.name), allowed, types, &tparams, needs, errs);
+                }
+            }
+            for fld in &t.fields {
+                rc_scan_type(&fld.ty, &format!("field `{}` of `type {}`", fld.name, t.name), allowed, types, &tparams, needs, errs);
+            }
+            for v in &t.variants {
+                for fld in &v.fields {
+                    rc_scan_type(&fld.ty, &format!("variant `{}` of `type {}`", v.name, t.name), allowed, types, &tparams, needs, errs);
+                }
+            }
+            for m in &t.methods {
+                if m.sig.name == "Rc" {
+                    errs.push(format!("error[E300]: `Rc` is a reserved name — rename method `Rc` of `type {}` (AGENTS.md §2.5)", t.name));
+                }
+                let mut mtparams = tparams.clone();
+                for g in &m.sig.generics {
+                    mtparams.push(g.name.clone());
+                }
+                rc_scan_sig(&m.sig, &format!("{}.{}", t.name, m.sig.name), allowed, types, &mtparams, needs, errs);
+                if let Some(b) = m.body.as_ref() {
+                    rc_scan_block(b, &format!("{}.{}", t.name, m.sig.name), allowed, types, &mtparams, needs, errs);
+                }
+            }
+        }
+        Item::Trait(tr) => {
+            if tr.name == "Rc" {
+                errs.push("error[E300]: `Rc` is a reserved name (the kernel shared-ownership type) — rename the trait (AGENTS.md §2.5)".into());
+            }
+            for m in &tr.methods {
+                rc_scan_fndef(m, &format!("trait {}.{}", tr.name, m.sig.name), allowed, types, &tr.generics.iter().map(|g| g.name.clone()).collect::<Vec<_>>(), needs, errs);
+            }
+        }
+        Item::Impl(im) => {
+            if im.trait_name.as_deref() == Some("Rc") {
+                errs.push("error[E300]: `Rc` is a reserved name — cannot implement trait `Rc` (AGENTS.md §2.5)".into());
+            }
+            rc_scan_type(&im.for_type, &format!("impl target"), allowed, types, &[], needs, errs);
+            for m in &im.methods {
+                rc_scan_fndef(m, &format!("impl {}.{}", im.for_type.name, m.sig.name), allowed, types, &[], needs, errs);
+            }
+        }
+        Item::Const { value, .. } => {
+            rc_scan_expr(value, "const", allowed, types, &[], needs, errs);
+        }
+        Item::Use { path, .. } => {
+            if path.len() == 2 && path[0] == "kernel" && path[1] == "Rc" {
+                return;
+            }
+            if path.iter().any(|s| s == "Rc") {
+                errs.push(rc_gate_msg(&format!("import `{}`", path.join("::"))));
+            }
+        }
+        Item::Extern { items, .. } => {
+            for s in items {
+                rc_scan_sig(s, &format!("extern {}", s.name), allowed, types, &[], needs, errs);
+            }
+        }
+        Item::Syscall { params, ret, name, .. } => {
+            for p in params {
+                if let Some(t) = p.ty.as_ref() {
+                    rc_scan_type(t, &format!("parameter of `syscall {name}`"), allowed, types, &[], needs, errs);
+                }
+            }
+            if let Some(t) = ret.as_ref() {
+                rc_scan_type(t, &format!("return of `syscall {name}`"), allowed, types, &[], needs, errs);
+            }
+        }
+        Item::Macro { body, .. } => {
+            rc_scan_expr(body, "macro", allowed, types, &[], needs, errs);
+        }
+        Item::ItemMacro { items, .. } => {
+            for sub in items {
+                rc_scan_item(sub, allowed, types, needs, errs);
+            }
+        }
+        Item::MacroInvoke { args, .. } => {
+            for a in args {
+                rc_scan_expr(a, "macro invocation", allowed, types, &[], needs, errs);
+            }
+        }
+        Item::Native { .. } | Item::Cxx { .. } | Item::Kernel { .. } => {}
+    }
+}
+
 pub fn lower_module(m: &Module) -> Result<Program, Vec<String>> {
     lower_module_src(m, "", &[])
 }
@@ -286,7 +749,7 @@ fn line_of(line_starts: &[usize], byte: usize) -> u32 {
 }
 
 /// `hw`: declared hardware regions (name → (base, len)) from `--hw-profile`
-/// (language/HW-SAFE.md §2), resolved by `Mmio.bind("name")`.
+/// (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2), resolved by `Mmio.bind("name")`.
 pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Result<Program, Vec<String>> {
     let line_starts: Vec<usize> = if src.is_empty() {
         Vec::new()
@@ -358,7 +821,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                 check_result_ann(&s.ret, &mut errs, &format!("return type of `extern {}`", s.name));
             }
         }
-        // `syscall NAME(params) -> Ret = NUM` (language/HW-SAFE.md §2): declarations
+        // `syscall NAME(params) -> Ret = NUM` (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): declarations
         // are always fully typed (E100) and narrowly shaped (E421): at most 6 params
         // (the kernel ABI), each `Int` or `Array[Byte]`, return `Int`.
         if let Item::Syscall { name, params, ret, num, span: _ } = it {
@@ -434,7 +897,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     // [(field name, type name)])]). Single-parameter; Result stays i64-erased.
     let mut generic_stypes: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, String)>)>)> = HashMap::new();
     let mut variant_owner_g: HashMap<String, String> = HashMap::new();
-    // `weak f: T` fields, keyed `Type.field` (DYNAMIC-VIRE-PLAN.md §6). A side table
+    // `weak f: T` fields, keyed `Type.field` (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6). A side table
     // instead of a 4th element in `Layout`, which threads through two dozen signatures
     // and means nothing to any of them: only `FieldInfo` construction reads this.
     let mut weak_fields: BTreeSet<String> = BTreeSet::new();
@@ -566,6 +1029,43 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         variant_owner_g.entry("Ok".into()).or_insert("Result".into());
         variant_owner_g.entry("Err".into()).or_insert("Result".into());
     }
+    // `Rc[T]` KERNEL GATE (AGENTS.md §2.5, E300): the name `Rc` is reserved.
+    // Userspace use is a loud error, never a silent I64 (bare `Rc` would
+    // otherwise fall through `ty_of`/`class_of` into a bogus scalar/class).
+    // A kernel module (`kernel` marker + `use kernel::Rc`) may use `Rc[T]`
+    // with a plain object type T; the instance class `Rc$T` aliases T's layout
+    // (same fields, same drop/trace) but forces sharing in the solver.
+    let is_kernel = m.items.iter().any(|it| matches!(it, Item::Kernel { .. }));
+    let imported_rc = m.items.iter().any(|it| matches!(it, Item::Use { path, .. }
+        if path.len() == 2 && path[0] == "kernel" && path[1] == "Rc"));
+    let rc_allowed = is_kernel && imported_rc;
+    {
+        let mut rc_needs: Vec<(String, String)> = Vec::new();
+        for it in &m.items {
+            rc_scan_item(it, rc_allowed, &types, &mut rc_needs, &mut errs);
+        }
+        // Register layout aliases (deduped): `Rc$T` shares T's fields, and
+        // `weak` back-edges carry over (a weak field stays non-owning).
+        rc_needs.sort();
+        rc_needs.dedup();
+        for (mangled, inner) in &rc_needs {
+            match types.get(inner) {
+                Some(layout) => {
+                    let layout = layout.clone();
+                    for (fname, _, _) in &layout {
+                        let key = format!("{inner}.{fname}");
+                        if weak_fields.contains(&key) {
+                            weak_fields.insert(format!("{mangled}.{fname}"));
+                        }
+                    }
+                    types.insert(mangled.clone(), layout);
+                }
+                None => {
+                    errs.push(format!("error[E300]: `Rc[{inner}]` refers to unknown type `{inner}` (AGENTS.md §2.5)"));
+                }
+            }
+        }
+    }
     // TRAIT OBJECTS (dynamic dispatch): traits are registered as interfaces,
     // `impl Trait for Typ` adds the methods into the type vtable at
     // consistent global slots (the backend's existing interface/CallVirtual
@@ -605,6 +1105,24 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     for bi in ["Option", "Result"] {
         if types.contains_key(bi) && !all_type_names.iter().any(|n| n == bi) {
             all_type_names.push(bi.into());
+        }
+    }
+    // Kernel `Rc$T` aliases get their own ClassInfo (vtable/drop/trace identical
+    // to T — same fields — so field access, method calls and drops resolve; the
+    // `Rc$` marker only forces sharing in the solver, never a new layout).
+    // Implemented-trait slots carry over too (the vtable entries point at the
+    // shared `T.method` bodies), so trait dispatch works through Rc handles.
+    {
+        let mut rcs: Vec<String> = types.keys().filter(|k| k.starts_with("Rc$")).cloned().collect();
+        rcs.sort();
+        for r in rcs {
+            if !all_type_names.iter().any(|n| n == &r) {
+                all_type_names.push(r.clone());
+            }
+            let inner = r.strip_prefix("Rc$").unwrap_or(&r);
+            if let Some(ifaces) = type_traits.get(inner).cloned() {
+                type_traits.entry(r).or_insert(ifaces);
+            }
         }
     }
     for tname in &all_type_names {
@@ -669,17 +1187,58 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         if let Item::Fn(f) = it {
             let ps = f.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
             let (ra, rac) = arr_ret(f.sig.ret.as_ref());
-            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
+            // `Ptr` shapes for user functions too: a `fn set(p: Ptr)` body trusts
+            // `p`, so the call site is checked exactly like the C boundary (E421).
+            // (The body itself is proven at its own `-> Ptr` returns.)
+            let ptr_params = f.sig.params.iter().map(|p| p.ty.as_ref().is_some_and(|t| t.name == "Ptr")).collect();
+            let ptr_ret = f.sig.ret.as_ref().is_some_and(|t| t.name == "Ptr");
+            sigs.insert(f.sig.name.clone(), Sig { params: ps, ret: guess_ret_ty(f), ret_class: class_of_ann(f.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac, ptr_params, ptr_ret, is_extern: false });
+        }
+        // `cxx { … }` is REMOVED (AGENTS.md §1/§3, E410): an embedded C++ body is
+        // a blind escape (it never passes the verifier — only C/asm do). C++
+        // interop lives outside the language: `extern "C" header` + the C++ TU
+        // linked via `--obj`/`-l` (C-ABI, like `cpp_call.vr`).
+        if let Item::Cxx { .. } = it {
+            errs.push("error[E410]: `cxx { … }` is removed — embedded C++ is a blind escape (AGENTS.md §1/§3). Put the C++ in its own TU behind `extern \"C\"` wrappers and link it via `--obj`/`-l` with an `extern \"C\"` declaration".into());
         }
         // extern "C" { fn name(...) -> T }: C-ABI function, directly under its
         // name (no mangling). Calls resolve through this; the backend
         // declares the called-but-undefined function, clang links it
         // (libc/libm/-lstdc++ / linked objects).
-        if let Item::Extern { items, .. } = it {
+        // E421 (AGENTS.md §3): the mapping is CHECKED — only scalars + opaque
+        // `Ptr` cross the boundary (the same set `vire bindgen` generates).
+        // Str/arrays/user objects have no C layout; passing one would hand a
+        // heap-object pointer to C — rejected, never silently passed.
+        // Compiler-generated glue (`C-glue`: the `spawn` shims, `@c` captures)
+        // is an internal handoff with internal shapes — it registers sigs but
+        // skips the user-boundary mapping check.
+        if let Item::Extern { items, abi, .. } = it {
+            let checked = abi == "C";
             for sig in items {
-                let ps = sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
+                if checked {
+                    for p in &sig.params {
+                        let tn = p.ty.as_ref().map(|t| t.name.as_str()).unwrap_or("?");
+                        if !extern_mappable(tn) {
+                            errs.push(format!("error[E421]: `extern` parameter `{}` in `{}` has type `{tn}` — only scalars and opaque `Ptr` cross the C ABI (strings via `cstr(s)`, byte buffers via `bview(p, len)` + length; objects never)", p.name, sig.name));
+                        }
+                    }
+                    if let Some(rt) = sig.ret.as_ref() {
+                        if !extern_mappable(&rt.name) {
+                            errs.push(format!("error[E421]: `extern` function `{}` returns `{}` — only scalars and opaque `Ptr` cross the C ABI", sig.name, rt.name));
+                        }
+                    }
+                }
+                let ps: Vec<Ty> = sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
                 let (ra, rac) = arr_ret(sig.ret.as_ref());
-                sigs.insert(sig.name.clone(), Sig { params: ps, ret: ret_ty(sig), ret_class: class_of(sig.ret.as_ref()), ret_arr: ra, ret_arr_class: rac });
+                let ptr_params: Vec<bool> = sig.params.iter().map(|p| p.ty.as_ref().map(|t| t.name == "Ptr").unwrap_or(false)).collect();
+                let ptr_ret = sig.ret.as_ref().map(|t| t.name == "Ptr").unwrap_or(false);
+                let ret = ret_ty(sig);
+                sigs.insert(sig.name.clone(), Sig { params: ps.clone(), ret, ret_class: class_of(sig.ret.as_ref()), ret_arr: ra, ret_arr_class: rac, ptr_params: ptr_params.clone(), ptr_ret, is_extern: true });
+                // Record the C-ABI boundary in the IR (checked types as-is;
+                // backends filter: LLVM links, Gabbro maps scalar-only).
+                if checked {
+                    prog.extern_fns.push(ExternDecl { name: sig.name.clone(), params: ps, ret, ptr_params: ptr_params.clone(), ptr_ret });
+                }
             }
         }
         // Declared syscalls resolve like functions (same arity/type checking at
@@ -693,7 +1252,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
                     SysParamKind::Int => Ty::I64,
                     SysParamKind::Buf => Ty::Ref,
                 }).collect();
-                sigs.insert(name.clone(), Sig { params: ps, ret: Ty::I64, ret_class: None, ret_arr: None, ret_arr_class: None });
+                sigs.insert(name.clone(), Sig { params: ps, ret: Ty::I64, ret_class: None, ret_arr: None, ret_arr_class: None, ptr_params: vec![], ptr_ret: false, is_extern: false });
             }
         }
     }
@@ -701,7 +1260,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
     // & co. are callable from pure Vire WITHOUT an `extern` block (the lowering
     // emits calls, the backend declares, the driver links the bridge).
     for (name, params, ret) in builtin_ffi_sigs() {
-        sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None, ret_arr: None, ret_arr_class: None });
+        sigs.entry(name.to_string()).or_insert(Sig { params, ret, ret_class: None, ret_arr: None, ret_arr_class: None, ptr_params: vec![], ptr_ret: false, is_extern: false });
     }
     // Methods (type-inline + impl blocks) → symbol `Class.method`, self = Ref.
     let methods = collect_methods(m);
@@ -732,7 +1291,9 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
             .collect();
         let sym = format!("{class}.{}", meth.sig.name);
         let (ra, rac) = arr_ret(meth.sig.ret.as_ref());
-        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
+        let ptr_params = meth.sig.params.iter().map(|p| if p.name == "self" { false } else { p.ty.as_ref().is_some_and(|t| t.name == "Ptr") }).collect();
+        let ptr_ret = meth.sig.ret.as_ref().is_some_and(|t| t.name == "Ptr");
+        sigs.insert(sym, Sig { params: ps, ret: guess_ret_ty(meth), ret_class: class_of_ann(meth.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac, ptr_params, ptr_ret, is_extern: false });
     }
     // Collect generic functions (do NOT lower directly — one monomorph.
     // instance per call type argument). Trait bounds are parsed, but not yet
@@ -764,7 +1325,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
             }
         }
     }
-    // Dynamic-fn / open-fn seams (DYNAMIC-VIRE-PLAN.md P1): the slot index is the position
+    // Dynamic-fn / open-fn seams (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1): the slot index is the position
     // in this SORTED list — deterministic, and the single source of truth that both the
     // backend (`@jrt_dynslot`) and `install_override` compute from `fn_defs`, so they agree.
     {
@@ -776,7 +1337,7 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         dl.sort();
         prog.dyn_fns = dl;
         // `@patchable fn` — a direct-call function with a NOP entry sled the runtime patcher
-        // can redirect (hot-update, DYNAMIC-VIRE-PATCH.md B1). Distinct from `dynamic fn`:
+        // can redirect (hot-update, the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B1). Distinct from `dynamic fn`:
         // not slot-dispatched. Sorted for a deterministic `@jrt_patchtab` order.
         let mut pl: Vec<String> = fn_defs
             .values()
@@ -908,7 +1469,9 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         // Register instance signature (for recursion/mutual calls).
         let ps = inst.sig.params.iter().map(|p| ty_of(p.ty.as_ref())).collect();
         let (ra, rac) = arr_ret(inst.sig.ret.as_ref());
-        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac });
+        let ptr_params = inst.sig.params.iter().map(|p| p.ty.as_ref().is_some_and(|t| t.name == "Ptr")).collect();
+        let ptr_ret = inst.sig.ret.as_ref().is_some_and(|t| t.name == "Ptr");
+        sigs.insert(sym.clone(), Sig { params: ps, ret: guess_ret_ty(&inst), ret_class: class_of_ann(inst.sig.ret.as_ref(), &generic_ptypes, &generic_stypes), ret_arr: ra, ret_arr_class: rac, ptr_params, ptr_ret, is_extern: false });
         match lower_fn(&inst, &sigs, &syscalls, &hw_regions, &types, &field_arr, &variants, &generics, &trait_methods, &fn_defs, &generic_ptypes, &generic_stypes, &variant_owner_g, &shared_inst, &shared_svars, &mut prog.strings, &mut str_index, None, Some(&sym), line_of(ls, inst.sig.span.0), ls) {
             Ok((func, mono, insts, names)) => {
                 prog.debug_local_names.insert(func.name.clone(), names);
@@ -941,19 +1504,10 @@ pub fn lower_module_src(m: &Module, src: &str, hw: &[(String, u64, u64)]) -> Res
         });
     }
     if errs.is_empty() {
-        // E300 enforcement (opt-in via FASTLLVM_DENY_DYNAMIC=1; preview via
-        // FASTLLVM_WARN_DYNAMIC=1 in main.rs): Shared heap allocations are hard
-        // errors — the program must name ceilings (`region(max)`) or move the
-        // graph to a kernel `Rc` (AGENTS.md §2.4, OWNERSHIP-STATIC.md §4b).
-        // The count is conservative (loop-arena-covered sites included until
-        // the arena verdict is threaded in); enforcement is the user's choice.
-        if std::env::var_os("FASTLLVM_DENY_DYNAMIC").is_some() {
-            for (f, i) in &fastllvm_solver::classify_ownership(&prog).shared_news {
-                errs.push(format!("error[E300]: heap allocation in `{f}` (site #{i}) has dynamic lifetime — name a ceiling (`region(max)`) or move the graph to a kernel `Rc` (AGENTS.md §2.4)"));
-            }
-        }
-    }
-    if errs.is_empty() {
+        // E300 enforcement lives in main.rs (post-solver-pass program — the same
+        // IR the ownership report and the WARN preview see). Judging the fresh
+        // lowering would reject programs whose News the escape analysis provably
+        // promotes (false positives against AGENTS.md §2.1).
         Ok(prog)
     } else {
         Err(errs)
@@ -976,9 +1530,31 @@ fn ty_of(t: Option<&Type>) -> Ty {
     }
 }
 
+/// `mut r: Rc[T] = …` annotation → `(Rc$T, T)` when T resolves to an object
+/// class (defensive: the gate scan already rejected malformed uses with errors;
+/// None here simply skips relabeling and the scan's errors abort the build).
+fn rc_mangled_of_ann(ann: &Option<Type>) -> Option<(String, String)> {
+    let t = ann.as_ref()?;
+    if t.name != "Rc" || t.args.len() != 1 {
+        return None;
+    }
+    let c = class_of(Some(&t.args[0]))?;
+    Some((format!("Rc${c}"), c))
+}
+
 /// Class name of a reference type annotation (for GetField/New), otherwise None.
 fn class_of(t: Option<&Type>) -> Option<String> {
-    let name = t?.name.as_str();
+    let t = t?;
+    let name = t.name.as_str();
+    // `Rc[T]` (kernel only, gated in the pre-pass) resolves to the ownership
+    // marker class `Rc$T` — same layout as `T`, but the solver forces sharing
+    // (AGENTS.md §2.5). Malformed uses (caught by the gate scan with errors)
+    // fall back to None here so lowering cannot invent a bogus class.
+    if name == "Rc" {
+        let inner = t.args.first()?;
+        let c = class_of(Some(inner))?;
+        return Some(format!("Rc${c}"));
+    }
     match name {
         // `Ref` = an object reference of unknown class (the inference write-back name):
         // no class attached, exactly like `Str` — so a method call falls through to the
@@ -1152,7 +1728,7 @@ struct FnLower<'a> {
     scopes: Vec<HashMap<String, (Local, Ty)>>,
     sigs: &'a HashMap<String, Sig>,
     /// Declared syscalls (name → number + param shapes) for `syscall(NUM, …)`
-    /// lowering at call sites (language/HW-SAFE.md §2).
+    /// lowering at call sites (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2).
     syscalls: &'a HashMap<String, SyscallInfo>,
     /// User type layouts (name → fields) for New/GetField.
     types: &'a HashMap<String, Layout>,
@@ -1207,10 +1783,20 @@ struct FnLower<'a> {
     sum_hint: Option<(String, String)>,
     expected_result: Option<(String, String)>,
     /// MMIO handles (local → (base address, region length)) from `Mmio.bind("name")`
-    /// (language/HW-SAFE.md §2). The handle value is an immortal descriptor object
+    /// (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2). The handle value is an immortal descriptor object
     /// (plain Ref local, RC no-ops via refcount -1); the table drives `readN`/`writeN`
     /// lowering to volatile accesses at base+offset. Propagated through copies.
     mmio: HashMap<u32, (String, u64, u64)>,
+    /// Opaque-pointer provenance (AGENTS.md §3, E421): locals proven to hold a `Ptr`
+    /// that came from a checked source (`cstr`, `bview`-checked input, an extern call
+    /// returning `Ptr`, a `Ptr` parameter, or the null literal `0`) — never a forged
+    /// integer. Only these (plus literal `0`) may flow into `Ptr` sinks (extern
+    /// params, `bview`, `as Ptr`). Propagated through copies; cleared on doubt.
+    ptr_locals: std::collections::HashSet<u32>,
+    /// True when this function's declared return annotation is `Ptr`: `return e`
+    /// and the tail value must then be Ptr-proven (E421), so a forged integer
+    /// cannot leave through a `Ptr` return either.
+    ret_is_ptr: bool,
     /// Explicit-`region` nesting depth. While > 0, inferred loop-arenas do NOT
     /// fire (their unbounded push would shadow the declared bounded pool —
     /// the explicit region's own admission check subsumes the loop check).
@@ -1351,6 +1937,27 @@ impl<'a> FnLower<'a> {
         match op {
             Operand::Copy(l) => self.mmio.get(&l.0).cloned(),
             _ => None,
+        }
+    }
+    /// Opaque-pointer provenance (AGENTS.md §3, E421): true when the operand is
+    /// proven to be a checked pointer — a `Ptr`-proven local, or the null
+    /// constant (`0` / `null`). Any other integer (a variable, a non-zero
+    /// literal, arithmetic) is NOT a pointer, even though both are i64-wide.
+    fn ptr_of_operand(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(l) => self.ptr_locals.contains(&l.0),
+            Operand::ConstI64(0) => true,
+            Operand::ConstI32(0) => true,
+            Operand::ConstNull => true,
+            _ => false,
+        }
+    }
+    /// Record/clear `Ptr` provenance on a fresh local from its source operand.
+    fn track_ptr(&mut self, dest: u32, op: &Operand) {
+        if self.ptr_of_operand(op) {
+            self.ptr_locals.insert(dest);
+        } else {
+            self.ptr_locals.remove(&dest);
         }
     }
     /// `Mmio.bind("name")` → immortal descriptor handle (`GetStatic $mmio`).
@@ -2031,7 +2638,7 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => {
                 let callee_bad = match callee.as_ref() {
                     Expr::Ident(n, _) => {
-                        // A `dynamic fn` / `open fn` is an extension SEAM (DYNAMIC-VIRE-PLAN.md
+                        // A `dynamic fn` / `open fn` is an extension SEAM (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history)
                         // §2/§6): a runtime override could store its args or escape, so it is a
                         // hard black box to region inference — treat it as opaque, exactly like
                         // an extern. This is what makes the arena decline at a seam (the sealed-
@@ -2106,8 +2713,15 @@ impl<'a> FnLower<'a> {
             Expr::List(xs, _) => xs.iter().any(|x| self.region_bad_expr(x, in_callee, in_loop, cur_fn, outer, seen, fresh)),
             Expr::Try { inner, .. } | Expr::Cast { inner, .. } | Expr::Comptime { inner, .. } => self.region_bad_expr(inner, in_callee, in_loop, cur_fn, outer, seen, fresh),
             Expr::Range { start, end, .. } => self.region_bad_expr(start, in_callee, in_loop, cur_fn, outer, seen, fresh) || self.region_bad_expr(end, in_callee, in_loop, cur_fn, outer, seen, fresh),
-            // Lambda/Comprehension/MapLit/Capsule: conservatively opaque (could capture/store outside).
-            Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) | Expr::Capsule { .. } => true,
+            // Lambda/Comprehension/MapLit: conservatively opaque (could capture/store outside).
+            Expr::Lambda { .. } | Expr::Comprehension { .. } | Expr::MapLit(..) => true,
+            // Capsule: precise, not opaque. Inputs are deep-COPIED (read-only —
+            // never a store into region objects), so only the body can be bad,
+            // checked with the same outer/fresh sets as a nested block (a body
+            // store of an outer ref into a region object, or a boundary-crossing
+            // return/break/continue, is still rejected; the arena-contained
+            // mutations of the input copies are admitted).
+            Expr::Capsule { body, .. } => self.region_bad_block(body, in_callee, in_loop, cur_fn, outer, seen, fresh),
             _ => false,
         }
     }
@@ -2333,23 +2947,102 @@ impl<'a> FnLower<'a> {
                         if let Some(c) = self.class_of_operand(&op) {
                             self.local_class.insert(l.0, c);
                         }
+                        // `Ptr` provenance follows the value: a reassigned integer
+                        // clears it (doubt removes the mark, never keeps a stale one).
+                        self.track_ptr(l.0, &op);
                         self.emit(Statement::Assign(l, Rvalue::Use(op)));
                         return;
                     }
                 }
                 self.arr_hint = arr_hint;
                 self.sum_hint = sum_hint;
+                // Kernel `Rc[T]` annotation: `New`s of T built by this RHS are
+                // relabeled to the ownership marker class `Rc$T` below (same
+                // layout — only the solver treats them as forced-shared).
+                let rc_base = self.locals.len();
                 let (op, ty) = match value {
                     Some(v) => self.lower_expr(v),
                     None => (Operand::ConstI64(0), Ty::I64),
                 };
                 self.arr_hint = None;
                 self.sum_hint = None;
+                // Relabel direct `T(..)` constructions under `mut r: Rc[T]` to
+                // `Rc$T` (range-scoped: only News this RHS built, only matching
+                // inner class — nested other-class News keep their class). The
+                // New-dest's table entry is relabeled too, so later field/method
+                // resolution sees `Rc$T` (not the ctor name). Field ops on the
+                // relabeled roots (and their in-range copies) are relabeled as
+                // well, so ownership sniffing (`Rc$` parents own via counting)
+                // and `weak` lookup see one consistent class.
+                let rc_ann = rc_mangled_of_ann(ann);
+                if let Some((mangled, inner)) = rc_ann.clone() {
+                    let mut relabeled: Vec<u32> = Vec::new();
+                    for b in &mut self.blocks {
+                        for st in &mut b.statements {
+                            if let Statement::New { dest, class } = st {
+                                if dest.0 as usize >= rc_base && class.as_str() == inner {
+                                    class.clone_from(&mangled);
+                                    relabeled.push(dest.0);
+                                }
+                            }
+                        }
+                    }
+                    // Copies of relabeled roots (same range) + their field ops.
+                    let mut grown = true;
+                    while grown {
+                        grown = false;
+                        for b in &mut self.blocks {
+                            for st in &mut b.statements {
+                                match st {
+                                    Statement::Assign(d, Rvalue::Use(Operand::Copy(s))) => {
+                                        if relabeled.contains(&s.0) && !relabeled.contains(&d.0) {
+                                            relabeled.push(d.0);
+                                            grown = true;
+                                        }
+                                    }
+                                    Statement::PutField { obj, class, .. } => {
+                                        if let Operand::Copy(o) = obj {
+                                            if relabeled.contains(&o.0) && class.as_str() == inner {
+                                                class.clone_from(&mangled);
+                                            }
+                                        }
+                                    }
+                                    Statement::GetField { obj, class, .. } => {
+                                        if let Operand::Copy(o) = obj {
+                                            if relabeled.contains(&o.0) && class.as_str() == inner {
+                                                class.clone_from(&mangled);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    for d in relabeled {
+                        self.local_class.insert(d, mangled.clone());
+                    }
+                }
                 let l = self.new_local(ty);
                 // Pass the object class resp. array element kind on to the new local.
                 // The explicit `: Type` annotation is the fallback when the RHS operand
-                // carries no class (the inference escape hatch).
-                if let Some(c) = self.class_of_operand(&op).or(ann_class) {
+                // carries no class (the inference escape hatch). A `Rc[T]`
+                // annotation OVERRIDES (never falls back): the bound value is
+                // claimed as `Rc$T` — or rejected on a genuine mismatch (a `Leaf`
+                // object is not a `Rc[Node]`, layouts would diverge).
+                if let Some((mangled, inner)) = rc_ann {
+                    match self.class_of_operand(&op) {
+                        Some(c) if c == mangled || c == inner => {
+                            self.local_class.insert(l.0, mangled);
+                        }
+                        Some(c) => {
+                            self.errs.push(format!("error[E300]: `{name}: Rc[{inner}]` is bound to a `{c}` value — construct the declared type (`{inner}(..)`) or drop the annotation (AGENTS.md §2.5)"));
+                        }
+                        None => {
+                            self.local_class.insert(l.0, mangled);
+                        }
+                    }
+                } else if let Some(c) = self.class_of_operand(&op).or(ann_class) {
                     self.local_class.insert(l.0, c);
                 }
                 if let Some(k) = self.arr_of_operand(&op) {
@@ -2362,6 +3055,20 @@ impl<'a> FnLower<'a> {
                 // Propagate a bound MMIO handle (`mut u2 = uart` stays a handle).
                 if let Some(m) = self.mmio_of_operand(&op) {
                     self.mmio.insert(l.0, m);
+                }
+                // `Ptr` provenance (AGENTS.md §3, E421): a `mut x: Ptr = v`
+                // annotation DEMANDS a proven pointer — an integer RHS is
+                // int→ptr, rejected, never silently relabeled. Without the
+                // annotation, provenance propagates from the value (so
+                // `mut p = cstr(s)` threads on as a pointer).
+                if ann.as_ref().is_some_and(|t| t.name == "Ptr") {
+                    if self.ptr_of_operand(&op) {
+                        self.ptr_locals.insert(l.0);
+                    } else {
+                        self.errs.push(format!("error[E421]: `{name}: Ptr` is bound to a non-pointer value — a number is never an address (AGENTS.md §3). Bind a `Ptr` source (`cstr`, an extern call returning `Ptr`, a `Ptr` parameter) or the null literal `0`"));
+                    }
+                } else {
+                    self.track_ptr(l.0, &op);
                 }
                 self.emit(Statement::Assign(l, Rvalue::Use(op)));
                 self.bind(name, l, ty);
@@ -2377,6 +3084,7 @@ impl<'a> FnLower<'a> {
                             if let Some(m) = self.mmio_of_operand(&rhs) {
                                 self.mmio.insert(l.0, m);
                             }
+                            self.track_ptr(l.0, &rhs);
                         }
                         let rv = match op {
                             None => Rvalue::Use(rhs),
@@ -2471,6 +3179,10 @@ impl<'a> FnLower<'a> {
                 let t = match e {
                     Some(e) => {
                         let (op, _) = self.lower_expr(e);
+                        // E421: a `-> Ptr` function returns only proven pointers.
+                        if self.ret_is_ptr && !self.ptr_of_operand(&op) {
+                            self.errs.push("error[E421]: `return` in a `-> Ptr` function with a non-pointer value — a number is never an address (AGENTS.md §3)".into());
+                        }
                         Terminator::Return(Some(op))
                     }
                     None => Terminator::Return(None),
@@ -2843,6 +3555,12 @@ impl<'a> FnLower<'a> {
             // `x as T` — numeric conversion (int↔float, widths).
             Expr::Cast { inner, ty, .. } => {
                 let (op, from) = self.lower_expr(inner);
+                // E421 (AGENTS.md §3): `x as Ptr` forges a pointer out of a
+                // number unless `x` is already a proven pointer (or null).
+                // Casts between other types are unaffected.
+                if ty.name == "Ptr" && !self.ptr_of_operand(&op) {
+                    self.errs.push("error[E421]: `as Ptr` on a non-pointer value — a number is never an address (AGENTS.md §3). Cast only a `Ptr` source or the null literal `0`".into());
+                }
                 let to = ty_of(Some(ty));
                 if from == to {
                     return (op, to);
@@ -3034,7 +3752,7 @@ impl<'a> FnLower<'a> {
             // object pointer survives the arena → isolation + fault containment without
             // deep copy. Object-in/-out (deep copy) remains open.
             Expr::Region { max, body, .. } => {
-                // M3 explicit bounded pool (OWNERSHIP-STATIC.md §2.4): `region(max)`
+                // M3 explicit bounded pool (the former OWNERSHIP-STATIC.md (removed in cleanup; see git history) §2.4): `region(max)`
                 // brackets the body in `jrt_region_push(max)`/`pop` — body
                 // allocations land in the pool (immortal, no RC/collector) and are
                 // freed en bloc; past `max` bytes the program aborts (refuse-on-
@@ -3296,6 +4014,14 @@ impl<'a> FnLower<'a> {
         let ret = ret_sub.as_ref().map(|t| ty_of(Some(t))).unwrap_or(Ty::Void);
         let ret_class = ret_sub.as_ref().and_then(|t| class_of(Some(t)));
         let (ret_arr, ret_arr_class) = arr_ret_generic(ret_sub.as_ref());
+        // E421: substituted `Ptr` parameters are checked like direct calls.
+        for (i, pty) in g.param_tys.iter().enumerate() {
+            if pty.as_ref().map(|t| subst_type(t, &bind)).is_some_and(|st| st.name == "Ptr") {
+                if lowered.get(i).is_some_and(|(o, _)| !self.ptr_of_operand(o)) {
+                    self.errs.push(format!("error[E421]: argument {} of `{callee}` is `Ptr` but the value is a non-pointer integer — a number is never an address (AGENTS.md §3)", i + 1));
+                }
+            }
+        }
         let arg_ops: Vec<Operand> = lowered.into_iter().map(|(o, _)| o).collect();
         if ret == Ty::Void {
             self.emit(Statement::Call { dest: None, func: sym, args: arg_ops });
@@ -3304,6 +4030,9 @@ impl<'a> FnLower<'a> {
         let d = self.new_local(ret);
         if let Some(c) = ret_class {
             self.local_class.insert(d.0, c);
+        }
+        if ret_sub.as_ref().is_some_and(|t| t.name == "Ptr") {
+            self.ptr_locals.insert(d.0);
         }
         if let Some(k) = ret_arr {
             self.local_arr.insert(d.0, k);
@@ -3380,7 +4109,7 @@ impl<'a> FnLower<'a> {
                 // Not an adapter → fall through (range-as-value is an error below).
             }
             // `Mmio.bind("name")` — a memory-mapped hardware handle, WITHOUT inline
-            // asm and WITHOUT an integer address in user code (language/HW-SAFE.md
+            // asm and WITHOUT an integer address in user code (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history)
             // §2). The name resolves against `--hw-profile` (E400 if unknown); the
             // handle is an immortal descriptor object (plain Ref local — RC no-ops
             // via refcount -1, exactly like string literals). Intercepted BEFORE
@@ -3685,6 +4414,9 @@ impl<'a> FnLower<'a> {
                     return (Operand::ConstI64(0), Ty::I64);
                 }
             };
+            // Kernel `Rc$T` handles share T's implementation: method lookup
+            // strips the ownership marker (the mangled `T.method` is shared).
+            let lookup_class = class.strip_prefix("Rc$").unwrap_or(&class);
             // TRAIT OBJECT: if the receiver is trait-typed (`s: Show`), dispatch
             // dynamically via the vtable (CallVirtual) — the concrete type is only
             // known at runtime. Otherwise a static `Typ.methode` call.
@@ -3702,7 +4434,7 @@ impl<'a> FnLower<'a> {
                     };
                 }
             }
-            let sym = format!("{class}.{name}");
+            let sym = format!("{lookup_class}.{name}");
             let mut arg_ops = vec![obj];
             for a in args {
                 arg_ops.push(self.lower_expr(a).0);
@@ -3749,7 +4481,7 @@ impl<'a> FnLower<'a> {
         // Buffer-capture intrinsics for inline C/asm blocks: `@arraydata(a)` yields the
         // raw data pointer (past the 16-byte object header), `@arraylen(a)` the element
         // count. Together they pass a Vire array to a `native "c"` block as a proven
-        // (ptr, len) pair (see cblock.rs / language/VERIFIED-C-ASM.md).
+        // (ptr, len) pair (see cblock.rs / the former language/the former VERIFIED-C-ASM.md (removed in cleanup; see git history) (removed in cleanup; see git history)).
         if name == "@arraydata" {
             let a = self.lower_expr(&args[0]).0;
             let d = self.new_local(Ty::Ref);
@@ -3771,6 +4503,7 @@ impl<'a> FnLower<'a> {
                     if let Some(c) = self.class_of_operand(&op) {
                         self.local_class.insert(d.0, c);
                     }
+                    self.track_ptr(d.0, &op);
                     self.emit(Statement::Assign(d, Rvalue::Use(op)));
                     self.bind(p, d, ty);
                 }
@@ -3897,7 +4630,7 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(d), Ty::F64);
         }
         // Declared `syscall NAME(…)`: lowers to `syscall(NUM, args…)` via libc —
-        // no inline asm, no user-written wrapper (language/HW-SAFE.md §2). `Int`
+        // no inline asm, no user-written wrapper (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2). `Int`
         // args pass directly (I32 widens); `Array[Byte]` args pass the data
         // pointer (the length stays an explicit user argument). At most 6 args
         // (checked at declaration); the backend declares libc `syscall`.
@@ -3939,7 +4672,7 @@ impl<'a> FnLower<'a> {
             self.emit(Statement::Call { dest: Some(d), func: "syscall".into(), args: call_args });
             return (Operand::Copy(d), Ty::I64);
         }
-        // Raw port I/O + compiler fences WITHOUT inline asm (language/HW-SAFE.md
+        // Raw port I/O + compiler fences WITHOUT inline asm (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history)
         // §2, prozedural statt OO: plain functions, no classes). `port_outb(p, v)`
         // / `port_inb(p)` lower to generated per-program helpers (`__vire_port_*`,
         // emitted by the driver into the program's own TU — the single justified
@@ -4079,7 +4812,13 @@ impl<'a> FnLower<'a> {
         // 2-element i64 array `[ptr, len]` (a real GC-managed array; the mmap bytes are never
         // copied), tagged class "ByteView" so those ops dispatch to the checked runtime path.
         if name == "bview" && args.len() == 2 {
-            let p0 = self.lower_expr(&args[0]).0; let p = to_i64(p0);
+            let p0 = self.lower_expr(&args[0]).0; let p = to_i64(p0.clone());
+            // E421: `bview` is the single trust point for external bytes — the
+            // pointer must be proven (`cstr`, an extern `Ptr` result, …), never a
+            // forged integer (the old `peek_u8`-class hole in a new shape).
+            if !self.ptr_of_operand(&p0) {
+                self.errs.push("error[E421]: `bview(ptr, len)` needs a proven `Ptr` (from `cstr`, an extern call returning `Ptr`, or the null literal) — a number is never an address (AGENTS.md §3)".into());
+            }
             let l0 = self.lower_expr(&args[1]).0; let l = to_i64(l0);
             let arr = self.new_local(Ty::Ref);
             self.local_arr.insert(arr.0, ArrKind::Long);
@@ -4147,7 +4886,7 @@ impl<'a> FnLower<'a> {
             let (op, ty) = lowered.into_iter().next().unwrap_or((Operand::ConstNull, Ty::Ref));
             return (self.to_str(op, ty), Ty::Ref);
         }
-        // ── Reflection API (P0 of the dynamic-runtime plan, DYNAMIC-VIRE-PLAN.md §3).
+        // ── Reflection API (P0 of the dynamic-runtime plan, the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §3).
         // Static, typed introspection resolved at compile time from the type graph — no
         // runtime metadata table yet (that lands with dynamic loading, P1, when a loaded
         // type's descriptor must be read at runtime). In a sealed build a value's runtime
@@ -4182,11 +4921,11 @@ impl<'a> FnLower<'a> {
             return (Operand::ConstI64(n), Ty::I64);
         }
         // `abi_version()` → the frozen dynamic-ABI version the binary was built with; the
-        // anchor a loaded module's manifest will be pinned against (DYNAMIC-VIRE-PLAN.md §3).
+        // anchor a loaded module's manifest will be pinned against (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §3).
         if name == "abi_version" {
             return (Operand::ConstI64(VIRE_ABI_VERSION), Ty::I64);
         }
-        // ── Dynamic module loading (M1, scalar-only) — DYNAMIC-VIRE-PLAN.md P1.
+        // ── Dynamic module loading (M1, scalar-only) — the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1.
         // `load_module(path: Str) -> Int` loads a prebuilt native module (`vire
         // --emit-module`), checks its ABI version, and returns an opaque handle (0 =
         // failed / ABI mismatch). `module_call(handle, arg: Int) -> Int` calls its scalar
@@ -4283,7 +5022,7 @@ impl<'a> FnLower<'a> {
         }
         // `patch("target", handle, "repl") -> Int` (1 = ok) — hot-update: redirect the
         // `@patchable fn` `target`'s entry to the loaded module's `repl` by rewriting its
-        // reserved NOP sled with a `jmp` (DYNAMIC-VIRE-PATCH.md B1). `unpatch("target")`
+        // reserved NOP sled with a `jmp` (the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B1). `unpatch("target")`
         // restores the original entry byte-identically. Both names are string literals.
         if name == "patch" || name == "unpatch" {
             let target = match args.first() {
@@ -4386,6 +5125,8 @@ impl<'a> FnLower<'a> {
             }
             let d = self.new_local(Ty::I64);
             self.emit(Statement::Call { dest: Some(d), func: "vire_cstr".into(), args: vec![arg] });
+            // `cstr` returns a checked pointer: provenance for `Ptr` sinks.
+            self.ptr_locals.insert(d.0);
             return (Operand::Copy(d), Ty::I64);
         }
         // Intrinsic `print` — multi-argument: each argument on its own line.
@@ -4445,11 +5186,27 @@ impl<'a> FnLower<'a> {
             return (Operand::Copy(d), ret);
         }
         // Call of an own function
-        let (ret, ret_class, ret_arr, ret_arr_class) = self
+        let (ret, ret_class, ret_arr, ret_arr_class, ptr_params, ptr_ret, is_extern) = self
             .sigs
             .get(&name)
-            .map(|s| (s.ret, s.ret_class.clone(), s.ret_arr, s.ret_arr_class.clone()))
-            .unwrap_or((Ty::I64, None, None, None));
+            .map(|s| (s.ret, s.ret_class.clone(), s.ret_arr, s.ret_arr_class.clone(), s.ptr_params.clone(), s.ptr_ret, s.is_extern))
+            .unwrap_or((Ty::I64, None, None, None, vec![], false, false));
+        // E421 (AGENTS.md §3): a `Ptr` parameter takes only proven pointers (a
+        // `Ptr` value or the null literal `0`) — never a forged integer. This
+        // holds at the C boundary AND at user functions (whose bodies trust a
+        // `Ptr` parameter). The check runs on the lowered operands so copies
+        // (`mut q = p`), `cstr` results and `0` pass, anything else fails loudly.
+        if ptr_params.iter().any(|b| *b) {
+            for (i, is_ptr) in ptr_params.iter().enumerate() {
+                if *is_ptr {
+                    let proven = lowered.get(i).map(|(o, _)| self.ptr_of_operand(o)).unwrap_or(true);
+                    if !proven {
+                        let what = if is_extern { format!("extern `{name}`") } else { format!("`{name}`") };
+                        self.errs.push(format!("error[E421]: argument {} of {what} is `Ptr` but the value is a non-pointer integer — a number is never an address (AGENTS.md §3). Pass a `Ptr` source (`cstr`, an extern call returning `Ptr`, a `Ptr` parameter) or the null literal `0`", i + 1));
+                    }
+                }
+            }
+        }
         // Convenience: for `py_*` bridge functions, string arguments are
         // automatically turned into C strings (`cstr`), so that one can write
         // `py_import("math")` instead of `py_import(cstr("math"))`.
@@ -4473,6 +5230,12 @@ impl<'a> FnLower<'a> {
             let d = self.new_local(ret);
             if let Some(c) = ret_class {
                 self.local_class.insert(d.0, c); // object return: remember the class
+            }
+            // An extern call returning `Ptr` yields a checked pointer: provenance
+            // for `Ptr` sinks (so helpers can thread `Ptr` through, checked at
+            // their own `-> Ptr` return).
+            if ptr_ret {
+                self.ptr_locals.insert(d.0);
             }
             // Array return: remember the element kind (+ class for a ref array) so
             // `f()[i]` / `f()[i].field` resolve like a local/param array.
@@ -4537,6 +5300,10 @@ impl<'a> FnLower<'a> {
                 }
                 _ => {
                     let (op, ty) = self.lower_expr(arg);
+                    // E421: inlined calls check `Ptr` parameters like direct calls.
+                    if p.ty.as_ref().is_some_and(|t| t.name == "Ptr") && !self.ptr_of_operand(&op) {
+                        self.errs.push(format!("error[E421]: argument of `{name}` is `Ptr` but the value is a non-pointer integer — a number is never an address (AGENTS.md §3)"));
+                    }
                     let d = self.new_local(ty);
                     if let Some(c) = self.class_of_operand(&op) {
                         self.local_class.insert(d.0, c);
@@ -4544,6 +5311,7 @@ impl<'a> FnLower<'a> {
                     if let Some(k) = self.arr_of_operand(&op) {
                         self.local_arr.insert(d.0, k);
                     }
+                    self.track_ptr(d.0, &op);
                     self.emit(Statement::Assign(d, Rvalue::Use(op)));
                     self.bind(&p.name, d, ty);
                 }
@@ -4826,6 +5594,10 @@ impl<'a> FnLower<'a> {
                     self.local_arr.insert(r.0, *first);
                 }
             }
+            // `Ptr` provenance: every value-producing arm must be proven.
+            if ends.iter().all(|(_, v, _)| self.ptr_of_operand(v)) {
+                self.ptr_locals.insert(r.0);
+            }
         }
         for (end, v, _) in &ends {
             if let Some(r) = res {
@@ -5018,6 +5790,12 @@ impl<'a> FnLower<'a> {
                 (Some(a), Some(b)) if a == b => { self.local_arr.insert(res.0, a); }
                 _ => {}
             }
+            // `Ptr` provenance merges only when BOTH branches are proven (a null
+            // literal counts as proven, so `if c { p } else { 0 }` stays a pointer;
+            // a forged integer on either side clears it — doubt, not trust).
+            if self.ptr_of_operand(&tv) && self.ptr_of_operand(&ev) {
+                self.ptr_locals.insert(res.0);
+            }
             self.blocks[te].statements.push(Statement::Assign(res, Rvalue::Use(tv)));
             self.blocks[ee].statements.push(Statement::Assign(res, Rvalue::Use(ev)));
             self.term(te, Terminator::Goto(merge));
@@ -5096,6 +5874,8 @@ fn lower_fn(
         sum_hint: None,
         expected_result: None,
         mmio: HashMap::new(),
+        ptr_locals: std::collections::HashSet::new(),
+        ret_is_ptr: false,
         in_region: 0,
         hw_regions,
         local_lambda: HashMap::new(),
@@ -5178,8 +5958,15 @@ fn lower_fn(
         if let Some(c) = arr_cls {
             fl.local_arr_class.insert(l.0, c);
         }
+        // A `Ptr`-annotated parameter starts with provenance (the caller was
+        // checked at its call site); any other parameter never does.
+        if p.ty.as_ref().is_some_and(|pt| pt.name == "Ptr") {
+            fl.ptr_locals.insert(l.0);
+        }
         fl.bind(&p.name, l, t);
     }
+    // A `-> Ptr` function must return proven pointers (checked at each return).
+    fl.ret_is_ptr = f.sig.ret.as_ref().is_some_and(|t| t.name == "Ptr");
     if let Some(body) = &f.body {
         // Statements + tail (tail = return value, if ret != Void)
         fl.scopes.push(HashMap::new());
@@ -5189,6 +5976,10 @@ fn lower_fn(
         let term = if let Some(t) = &body.tail {
             fl.mark_line(expr_span(t));
             let (op, _) = fl.lower_expr(t);
+            // E421: a `-> Ptr` tail value must be a proven pointer too.
+            if fl.ret_is_ptr && ret != Ty::Void && !fl.ptr_of_operand(&op) {
+                fl.errs.push("error[E421]: `-> Ptr` function with a non-pointer tail value — a number is never an address (AGENTS.md §3)".into());
+            }
             if ret == Ty::Void { Terminator::Return(None) } else { Terminator::Return(Some(op)) }
         } else if ret == Ty::Void {
             Terminator::Return(None)

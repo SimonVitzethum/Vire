@@ -1,24 +1,2 @@
-# rustc-Quellcheckout: nur Referenzlektüre, keine Abhängigkeit (DESIGN.md §1.2)
-/rustc-src
-
 # Rust
 /target/
-
-# javac-/fastjavac-Ausgaben in den Beispielen: alles außer den Quellen
-examples/*
-!examples/*.java
-# Vire-Beispielprogramme + Runner/README sind Quellcode, kein Build-Artefakt.
-!examples/vire/
-
-# kompilierte Stub-Klassenbibliothek
-/stdlib/out/
-benchmarks/m0/q[0-9]*
-
-# Java-Bootstrap Build-Artefakte
-examples/*.class
-examples/*.bin
-examples/bench
-tests/work/
-
-# Autonomer Arbeits-Journal (nicht committen)
-workflow.md

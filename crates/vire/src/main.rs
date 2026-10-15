@@ -1,14 +1,11 @@
 //! `vire` — compiler driver.
-//! Usage: `vire parse DATEI.vr` | `vire lex DATEI.vr` |
-//!         `vire build [-o BIN] [--emit-ir|--emit-llvm] DATEI.vr` |
-//!         `vire run DATEI.vr`.
-//! `build`/`run` lower the AST to `crates/ir` and use the same
-//! solver + LLVM backend + runtime as the Java driver (fastjavac).
+//! Usage: `vire build FILE.vr --emit=gab` (Gabbro source, the only target) |
+//!         `vire run FILE.vr` (LLVM execution oracle, paused — no new work).
+//! `build`/`run` lower the AST to `crates/ir` and run the solver; `--emit=gab`
+//! emits Gabbro source, everything else goes through the LLVM oracle backend.
 
 use std::path::PathBuf;
 use std::process::{exit, Command};
-
-mod cverify;
 
 // The minimal C support source (crates/runtime/runtime.c) — entry point,
 // print helpers. No GC, no RC, no collector (AGENTS.md §2).
@@ -26,10 +23,6 @@ fn main() {
     }
     if args[0] == "bindgen" {
         bindgen(&args[1..]);
-        return;
-    }
-    if args[0] == "audit" {
-        audit(&args[1..]);
         return;
     }
     if args[0] == "check" {
@@ -147,165 +140,6 @@ fn main() {
     }
 }
 
-/// Map a Vire `@assume:` name to the CSolver assumption flag it authorizes. These are
-/// the irreducible hardware/framework invariants no software proof can discharge; each
-/// is unsound in general and is why it must be written down and audited.
-fn assume_flag(name: &str) -> Option<&'static str> {
-    match name {
-        "mmio" => Some("--assume-valid-mmio"),
-        "field_invariants" | "field" => Some("--assume-field-invariants"),
-        "valid_returns" | "returns" => Some("--assume-valid-returns"),
-        "loop_ptrs" | "loop" => Some("--assume-valid-loop-ptrs"),
-        "struct_tail" => Some("--assume-struct-tail"),
-        _ => None,
-    }
-}
-
-/// Parse `@assume: <name> [justification]` directives out of an inline block's code
-/// (they are ordinary C/asm comments, copied verbatim into the generated block).
-/// Returns (name, justification) pairs in source order.
-fn parse_assumes(code: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in code.lines() {
-        if let Some(rest) = line.split("@assume:").nth(1) {
-            // strip a trailing `*/` if it was a block comment.
-            let rest = rest.trim().trim_end_matches("*/").trim();
-            let mut it = rest.splitn(2, char::is_whitespace);
-            let name = it.next().unwrap_or("").trim().to_string();
-            let just = it.next().unwrap_or("").trim().trim_matches('"').to_string();
-            if !name.is_empty() {
-                out.push((name, just));
-            }
-        }
-    }
-    out
-}
-
-/// Auto-synthesize a CSolver `--pre` contract from the C block's function signatures:
-/// an adjacent `(T* ptr, intN len)` parameter pair (the C `(buf, len)` idiom) becomes
-/// `<fn> <ptr#> elements <len#> <elem-bytes>` — a PROVEN bound, not a blanket trust.
-/// This is the contract a typed Vire caller supplies (a Vire array is a proven
-/// (ptr, len)). Returns the contract text (one line per pair) or None. Heuristic +
-/// prove-only (refutable=false), so it never introduces a false FAIL; the remaining
-/// pointers stay under `assume_valid_params`.
-fn synthesize_pre(code: &str) -> Option<String> {
-    fn elem_bytes(ptr_ty: &str) -> u32 {
-        let t = ptr_ty.replace('*', " ");
-        let t = t.split_whitespace().filter(|w| *w != "const").collect::<Vec<_>>().join(" ");
-        if t.contains("char") || t.contains("int8") || t.contains("uint8") {
-            1
-        } else if t.contains("short") || t.contains("int16") {
-            2
-        } else if t.contains("long long") || t.contains("int64") || t.contains("double") || t.contains("size_t") {
-            8
-        } else if t.contains("long") {
-            8
-        } else {
-            4 // int / float / default
-        }
-    }
-    fn is_int_param(p: &str) -> bool {
-        !p.contains('*')
-            && ["int", "long", "short", "size_t", "unsigned", "int32", "int64", "size"].iter().any(|k| p.contains(k))
-    }
-    let mut lines = Vec::new();
-    let bytes = code.as_bytes();
-    let mut idx = 0;
-    while let Some(open) = code[idx..].find('(') {
-        let open = idx + open;
-        // Function name = identifier immediately before '('.
-        let mut ns = open;
-        while ns > 0 && (bytes[ns - 1].is_ascii_alphanumeric() || bytes[ns - 1] == b'_') {
-            ns -= 1;
-        }
-        let name = &code[ns..open];
-        let Some(close_rel) = code[open..].find(')') else { break };
-        let close = open + close_rel;
-        // Only real definitions: a '{' should follow the ')' (skip whitespace).
-        let after = code[close + 1..].trim_start();
-        idx = close + 1;
-        if name.is_empty() || !after.starts_with('{') {
-            continue;
-        }
-        let params: Vec<&str> = code[open + 1..close].split(',').map(|s| s.trim()).filter(|s| !s.is_empty() && *s != "void").collect();
-        for (i, p) in params.iter().enumerate() {
-            if p.contains('*') && i + 1 < params.len() && is_int_param(params[i + 1]) {
-                lines.push(format!("{name} {i} elements {} {}", i + 1, elem_bytes(p)));
-            }
-        }
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n") + "\n")
-    }
-}
-
-/// Parse the `@assume:` directives of a block into the CSolver assumption set. An
-/// unknown name is an error (no silent trust).
-fn assume_set(code: &str) -> Result<cverify::Assume, String> {
-    let mut a = cverify::Assume::default();
-    for (name, _just) in parse_assumes(code) {
-        match name.as_str() {
-            "mmio" => a.valid_mmio = true,
-            "field_invariants" | "field" => a.field_invariants = true,
-            "valid_returns" | "returns" => a.valid_returns = true,
-            "loop_ptrs" | "loop" => a.valid_loop_ptrs = true,
-            "struct_tail" => a.struct_tail = true,
-            other => {
-                return Err(format!(
-                    "    unknown @assume `{other}` (known: mmio, field_invariants, valid_returns, loop_ptrs, struct_tail)"
-                ))
-            }
-        }
-    }
-    Ok(a)
-}
-
-/// Gate a `native "c"`/`native "asm"` block through the CSolver memory-safety verifier.
-/// C is compiled to LLVM IR (`clang -O0 -emit-llvm`); assembly (`ext == "s"`) is verified
-/// directly (CSolver decodes x86-64/AArch64). Returns Ok only on a proven-safe verdict
-/// (exit 0 = PASS); otherwise Err with the residual obligations / counterexample.
-/// Content-addressed verification cache. A block's proof is expensive (CDCL SAT +
-/// symbolic execution); an unchanged block need not be re-verified. Key = hash of the
-/// block kind + its exact source (the contract/assumptions are derived from it). Only
-/// PASS verdicts are cached (a rejection fails the build anyway). Bump VERIFY_CACHE_TAG
-/// when the verifier changes so stale PASSes are not reused.
-const VERIFY_CACHE_TAG: &str = "v1";
-
-fn cache_key(ext: &str, code: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    VERIFY_CACHE_TAG.hash(&mut h);
-    ext.hash(&mut h);
-    code.hash(&mut h);
-    h.finish()
-}
-
-fn cache_file() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    let dir = base.join("vire");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("verify-cache"))
-}
-
-fn cache_has(key: u64) -> bool {
-    let Some(f) = cache_file() else { return false };
-    let hex = format!("{key:016x}");
-    std::fs::read_to_string(f).map(|s| s.lines().any(|l| l == hex)).unwrap_or(false)
-}
-
-fn cache_add(key: u64) {
-    if let Some(f) = cache_file() {
-        use std::io::Write;
-        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
-            let _ = writeln!(fh, "{key:016x}");
-        }
-    }
-}
-
 /// Precompile `runtime.c` to LLVM bitcode once per (content, `-D` flags, target,
 /// clang version) and cache it. The runtime is identical every build, yet its
 /// `-O2 -flto -c` bitcode generation is ~80% of a small build's wall time. The LTO
@@ -371,105 +205,7 @@ fn cached_runtime_object(threads: bool, backtrace: bool, no_cycles: bool, no_rc:
     Some(obj)
 }
 
-fn verify_native_block(path: &std::path::Path, code: &str, ext: &str, build_dir: &std::path::Path, i: usize) -> Result<bool, String> {
-    let assume = assume_set(code)?;
-    let key = cache_key(ext, code);
-    if cache_has(key) {
-        return Ok(true); // cached PASS — skip re-verification
-    }
-    let outcome = if ext == "s" {
-        // Assembly is CSolver's native input — verify the .s text directly.
-        let src = std::fs::read_to_string(path).map_err(|e| format!("reading asm block: {e}"))?;
-        cverify::verify_asm(&src, &assume)
-    } else {
-        // C → LLVM IR via clang, then verify the IR. Auto-synthesized (ptr,len)→elements
-        // contracts give PROVEN buffer bounds; assume_valid_params covers the rest.
-        let ll = build_dir.join(format!("native_{i}.verify.ll"));
-        let clang = Command::new("clang")
-            .args(["-O0", "-S", "-emit-llvm", "-g", "-o"])
-            .arg(&ll)
-            .arg(path)
-            .output()
-            .map_err(|e| format!("clang not runnable for verification: {e}"))?;
-        if !clang.status.success() {
-            return Err(format!("the C block does not compile:\n{}", String::from_utf8_lossy(&clang.stderr)));
-        }
-        let src = std::fs::read_to_string(&ll).map_err(|e| format!("reading lowered IR: {e}"))?;
-        let pre = synthesize_pre(code);
-        cverify::verify_llvm(&src, &format!("native_{i}"), pre.as_deref(), &assume)
-    };
-    match outcome {
-        cverify::Outcome::Pass => {
-            cache_add(key);
-            Ok(false)
-        }
-        cverify::Outcome::Rejected(report) => Err(report),
-    }
-}
-
-/// Verify all native `@c`/`@asm` blocks, in PARALLEL when there is more than one.
-/// Each proof is independent — a separate `clang -emit-llvm` on its own
-/// `native_{i}.verify.ll` plus a functional CSolver run, with only the atomic,
-/// content-addressed PASS cache shared — so they run on a bounded worker pool
-/// (≤ CPU count). Results are reported in block order and the build exits on the
-/// FIRST rejection, so the diagnostics are deterministic regardless of scheduling.
-fn verify_blocks_parallel(jobs: &[(usize, PathBuf, String, &'static str, String)], build_dir: &std::path::Path) {
-    if jobs.is_empty() {
-        return;
-    }
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-    let n = jobs.len();
-    let results: Vec<Mutex<Option<Result<bool, String>>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let cursor = AtomicUsize::new(0);
-    let nthreads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(n);
-    std::thread::scope(|s| {
-        for _ in 0..nthreads {
-            s.spawn(|| loop {
-                let idx = cursor.fetch_add(1, Ordering::Relaxed);
-                if idx >= n {
-                    break;
-                }
-                let (i, path, code, ext, _abi) = &jobs[idx];
-                let r = verify_native_block(path, code, ext, build_dir, *i);
-                *results[idx].lock().unwrap() = Some(r);
-            });
-        }
-    });
-    for (idx, (i, _p, _c, _e, abi)) in jobs.iter().enumerate() {
-        match results[idx].lock().unwrap().take().expect("verify job not run") {
-            Ok(cached) => eprintln!(
-                "verify: native \"{abi}\" block {i}: PASS (proven memory-safe{})",
-                if cached { ", cached" } else { "" }
-            ),
-            Err(report) => {
-                eprintln!(
-                    "error: native \"{abi}\" block {i} is not provably memory-safe \
-                     (rejected instead of trusted like `unsafe`):\n{report}\n       \
-                     Close the proof with a contract/`@assume` (E410: there is no opt-out)."
-                );
-                exit(1);
-            }
-        }
-    }
-}
-
 /// Python include path + lib name via `python3`/sysconfig (for `native "python"`).
-fn python_config() -> Option<(String, String)> {
-    let out = Command::new("python3")
-        .args(["-c", "import sysconfig;print(sysconfig.get_config_var('INCLUDEPY'));print(sysconfig.get_config_var('LDVERSION'))"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
-    let inc = lines.next()?.trim().to_string();
-    let ver = lines.next()?.trim().to_string();
-    Some((inc, format!("python{ver}")))
-}
-
 /// Loads a `vire.syntax` file next to the source (if present) → user-
 /// defined keyword spellings. If it is missing, the default syntax applies.
 /// Resolve a custom-syntax config **only when explicitly requested** — never the old
@@ -623,7 +359,7 @@ fn check(args: &[String]) {
     }
 }
 
-/// Load a hardware profile for `Mmio.bind` (language/HW-SAFE.md §2): lines
+/// Load a hardware profile for `Mmio.bind` (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): lines
 /// `name base len` (`#` comments, decimal or `0x`-hex). A malformed line is a
 /// hard error — silently skipping it would turn an address typo into E400
 /// confusion (or worse, a wrong mapping).
@@ -715,56 +451,6 @@ fn syntax_directive(src: &str) -> Option<String> {
     None
 }
 
-/// `vire audit FILE.vr`: list every `@assume` in the program's inline C/asm blocks —
-/// the complete, named trust boundary. Everything NOT listed here is machine-proven;
-/// each entry is a hardware/framework invariant the proof rests on but cannot discharge.
-fn audit(args: &[String]) {
-    let Some(path) = args.first() else {
-        eprintln!("Usage: vire audit FILE.vr");
-        exit(2);
-    };
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            exit(1);
-        }
-    };
-    let (mut module, _diags) = vire::parse(&src);
-    let _ = vire::desugar_cblocks(&mut module);
-    let mut total_blocks = 0usize;
-    let mut total_assumes = 0usize;
-    println!("Trust audit — {path}");
-    println!("Every inline block below is memory-verified; the @assume lines are the ONLY");
-    println!("facts trusted without proof.\n");
-    for it in &module.items {
-        if let vire::ast::Item::Native { abi, code, .. } = it {
-            let a = abi.to_ascii_lowercase();
-            if a != "c" && a != "asm" && a != "s" && a != "assembly" {
-                continue;
-            }
-            total_blocks += 1;
-            let assumes = parse_assumes(code);
-            let label = code.lines().find(|l| l.contains("__cblock")).map(|l| l.trim()).unwrap_or("<inline block>");
-            if assumes.is_empty() {
-                println!("  ✓ {label}\n      fully proven — no assumptions");
-            } else {
-                println!("  ⚠ {label}");
-                for (name, just) in &assumes {
-                    total_assumes += 1;
-                    let flag = assume_flag(name).unwrap_or("<UNKNOWN>");
-                    let why = if just.is_empty() { "(no justification given)" } else { just.as_str() };
-                    println!("      @assume {name} [{flag}]  —  {why}");
-                }
-            }
-        }
-    }
-    println!("\n{total_blocks} inline block(s), {total_assumes} assumption(s) at the trust boundary.");
-    if total_assumes == 0 && total_blocks > 0 {
-        println!("No unproven assumptions — every inline block is fully machine-verified.");
-    }
-}
-
 /// `vire build`/`run`: .vr → AST → IR (lowering) → solver → LLVM → clang → binary.
 /// `run` executes the binary afterwards and passes through its exit code.
 fn build_or_run(args: &[String]) {
@@ -772,6 +458,9 @@ fn build_or_run(args: &[String]) {
     let mut out: Option<PathBuf> = None;
     let mut emit_ir = false;
     let mut emit_llvm = false;
+    // Gabbro target (AGENTS.md §0): `--emit=gab` emits `.gab` source text
+    // (Lean-conformant) instead of a native binary. Transition dual-backend.
+    let mut emit_gab = false;
     // -O0: clang optimization/LTO off. For honest RC/heap MEASUREMENTS — otherwise
     // `-O2 -flto` eliminates dead allocation/release pairs (the objects are
     // optimized away, the runtime counters stay 0). The solver always runs.
@@ -796,10 +485,8 @@ fn build_or_run(args: &[String]) {
     let mut link_libs: Vec<String> = Vec::new();
     let mut link_objs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
-    // Memory-safety verification of `native "c"`/`native "asm"` blocks is
-    // MANDATORY (the sound alternative to a blind `unsafe`): each block is proven safe by
-    // the vendored CSolver verifier (linked in — no external binary) or it is a compile
-    // error (E410). There is no opt-out (AGENTS.md §3).
+    // User `native "c"`/`native "asm"` blocks are removed (E410 at emission,
+    // AGENTS.md §1). Only `extern "C"` declarations + `--obj`/`-l` link C code.
     let mut threads_flag = false;
     let mut backtrace_flag = false;
     let mut debug_flag = false;
@@ -836,7 +523,7 @@ fn build_or_run(args: &[String]) {
             // disabled the memory-safety proof for native blocks. There is no opt-out;
             // use a contract/`@assume` or remove the block.
             "--noverify" | "--unsafe-c" | "--no-verify-c" => {
-                eprintln!("error[E410]: `--noverify`/`--unsafe-c` is removed — native blocks must verify (AGENTS.md §3). Close the proof with a contract/`@assume`.");
+                eprintln!("error[E410]: `--noverify`/`--unsafe-c` is removed (AGENTS.md §1/§3).");
                 exit(2);
             }
             // Force the threads runtime even without `spawn` (atomic RC + pthreads).
@@ -848,14 +535,13 @@ fn build_or_run(args: &[String]) {
             // Emit DWARF debug info (DISubprogram/DILocation) mapping to the .vr
             // source, and build at -O0 so gdb/lldb/addr2line resolve file:line.
             "--debug" | "-g" => debug_flag = true,
-            // Obsolete: the verifier is now linked in (vendored). Accept + ignore the
-            // old `--verify-c <path>` form so existing invocations keep working.
+            // Obsolete: accept + ignore the old `--verify-c <path>` form.
             "--verify-c" => {
                 let _ = it.next();
             }
             "--emit-ir" => emit_ir = true,
             "--emit-llvm" => emit_llvm = true,
-            // Dynamic module (M1, DYNAMIC-VIRE-PLAN.md P1): a PIC `.so` exporting a scalar
+            // Dynamic module (M1, the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1): a PIC `.so` exporting a scalar
             // C-ABI entry `vire_module_main(i64)->i64` (from `fn module_main(x: Int) -> Int`)
             // + a `vire_module_abi` version constant, loadable at runtime via `load_module`.
             "--emit-module" => emit_module = true,
@@ -863,12 +549,13 @@ fn build_or_run(args: &[String]) {
             a if a.starts_with("--emit=") => match &a[7..] {
                 "ir" => emit_ir = true,
                 "llvm" => emit_llvm = true,
+                "gab" => emit_gab = true,
                 "obj" | "object" => emit_obj = true,
                 "asm" | "assembly" => emit_asm = true,
                 "staticlib" | "lib" | "static" => emit_staticlib = true,
                 "exe" | "bin" | "executable" => {}
                 k => {
-                    eprintln!("--emit: unknown kind '{k}' (obj|asm|llvm|ir|staticlib|exe)");
+                    eprintln!("--emit: unknown kind '{k}' (obj|asm|llvm|ir|staticlib|gab|exe)");
                     exit(2);
                 }
             },
@@ -903,7 +590,7 @@ fn build_or_run(args: &[String]) {
                     exit(2);
                 }
             },
-            // Hardware profile for `Mmio.bind("name")` (language/HW-SAFE.md §2):
+            // Hardware profile for `Mmio.bind("name")` (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2):
             // lines `name base len` (`#` comments, decimal or 0x-hex). Without it
             // every bind is E400 — addresses never come from user integers.
             "--hw-profile" => match it.next() {
@@ -1073,29 +760,11 @@ fn build_or_run(args: &[String]) {
     }
     let want_threads = !spawn_workers.is_empty();
 
-    // C++ bridge generator: `cxx { fn sig = "c++ body" }` → generate an
-    // `extern "C"` trampoline per fn (compiled via the native "c++" path) and
-    // replace the item with an `extern` item so that infer/lower see the
-    // signatures. Saves the hand-written facade.
-    let mut cxx_native: Vec<(String, String)> = Vec::new();
-    for it in &mut module.items {
-        if let vire::ast::Item::Cxx { links, preamble, fns, span } = it {
-            let mut src = String::from("// generated by `cxx {}` (bridge generator)\n");
-            src.push_str(preamble);
-            src.push('\n');
-            for (sig, body) in fns.iter() {
-                src.push_str(&gen_cxx_trampoline(sig, body));
-            }
-            cxx_native.push(("c++".into(), src));
-            link_libs.extend(links.iter().cloned());
-            let sigs: Vec<vire::ast::FnSig> = fns.iter().map(|(s, _)| s.clone()).collect();
-            *it = vire::ast::Item::Extern { abi: "C".into(), items: sigs, links: links.clone(), header: None, span: *span };
-        }
-    }
-
     // FFI from the source: `extern "…" link "lib"` + `native "…" … """code"""`.
     // Link libs → clang `-l`; native blocks → compiled in automatically.
-    let mut native_blocks: Vec<(String, String)> = cxx_native;
+    // NOTE: no `cxx { }` bridge anymore (REMOVED, E410 in lowering): embedded C++
+    // never passed the verifier. C++ lives in its own TU via `--obj` + `extern "C"`.
+    let mut native_blocks: Vec<(String, String)> = Vec::new();
     for it in &module.items {
         match it {
             vire::ast::Item::Extern { links, .. } => {
@@ -1160,7 +829,7 @@ fn build_or_run(args: &[String]) {
     // markers; non-debug builds pass no source (no markers → no interference with
     // the optimizing passes, IR byte-for-byte as before).
     let lower_src = if debug_flag { src.as_str() } else { "" };
-    // Hardware profile for `Mmio.bind` (language/HW-SAFE.md §2).
+    // Hardware profile for `Mmio.bind` (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2).
     let hw_profile: Vec<(String, u64, u64)> = hw_profile_file
         .as_deref()
         .map(load_hw_profile)
@@ -1212,7 +881,23 @@ fn build_or_run(args: &[String]) {
     // `mut n = <const>` local becomes a literal → native srem/magic-multiply
     // instead of a jrt_lrem call, and constant sizes/bounds help the passes below.
     let _ = timed!("propagate_const_scalars", fastllvm_solver::propagate_const_scalars(&mut program));
-    let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
+    // Proof passes the Gabbro path does not read (Gabbro re-verifies bounds,
+    // checks and layouts itself): skipped for `--emit=gab`, where they are
+    // dead weight (measured 77 s on 1500 chained functions, all inside
+    // `elide_bounds_post_inline`). Kept everywhere: `run` (devirt shapes
+    // emission), constprop (const bounds feed trip inference), `inline`
+    // (structure), refcopy. Gating is output-neutral for `.gab` (verified
+    // byte-identical on the gate corpus) and changes no LLVM-path behavior.
+    // - `elide_bounds` ×2: only re-marks `checked` on array accesses; gab
+    //   emission never reads `checked` (checked-trap ≡ abort).
+    // - `stack_allocate`: New→StackNew / NewArray→StackNewArray; gab maps
+    //   both spellings of each identically (tables, sum pairs).
+    // - `narrow_fields`: Int→i32 field widths; gab declines all objects
+    //   (M4) before widths could matter.
+    let gab_only = emit_gab;
+    if !gab_only {
+        let _ = timed!("elide_bounds", fastllvm_solver::elide_bounds(&mut program));
+    }
     s.inlined_calls = timed!("inline_program", fastllvm_solver::inline_program(&mut program));
     // Bounds again, AFTER inlining. The first run above sees `fn f(a: Array[Int])` with
     // the array as a parameter: no allocation site, hence no length, hence
@@ -1221,8 +906,11 @@ fn build_or_run(args: &[String]) {
     // is inlined, the array and its `array(n)` are in the same function and every path
     // (constant length, loop guard, affine index) can finally see them. Cheap: the pass
     // is linear in the IR and only re-marks, it never un-elides.
-    let _ = timed!("elide_bounds_post_inline", fastllvm_solver::elide_bounds(&mut program));
-    s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
+    // (LLVM path only — see the Gabbro note above.)
+    if !gab_only {
+        let _ = timed!("elide_bounds_post_inline", fastllvm_solver::elide_bounds(&mut program));
+        s.stack_allocated = timed!("stack_allocate", fastllvm_solver::stack_allocate(&mut program));
+    }
     // Field auto-narrowing (value-range analysis): narrow `Int` fields whose values
     // provably fit in i32 to 4 bytes (RAM). Sound (widening).
     //
@@ -1245,15 +933,20 @@ fn build_or_run(args: &[String]) {
                     .any(|s| matches!(s, fastllvm_ir::Statement::Call { func, .. } if func == "jrt_module_call_obj"))
             })
         });
-    let _narrowed = if obj_boundary { 0 } else { timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program)) };
+    let _narrowed = if gab_only || obj_boundary { 0 } else { timed!("narrow_fields", fastllvm_solver::narrow_fields(&mut program)) };
     // Solver-side ownership classification (borrowck offload, AGENTS.md §2):
     // analysis-only report behind FASTLLVM_DUMP_OWN=1 — measures the provable
     // fraction (Unique/Borrow/Region vs Shared). No codegen effect yet.
-    // FASTLLVM_WARN_DYNAMIC=1 previews E300 (AGENTS.md §2.4, OWNERSHIP-STATIC.md):
+    // FASTLLVM_WARN_DYNAMIC=1 previews E300 (AGENTS.md §2.4, the former OWNERSHIP-STATIC.md (removed in cleanup; see git history)):
     // every Shared heap allocation site is a program point that would need a
     // ceiling (`region(max)`) or a kernel `Rc` once E300 is enforced. Warning
     // only — measures the blast radius without breaking the corpus.
-    if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() || std::env::var_os("FASTLLVM_WARN_DYNAMIC").is_some() {
+    // E300 enforcement (opt-in via FASTLLVM_DENY_DYNAMIC=1 for now; default-deny
+    // lands with the kernel-`Rc` gate): runs on this same post-pass program, so
+    // escape-promoted News (StackNew/…) never count — judging the fresh lowering
+    // instead would reject provably-stack programs (false positives vs §2.1).
+    let deny_dynamic = std::env::var_os("FASTLLVM_DENY_DYNAMIC").is_some();
+    if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() || std::env::var_os("FASTLLVM_WARN_DYNAMIC").is_some() || deny_dynamic {
         let rep = fastllvm_solver::classify_ownership(&program);
         if std::env::var_os("FASTLLVM_DUMP_OWN").is_some() {
             eprintln!(
@@ -1264,17 +957,51 @@ fn build_or_run(args: &[String]) {
             for (f, i) in &rep.shared_news {
                 eprintln!("[own] shared-new {f} stmt#{i}");
             }
+            for f in &rep.rc_cycle_fns {
+                eprintln!("[own] rc-cycle {f}");
+            }
         }
         if std::env::var_os("FASTLLVM_WARN_DYNAMIC").is_some() {
             for (f, i) in &rep.shared_news {
                 eprintln!("warning[E300-preview]: heap allocation in `{f}` (site #{i}) has dynamic lifetime — will need `region(max)` or kernel `Rc` when E300 is enforced (AGENTS.md §2.4)");
             }
+            for f in &rep.rc_cycle_fns {
+                eprintln!("warning[E300-preview]: strong `Rc` cycle in `{f}` — with no collector nothing could reclaim it; break with `weak` or move to a ceiling (AGENTS.md §2.6)");
+            }
+        }
+        if deny_dynamic && (!rep.shared_news.is_empty() || !rep.rc_cycle_fns.is_empty()) {
+            for (f, i) in &rep.shared_news {
+                eprintln!("lowering: error[E300]: heap allocation in `{f}` (site #{i}) has dynamic lifetime — name a ceiling (`region(max)`) or move the graph to a kernel `Rc` (AGENTS.md §2.4)");
+            }
+            for f in &rep.rc_cycle_fns {
+                eprintln!("lowering: error[E300]: strong `Rc` cycle in `{f}` — with no collector nothing could reclaim it; break the cycle with `weak` or move the graph to a ceiling (`region(max)`) (AGENTS.md §2.6)");
+            }
+            exit(1);
         }
     }
     let acyclic = s.acyclic;
 
     if emit_ir {
         print!("{program}");
+        return;
+    }
+    // Gabbro target: emit `.gab` source text (checked by `gabbro check`).
+    if emit_gab {
+        let stem = std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "prog".to_string());
+        match fastllvm_backend::emit_gab(&program, &stem) {
+            Ok(text) => {
+                print!("{text}");
+            }
+            Err(errs) => {
+                for e in &errs {
+                    eprintln!("lowering: {e}");
+                }
+                exit(1);
+            }
+        }
         return;
     }
     // Debug info (DWARF) mapping to the .vr source for `--debug`/`-g`. Debug builds
@@ -1378,26 +1105,27 @@ fn build_or_run(args: &[String]) {
     // Write embedded native blocks to files (extension by ABI) and
     // add compile/link flags for C++/Python automatically.
     let mut native_paths: Vec<PathBuf> = Vec::new();
-    let mut want_cpp = false;
-    let mut want_python = false;
-    // Blocks that need the memory-safety proof: (block index, path, code, ext, abi).
-    // Collected here, then verified in PARALLEL below (each proof is an independent
-    // clang `-emit-llvm` + a functional CSolver run over its own `.verify.ll`).
-    let mut verify_jobs: Vec<(usize, PathBuf, String, &'static str, String)> = Vec::new();
     for (i, (abi, code)) in native_blocks.iter().enumerate() {
         let a = abi.to_ascii_lowercase();
         // Compiler-generated glue (`c-glue`, e.g. the `spawn` shim): compiled as C
         // but exempt from the verification gate — it is a trusted runtime handoff,
         // not user `unsafe`.
         let glue = a == "c-glue";
-        let ext = if a == "c++" || a == "cpp" || a == "cxx" {
-            want_cpp = true;
-            "cpp"
-        } else if a == "asm" || a == "s" || a == "assembly" {
+        // REMOVED (AGENTS.md §1/§3, E410): embedded C++ (`native "c++"`) is a blind
+        // escape — it never passes the verifier (only C/asm do). C++ interop lives
+        // outside the language (`extern "C"` decl + `--obj`/`-l`, C-ABI).
+        if !glue && (a == "c++" || a == "cpp" || a == "cxx") {
+            eprintln!("error[E410]: `native \"c++\"` is removed — embedded C++ is a blind escape (AGENTS.md §1/§3, only C/asm verify). Put the C++ in its own TU behind `extern \"C\"` wrappers and link it via `--obj`/`-l` with an `extern \"C\"` declaration");
+            exit(1);
+        }
+        // REMOVED (AGENTS.md §1, E410): `native "python"` (the pybridge implicit
+        // shim) — silently dropping the block at link time was the worst outcome.
+        if !glue && (a == "python" || a == "py") {
+            eprintln!("error[E410]: `native \"python\"` is removed — the implicit pybridge shim is gone (AGENTS.md §1). Call Python through an explicit out-of-language bridge (a helper process/FFI server), not an inline block");
+            exit(1);
+        }
+        let ext = if a == "asm" || a == "s" || a == "assembly" {
             "s"
-        } else if a == "python" || a == "py" {
-            want_python = true;
-            "py"
         } else {
             "c"
         };
@@ -1406,18 +1134,16 @@ fn build_or_run(args: &[String]) {
             eprintln!("writing native block: {e}");
             exit(1);
         }
-        // Verification gate (MANDATORY): a `native "c"`/`native "asm"` block is
-        // accepted only when the vendored CSolver memory-safety verifier PROVES it safe
-        // (called as a library — structured verdicts, no subprocess) — the sound
-        // replacement for a blind `unsafe`. A block that cannot be proven safe is a
-        // compile error (E410), not a runtime hazard. No opt-out.
+        // REMOVED: user `native "c"`/`native "asm"` blocks are blind escapes
+        // (AGENTS.md §1 — the CSolver verifier is gone). Only compiler-generated
+        // glue (`c-glue`: spawn shims, port helpers) still compiles to C.
         if !glue && (ext == "c" || ext == "s") {
-            verify_jobs.push((i, p.clone(), code.clone(), ext, abi.clone()));
+            eprintln!("error[E410]: `native \"{abi}\"` is removed — inline C/asm is a blind escape (AGENTS.md §1). Put the code in its own translation unit behind `extern \"C\"` wrappers and link it via `--obj`/`-l` with an `extern \"C\"` declaration");
+            exit(1);
         }
         native_paths.push(p);
     }
-    verify_blocks_parallel(&verify_jobs, &build_dir);
-    // Raw port I/O helpers (language/HW-SAFE.md §2): x86 `in`/`out` have no
+    // Raw port I/O helpers (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) §2): x86 `in`/`out` have no
     // alternative encoding, so the compiler generates this tiny TU into the
     // PROGRAM's own build (never a shared runtime, never user-written asm).
     // Counted toolchain-side glue like the `spawn` shim. Only when used.
@@ -1435,27 +1161,13 @@ fn build_or_run(args: &[String]) {
             }
         }
         if want_port {
-            let code = "/* Generated per program (language/HW-SAFE.md H2): raw x86 port I/O.\n * The ONLY toolchain-side asm in Vire output; user code can never emit asm.\n * `asm volatile` + memory clobber: the compiler may neither reorder nor drop it. */\n#include <stdint.h>\nvoid __vire_port_outb(int64_t port, int64_t val) { __asm__ volatile (\"outb %0, %1\" :: \"a\"((uint8_t)val), \"Nd\"((uint16_t)port) : \"memory\"); }\nint64_t __vire_port_inb(int64_t port) { uint8_t v; __asm__ volatile (\"inb %1, %0\" : \"=a\"(v) : \"Nd\"((uint16_t)port) : \"memory\"); return (int64_t)v; }\n";
+            let code = "/* Generated per program (the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history) H2): raw x86 port I/O.\n * The ONLY toolchain-side asm in Vire output; user code can never emit asm.\n * `asm volatile` + memory clobber: the compiler may neither reorder nor drop it. */\n#include <stdint.h>\nvoid __vire_port_outb(int64_t port, int64_t val) { __asm__ volatile (\"outb %0, %1\" :: \"a\"((uint8_t)val), \"Nd\"((uint16_t)port) : \"memory\"); }\nint64_t __vire_port_inb(int64_t port) { uint8_t v; __asm__ volatile (\"inb %1, %0\" : \"=a\"(v) : \"Nd\"((uint16_t)port) : \"memory\"); return (int64_t)v; }\n";
             let p = build_dir.join("vire_port.c");
             if let Err(e) = std::fs::write(&p, code) {
                 eprintln!("writing port helpers: {e}");
                 exit(1);
             }
             native_paths.push(p);
-        }
-    }
-    // Python: include path + libpython automatically (from python3/sysconfig).
-    let mut py_include: Option<String> = None;
-    if want_python {
-        match python_config() {
-            Some((inc, lib)) => {
-                py_include = Some(inc);
-                link_libs.push(lib);
-            }
-            None => {
-                eprintln!("native \"python\": python3/sysconfig not found");
-                exit(1);
-            }
         }
     }
     // === Object / assembly / static-library emit (Meson & C/C++/Rust interop) ===
@@ -1491,9 +1203,6 @@ fn build_or_run(args: &[String]) {
             cg.push("-DFASTLLVM_NO_RC".into());
         }
         for inc in &include_dirs {
-            cg.push(format!("-I{inc}"));
-        }
-        if let Some(inc) = &py_include {
             cg.push(format!("-I{inc}"));
         }
         cg.extend(pkg_cflags.iter().cloned());
@@ -1684,9 +1393,6 @@ fn build_or_run(args: &[String]) {
         cmd.arg("-DFASTLLVM_NO_RC");
     }
     // Embedded native sources + include/stdlib flags.
-    if let Some(inc) = &py_include {
-        cmd.arg(format!("-I{inc}"));
-    }
     // User include paths (`-I`) and pkg-config cflags — for `native "c"` blocks / headers.
     for inc in &include_dirs {
         cmd.arg(format!("-I{inc}"));
@@ -1695,8 +1401,9 @@ fn build_or_run(args: &[String]) {
     for p in &native_paths {
         cmd.arg(p);
     }
-    if want_cpp {
-        link_libs.push("stdc++".into()); // C++ blocks need the C++ stdlib
+    // C++ TUs linked via `--obj` (extern "C" wrappers, C-ABI) need the C++ stdlib.
+    if link_objs.iter().any(|o| o.ends_with(".cpp") || o.ends_with(".cxx") || o.ends_with(".cc") || o.ends_with(".C")) {
+        link_libs.push("stdc++".into());
     }
     // FFI linking: user objects/sources first, then libraries. libm always
     // (math intrinsics via extern "C"). clang compiles supplied .c/.cpp directly.
@@ -1949,44 +1656,5 @@ fn map_c_ty(s: &str, is_ret: bool) -> Result<&'static str, ()> {
     })
 }
 
-/// C++ bridge: Vire type name → C-ABI C++ type (for the trampoline signature).
-/// Scalar + `Ptr` (opaque object handle) directly; Str/ref → `void*` (raw handle).
-fn map_cxx_ty(n: &str) -> &'static str {
-    match n {
-        "Int" | "I64" | "U64" => "long",
-        "I32" | "U32" => "int",
-        "Float" | "F64" => "double",
-        "F32" => "float",
-        "Bool" => "int",
-        _ => "void*", // Ptr / Str / ref → opaque pointer
-    }
-}
-
-/// Generates the `extern "C"` trampoline for a `cxx` fn. The body is C++:
-/// if it contains `;`/`return`, it is taken as a statement block; otherwise it is
-/// wrapped as an expression (`return (expr);`, or `expr;` for Unit).
-fn gen_cxx_trampoline(sig: &vire::ast::FnSig, body: &str) -> String {
-    let ret_name = sig.ret.as_ref().map(|t| t.name.as_str());
-    let cret = match ret_name {
-        None | Some("Unit") => "void",
-        Some(n) => map_cxx_ty(n),
-    };
-    let params: Vec<String> = sig
-        .params
-        .iter()
-        .map(|p| {
-            let cty = p.ty.as_ref().map(|t| map_cxx_ty(&t.name)).unwrap_or("long");
-            format!("{cty} {}", p.name)
-        })
-        .collect();
-    let b = body.trim();
-    let is_void = matches!(ret_name, None | Some("Unit"));
-    let wrapped = if b.contains("return") || b.contains(';') {
-        b.to_string()
-    } else if is_void {
-        format!("{b};")
-    } else {
-        format!("return ({b});")
-    };
-    format!("extern \"C\" {cret} {}({}) {{ {wrapped} }}\n", sig.name, params.join(", "))
-}
+// REMOVED: `cxx { }` embedded C++ never passed the verifier — see the E410
+// rejection in lowering. C++ lives in its own TU via `--obj` + `extern "C"`.

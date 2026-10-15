@@ -1,5 +1,5 @@
 //! Vire parser: `Vec<Token> → ast::Module`. Recursive descent for items/
-//! statements, Pratt (precedence climbing) for expressions. See language/PARSER.md.
+//! statements, Pratt (precedence climbing) for expressions. See the former language/PARSER.md (removed in cleanup; see git history).
 
 use crate::ast::*;
 use crate::diag::{Diag, Span};
@@ -77,6 +77,15 @@ impl Parser {
             }
         }
     }
+    /// A `use`-path segment: an identifier — or the `kernel` keyword (which is a
+    /// keyword only so the module marker parses; paths still spell it plainly).
+    fn use_segment(&mut self) -> String {
+        if self.at_kw(Kw::Kernel) {
+            self.bump();
+            return "kernel".into();
+        }
+        self.ident()
+    }
     /// Read an identifier, honoring the `##` token-paste operator (`A ## B`).
     /// Fragments are joined with the reserved sentinel `\u{1}`; item-macro
     /// expansion resolves each fragment (a parameter → its `ident` argument,
@@ -150,13 +159,14 @@ impl Parser {
             Tok::Kw(Kw::Fn) | Tok::Kw(Kw::Type) | Tok::Kw(Kw::Trait) | Tok::Kw(Kw::Impl)
                 | Tok::Kw(Kw::Const) | Tok::Kw(Kw::Use) | Tok::Kw(Kw::Extern) | Tok::Kw(Kw::Pub)
                 | Tok::Kw(Kw::Macro) | Tok::Kw(Kw::Native) | Tok::Kw(Kw::Syscall)
+                | Tok::Kw(Kw::Kernel)
                 // Dynamic-surface seam declarations: `dynamic fn` / `open trait|type|fn`.
                 | Tok::Kw(Kw::Dynamic) | Tok::Kw(Kw::Open)
         ) || matches!(self.peek(), Tok::Ident(n) if n == "cxx")
             // `@derive(...)`/`@when(...)` introduce a
             // declaration item (other `@…` stay expressions/script statements, e.g.
             // inline `@c`/`@asm` blocks).
-            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "patchable")))
+            || (matches!(self.peek(), Tok::At) && matches!(self.peek_at(1), Tok::Ident(n) if matches!(n.as_str(), "derive" | "when" | "patchable" | "gpu" | "vertex" | "fragment" | "mesh" | "task" | "compute" | "gpuvk")))
             // `name!(…)` — an item-macro invocation.
             || (matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Bang))
     }
@@ -171,7 +181,7 @@ impl Parser {
         }
         match self.peek() {
             Tok::Kw(Kw::Fn) => Some(Item::Fn(self.parse_fn_attrs(is_pub, attrs))),
-            // `dynamic fn` — a runtime-overridable seam (DYNAMIC-VIRE-PLAN.md §2/§4). Marked
+            // `dynamic fn` — a runtime-overridable seam (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §2/§4). Marked
             // with a synthetic `__dynamic` attribute; the optimizer treats a call to it as an
             // opaque black box (no arena/RC-elision across it — a future override could
             // escape/retain). `open fn` is an accepted alias.
@@ -225,13 +235,26 @@ impl Parser {
             Tok::Kw(Kw::Use) => {
                 let sp = self.span();
                 self.bump();
-                let mut path = vec![self.ident()];
-                while self.eat(&Tok::Dot) {
-                    // selective: use a.{b, c} – simplified here, read to end of line
-                    if matches!(self.peek(), Tok::LBrace) {
+                // Path segments are usually identifiers, but `kernel` (a keyword
+                // since the §2.5 gate) must stay usable in `use kernel::Rc`.
+                let mut path = vec![self.use_segment()];
+                loop {
+                    if self.eat(&Tok::Dot) {
+                        // selective: use a.{b, c} – simplified here, read to end of line
+                        if matches!(self.peek(), Tok::LBrace) {
+                            break;
+                        }
+                        path.push(self.use_segment());
+                    } else if matches!(self.peek(), Tok::Colon)
+                        && matches!(self.peek_at(1), Tok::Colon)
+                    {
+                        // `::` separator (`use kernel::Rc`).
+                        self.bump();
+                        self.bump();
+                        path.push(self.use_segment());
+                    } else {
                         break;
                     }
-                    path.push(self.ident());
                 }
                 // skip the rest of the line (e.g. {..} / as ..) for M1
                 while !matches!(self.peek(), Tok::Newline | Tok::Semi | Tok::Eof) {
@@ -241,6 +264,7 @@ impl Parser {
             }
             Tok::Kw(Kw::Extern) => Some(self.parse_extern()),
             Tok::Kw(Kw::Syscall) => Some(self.parse_syscall()),
+            Tok::Kw(Kw::Kernel) => Some(self.parse_kernel()),
             Tok::Ident(n) if n == "cxx" => Some(self.parse_cxx()),
             // `name!(args)` — item-macro invocation.
             Tok::Ident(_) if matches!(self.peek_at(1), Tok::Bang) => Some(self.parse_macro_invoke()),
@@ -317,7 +341,7 @@ impl Parser {
         // Return type: `-> T` OR the shorter `> T`. After `)` there is no
         // expression context in which `>` could be a comparison → unambiguous.
         // (Match arms/lambdas CANNOT do this: there `>` would collide with the
-        // comparison operator or the guard — see language/SYNTAX-SIMPLIFICATION.md.)
+        // comparison operator or the guard — see the former language/SYNTAX-SIMPLIFICATION.md (removed in cleanup; see git history).)
         let ret = if self.eat(&Tok::Arrow) || self.eat(&Tok::Gt) { Some(self.parse_type()) } else { None };
         FnSig { name, generics, params, ret, span: sp }
     }
@@ -594,6 +618,11 @@ impl Parser {
             Tok::Str(s) => s,
             _ => "c".into(),
         };
+        // `c-glue` is reserved for compiler-generated shims: user code claiming it
+        // would dodge the verification gate. Reject loudly.
+        if abi == "c-glue" {
+            self.err("error[E410]: `native \"c-glue\"` is reserved for compiler-generated shims — use `native \"c\"`/`native \"asm\"` (verified)");
+        }
         let links = self.parse_links();
         let code = match self.bump() {
             Tok::Str(s) => s,
@@ -644,6 +673,11 @@ impl Parser {
             Tok::Str(s) => s,
             _ => "C".into(),
         };
+        // `C-glue` is reserved for compiler-generated shims (`spawn`, `@c` captures):
+        // user code claiming it would dodge the E421 mapping check. Reject loudly.
+        if abi == "C-glue" {
+            self.err("error[E410]: `extern \"C-glue\"` is reserved for compiler-generated shims — declare `extern \"C\"`");
+        }
         // Optional: `header "datei.h"` → generate signatures later from the C header
         // (auto-bindgen), no `{}` block.
         let mut header = None;
@@ -671,7 +705,7 @@ impl Parser {
     }
 
     /// `syscall NAME(params) -> Ret = NUM` — a declared OS system call (no
-    /// inline asm, no user-written wrapper; see language/HW-SAFE.md). Params
+    /// inline asm, no user-written wrapper; see the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history)). Params
     /// are `name: Type` (checked in lowering: `Int` or `Array[Byte]`); the
     /// return type must be annotated (`-> Int`); `NUM` is the OS syscall number
     /// (decimal or `0x`-hex literal).
@@ -690,6 +724,18 @@ impl Parser {
             }
         };
         Item::Syscall { name, params, ret, num, span: sp }
+    }
+
+    /// `kernel [name]` — marks this compilation unit as a kernel module
+    /// (AGENTS.md §2.5: `Rc[T]` lives only here, plus `use kernel::Rc`).
+    fn parse_kernel(&mut self) -> Item {
+        let sp = self.span();
+        self.expect(&Tok::Kw(Kw::Kernel), "'kernel'");
+        let name = match self.peek() {
+            Tok::Ident(_) => Some(self.ident()),
+            _ => None,
+        };
+        Item::Kernel { name, span: sp }
     }
 
     fn parse_type(&mut self) -> Type {

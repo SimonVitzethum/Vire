@@ -5,7 +5,7 @@
 //! The captured Vire values (currently scalar parameters of the enclosing function)
 //! become the block's parameters, so the C/asm reads them by name / by the SysV
 //! register they land in. The default memory-safety verification gate then PROVES the
-//! generated block safe (see language/VERIFIED-C-ASM.md). Buffer/array capture (the
+//! generated block safe (see the former language/the former VERIFIED-C-ASM.md (removed in cleanup; see git history) (removed in cleanup; see git history)). Buffer/array capture (the
 //! (ptr,len) ABI + a call-site `elements` contract) is the next step.
 
 use crate::ast::*;
@@ -226,8 +226,12 @@ impl Desugar<'_> {
             ("c".to_string(), format!("long {fname}({sig}) {{\n{code}\n}}\n"))
         };
         self.generated.push(Item::Native { abi, code: gen_code, links: vec![], span });
+        // Compiler-generated glue (like the `spawn` shim): the captured Vire values
+        // are reified by `@arraydata`/`@arraylen` at the call site, so the declared
+        // shapes are an internal handoff, not a user C-ABI contract (C-glue skips
+        // the E421 mapping check; the native body itself still verifies).
         let ext_sig = FnSig { name: fname.clone(), generics: vec![], params: ext_params, ret: Some(ty("Int")), span };
-        self.generated.push(Item::Extern { abi: "C".into(), items: vec![ext_sig], links: vec![], header: None, span });
+        self.generated.push(Item::Extern { abi: "C-glue".into(), items: vec![ext_sig], links: vec![], header: None, span });
         Some(Expr::Call { callee: Box::new(Expr::Ident(fname, span)), args: call_args, span })
     }
 }

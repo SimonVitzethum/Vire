@@ -49,7 +49,7 @@ impl Fmt {
                 let v = self.expr(value);
                 self.line(&format!("const {name} = {v}"));
             }
-            Item::Use { path, .. } => self.line(&format!("use {}", path.join("."))),
+            Item::Use { path, .. } => self.line(&format!("use {}", path.join("::"))),
             Item::Extern { abi, items, links, header, .. } => {
                 let mut head = format!("extern \"{abi}\"");
                 for l in links {
@@ -121,6 +121,12 @@ impl Fmt {
                     .collect();
                 let r = ret.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
                 self.line(&format!("syscall {name}({}){r} = {num}", ps.join(", ")));
+            }
+            Item::Kernel { name, .. } => {
+                match name {
+                    Some(n) => self.line(&format!("kernel {n}")),
+                    None => self.line("kernel"),
+                }
             }
         }
     }

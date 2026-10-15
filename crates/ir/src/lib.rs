@@ -257,7 +257,7 @@ pub struct FieldInfo {
     /// AND for primitive arrays (`int[]` references nothing → no cycle
     /// edge). Basis of the acyclicity analysis (cycle collector elimination).
     pub ref_target: Option<String>,
-    /// Vire `weak f: T` — a **non-owning** reference field (DYNAMIC-VIRE-PLAN.md §6).
+    /// Vire `weak f: T` — a **non-owning** reference field (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) §6).
     /// No retain on store, no release on drop, not traced: it carries no ownership, so
     /// it forms **no edge** in the acyclicity analysis and none in the load verifier's
     /// ownership graph. This is the declared back-edge of "acyclicity-or-weak" — how a
@@ -317,6 +317,22 @@ pub struct ClassInfo {
     pub has_clinit: bool,
 }
 
+/// An `extern "C"` function declaration: the C-ABI boundary entry.
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    /// C function name (unmangled, as declared in `extern "C"`).
+    pub name: String,
+    /// Parameter types as checked by E421 (scalars and opaque `Ptr`;
+    /// `Ptr` erases to `I64` in the IR — see `ptr_params`).
+    pub params: Vec<Ty>,
+    /// Return type (`Void` = procedure; `Ptr` erases to `I64`).
+    pub ret: Ty,
+    /// Per-parameter `Ptr` shape (parallel to `params`).
+    pub ptr_params: Vec<bool>,
+    /// True where the declared return annotation is `Ptr`.
+    pub ptr_ret: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub functions: Vec<Function>,
@@ -339,21 +355,26 @@ pub struct Program {
     /// generated/native glue invisible to RTA (e.g. a Vire `spawn` worker, called
     /// from its C shim via `jrt_spawn`). Analogous to the Runnable.run() roots.
     pub exported: Vec<String>,
-    /// `dynamic fn` / `open fn` names, in slot order (DYNAMIC-VIRE-PLAN.md P1). A call to
+    /// `dynamic fn` / `open fn` names, in slot order (the former DYNAMIC-VIRE-PLAN.md (removed in cleanup; see git history) P1). A call to
     /// one of these is dispatched through the mutable runtime slot `@jrt_dynslot[slot]`
     /// (default = the function's own body) instead of a direct call, so a loaded module can
     /// override it at runtime. Empty for the Java path and any sealed program (zero effect).
     pub dyn_fns: Vec<String>,
-    /// `@patchable` function names (DYNAMIC-VIRE-PATCH.md B1). Like `dyn_fns` they get a NOP
+    /// `@patchable` function names (the former DYNAMIC-VIRE-PATCH.md (removed in cleanup; see git history) B1). Like `dyn_fns` they get a NOP
     /// entry sled + a `@jrt_patchtab` record, but they are NOT slot-dispatched — they stay
     /// ordinary direct calls whose entry the runtime patcher redirects in place (hot-update).
     /// Not inlined (a single entry must remain to patch). Empty for Java/sealed programs.
     pub patch_fns: Vec<String>,
     /// Declared hardware regions (name, base address, length in bytes) from
-    /// `--hw-profile` (see language/HW-SAFE.md). `Mmio::bind("name")` resolves
+    /// `--hw-profile` (see the former language/the former HW-SAFE.md (removed in cleanup; see git history) (removed in cleanup; see git history)). `Mmio::bind("name")` resolves
     /// against this table; the backend emits volatile accesses at base+offset.
     /// Empty = no hardware access (any bind is E400).
     pub hw_regions: Vec<(String, u64, u64)>,
+    /// `extern "C"` declarations (name + checked param/return types): the
+    /// C-ABI boundary. The LLVM backend links them; the Gabbro path maps
+    /// scalar-only decls to `extern fn` heads (`Ptr` stays rejected there —
+    /// no `int -> ptr`).
+    pub extern_fns: Vec<ExternDecl>,
 }
 
 impl Program {
