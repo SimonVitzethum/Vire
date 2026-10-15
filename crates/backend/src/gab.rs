@@ -47,6 +47,19 @@ fn sanitize_mod(s: &str) -> String {
     out
 }
 
+/// Method names (`Vec2.len`) carry a dot the Gabbro surface forbids.
+/// Map them into the `vire_`-prefixed namespace users cannot declare
+/// (the signature guard rejects every user `vire_` name but `vire_main`,
+/// so the mapping is collision-free by construction). Applied at render
+/// only — analysis keeps real names. `$` instantiations stay E500.
+fn meth_name(name: &str) -> String {
+    if name.contains('.') {
+        format!("vire_method_{}", name.replace('.', "_"))
+    } else {
+        name.to_string()
+    }
+}
+
 fn gab_ty(t: Ty) -> Option<&'static str> {
     match t {
         Ty::I64 => Some("i64"),
@@ -504,24 +517,53 @@ fn obj_usable_classes(program: &Program) -> BTreeMap<String, Vec<(String, ObjSlo
     out
 }
 
-/// Object flow info for the whole program (M4a).
+/// Object flow info for the whole program (M4a + M4b).
 struct ObjInfo {
     /// Function → local → class (union over defs; conflicts removed).
     locals: BTreeMap<String, BTreeMap<u32, String>>,
     /// Functions returning references: name → class (fixpoint over Returns).
     ret_class: BTreeMap<String, String>,
+    /// Reference parameters with proven classes (Phase 1): fn → param → class.
+    /// From body-use classes + call-site unions (two passes, deterministic).
+    params: BTreeMap<String, BTreeMap<u32, String>>,
     /// New/StackNew sites with static rows: (fn, block, stmt) → (class, row).
     rows: BTreeMap<(String, u32, usize), (String, u64)>,
     /// Class → row count (table `count`).
     row_counts: BTreeMap<String, u64>,
 }
 
+/// Body-use classes per Ref param: classes named at GetField/PutField with
+/// the param as base. Purely local (no fixpoint); the call-site half lives
+/// in `analyze_objects`.
+fn body_param_uses(func: &Function) -> Vec<BTreeSet<String>> {
+    let mut out: Vec<BTreeSet<String>> = func.params.iter().map(|_| BTreeSet::new()).collect();
+    for b in &func.blocks {
+        for st in &b.statements {
+            match st {
+                Statement::GetField { obj: Operand::Copy(l), class, .. }
+                | Statement::PutField { obj: Operand::Copy(l), class, .. } => {
+                    if (l.0 as usize) < func.params.len()
+                        && func.params[l.0 as usize] == Ty::Ref
+                    {
+                        out[l.0 as usize].insert(class.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Local→class union for one function given callee return classes.
 /// Unknown absorbs (null defs carry no class); disagreement removes.
+/// `param_seed` binds proven parameter classes (Phase 1) so copies from
+/// parameters propagate like any other known class.
 fn obj_local_map(
     func: &Function,
     usable: &BTreeMap<String, Vec<(String, ObjSlot)>>,
     ret_class: &BTreeMap<String, String>,
+    param_seed: &BTreeMap<u32, String>,
 ) -> BTreeMap<u32, String> {
     let field_target = |class: &str, field: &str| -> Option<String> {
         usable.get(class)?.iter().find(|(n, _)| n == field).and_then(|(_, s)| match s {
@@ -531,6 +573,11 @@ fn obj_local_map(
     };
     let mut map: BTreeMap<u32, String> = BTreeMap::new();
     let mut bad: BTreeSet<u32> = BTreeSet::new();
+    // Proven parameter classes seed the map (Phase 1): a copy from a
+    // classed parameter carries that class everywhere the copy flows.
+    for (l, c) in param_seed.iter() {
+        map.insert(*l, c.clone());
+    }
     let put = |map: &mut BTreeMap<u32, String>, bad: &mut BTreeSet<u32>, l: u32, c: String| {
         if bad.contains(&l) {
             return;
@@ -567,11 +614,24 @@ fn obj_local_map(
                             }
                         }
                     }
-                    Statement::GetField { dest: d, class, field, .. } => {
+                    Statement::GetField { dest: d, obj, class, field } => {
                         if func.locals.get(d.0 as usize) == Some(&Ty::Ref) {
                             if let Some(t) = field_target(class, field) {
                                 let before = (map.len(), bad.len());
                                 put(&mut map, &mut bad, d.0, t);
+                                grew |= (map.len(), bad.len()) != before;
+                            }
+                        }
+                        // Use-site class: the access names the class lowering
+                        // proved for its base (inlined null args, flattened
+                        // temps). Conflicts still remove; heterogeneous merges
+                        // never reach IR, so this adds no unsound accept.
+                        if let Operand::Copy(l) = obj {
+                            if func.locals.get(l.0 as usize) == Some(&Ty::Ref)
+                                && usable.contains_key(class)
+                            {
+                                let before = (map.len(), bad.len());
+                                put(&mut map, &mut bad, l.0, class.clone());
                                 grew |= (map.len(), bad.len()) != before;
                             }
                         }
@@ -583,6 +643,16 @@ fn obj_local_map(
                                 put(&mut map, &mut bad, d.0, c);
                                 grew |= (map.len(), bad.len()) != before;
                             }
+                        }
+                    }
+                    // Use-site class on stores (same soundness as loads).
+                    Statement::PutField { obj: Operand::Copy(l), class, .. } => {
+                        if func.locals.get(l.0 as usize) == Some(&Ty::Ref)
+                            && usable.contains_key(class)
+                        {
+                            let before = (map.len(), bad.len());
+                            put(&mut map, &mut bad, l.0, class.clone());
+                            grew |= (map.len(), bad.len()) != before;
                         }
                     }
                     _ => {}
@@ -622,6 +692,31 @@ fn analyze_objects(
         }
     }
     // Return-class fixpoint (monotone: entries only added; ≤ F+1 rounds).
+    // Body-use singletons seed the local maps (a parameter used through
+    // exactly one class carries it — call-site agreement is checked below).
+    let body_uses: BTreeMap<String, Vec<BTreeSet<String>>> = program
+        .functions
+        .iter()
+        .filter(|f| reachable.contains(&f.name))
+        .map(|f| (f.name.clone(), body_param_uses(f)))
+        .collect();
+    let seed_of = |f: &Function| -> BTreeMap<u32, String> {
+        body_uses
+            .get(&f.name)
+            .map(|sets| {
+                sets.iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        if s.len() == 1 {
+                            Some((i as u32, s.iter().next().unwrap().clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut ret_class: BTreeMap<String, String> = BTreeMap::new();
     for _ in 0..program.functions.len() + 1 {
         let mut grew = false;
@@ -632,7 +727,7 @@ fn analyze_objects(
             if f.ret != Ty::Ref || ret_class.contains_key(&f.name) {
                 continue;
             }
-            let lm = obj_local_map(f, usable, &ret_class);
+            let lm = obj_local_map(f, usable, &ret_class, &seed_of(f));
             let mut cls: BTreeSet<String> = BTreeSet::new();
             let mut unknown = false;
             for b in &f.blocks {
@@ -661,7 +756,96 @@ fn analyze_objects(
         if !reachable.contains(&f.name) {
             continue;
         }
-        locals.insert(f.name.clone(), obj_local_map(f, usable, &ret_class));
+        locals.insert(f.name.clone(), obj_local_map(f, usable, &ret_class, &seed_of(f)));
+    }
+    // Phase 1 parameter classes (two passes, deterministic): body-use
+    // classes plus call-site arg unions. A parameter is proven iff its body
+    // uses name at most one class AND every known call-site arg agrees
+    // (nulls are compatible with anything); with no body uses, a single
+    // call-site class suffices. Anything else stays unknown → E500 M4b.
+    let by_name: BTreeMap<&str, &Function> =
+        program.functions.iter().map(|f| (f.name.as_str(), f)).collect();
+    // (callee, arg index) → classes seen at call sites.
+    let mut call_sets: BTreeMap<(String, u32), BTreeSet<String>> = BTreeMap::new();
+    for f in &program.functions {
+        if !reachable.contains(&f.name) {
+            continue;
+        }
+        let lm: &BTreeMap<u32, String> =
+            match locals.get(&f.name) {
+                Some(m) => m,
+                None => continue,
+            };
+        for b in &f.blocks {
+            for st in &b.statements {
+                if let Statement::Call { func: c, args, .. } = st {
+                    let callee = match by_name.get(c.as_str()) {
+                        Some(g) => g,
+                        None => continue,
+                    };
+                    for (k, a) in args.iter().enumerate() {
+                        if (k as usize) >= callee.params.len()
+                            || callee.params[k] != Ty::Ref
+                        {
+                            continue;
+                        }
+                        if let Operand::Copy(l) = a {
+                            if let Some(ac) = lm.get(&l.0).cloned() {
+                                call_sets
+                                    .entry((c.clone(), k as u32))
+                                    .or_default()
+                                    .insert(ac);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut params: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
+    for f in &program.functions {
+        if !reachable.contains(&f.name) {
+            continue;
+        }
+        let mut pm = BTreeMap::new();
+        if let Some(sets) = body_uses.get(&f.name) {
+            for (k, bset) in sets.iter().enumerate() {
+                if f.params[k] != Ty::Ref {
+                    continue;
+                }
+                let cset =
+                    call_sets.get(&(f.name.clone(), k as u32)).cloned().unwrap_or_default();
+                let decided = if bset.len() > 1 {
+                    None
+                } else if bset.len() == 1 {
+                    let b = bset.iter().next().unwrap();
+                    if cset.iter().all(|c| c == b) {
+                        Some(b.clone())
+                    } else {
+                        None
+                    }
+                } else if cset.len() == 1 {
+                    Some(cset.iter().next().unwrap().clone())
+                } else {
+                    None
+                };
+                if let Some(c) = decided {
+                    pm.insert(k as u32, c);
+                }
+            }
+        }
+        if !pm.is_empty() {
+            params.insert(f.name.clone(), pm);
+        }
+    }
+    // Pass B: local maps with finalized parameter classes (copies from
+    // parameters now resolve through chains of any depth the two passes see).
+    for f in &program.functions {
+        if !reachable.contains(&f.name) {
+            continue;
+        }
+        let seed = params.get(&f.name).cloned().unwrap_or_default();
+        locals.insert(f.name.clone(), obj_local_map(f, usable, &ret_class, &seed));
     }
     // Single-execution: walk the unique caller chain; every call block must
     // sit outside loops AND headers (headers hold pure calls only, and a
@@ -727,7 +911,7 @@ fn analyze_objects(
             }
         }
     }
-    ObjInfo { locals, ret_class, rows, row_counts }
+    ObjInfo { locals, ret_class, params, rows, row_counts }
 }
 /// Sites cover `StackNewArray` and const-length `NewArray` of `Long`/`U8`
 /// kind (both value-typed I64 — U8 reads 0..255 into i64 slots, no range
@@ -1079,6 +1263,8 @@ struct BodyEmit<'a> {
     obj_rows: BTreeMap<(u32, usize), (String, u64)>,
     /// Ref-returning callees (whole program; name → class).
     obj_rets: BTreeMap<String, String>,
+    /// Proven reference parameters (whole program; fn → param → class).
+    obj_params: BTreeMap<String, BTreeMap<u32, String>>,
     out: String,
 }
 
@@ -3144,11 +3330,48 @@ impl<'a> BodyEmit<'a> {
                     return;
                 }
                 // Arity/types are consistent by construction; dest type decides form.
-                let arg_ts: Vec<String> =
-                    args.iter().map(|a| self.operand_inline(a, Ty::I64)).collect();
+                // Reference args render through their option bindings; `null`
+                // renders as `None` exactly where the callee parameter is a
+                // proven option (Phase 1) — anywhere else it stays loud.
+                // A reference arg into a classed parameter must itself be
+                // classed the same (never a bare name into the checker).
+                let callee_params = self.obj_params.get(func).cloned().unwrap_or_default();
+                let mut arg_ts = vec![];
+                for (k, a) in args.iter().enumerate() {
+                    match callee_params.get(&(k as u32)) {
+                        Some(c) => match a {
+                            Operand::ConstNull => {
+                                arg_ts.push("None".to_string());
+                            }
+                            Operand::Copy(l) => match self.obj_locals.get(&l.0) {
+                                Some(ac) if ac == c => {
+                                    arg_ts.push(self.operand_inline(a, Ty::I64));
+                                }
+                                _ => {
+                                    self.fe.errs.push(e500(format!(
+                                        "call to `{func}` passes an object of unknown or mismatched class into `{c}` (M4: construction must dominate every use)"
+                                    )));
+                                    return;
+                                }
+                            },
+                            _ => {
+                                self.fe.errs.push(e500(format!(
+                                    "call to `{func}` passes a non-reference into `{c}` (M4: internal)"
+                                )));
+                                return;
+                            }
+                        },
+                        None => {
+                            arg_ts.push(self.operand_inline(a, Ty::I64));
+                        }
+                    }
+                }
+                // Rendered callee name (dotted methods map into the reserved
+                // `vire_method_` namespace — same mapping as the definition).
+                let gfunc = meth_name(func);
                 match dest {
                     None => {
-                        let _ = writeln!(self.out, "    {func}({});", arg_ts.join(", "));
+                        let _ = writeln!(self.out, "    {gfunc}({});", arg_ts.join(", "));
                     }
                     Some(d) => {
                         let ty = self.fe.func.locals[d.0 as usize];
@@ -3162,7 +3385,7 @@ impl<'a> BodyEmit<'a> {
                                     Some(c) => {
                                         self.emit_assign(
                                             *d,
-                                            format!("{func}({})", arg_ts.join(", ")),
+                                            format!("{gfunc}({})", arg_ts.join(", ")),
                                             &format!("option index into {}", obj_table_name(&c)),
                                         );
                                         return;
@@ -3175,7 +3398,7 @@ impl<'a> BodyEmit<'a> {
                                     }
                                 }
                             }
-                            let _ = writeln!(self.out, "    {func}({});", arg_ts.join(", "));
+                            let _ = writeln!(self.out, "    {gfunc}({});", arg_ts.join(", "));
                             return;
                         }
                         // Object-typed results ride the callee's return class.
@@ -3184,7 +3407,7 @@ impl<'a> BodyEmit<'a> {
                                 Some(c) => {
                                     self.emit_assign(
                                         *d,
-                                        format!("{func}({})", arg_ts.join(", ")),
+                                        format!("{gfunc}({})", arg_ts.join(", ")),
                                         &format!("option index into {}", obj_table_name(&c)),
                                     );
                                 }
@@ -3198,7 +3421,7 @@ impl<'a> BodyEmit<'a> {
                         }
                         match gab_ty(ty) {
                             Some(gt) => {
-                                self.emit_assign(*d, format!("{func}({})", arg_ts.join(", ")), gt);
+                                self.emit_assign(*d, format!("{gfunc}({})", arg_ts.join(", ")), gt);
                             }
                             None => {
                                 self.fe.errs.push(e500(format!(
@@ -4420,12 +4643,17 @@ fn emit_function(
     obj_locals: BTreeMap<u32, String>,
     obj_rows: BTreeMap<(u32, usize), (String, u64)>,
     obj_rets: &BTreeMap<String, String>,
+    obj_params_all: &BTreeMap<String, BTreeMap<u32, String>>,
 ) -> String {
     // Signature validation.
     // (`vire_main` is the compiler-known entry, exempt from the namespace
     // guard; every other `vire_`-prefixed name would collide with prelude
-    // helpers like `vire_print_str_M`.)
-    if !is_ident(&func.name) || func.name.contains('$') || (func.name.starts_with("vire_") && func.name != "vire_main") {
+    // helpers like `vire_print_str_M`. Dotted method names (`Vec2.len`) map
+    // into that same reserved namespace at render — users cannot declare
+    // them, so the mapping cannot collide.)
+    // The rendered name (methods mapped, everything else verbatim).
+    let gname = meth_name(&func.name);
+    if !is_ident(&gname) || func.name.contains('$') || (func.name.starts_with("vire_") && func.name != "vire_main") {
         errs.push(e500(format!(
             "function name `{}` not emittable (M1: plain idents, generics later; `vire_` is the prelude namespace)",
             func.name
@@ -4434,10 +4662,14 @@ fn emit_function(
     }
     for (i, p) in func.params.iter().enumerate() {
         if *p == Ty::Ref {
-            errs.push(e500(format!(
-                "parameter {i} of `{}` is a reference (M4b: monomorphized signatures later)",
-                func.name
-            )));
+            // Proven reference parameters ride the tables as options
+            // (Phase 1); unproven ones stay loud E500 M4b.
+            if obj_params_all.get(&func.name).and_then(|m| m.get(&(i as u32))).is_none() {
+                errs.push(e500(format!(
+                    "parameter {i} of `{}` is a reference of unknown class (M4b: monomorphized signatures later)",
+                    func.name
+                )));
+            }
         } else if *p != Ty::I64 {
             errs.push(e500(format!(
                 "parameter {i} of `{}` has type {p:?} (M1: Int params only)",
@@ -4607,7 +4839,7 @@ fn emit_function(
     }
     let mut fe = FnEmit { func, strings, str_max, arr_site, arr_sites, arr_conflict, len32, i64free, opt_locs, wide32: BTreeSet::new(), trace_hints: BTreeMap::new(), bools, used, temps: 0, prelude: PreludeUse::default(), errs: vec![] };
     let headers: BTreeSet<u32> = loops.keys().copied().collect();
-    let mut be = BodyEmit { fe: &mut fe, is_main, active: vec![], seen: BTreeSet::new(), nparams: func.params.len(), bound: BTreeSet::new(), loops: vec![], loop_seq: 0, loop_info: loops, headers, pdom, out: String::new(), region_sites, region_stack: vec![], externs: externs.clone(), unmapped_externs: unmapped_externs.clone(), obj_classes: obj_classes.clone(), obj_locals, obj_rows, obj_rets: obj_rets.clone() };
+    let mut be = BodyEmit { fe: &mut fe, is_main, active: vec![], seen: BTreeSet::new(), nparams: func.params.len(), bound: BTreeSet::new(), loops: vec![], loop_seq: 0, loop_info: loops, headers, pdom, out: String::new(), region_sites, region_stack: vec![], externs: externs.clone(), unmapped_externs: unmapped_externs.clone(), obj_classes: obj_classes.clone(), obj_locals, obj_rows, obj_rets: obj_rets.clone(), obj_params: obj_params_all.clone() };
     // Option pairs bound once at function top (dominator-safe: every later
     // write — branches, joins, loop passes — is a plain assign).
     {
@@ -4694,8 +4926,20 @@ fn emit_function(
         }
         let _ = writeln!(s, "}}");
     } else {
-        let params: Vec<String> =
-            func.params.iter().enumerate().map(|(i, _)| format!("p{i} : i64")).collect();
+        // Reference parameters with proven classes ride as options
+        // (Phase 1); unproven ones already failed validation above.
+        let obj_pm = obj_params_all.get(&func.name).cloned().unwrap_or_default();
+        let params: Vec<String> = func
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match (p, obj_pm.get(&(i as u32))) {
+                (Ty::Ref, Some(c)) => {
+                    format!("p{i} : option index into {}", obj_table_name(c))
+                }
+                _ => format!("p{i} : i64"),
+            })
+            .collect();
         let ret = match func.ret {
             Ty::I64 => " -> i64".to_string(),
             Ty::Ref => match obj_ret {
@@ -4704,7 +4948,7 @@ fn emit_function(
             },
             _ => String::new(),
         };
-        let _ = writeln!(s, "fn {}({}){} effects {{ {eff} }} costs <= {est} ops {{", func.name, params.join(", "), ret);
+        let _ = writeln!(s, "fn {}({}){} effects {{ {eff} }} costs <= {est} ops {{", gname, params.join(", "), ret);
         s.push_str(&be.out);
         let _ = writeln!(s, "}}");
     }
@@ -5166,7 +5410,7 @@ pub fn emit_gab(program: &Program, modname: &str) -> Result<String, Vec<String>>
                 obj_rows.insert((*bi, *si), v.clone());
             }
         }
-        bodies.push_str(&emit_function(f, is_main, &er, &ew, est, loops, pdom, &program.strings, str_max, len32, &funcs, &mut errs, &mut prelude, &externs, &unmapped_externs, &obj_classes, obj_locals, obj_rows, &obj_info.ret_class));
+        bodies.push_str(&emit_function(f, is_main, &er, &ew, est, loops, pdom, &program.strings, str_max, len32, &funcs, &mut errs, &mut prelude, &externs, &unmapped_externs, &obj_classes, obj_locals, obj_rows, &obj_info.ret_class, &obj_info.params));
     }
     if !errs.is_empty() {
         // Dedupe identical diagnostics (loops report E501 per enclosed branch).

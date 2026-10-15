@@ -510,8 +510,8 @@ fn main() {
 }
 EOF
 
-# --- decline: reference parameters (E500, M4b signatures later) ---------------
-gab_reject gab_objparam_e500 "E500" <<'EOF'
+# --- M4b: reference parameters (body-use class + call-site union) ------------
+gab_case gab_objparam "$(printf '18')" <<'EOF'
 type Node { val: Int }
 fn get(v: Node) -> Int {
     mut a = v.val
@@ -536,6 +536,102 @@ fn get(v: Node) -> Int {
 }
 fn main() {
     print(get(Node(1)))
+}
+EOF
+
+# --- M4b: predicate over a nullable parameter (null checked, never derefed) --
+gab_case gab_objpred "$(printf '18\n17')" <<'EOF'
+type Node { val: Int }
+fn isNil(n: Node) -> Int {
+    mut r = 0
+    if n == null {
+        r = 1
+    } else {
+        r = 0
+    }
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r = r + 1
+    r
+}
+fn main() {
+    print(isNil(null))
+    print(isNil(Node(7)))
+}
+EOF
+
+# --- M4b: surviving method call (mapped into vire_method_ namespace) ---------
+gab_case gab_objmethod "$(printf '160')" <<'EOF'
+type Vec2 { x: Int y: Int }
+impl Vec2 {
+    fn len(self) -> Int {
+        mut a = self.x + self.y
+        a = a + 0
+        a = a + 1
+        a = a + 2
+        a = a + 3
+        a = a + 4
+        a = a + 5
+        a = a + 6
+        a = a + 7
+        a = a + 8
+        a = a + 9
+        a = a + 10
+        a = a + 11
+        a = a + 12
+        a = a + 13
+        a = a + 14
+        a = a + 15
+        a = a + 16
+        a = a + 17
+        a
+    }
+}
+fn main() {
+    mut v = Vec2(3, 4)
+    print(v.len())
+}
+EOF
+
+# --- decline: null-only call leaves the class unknown (E500 M4b) -------------
+gab_reject gab_objparamnull_e500 "E500" <<'EOF'
+type Node { val: Int }
+fn ghost(x: Node) -> Int {
+    mut a = 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a
+}
+fn main() {
+    print(ghost(null))
 }
 EOF
 

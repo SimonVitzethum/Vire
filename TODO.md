@@ -15,6 +15,64 @@ errors; every rejection has a code + test (promote **and** decline).
 
 ---
 
+## Full-coverage plan (every valid Vire program → valid Gabbro)
+
+Rule: the solver finds or proves every bound/cost/contract (never the human);
+Gabbro holds each one. What has no static source stays declined with a code
+(K003 costs, O29 unbounded dynamics). Per phase: probe the Gabbro form at the
+oracle first, then promote + decline tests, 0 errors, run parity.
+
+## Phase 1 — M4b signatures (in work)
+
+- [x] **Reference parameters:** `option index into T` params from body-use
+  classes + call-site unions (getters, predicates, builders taking objects).
+  Use-site classes cover inlined null args; dotted methods map into the
+  reserved `vire_method_` namespace (collision-free by construction).
+- [ ] **Method calls:** direct fns after devirt/inline (inlined ones already work;
+  surviving calls need mangled-name + self-class mapping).
+- [ ] **`?` as match** and **monomorphized sum signatures** across functions
+  (Phase 1b — needs a multi-value return form).
+
+## Phase 2 — rows + table-bounded traversal
+
+- [ ] **Row linearization:** `New` in loops → one row per trip (E501 today).
+- [ ] **Traversal loops:** `while c != null` over `count K` tables →
+  `retry bounded K until (c == None)` (bound from the declaration).
+
+## Phase 3 — scalar completion
+
+- [ ] Floats (`f64` ranges, narrow or proven), division/modulo (narrow-guard),
+  `Bool`/`Char` slots, mixed int widths, explicit overflow semantics.
+
+## Phase 4 — dynamic bounds via provenance
+
+- [ ] `for i in 0..n` compiles iff the solver finds a static ceiling
+  (const array lengths, region ceilings, constant call chains). Else honest E501.
+
+## Phase 5 — collections, closures, tuples
+
+- [ ] `List`/`Map`/`Set` with static caps → tables + length, over-cap → `refuse`.
+  Iterator adapters → loop fusion. Lambdas → defunctionalized direct calls.
+  Tuples/fixed arrays → locals/tables. Full `Str` methods via max arithmetic.
+
+## Phase 6 — errors, hardware, threads, capsules
+
+- [ ] `Result` across functions, panic paths → `abort`/refuse.
+- [ ] `hw`/`syscall` → `device`/`reg` + syscall gates (solver-built ABI/costs).
+- [ ] `spawn` → Gabbro concurrency (probe 05 first: locks + `shared` guards).
+- [ ] `capsule` → arenas with copy in/out loops.
+
+## Phase 7 — costs + link units
+
+- [ ] Inferred costs/contracts instead of flat rates. Recursion `decreases`.
+- [ ] Dynamic modules/`open fn` as `gabbro link` units (research, not promised).
+
+## Honestly out
+
+- [ ] Deckenlose Unbeschränktheit ohne statische Quelle, `Rc`, Probabilistik.
+
+---
+
 ## M4b — object signatures (biggest scope lever)
 
 - [ ] **Row linearization:** `New` inside loops → one row per iteration (E501 today,
