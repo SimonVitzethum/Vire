@@ -57,6 +57,13 @@ oracle first, then promote + decline tests, 0 errors, run parity.
 
 ## Phase 6 — errors, hardware, threads, capsules
 
+- [~] **Syscalls + machine intrinsics (H1, done):** `syscall NAME(..) = NUM`
+  items and the `__vire_*` family (MMIO/port/fence from `Mmio`/`Port`/`fence`)
+  become per-site `extern fn` heads (number rides as data); `$mmio` handles are
+  compile-time descriptors; user shadowing of the intrinsic namespace is E500.
+  Full `device`/`reg` decls and `syscall ... via ...` gates need target ABI
+  knowledge — later step, never faked. MMIO/port are compile-only (the host
+  cannot execute them); `fence` + `getpid`-class syscalls carry run parity.
 - [ ] `Result` across functions, panic paths → `abort`/refuse.
 - [ ] `hw`/`syscall` → `device`/`reg` + syscall gates (solver-built ABI/costs).
 - [ ] `spawn` → Gabbro concurrency (probe 05 first: locks + `shared` guards).
@@ -111,7 +118,11 @@ oracle first, then promote + decline tests, 0 errors, run parity.
 - [ ] Value generics in return position (defaults to `Int` today).
 - [ ] `?`-payload class propagation, iterator invalidation, `Str.split → List[Str]`.
 
-## Scaling (millions of LOC)
+## Scaling (millions of LOC) — low priority
+
+The compiler may be slow (many solvers, minutes are fine); the binary must be
+fast (Gabbro is the target). So: termination guarantees yes, speed no. Still
+open, but behind binary performance.
 
 - [ ] Cap the uncapped fixpoints (`bounds.rs` GVN/upper/lower, RTA `O(F²)`,
   `own.rs` `O(B²)`), intern string keys, worklists instead of rescan loops.

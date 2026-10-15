@@ -758,6 +758,93 @@ fn main() {
 }
 EOF
 
+# --- H1: syscalls → extern fn heads (number rides as data) ------------------
+# getpid(39) is side-effect-free enough to run under the oracle (exit 0 only —
+# the pid itself varies, so no output parity asserted here).
+cat > "$work/gab_syscall.vr" <<'EOF'
+syscall getpid() -> Int = 39
+fn main() {
+    mut p = getpid()
+    print(0)
+}
+EOF
+if "$vire" build "$work/gab_syscall.vr" --emit=gab > "$work/gab_syscall.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_syscall.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "extern fn vire_syscall_39_0(a0 : i64)" "$work/gab_syscall.gab" \
+    && "$vire" run "$work/gab_syscall.vr" >/dev/null 2>&1; then
+    echo "ok   gab_syscall"; pass=$((pass+1))
+else echo "FAIL gab_syscall ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+# --- H1: fence runs under both (single LLVM fence, no asm) --------------------
+gab_case gab_fence "$(printf '7')" <<'EOF'
+fn main() {
+    fence()
+    print(7)
+}
+EOF
+
+# --- H1: MMIO + port are compile-only (the host cannot execute them) ----------
+# The hw-profile declares the region; offsets/widths are checked at lowering
+# (E400), heads are per-site externs, `gabbro check` holds the rest.
+printf 'uart0 0x1000 256\n' > "$work/hw.profile"
+cat > "$work/gab_mmio.vr" <<'EOF'
+fn main() {
+    mut u = Mmio.bind("uart0")
+    u.write32(0, 65)
+    mut v = u.read32(0)
+    print(v)
+}
+EOF
+if "$vire" build "$work/gab_mmio.vr" --emit=gab --hw-profile "$work/hw.profile" > "$work/gab_mmio.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_mmio.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "extern fn vire_mmio_w32_1000_0(a0 : i64)" "$work/gab_mmio.gab" \
+    && grep -q "extern fn vire_mmio_r32_1000_0() -> i64" "$work/gab_mmio.gab"; then
+    echo "ok   gab_mmio"; pass=$((pass+1))
+else echo "FAIL gab_mmio ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+cat > "$work/gab_port.vr" <<'EOF'
+fn main() {
+    port_outb(96, 65)
+    print(1)
+}
+EOF
+if "$vire" build "$work/gab_port.vr" --emit=gab > "$work/gab_port.gab" 2>"$work/e" \
+    && "$gab" check "$work/gab_port.gab" > "$work/chk" 2>&1 \
+    && grep -q "0 errors" "$work/chk" \
+    && grep -q "extern fn vire_port_outb(" "$work/gab_port.gab"; then
+    echo "ok   gab_port"; pass=$((pass+1))
+else echo "FAIL gab_port ($(head -1 "$work/e" "$work/chk" 2>/dev/null))"; fail=$((fail+1)); fi
+
+# --- decline: user fn shadowing the intrinsic namespace (E500) -----------------
+gab_reject gab_syscall_shadow_e500 "E500" <<'EOF'
+fn __vire_port_outb(x: Int) -> Int {
+    mut a = x
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a = a + 1
+    a
+}
+fn main() {
+    print(__vire_port_outb(1))
+}
+EOF
+
 # --- runtime-freedom: no jrt_* may leak into any emitted .gab ----------------
 if grep -l "jrt_" "$work"/*.gab >/dev/null 2>&1; then
     echo "FAIL gab_no_runtime (jrt_ reference in .gab: $(grep -l "jrt_" "$work"/*.gab | head -1))"; fail=$((fail+1))

@@ -60,6 +60,19 @@ fn meth_name(name: &str) -> String {
     }
 }
 
+/// Map a machine-intrinsic call name (`__vire_*`) into the reserved
+/// `vire_` head namespace (idempotent — names already starting there keep
+/// exactly one prefix). Users cannot declare `vire_` names, so the mapping
+/// is collision-free by construction.
+fn hw_head_name(cname: &str) -> String {
+    let t = cname.trim_start_matches('_');
+    if t.starts_with("vire_") {
+        t.to_string()
+    } else {
+        format!("vire_{t}")
+    }
+}
+
 fn gab_ty(t: Ty) -> Option<&'static str> {
     match t {
         Ty::I64 => Some("i64"),
@@ -133,6 +146,173 @@ fn analyze_externs(
             }
         }
     }
+    // Machine intrinsics (Phase H1): `syscall` (Vire `syscall NAME(..) = NUM`
+    // items lower to `Call "syscall" [num, args..]`) and the `__vire_*`
+    // family (MMIO/port/fence helpers from `Mmio`/`Port`/`fence`). All shapes
+    // are scalar by construction; each becomes an `extern fn` head (Gabbro
+    // has no `syscall`-with-bare-number or device form for these — the
+    // contract is signature + effects + costs, the body is machine, held at
+    // `gabbro link` like every `extern fn`). Full `device`/`reg` decls and
+    // `syscall ... via ...` gates need target ABI knowledge the Vire side
+    // does not carry yet — later step, never faked.
+    // Head names live in the reserved `vire_` namespace (users cannot
+    // declare them — the signature guard rejects all user `vire_` names),
+    // so synthesis is collision-free by construction.
+    // Scalar type of an operand at a call site (consts take their width).
+    let op_ty = |func: &Function, op: &Operand| -> Option<Ty> {
+        match op {
+            Operand::Copy(l) => func.locals.get(l.0 as usize).copied(),
+            Operand::ConstI64(_) => Some(Ty::I64),
+            Operand::ConstI32(_) => Some(Ty::I32),
+            _ => None,
+        }
+    };
+    // Register one synthesized head (arity-checked across sites).
+    let mut synth = |ok: &mut BTreeMap<String, ExternDecl>,
+                     bad: &mut BTreeMap<String, String>,
+                     errs: &mut Vec<String>,
+                     name: String,
+                     params: Vec<Ty>,
+                     ret: Ty| {
+        if bad.contains_key(&name) {
+            return;
+        }
+        match ok.get(&name) {
+            Some(d) if d.params == params && d.ret == ret => {}
+            Some(_) => {
+                let m = format!("intrinsic `{name}` used with inconsistent shapes (M4: internal)");
+                errs.push(e500(m.clone()));
+                bad.insert(name, m);
+            }
+            None => {
+                ok.insert(
+                    name.clone(),
+                    ExternDecl {
+                        name,
+                        params: params.clone(),
+                        ret,
+                        ptr_params: vec![false; params.len()],
+                        ptr_ret: false,
+                    },
+                );
+            }
+        }
+    };
+    for f in &program.functions {
+        for b in &f.blocks {
+            for st in &b.statements {
+                let (cname, args, dest) = match st {
+                    Statement::Call { func, args, dest } => (func, args, dest),
+                    _ => continue,
+                };
+                // User functions win over the intrinsic family: a call that
+                // resolves to a Vire function is never an intrinsic (name
+                // shadowing itself is E500 at signature validation).
+                if user.contains(cname.as_str()) {
+                    continue;
+                }
+                if cname == "syscall" {
+                    // [num, args..]; the number rides along as data (a static
+                    // head per arity class would hide it — the name carries
+                    // it when constant, `dyn` when computed).
+                    let (num_key, rest) = match args.first() {
+                        Some(Operand::ConstI64(n)) if *n >= 0 => (format!("{n}"), &args[1..]),
+                        Some(Operand::ConstI32(n)) if *n >= 0 => (format!("{n}"), &args[1..]),
+                        Some(_) => ("dyn".to_string(), &args[1..]),
+                        None => {
+                            let m = "syscall without a number (M4: internal)".to_string();
+                            errs.push(e500(m.clone()));
+                            bad.insert("syscall".to_string(), m);
+                            continue;
+                        }
+                    };
+                    let mut params = vec![];
+                    let mut okk = true;
+                    for a in args.iter() {
+                        match op_ty(f, a) {
+                            Some(t @ (Ty::I64 | Ty::I32)) => params.push(t),
+                            _ => {
+                                let m = format!(
+                                    "syscall argument of non-scalar type (M4: scalars only — no int->ptr)"
+                                );
+                                errs.push(e500(m.clone()));
+                                bad.insert(format!("vire_syscall_{num_key}_{}", args.len() - 1), m);
+                                okk = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !okk {
+                        continue;
+                    }
+                    let ret = match dest {
+                        None => Ty::Void,
+                        Some(d) => match f.locals.get(d.0 as usize).copied() {
+                            Some(t @ (Ty::I64 | Ty::I32)) => t,
+                            _ => {
+                                let m = "syscall result of non-scalar type (M4: internal)".to_string();
+                                errs.push(e500(m.clone()));
+                                bad.insert(format!("vire_syscall_{num_key}_{}", args.len() - 1), m);
+                                continue;
+                            }
+                        },
+                    };
+                    synth(
+                        &mut ok,
+                        &mut bad,
+                        errs,
+                        format!("vire_syscall_{num_key}_{}", args.len() - 1),
+                        params,
+                        ret,
+                    );
+                } else if cname.starts_with("__vire_") {
+                    // Machine helper: static name, scalar shapes.
+                    let mut params = vec![];
+                    let mut okk = true;
+                    for a in args.iter() {
+                        match op_ty(f, a) {
+                            Some(t @ (Ty::I64 | Ty::I32)) => params.push(t),
+                            _ => {
+                                let m = format!(
+                                    "intrinsic `{cname}` argument of non-scalar type (M4: internal)"
+                                );
+                                errs.push(e500(m.clone()));
+                                bad.insert(hw_head_name(cname), m);
+                                okk = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !okk {
+                        continue;
+                    }
+                    let ret = match dest {
+                        None => Ty::Void,
+                        Some(d) => match f.locals.get(d.0 as usize).copied() {
+                            Some(t @ (Ty::I64 | Ty::I32)) => t,
+                            _ => {
+                                let m = format!("intrinsic `{cname}` result of non-scalar type (M4: internal)");
+                                errs.push(e500(m.clone()));
+                                bad.insert(hw_head_name(cname), m);
+                                continue;
+                            }
+                        },
+                    };
+                    synth(
+                        &mut ok,
+                        &mut bad,
+                        errs,
+                        hw_head_name(cname),
+                        params,
+                        ret,
+                    );
+                }
+            }
+        }
+    }
+    // Rewrite intrinsic calls to their synthesized heads (same pass order as
+    // analysis would see them — names only; statements are untouched).
+    // NOTE: actual call rendering happens in `emit_stmt` via `obj_params`…
     (ok, bad)
 }
 
@@ -3264,7 +3444,27 @@ impl<'a> BodyEmit<'a> {
                 // `extern "C"` calls: mappable decls become direct `extern fn`
                 // calls (rendered with the declared param types); unmappable
                 // ones decline with their reason (Ptr/layouts never cross).
-                if let Some(d) = self.externs.get(func).cloned() {
+                // Machine intrinsics (`syscall`, `__vire_*`) resolve to their
+                // synthesized heads (same names as analysis builds); the
+                // number rides along as data, so rendering is uniform.
+                let head: Option<String> = if func == "syscall" {
+                    match args.first() {
+                        Some(Operand::ConstI64(n)) if *n >= 0 => {
+                            Some(format!("vire_syscall_{n}_{}", args.len() - 1))
+                        }
+                        Some(Operand::ConstI32(n)) if *n >= 0 => {
+                            Some(format!("vire_syscall_{n}_{}", args.len() - 1))
+                        }
+                        Some(_) => Some(format!("vire_syscall_dyn_{}", args.len() - 1)),
+                        None => None,
+                    }
+                } else if func.starts_with("__vire_") {
+                    Some(hw_head_name(func))
+                } else {
+                    None
+                };
+                let efunc: &str = head.as_deref().unwrap_or(func);
+                if let Some(d) = self.externs.get(efunc).cloned() {
                     if args.len() != d.params.len() {
                         self.fe.errs.push(e500(format!(
                             "extern `{func}` arity mismatch (M1: internal)"
@@ -3295,7 +3495,7 @@ impl<'a> BodyEmit<'a> {
                                 )));
                                 return;
                             }
-                            let _ = writeln!(self.out, "    {func}({});", ats.join(", "));
+                            let _ = writeln!(self.out, "    {efunc}({});", ats.join(", "));
                         }
                         Some(dd) => {
                             let want = match d.ret {
@@ -3314,7 +3514,7 @@ impl<'a> BodyEmit<'a> {
                                 )));
                                 return;
                             }
-                            self.emit_assign(*dd, format!("{func}({})", ats.join(", ")), want);
+                            self.emit_assign(*dd, format!("{efunc}({})", ats.join(", ")), want);
                         }
                     }
                     return;
@@ -3362,6 +3562,17 @@ impl<'a> BodyEmit<'a> {
                             }
                         },
                         None => {
+                            // Unknown-class references never render as bare
+                            // names (that would fail at `gabbro check` instead
+                            // of here) — e.g. escaping `$mmio` handles.
+                            if let Operand::Copy(l) = a {
+                                if self.fe.func.locals.get(l.0 as usize) == Some(&Ty::Ref) {
+                                    self.fe.errs.push(e500(
+                                        "call passes a reference of unknown class (M4: construction must dominate every use)".to_string(),
+                                    ));
+                                    return;
+                                }
+                            }
                             arg_ts.push(self.operand_inline(a, Ty::I64));
                         }
                     }
@@ -3785,8 +3996,20 @@ impl<'a> BodyEmit<'a> {
                 // Values widen identically (Vire-truncated at construction).
                 self.emit_assign(*dest, val, "i64");
             }
-            Statement::GetStatic { .. }
-            | Statement::PutStatic { .. }
+            Statement::GetStatic { class, .. } => {
+                // `$mmio` handles are compile-time descriptors (bound to a
+                // `--hw-profile` region, consumed into specialized
+                // `__vire_mmio_*` calls): no value to bind, like array
+                // aliases vanishing into their tables. Escaping uses stay
+                // loud (unknown-class reference args are E500 at calls).
+                if class == "$mmio" {
+                    return;
+                }
+                self.fe.errs.push(e500(format!(
+                    "reference statement `GetStatic {class}` (M1: integer code only — objects become tables later)"
+                )));
+            }
+            Statement::PutStatic { .. }
             | Statement::InstanceOfPending { .. }
             | Statement::CheckCast { .. }
             | Statement::InstanceOf { .. } => {
@@ -4653,9 +4876,14 @@ fn emit_function(
     // them, so the mapping cannot collide.)
     // The rendered name (methods mapped, everything else verbatim).
     let gname = meth_name(&func.name);
-    if !is_ident(&gname) || func.name.contains('$') || (func.name.starts_with("vire_") && func.name != "vire_main") {
+    if !is_ident(&gname)
+        || func.name.contains('$')
+        || (func.name.starts_with("vire_") && func.name != "vire_main")
+        || func.name == "syscall"
+        || func.name.starts_with("__vire_")
+    {
         errs.push(e500(format!(
-            "function name `{}` not emittable (M1: plain idents, generics later; `vire_` is the prelude namespace)",
+            "function name `{}` not emittable (M1: plain idents, generics later; `vire_` is the prelude namespace; `syscall`/`__vire_*` are reserved intrinsics)",
             func.name
         )));
         return String::new();
